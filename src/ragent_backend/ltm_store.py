@@ -182,7 +182,20 @@ class LTMStore:
 1. 只提取关于用户身份、偏好、禁忌、工作背景的客观事实
 2. 事实应简洁，一句话说完
 3. 不要提取泛泛而谈或临时性的内容
-4. 如果没有值得记住的内容，请返回空列表 []
+4. 用户明确提到自己的姓名、职位、所属团队/项目时，必须提取——这类身份信息永远算"值得记住"
+5. 如果确实没有任何值得记住的内容，才返回空列表 []
+
+示例 1 —
+【用户问题】请记住：我的名字是李雷，我的职位是产品经理，我负责客服系统
+【助手回答】好的，已经记住了，李雷你好。
+输出：["用户姓名是李雷", "用户职位是产品经理", "用户负责客服系统项目"]
+
+示例 2 —
+【用户问题】今天天气怎么样
+【助手回答】抱歉，我无法获取实时天气信息。
+输出：[]
+
+现在请处理：
 
 【用户问题】
 {query}
@@ -190,9 +203,9 @@ class LTMStore:
 【助手回答】
 {answer}
 
-请直接输出 JSON 列表，格式示例：
-["用户是金融风控工程师，主要使用 Python", "用户偏好简洁的技术回答，不喜欢过多业务解释"]
+请直接输出 JSON 列表，不要输出其他文字。
 """
+        content: Optional[str] = None
         try:
             response = await llm.ainvoke([HumanMessage(content=prompt)])
             content = response.content.strip()
@@ -203,8 +216,8 @@ class LTMStore:
             facts = json.loads(content)
             if isinstance(facts, list):
                 return [str(f).strip() for f in facts if str(f).strip()]
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[LTM] extract_facts failed: {e!r}; raw content={content!r}")
         return []
 
     async def delete_facts_from_turn(

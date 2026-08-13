@@ -57,6 +57,11 @@ class RAGWorkflow:
         self._llm = llm
         self._checkpointer = checkpointer
         self._ltm_store = ltm_store
+        # asyncio only holds a *weak* reference to a task; one created and never
+        # stored anywhere (as the archive/LTM background tasks below are) can be
+        # garbage-collected before it finishes running. Keeping a strong reference
+        # here until each task completes is the documented fix.
+        self._background_tasks: set[asyncio.Task] = set()
         self._token_queue: Optional[asyncio.Queue[str]] = None
         self._trace_queue: Optional[asyncio.Queue[Dict[str, Any]]] = None
         self._memory_manager = RollingMemoryManager(
@@ -676,17 +681,19 @@ class RAGWorkflow:
             task = asyncio.create_task(
                 self._store.append_to_history(conversation_id, all_to_archive, turn_id=turn_id)
             )
-            
+            self._background_tasks.add(task)
+
             # 添加完成回调，处理异常
             def on_done(t):
+                self._background_tasks.discard(t)
                 try:
                     t.result()
                     print(f"[Archive] Saved {len(all_to_archive)} messages for {conversation_id}")
                 except Exception as e:
                     print(f"[Archive] Failed to save history: {e}")
-            
+
             task.add_done_callback(on_done)
-        
+
         # 5. 长期记忆提取（异步，不阻塞响应）
         user_id = state.get("user_id")
         if self._ltm_store and user_id and len(messages) >= 2:
@@ -700,7 +707,11 @@ class RAGWorkflow:
                             await self._ltm_store.save_facts(user_id, facts, conversation_id=conversation_id, turn_id=turn_id)
                             print(f"[Archive] Extracted {len(facts)} LTM facts for user {user_id}")
                     except Exception as e:
-                        print(f"[Archive] LTM extraction failed: {e}")
+                        print(f"[Archive] LTM extraction failed: {e!r}")
+
+                ltm_task = asyncio.create_task(_extract_and_save())
+                self._background_tasks.add(ltm_task)
+                ltm_task.add_done_callback(self._background_tasks.discard)
                 asyncio.create_task(_extract_and_save())
         
         # 添加追踪事件

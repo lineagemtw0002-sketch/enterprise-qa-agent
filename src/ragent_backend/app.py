@@ -41,6 +41,7 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from src.ragent_backend.schemas import ChatRequest, ChatResponse, RollbackRequest
 from src.ragent_backend.store import build_archive_store, ConversationArchiveStore
 from src.ragent_backend.workflow import RAGWorkflow
+from src.ragent_backend.ltm_store import LTMStore
 from src.ragent_backend.file_store import build_file_store, ConversationFileStore
 from src.ragent_backend.conversation_store import build_conversation_store, ConversationStore
 from src.ingestion.pipeline import IngestionPipeline
@@ -263,6 +264,12 @@ def create_app() -> FastAPI:
         llm = None
 
     # 创建工作流（传入 tool_registry）
+    # LTMStore was never constructed here, so RAGWorkflow always received
+    # ltm_store=None -- long-term memory recall/extraction and the rollback
+    # endpoint's LTM trim step were silently no-ops despite being fully
+    # implemented in ltm_store.py.
+    ltm_store = LTMStore()
+
     workflow = RAGWorkflow(
         store=archive_store,
         llm=llm,
@@ -270,6 +277,7 @@ def create_app() -> FastAPI:
         max_messages=int(os.getenv("RAGENT_MAX_MESSAGES", "20")),
         keep_recent=int(os.getenv("RAGENT_KEEP_RECENT", "4")),
         tool_registry=tool_registry,
+        ltm_store=ltm_store,
     )
 
     # lifespan：异步连接 MCP Servers（必须在 FastAPI 构造函数之前定义）
@@ -581,6 +589,7 @@ def create_app() -> FastAPI:
         # 准备初始状态
         initial_state = {
             "query": request.query,
+            "user_id": request.user_id,
             "conversation_id": thread_id,
             "task_id": request.task_id or os.urandom(8).hex(),
             "top_k": request.top_k,
@@ -621,6 +630,7 @@ def create_app() -> FastAPI:
             
             initial_state = {
                 "query": request.query,
+                "user_id": request.user_id,
                 "conversation_id": thread_id,
                 "task_id": request.task_id or os.urandom(8).hex(),
                 "top_k": request.top_k,
