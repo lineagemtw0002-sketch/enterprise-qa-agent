@@ -55,9 +55,9 @@ retrieval:
 # Rerank Configuration
 # =============================================================================
 rerank:
-  enabled: false
-  provider: "none"  # Options: none, cross_encoder, dashscope, llm
-  model: "qwen3-rerank"
+  enabled: true
+  provider: "cross_encoder"  # Options: none, cross_encoder, dashscope, llm
+  model: "BAAI/bge-reranker-base"  # local, no API key, supports zh/en
   top_k: 5
 
 # =============================================================================
