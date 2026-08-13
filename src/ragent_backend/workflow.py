@@ -114,7 +114,10 @@ class RAGWorkflow:
     def _route_after_intent(self, state: RAGState) -> str:
         """根据意图判断结果决定下一步走向（三分支）"""
         intent_type = state.get("intent_type", "rag")
-        if intent_type == "clarify" or state.get("need_clarify"):
+        # need_clarify is the authoritative signal; intent_type=="clarify" alone is not
+        # trustworthy on smaller local models, which sometimes set intent_type="clarify"
+        # while need_clarify=False, causing a spurious short-circuit to an empty reply.
+        if state.get("need_clarify"):
             return "clarify"
         if intent_type == "tool":
             # 如果 LLM 不可用，无法运行 tool_subgraph，回退到 retrieve
@@ -396,7 +399,9 @@ class RAGWorkflow:
         """澄清节点：当意图为 clarify 时，生成澄清提示并准备进入 generate。"""
         self._emit_trace("clarify", "node_start", "running")
         
-        clarify_prompt = state.get("clarify_prompt", "请补充更多信息。")
+        # state["clarify_prompt"] is set (possibly to "") by _intent_node, so the
+        # dict.get default never fires for a missing key -- it must fire on falsy too.
+        clarify_prompt = state.get("clarify_prompt") or "请补充更多信息。"
         
         self._emit_trace("clarify", "node_end", "success", {
             "clarify_prompt": clarify_prompt,
