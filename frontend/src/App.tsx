@@ -1,9 +1,12 @@
+import { useState } from "react";
 import { NavLink, Route, Routes } from "react-router-dom";
 import "./App.css";
-import { ChatPage } from "./pages/ChatPage";
+import { ChatPage, type ChatMessage } from "./pages/ChatPage";
 import { KnowledgeBasePage } from "./pages/KnowledgeBasePage";
 
 function App() {
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+
   return (
     <div className="app">
       <header className="app-header">
@@ -19,7 +22,7 @@ function App() {
       </header>
       <main className="app-main">
         <Routes>
-          <Route path="/" element={<ChatPage />} />
+          <Route path="/" element={<ChatPage messages={messages} setMessages={setMessages} />} />
           <Route path="/knowledge-base" element={<KnowledgeBasePage />} />
         </Routes>
       </main>

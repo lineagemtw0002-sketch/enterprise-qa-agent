@@ -57,12 +57,25 @@ def query_structured_data(question: str) -> str:
     prompt = (
         "You generate PostgreSQL SELECT statements for a read-only role.\n"
         f"Schema:\n{_SCHEMA_DESCRIPTION}\n"
-        "Rules: single SELECT statement only, no comments, no semicolons, no CTEs that write.\n"
+        "Rules:\n"
+        "- Single SELECT statement only, no comments, no semicolons, no CTEs that write.\n"
+        "- Match names case-insensitively (ILIKE) since the question may not match stored casing.\n"
+        "\n"
+        "Example — question: \"How many orders does Acme Corp have?\"\n"
+        "SELECT COUNT(*) FROM orders o JOIN customers c ON c.id = o.customer_id "
+        "WHERE c.name ILIKE 'Acme Corp'\n"
+        "\n"
         f"Question: {question}\n"
-        "Return only the SQL, nothing else."
+        "\n"
+        "Step 1: List every specific customer/product/status name mentioned in the question above.\n"
+        "Step 2: Write the SELECT statement. For each name from Step 1, it MUST appear in a WHERE\n"
+        "...ILIKE clause (joining customers/orders on customer_id if needed). An aggregate with no\n"
+        "WHERE clause is only correct if Step 1's list is empty.\n"
+        "Step 3: Output ONLY the final SQL on the last line, no explanation, no markdown fences."
     )
     raw = llm.invoke(prompt).content.strip()
-    sql = raw.strip("`")
+    # The model reasons through Step 1/2 first; the SQL is the last non-empty line.
+    sql = raw.strip().splitlines()[-1].strip().strip("`")
     if sql.lower().startswith("sql"):
         sql = sql[3:].strip()
 

@@ -1,15 +1,20 @@
 import { useRef, useState } from "react";
+import type { Dispatch, SetStateAction } from "react";
 import { streamChat } from "../api/client";
 
-interface ChatMessage {
+export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   toolCalls: { tool: string; content: string }[];
   error?: string;
 }
 
-export function ChatPage() {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+interface ChatPageProps {
+  messages: ChatMessage[];
+  setMessages: Dispatch<SetStateAction<ChatMessage[]>>;
+}
+
+export function ChatPage({ messages, setMessages }: ChatPageProps) {
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
