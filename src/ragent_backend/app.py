@@ -95,37 +95,36 @@ def create_checkpointer():
 async def _trim_checkpoints(checkpointer, thread_id: str, keep_checkpoint_id: Optional[str]) -> None:
     """
     物理裁剪 checkpoint：保留 keep_checkpoint_id 对应的状态，删除该 thread 下所有其他 checkpoint 记录。
-    支持 AsyncSqliteSaver 和 PostgresSaver，同时清理关联的 blobs/writes 表。
+
+    本项目实际使用的是 langgraph-checkpoint-postgres 的 AsyncPostgresSaver（app.py
+    create_checkpointer() 里用 psycopg.AsyncConnection 构造），它的连接对象存在
+    `checkpointer.conn`，不是这里原来假设的 `_async_connection`；且 psycopg3 用 `%s`
+    占位符，不是 asyncpg 的 `$1/$2`。原实现的类型判断和属性名都对不上，会直接跳过整个
+    分支、静默不删除任何东西，但外层仍然报告 trimmed=True。
+
+    checkpoint_blobs 表按 (thread_id, checkpoint_ns, channel, version) 寻址，没有
+    checkpoint_id 列——它是内容寻址、可能被多个 checkpoint 共享引用的，这里不裁剪，
+    避免误删被保留的 checkpoint 仍然引用的 blob。
     """
-    
-    async def _safe_delete(db, sql, params):
-        try:
-            await db.execute(sql, params)
-        except Exception as e:
-            if "no such table" in str(e).lower() or "does not exist" in str(e).lower():
-                pass  # 表不存在则忽略
-            else:
-                raise
-    
+    conn = getattr(checkpointer, "conn", None)
+    if conn is None:
+        print(f"[TrimCheckpoint] checkpointer 没有可用连接，跳过 thread={thread_id}")
+        return
+
     try:
-        # PostgresSaver
-        if hasattr(checkpointer, '_async_connection') or type(checkpointer).__name__ == 'PostgresSaver':
-            conn = getattr(checkpointer, '_async_connection', None)
-            if conn is None:
-                return
-            if keep_checkpoint_id:
-                await conn.execute(
-                    "DELETE FROM checkpoints WHERE thread_id = $1 AND checkpoint_id != $2",
-                    thread_id, keep_checkpoint_id
-                )
-                await _safe_delete(conn, "DELETE FROM checkpoint_blobs WHERE thread_id = $1 AND checkpoint_id != $2", (thread_id, keep_checkpoint_id))
-                await _safe_delete(conn, "DELETE FROM checkpoint_writes WHERE thread_id = $1 AND checkpoint_id != $2", (thread_id, keep_checkpoint_id))
-            else:
-                await conn.execute("DELETE FROM checkpoints WHERE thread_id = $1", thread_id)
-                await _safe_delete(conn, "DELETE FROM checkpoint_blobs WHERE thread_id = $1", (thread_id,))
-                await _safe_delete(conn, "DELETE FROM checkpoint_writes WHERE thread_id = $1", (thread_id,))
-            print(f"[TrimCheckpoint] Postgres trimmed for thread={thread_id}, kept={keep_checkpoint_id}")
-            return
+        if keep_checkpoint_id:
+            await conn.execute(
+                "DELETE FROM checkpoints WHERE thread_id = %s AND checkpoint_id != %s",
+                (thread_id, keep_checkpoint_id),
+            )
+            await conn.execute(
+                "DELETE FROM checkpoint_writes WHERE thread_id = %s AND checkpoint_id != %s",
+                (thread_id, keep_checkpoint_id),
+            )
+        else:
+            await conn.execute("DELETE FROM checkpoints WHERE thread_id = %s", (thread_id,))
+            await conn.execute("DELETE FROM checkpoint_writes WHERE thread_id = %s", (thread_id,))
+        print(f"[TrimCheckpoint] Postgres trimmed for thread={thread_id}, kept={keep_checkpoint_id}")
     except Exception as e:
         print(f"[TrimCheckpoint] Postgres trim failed: {e}")
 
