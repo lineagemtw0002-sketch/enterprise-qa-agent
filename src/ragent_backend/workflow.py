@@ -421,26 +421,38 @@ class RAGWorkflow:
         }
 
     async def _retrieve_node(self, state: RAGState) -> Dict[str, Any]:
-        """检索节点 - 接入真实的 RAG MCP 检索"""
+        """检索节点 - 接入真实的 RAG MCP 检索
+
+        意图节点(_intent_node)会把并列主题拆分成多个 sub_queries（例如"退款政策和年假
+        制度分别是什么" -> ["退款政策是什么", "年假制度是什么"]），但这里过去只用了
+        rewritten_query 这一个字符串，sub_queries 从没被读取过——并行子查询检索一直是
+        没接上的死代码。真正有多个子查询时，并行检索后合并结果；只有一个时走原来的单查询
+        路径，行为不变。
+        """
         self._emit_trace("retrieve", "node_start", "running")
-        
-        query = state.get("rewritten_query") or state["query"]
+
         conversation_id = state["conversation_id"]
-        # 构建对话级 collection 名称
         collection = f"conv_{conversation_id}"
-        
+        top_k = state.get("top_k", 5)
+        sub_queries = [q.strip() for q in state.get("sub_queries", []) if q and q.strip()]
+
+        if len(sub_queries) > 1:
+            return await self._retrieve_multi(state, sub_queries, collection, top_k)
+
+        query = state.get("rewritten_query") or state["query"]
+
         self._emit_trace("retrieve", "knowledge_retrieval", "running", {
             "query": query,
             "collection": collection,
-            "top_k": state.get("top_k", 5),
+            "top_k": top_k,
         })
-        
+
         try:
             # 调用 RAG MCP 检索工具
             retrieval_result = await self._retrieval_tool.execute(
                 query=query,
                 collection=collection,
-                top_k=state.get("top_k", 5),
+                top_k=top_k,
             )
             
             # retrieval_result 是 MCPToolResponse 对象
@@ -478,6 +490,66 @@ class RAGWorkflow:
                     {"node": "retrieve", "ts": time.time(), "ok": False, "error": str(e)}
                 ],
             }
+
+    async def _retrieve_multi(
+        self,
+        state: RAGState,
+        sub_queries: List[str],
+        collection: str,
+        top_k: int,
+    ) -> Dict[str, Any]:
+        """并行检索多个子查询，逐个失败互不影响，最后合并成一份带子查询标签的上下文。"""
+        self._emit_trace("retrieve", "knowledge_retrieval", "running", {
+            "sub_queries": sub_queries,
+            "collection": collection,
+            "top_k": top_k,
+        })
+
+        async def _run_one(q: str) -> tuple[str, Optional[str], int, Optional[str]]:
+            try:
+                result = await self._retrieval_tool.execute(query=q, collection=collection, top_k=top_k)
+                count = result.metadata.get("result_count", 0) if hasattr(result, "metadata") else 0
+                return q, result.content, count, None
+            except Exception as e:
+                return q, None, 0, str(e)
+
+        results = await asyncio.gather(*[_run_one(q) for q in sub_queries])
+
+        contexts: List[str] = []
+        total_count = 0
+        errors: List[Dict[str, str]] = []
+        for q, content, count, err in results:
+            if err:
+                errors.append({"query": q, "error": err})
+                continue
+            if content:
+                contexts.append(f"[子查询: {q}]\n{content}")
+                total_count += count
+
+        context_text = "\n\n---\n\n".join(contexts) if contexts else "该对话暂无文件或检索服务暂时不可用。"
+
+        self._emit_trace("retrieve", "knowledge_retrieval", "success" if contexts else "error", {
+            "collection": collection,
+            "result_count": total_count,
+            "sub_query_count": len(sub_queries),
+            "errors": errors,
+        })
+        self._emit_trace("retrieve", "node_end", "success")
+        return {
+            "retrieval_context": context_text,
+            "retrieval_contexts": contexts,
+            "trace_events": [
+                *state.get("trace_events", []),
+                {
+                    "node": "retrieve",
+                    "ts": time.time(),
+                    "ok": True,
+                    "collection": collection,
+                    "result_count": total_count,
+                    "sub_query_count": len(sub_queries),
+                }
+            ],
+        }
 
     async def _generate_node(self, state: RAGState) -> Dict[str, Any]:
         """生成回复节点（支持内部流式输出）"""
