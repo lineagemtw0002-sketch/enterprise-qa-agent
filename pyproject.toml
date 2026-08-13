@@ -29,7 +29,9 @@ dependencies = [
     "langchain>=0.3.0",
     "langgraph>=0.2.0",
     "chromadb>=0.4.0",
-    "mcp>=1.0.0",
+    # mcp>=2.0.0 replaced the decorator-based Server API (@server.list_tools() etc.)
+    # that scripts/simple_mcp_server.py and src/mcp_server/ are written against.
+    "mcp>=1.0.0,<2.0.0",
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
     "asyncpg>=0.29.0",
