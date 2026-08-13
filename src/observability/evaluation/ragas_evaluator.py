@@ -28,8 +28,34 @@ CONTEXT_PRECISION = "context_precision"
 SUPPORTED_METRICS = {FAITHFULNESS, ANSWER_RELEVANCY, CONTEXT_PRECISION}
 
 
+def _shim_langchain_community_vertexai() -> None:
+    """ragas>=0.4 unconditionally imports langchain_community.chat_models.vertexai
+    at module load time (ragas/llms/base.py), even though this project never uses
+    Vertex AI. Current langchain-community (0.4.x) dropped that bundled
+    integration as part of sunsetting langchain-community, so the submodule no
+    longer exists and plain `import ragas` fails with a ModuleNotFoundError that
+    looks like ragas itself is broken. Register a harmless stub so the import
+    succeeds; nothing in this project ever instantiates ChatVertexAI.
+    """
+    import sys
+    import types
+
+    if "langchain_community.chat_models.vertexai" in sys.modules:
+        return
+    try:
+        import langchain_community.chat_models.vertexai  # noqa: F401
+        return  # real module exists (older langchain-community); nothing to shim
+    except ImportError:
+        pass
+
+    stub = types.ModuleType("langchain_community.chat_models.vertexai")
+    stub.ChatVertexAI = type("ChatVertexAI", (), {})
+    sys.modules["langchain_community.chat_models.vertexai"] = stub
+
+
 def _import_ragas() -> None:
     """Validate that ragas is importable, raising a clear error if not."""
+    _shim_langchain_community_vertexai()
     try:
         import ragas  # noqa: F401
     except ImportError as exc:
@@ -231,10 +257,18 @@ class RagasEvaluator(BaseEvaluator):
                 api_key=llm_cfg.api_key,
                 base_url=getattr(llm_cfg, "base_url", None),
             )
+        elif provider == "ollama":
+            # No dedicated Ollama client in ragas; reuse its OpenAI-compatible
+            # endpoint like the rest of this project does for the main LLM.
+            ollama_base_url = getattr(llm_cfg, "base_url", None) or "http://localhost:11434"
+            llm_client = AsyncOpenAI(
+                api_key=llm_cfg.api_key or "ollama",
+                base_url=f"{ollama_base_url.rstrip('/')}/v1" if not ollama_base_url.rstrip("/").endswith("/v1") else ollama_base_url,
+            )
         else:
             raise ValueError(
                 f"Unsupported LLM provider for Ragas: '{provider}'. "
-                "Supported: azure, openai"
+                "Supported: azure, openai, ollama"
             )
 
         llm = llm_factory(llm_cfg.model, client=llm_client, max_tokens=8192)
@@ -261,10 +295,16 @@ class RagasEvaluator(BaseEvaluator):
                 api_key=emb_cfg.api_key,
                 base_url=getattr(emb_cfg, "base_url", None),
             )
+        elif emb_provider == "ollama":
+            ollama_emb_base_url = getattr(emb_cfg, "base_url", None) or "http://localhost:11434"
+            emb_client = AsyncOpenAI(
+                api_key=emb_cfg.api_key or "ollama",
+                base_url=f"{ollama_emb_base_url.rstrip('/')}/v1" if not ollama_emb_base_url.rstrip("/").endswith("/v1") else ollama_emb_base_url,
+            )
         else:
             raise ValueError(
                 f"Unsupported embedding provider for Ragas: '{emb_provider}'. "
-                "Supported: azure, openai"
+                "Supported: azure, openai, ollama"
             )
 
         embeddings = OpenAIEmbeddings(model=emb_cfg.model, client=emb_client)

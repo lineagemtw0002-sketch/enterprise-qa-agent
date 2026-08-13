@@ -62,8 +62,8 @@ rerank:
 # Evaluation Configuration
 # =============================================================================
 evaluation:
-  enabled: false
-  provider: "custom"  # Options: ragas, deepeval, custom
+  enabled: true
+  provider: "ragas"  # Options: ragas, deepeval, custom
   metrics:
     - "hit_rate"
     - "mrr"
