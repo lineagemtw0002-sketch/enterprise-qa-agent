@@ -246,10 +246,18 @@ def create_app() -> FastAPI:
             "temperature": settings.llm.temperature,
             "max_tokens": settings.llm.max_tokens,
         }
-        if getattr(settings.llm, "base_url", None):
-            llm_kwargs["base_url"] = settings.llm.base_url
-        if getattr(settings.llm, "api_key", None):
-            llm_kwargs["api_key"] = settings.llm.api_key
+        base_url = getattr(settings.llm, "base_url", None)
+        api_key = getattr(settings.llm, "api_key", None)
+        if settings.llm.provider == "ollama":
+            # Ollama exposes an OpenAI-compatible endpoint under /v1; ChatOpenAI
+            # requires a non-empty api_key even though Ollama ignores it.
+            llm_kwargs["base_url"] = f"{(base_url or 'http://localhost:11434').rstrip('/')}/v1"
+            llm_kwargs["api_key"] = api_key or "ollama"
+        else:
+            if base_url:
+                llm_kwargs["base_url"] = base_url
+            if api_key:
+                llm_kwargs["api_key"] = api_key
         llm = ChatOpenAI(**llm_kwargs)
     except Exception as e:
         print(f"[Init] Failed to init LLM: {e}")
