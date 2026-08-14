@@ -314,20 +314,18 @@ def _evaluate_single_trace(
     Returns dict with 'metrics' (score dict) or 'error' (str).
     """
     try:
-        from dataclasses import replace as dc_replace
-
         from src.core.settings import load_settings, EvaluationSettings
         from src.libs.evaluator.evaluator_factory import EvaluatorFactory
 
         settings = load_settings()
 
-        # Override evaluation settings to force Ragas (frozen dataclass, use replace)
+        # Override evaluation settings to force Ragas (frozen pydantic model, use model_copy)
         ragas_eval = EvaluationSettings(
             enabled=True,
             provider="ragas",
             metrics=["faithfulness", "answer_relevancy", "context_precision"],
         )
-        settings = dc_replace(settings, evaluation=ragas_eval)
+        settings = settings.model_copy(update={"evaluation": ragas_eval})
         evaluator = EvaluatorFactory.create(settings)
 
         # Re-run retrieval

@@ -208,8 +208,6 @@ def _execute_evaluation(
     This function imports heavy dependencies lazily to keep the
     dashboard responsive when the page is not used.
     """
-    from dataclasses import replace as dc_replace
-
     from src.core.settings import load_settings
     from src.libs.evaluator.evaluator_factory import EvaluatorFactory
     from src.observability.evaluation.eval_runner import EvalRunner, load_test_set
@@ -224,8 +222,8 @@ def _execute_evaluation(
         provider=backend,
         metrics=eval_settings.metrics if hasattr(eval_settings, "metrics") else [],
     )
-    # Replace only the evaluation sub-config in the full settings
-    settings_with_override = dc_replace(settings, evaluation=overridden_eval)
+    # Replace only the evaluation sub-config in the full settings (frozen pydantic model)
+    settings_with_override = settings.model_copy(update={"evaluation": overridden_eval})
 
     evaluator = EvaluatorFactory.create(settings_with_override)
 
