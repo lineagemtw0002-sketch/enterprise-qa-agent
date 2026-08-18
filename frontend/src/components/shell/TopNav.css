@@ -59,14 +59,12 @@
   color: var(--accent);
 }
 
-.nav-item.disabled {
+.nav-item.soon {
   opacity: 0.42;
-  cursor: not-allowed;
 }
 
-.nav-item.disabled:hover {
-  background: none;
-  color: var(--text-secondary);
+.nav-item.soon.active {
+  opacity: 1;
 }
 
 .nav-soon {

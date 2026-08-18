@@ -1,17 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import axios from 'axios'
-import { message, Modal, Popover, Drawer } from 'antd'
+import { message, Modal, Drawer } from 'antd'
 import {
   Sparkles, Plus, History, ChevronDown, RefreshCw, MessageCircle, MessageSquare, Trash2,
   Files as FilesIcon, UploadCloud, Box, FileText, BarChart2, LayoutDashboard, Link as LinkIcon,
   Activity, Settings, User, Bot, Send, XCircle, Info, Lock, UserRound,
-  Cpu, Clock, Package, Scale, BookOpen, Sparkle,
 } from 'lucide-react'
+import AppShell from './components/shell/AppShell.jsx'
 import TracePanel from './components/TracePanel.jsx'
 import AdminPanel from './components/admin/AdminPanel.jsx'
 import WorkflowPanel from './components/workflow/WorkflowPanel.jsx'
 import WorkflowStatusPill from './components/workflow/WorkflowStatusPill.jsx'
-import NotificationBell from './components/workflow/NotificationBell.jsx'
+import OpsPlaceholder from './components/ops/OpsPlaceholder.jsx'
 import './App.css'
 
 const ADMIN_ROLE_NAMES = new Set(['admin', 'super_admin'])
@@ -47,34 +47,6 @@ const FILE_ICONS = {
 
 const STATUS_LABEL = { pending: '等待中', ingesting: '处理中', ready: '就绪', error: '错误' }
 const STATUS_CLASS = { pending: 'warning', ingesting: 'primary', ready: 'success', error: 'danger' }
-
-// collection 内部用 ASCII slug（ChromaDB 不接受中文名），但界面上不应该让用户
-// 看到这种"代码感"的英文标识——统一映射成中文展示名，每个知识库再配一个专属的
-// 图标和主题色，一眼就能分清"这是哪个库"，不用读文字。没在表里的 slug 原样兜底显示。
-const KB_META = {
-  default: { label: '通用知识库', icon: BookOpen, color: '#6b7280' },
-  it_kb: { label: 'IT 知识库', icon: Cpu, color: '#3b82f6' },
-  attendance_kb: { label: '考勤知识库', icon: Clock, color: '#f59e0b' },
-  logistics_kb: { label: '后勤知识库', icon: Package, color: '#10b981' },
-  legal_kb: { label: '法务知识库', icon: Scale, color: '#ef4444' },
-}
-const KB_META_FALLBACK = { icon: FilesIcon, color: '#6b7280' }
-const KB_META_UNLIMITED = { label: '不限', icon: Sparkle, color: '#8b5cf6' }
-
-function kbMeta(slug) {
-  return { ...KB_META_FALLBACK, label: slug, ...KB_META[slug] }
-}
-
-function KbTag({ slug }) {
-  const meta = slug === '*' ? KB_META_UNLIMITED : kbMeta(slug)
-  const Icon = meta.icon
-  return (
-    <span className="tag tag--kb" style={{ '--kb-color': meta.color }}>
-      <Icon size={12} strokeWidth={2.25} />
-      {meta.label}
-    </span>
-  )
-}
 
 function loadStoredSettings() {
   const saved = localStorage.getItem('ragAgentSettings')
@@ -124,26 +96,6 @@ function renderMarkdown(text) {
     .replace(/`([^`]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/\*([^*]+)\*/g, '<em>$1</em>')
-}
-
-// 用户名 hash 出一个稳定的颜色，同一个用户名每次颜色都一样，不用后端存头像
-function avatarColor(username) {
-  if (!username) return '#94a3b8'
-  let hash = 0
-  for (let i = 0; i < username.length; i++) {
-    hash = username.charCodeAt(i) + ((hash << 5) - hash)
-  }
-  const hue = Math.abs(hash) % 360
-  return `hsl(${hue}, 55%, 45%)`
-}
-
-function avatarInitial(username) {
-  return username ? username.charAt(0).toUpperCase() : '?'
-}
-
-function formatDate(timestamp) {
-  if (!timestamp) return ''
-  return new Date(timestamp * 1000).toLocaleDateString('zh-CN')
 }
 
 export default function App() {
@@ -331,7 +283,6 @@ export default function App() {
     setConversationId(null)
     conversationIdRef.current = null
     setActiveWorkflow(null)
-    setSelectedWorkflow(null)
     setWorkflowDeepLinkId(null)
     setView('chat')
   }
@@ -404,7 +355,6 @@ export default function App() {
     setFiles([])
     setTraceEvents([])
     setActiveWorkflow(null)
-    setSelectedWorkflow(null)
     localStorage.setItem('currentConversationId', convId)
 
     await loadHistory(convId)
@@ -836,105 +786,43 @@ export default function App() {
     )
   }
 
-  const profileCard = (
-    <div className="profile-card">
-      <div className="profile-card-header">
-        <div className="user-avatar user-avatar--lg" style={{ background: avatarColor(currentUsername) }}>
-          {avatarInitial(currentUsername)}
-        </div>
-        <div>
-          <div className="profile-name">{currentUsername}</div>
-          {meProfile && <div className="profile-joined">加入于 {formatDate(meProfile.created_at)}</div>}
-        </div>
-      </div>
-
-      <div className="profile-section">
-        <div className="profile-section-label">可访问知识库</div>
-        <div className="profile-collections">
-          {meProfile?.allowed_collections?.includes('*') ? (
-            <KbTag slug="*" />
-          ) : meProfile?.allowed_collections?.length ? (
-            meProfile.allowed_collections.map((c) => <KbTag key={c} slug={c} />)
-          ) : (
-            <span className="profile-empty-hint">仅自己的对话</span>
-          )}
-        </div>
-      </div>
-
-      <hr className="profile-divider" />
-
-      <div className="profile-actions">
-        <button className="dialog-btn" style={{ width: '100%', marginLeft: 0 }} onClick={() => setView('workflow')}>
-          工作流
-        </button>
-        {isAdmin && (
-          <button className="dialog-btn" style={{ width: '100%', marginLeft: 0 }} onClick={() => setView('admin')}>
-            管理后台
-          </button>
-        )}
-        <button className="dialog-btn" style={{ width: '100%', marginLeft: 0 }} onClick={openChangePassword}>
-          修改密码
-        </button>
-        <button className="dialog-btn dialog-btn--danger" style={{ width: '100%', marginLeft: 0 }} onClick={logout}>
-          退出登录
-        </button>
-      </div>
-    </div>
-  )
-
-  if (authToken && view === 'admin') {
-    return <AdminPanel onBack={() => setView('chat')} />
-  }
-
-  if (authToken && view === 'workflow') {
-    return (
-      <WorkflowPanel
-        onBack={() => setView('chat')}
-        meUserId={meProfile?.user_id}
-        onGoToChat={(convId) => {
-          setView('chat')
-          if (convId) switchConversation(convId)
-          else startNewChat()
-        }}
-        deepLinkInstanceId={workflowDeepLinkId}
-        onDeepLinkConsumed={() => setWorkflowDeepLinkId(null)}
-      />
-    )
-  }
-
   return (
-    <div className="app-container">
-      <div className="main-container">
+    <>
+    <AppShell
+      view={view}
+      onNavigate={setView}
+      isAdmin={isAdmin}
+      currentUsername={currentUsername}
+      meProfile={meProfile}
+      onLogout={logout}
+      onOpenChangePassword={openChangePassword}
+      onWorkflowDeepLink={(instanceId) => {
+        setWorkflowDeepLinkId(instanceId)
+        setView('workflow')
+      }}
+    >
+      {view === 'admin' && <AdminPanel />}
+
+      {view === 'workflow' && (
+        <WorkflowPanel
+          meUserId={meProfile?.user_id}
+          onGoToChat={(convId) => {
+            setView('chat')
+            if (convId) switchConversation(convId)
+            else startNewChat()
+          }}
+          deepLinkInstanceId={workflowDeepLinkId}
+          onDeepLinkConsumed={() => setWorkflowDeepLinkId(null)}
+        />
+      )}
+
+      {view === 'ops' && <OpsPlaceholder />}
+
+      {view === 'chat' && (
+      <>
+      <div className="chat-layout">
         {/* 左侧边栏 */}
         <aside className="sidebar">
-          <div className="sidebar-header">
-            <div className="logo">
-              <Sparkles size={28} color="var(--accent)" />
-              <span className="logo-text">RAG Agent</span>
-            </div>
-            <p className="logo-subtitle">Intelligent Copilot</p>
-
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <Popover content={profileCard} trigger="click" placement="bottomLeft" overlayClassName="profile-popover">
-                <div className="user-bar" style={{ flex: 1 }}>
-                  <div className="user-avatar" style={{ background: avatarColor(currentUsername) }}>
-                    {avatarInitial(currentUsername)}
-                  </div>
-                  <span className="username">{currentUsername}</span>
-                  <ChevronDown size={14} className="user-bar-arrow" />
-                </div>
-              </Popover>
-              <NotificationBell
-                onNavigate={(link) => {
-                  const instanceId = link?.startsWith('workflow:') ? link.slice('workflow:'.length) : null
-                  if (!instanceId) return
-                  setWorkflowDeepLinkId(instanceId)
-                  setView('workflow')
-                }}
-              />
-            </div>
-          </div>
-
           <div className="sidebar-actions">
             <button className="new-chat-btn" onClick={startNewChat}>
               <Plus size={16} />
@@ -1284,54 +1172,57 @@ export default function App() {
           )}
         </div>
       </Drawer>
+      </>
+      )}
+    </AppShell>
 
-      {/* 修改密码 */}
-      <Modal
-        title="修改密码"
-        open={changePasswordVisible}
-        onCancel={() => setChangePasswordVisible(false)}
-        width={380}
-        footer={[
-          <button key="cancel" className="dialog-btn" onClick={() => setChangePasswordVisible(false)}>取消</button>,
-          <button
-            key="submit"
-            className="dialog-btn dialog-btn--primary"
-            disabled={changePasswordLoading}
-            onClick={submitChangePassword}
-          >
-            {changePasswordLoading ? '提交中…' : '确认修改'}
-          </button>,
-        ]}
-        destroyOnHidden
-      >
-        <div className="settings-form">
-          <div className="form-row form-row--stacked">
-            <label>当前密码</label>
-            <input
-              type="password"
-              value={changePasswordForm.old_password}
-              onChange={(e) => setChangePasswordForm((prev) => ({ ...prev, old_password: e.target.value }))}
-            />
-          </div>
-          <div className="form-row form-row--stacked">
-            <label>新密码</label>
-            <input
-              type="password"
-              value={changePasswordForm.new_password}
-              onChange={(e) => setChangePasswordForm((prev) => ({ ...prev, new_password: e.target.value }))}
-            />
-          </div>
-          <div className="form-row form-row--stacked">
-            <label>确认新密码</label>
-            <input
-              type="password"
-              value={changePasswordForm.confirm_password}
-              onChange={(e) => setChangePasswordForm((prev) => ({ ...prev, confirm_password: e.target.value }))}
-              onKeyDown={(e) => { if (e.key === 'Enter') submitChangePassword() }}
-            />
-          </div>
+    {/* 修改密码——顶部导航头像弹层触发，任意视图下都可能打开，所以放在 AppShell 外层 */}
+    <Modal
+      title="修改密码"
+      open={changePasswordVisible}
+      onCancel={() => setChangePasswordVisible(false)}
+      width={380}
+      footer={[
+        <button key="cancel" className="dialog-btn" onClick={() => setChangePasswordVisible(false)}>取消</button>,
+        <button
+          key="submit"
+          className="dialog-btn dialog-btn--primary"
+          disabled={changePasswordLoading}
+          onClick={submitChangePassword}
+        >
+          {changePasswordLoading ? '提交中…' : '确认修改'}
+        </button>,
+      ]}
+      destroyOnHidden
+    >
+      <div className="settings-form">
+        <div className="form-row form-row--stacked">
+          <label>当前密码</label>
+          <input
+            type="password"
+            value={changePasswordForm.old_password}
+            onChange={(e) => setChangePasswordForm((prev) => ({ ...prev, old_password: e.target.value }))}
+          />
         </div>
-      </Modal>
-    </div>
+        <div className="form-row form-row--stacked">
+          <label>新密码</label>
+          <input
+            type="password"
+            value={changePasswordForm.new_password}
+            onChange={(e) => setChangePasswordForm((prev) => ({ ...prev, new_password: e.target.value }))}
+          />
+        </div>
+        <div className="form-row form-row--stacked">
+          <label>确认新密码</label>
+          <input
+            type="password"
+            value={changePasswordForm.confirm_password}
+            onChange={(e) => setChangePasswordForm((prev) => ({ ...prev, confirm_password: e.target.value }))}
+            onKeyDown={(e) => { if (e.key === 'Enter') submitChangePassword() }}
+          />
+        </div>
+      </div>
+    </Modal>
+    </>
   )
 }

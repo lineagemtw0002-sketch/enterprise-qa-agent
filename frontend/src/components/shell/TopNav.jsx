@@ -57,6 +57,7 @@ const MODULES = [
   { key: 'chat', label: '智能问答', icon: MessageSquare },
   { key: 'workflow', label: '工作流', icon: ListChecks },
   { key: 'admin', label: '权限系统', icon: ShieldCheck, adminOnly: true },
+  { key: 'ops', label: '智能运维', icon: Activity, soon: true },
 ]
 
 // 顶部导航：登录后所有界面共用的壳——模块切换 + 通知 + 个人信息，替代原来
@@ -120,18 +121,18 @@ export default function TopNav({
         {MODULES.filter((m) => !m.adminOnly || isAdmin).map((m) => (
           <div
             key={m.key}
-            className={view === m.key ? 'nav-item active' : 'nav-item'}
+            className={[
+              'nav-item',
+              view === m.key ? 'active' : '',
+              m.soon ? 'soon' : '',
+            ].filter(Boolean).join(' ')}
             onClick={() => onNavigate(m.key)}
           >
             <m.icon size={16} />
             {m.label}
+            {m.soon && <span className="nav-soon">即将上线</span>}
           </div>
         ))}
-        <div className="nav-item disabled" title="即将上线">
-          <Activity size={16} />
-          智能运维
-          <span className="nav-soon">即将上线</span>
-        </div>
       </div>
 
       <div className="nav-right">

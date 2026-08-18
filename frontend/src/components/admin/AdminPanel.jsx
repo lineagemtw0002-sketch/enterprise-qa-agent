@@ -1,20 +1,13 @@
 import { Tabs } from 'antd'
-import { ArrowLeft } from 'lucide-react'
 import RoleManagement from './RoleManagement.jsx'
 import UserRoleAssignment from './UserRoleAssignment.jsx'
 import WorkflowTemplateManagement from './WorkflowTemplateManagement.jsx'
 import './AdminPanel.css'
 
-export default function AdminPanel({ onBack }) {
+export default function AdminPanel() {
   return (
     <div className="admin-panel">
-      <div className="admin-panel-header">
-        <button className="admin-back-btn" onClick={onBack}>
-          <ArrowLeft size={16} />
-          返回对话
-        </button>
-        <h2>管理后台</h2>
-      </div>
+      <h2 className="module-title">权限系统</h2>
 
       <Tabs
         className="admin-panel-tabs"

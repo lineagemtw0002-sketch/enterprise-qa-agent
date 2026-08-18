@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
 import { Tabs } from 'antd'
-import { ArrowLeft } from 'lucide-react'
 import * as workflowApi from '../../api/workflow.js'
 import WorkflowMyRequests from './WorkflowMyRequests.jsx'
 import WorkflowApprovalInbox from './WorkflowApprovalInbox.jsx'
@@ -9,7 +8,7 @@ import './WorkflowPanel.css'
 
 // "待我审批" Tab 是条件渲染的：只有当前用户至少持有一个模板的审批角色时才显示
 // （work-flow-web.md 第 3 节）——不是"看到但空空如也"，是压根不显示。
-export default function WorkflowPanel({ onBack, meUserId, onGoToChat, deepLinkInstanceId, onDeepLinkConsumed }) {
+export default function WorkflowPanel({ meUserId, onGoToChat, deepLinkInstanceId, onDeepLinkConsumed }) {
   const [isApprover, setIsApprover] = useState(false)
   const [deepLinkOpen, setDeepLinkOpen] = useState(false)
 
@@ -45,13 +44,7 @@ export default function WorkflowPanel({ onBack, meUserId, onGoToChat, deepLinkIn
 
   return (
     <div className="workflow-panel">
-      <div className="workflow-panel-header">
-        <button className="workflow-back-btn" onClick={onBack}>
-          <ArrowLeft size={16} />
-          返回对话
-        </button>
-        <h2>工作流</h2>
-      </div>
+      <h2 className="module-title">工作流</h2>
 
       <Tabs className="workflow-panel-tabs" defaultActiveKey="mine" items={items} />
 
