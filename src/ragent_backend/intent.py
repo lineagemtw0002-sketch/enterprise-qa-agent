@@ -30,9 +30,10 @@ class QueryAnalysisResult(BaseModel):
 
 
 class IntentDetectionResult(BaseModel):
-    """LLM 结构化输出：意图三分类"""
-    intent_type: Literal["clarify", "rag", "tool"] = Field(
-        description="意图类型: clarify=需要澄清, rag=知识库检索, tool=需要调用外部工具"
+    """LLM 结构化输出：意图四分类"""
+    intent_type: Literal["clarify", "rag", "tool", "workflow"] = Field(
+        description="意图类型: clarify=需要澄清, rag=知识库检索, tool=需要调用外部工具, "
+                    "workflow=发起一个业务流程（报修/请假/出差等）"
     )
     confidence: float = Field(
         ge=0.0, le=1.0,
@@ -45,6 +46,10 @@ class IntentDetectionResult(BaseModel):
     tool_args_preview: Optional[Dict[str, Any]] = Field(
         default=None,
         description="当 intent_type=tool 时，预解析的参数（可选）"
+    )
+    workflow_type: Optional[str] = Field(
+        default=None,
+        description="当 intent_type=workflow 时，匹配到的流程类型（必须从可用流程列表中选择）"
     )
     need_clarify: bool = Field(
         default=False,
@@ -212,24 +217,36 @@ _TOOL_INTENT_KEYWORDS: List[str] = [
     "天气", "气温", "降水",
 ]
 
+# 工作流意图关键词映射（规则 fallback 用）——workflow_type 必须与
+# WorkflowStore 里注册的实际类型完全一致（见 workflow_store.py 的种子模板）
+_WORKFLOW_KEYWORDS: Dict[str, List[str]] = {
+    "laptop_repair": ["报修", "电脑坏了", "键盘坏了", "屏幕坏了", "设备故障"],
+    "leave_request": ["请假", "事假", "病假", "年假", "调休"],
+    "business_trip": ["出差", "出差申请"],
+    "expense_reimbursement": ["报销", "发票", "报销单"],
+}
+
 
 async def detect_intent(
     rewritten_query: str,
     llm=None,
     available_tools: Optional[List[Dict[str, Any]]] = None,
+    available_workflows: Optional[List[Dict[str, Any]]] = None,
 ) -> IntentResult:
     """
-    意图三分类：clarify / rag / tool。
+    意图四分类：clarify / rag / tool / workflow。
 
     策略：
     1. 先检查是否需要澄清（保留现有规则）
-    2. 如果有 LLM，用结构化调用做三分类（推荐）
+    2. 如果有 LLM，用结构化调用做四分类（推荐）
     3. 无 LLM 时，回退到规则-based 分类
 
     Args:
         rewritten_query: 已重写（指代消解后）的查询
         llm: 可选的 LLM 实例
         available_tools: 可用工具列表（用于 LLM 判断 tool 意图）
+        available_workflows: 可用流程模板列表，每项至少含
+            {"workflow_type", "display_name", "description"}（用于 LLM 判断 workflow 意图）
 
     Returns:
         IntentResult
@@ -248,25 +265,26 @@ async def detect_intent(
             reasoning="查询过短或包含模糊代词，需要澄清",
         )
 
-    # === Step 2: LLM-based 三分类 ===
+    # === Step 2: LLM-based 四分类 ===
     if llm is not None:
         try:
             return await _detect_intent_with_llm(
-                rewritten_query, llm, available_tools or []
+                rewritten_query, llm, available_tools or [], available_workflows or [],
             )
         except Exception as e:
             print(f"[Intent] LLM-based detection failed: {e}, falling back to rule-based")
 
     # === Step 3: 规则 fallback ===
-    return _detect_intent_rule_based(rewritten_query, available_tools or [])
+    return _detect_intent_rule_based(rewritten_query, available_tools or [], available_workflows or [])
 
 
 async def _detect_intent_with_llm(
     rewritten_query: str,
     llm,
     available_tools: List[Dict[str, Any]],
+    available_workflows: List[Dict[str, Any]],
 ) -> IntentResult:
-    """使用 LLM 做结构化意图三分类。"""
+    """使用 LLM 做结构化意图四分类。"""
 
     # 构建工具描述（从 OpenAI function schema 中提取）
     tools_text = ""
@@ -282,20 +300,34 @@ async def _detect_intent_with_llm(
     else:
         tools_text = "（当前无可用的外部工具）"
 
-    prompt = f"""你是意图分类专家。请根据用户查询和可用工具列表，判断用户的真实意图。
+    workflows_text = ""
+    if available_workflows:
+        lines = [
+            f"- {w.get('workflow_type')}: {w.get('display_name')} — {(w.get('description') or '')[:80]}"
+            for w in available_workflows
+        ]
+        workflows_text = "\n".join(lines)
+    else:
+        workflows_text = "（当前无可用的流程模板）"
+
+    prompt = f"""你是意图分类专家。请根据用户查询、可用工具列表和可用流程模板列表，判断用户的真实意图。
 
 分类规则：
 - "clarify": 查询模糊、不完整、需要用户补充信息才能回答
 - "rag": 查询涉及知识库、文档、内部资料等，可以通过检索回答
 - "tool": 查询明确需要调用外部工具（如搜索网页、查天气、计算等）
+- "workflow": 用户想发起一个业务流程/申请（如报修、请假、出差、报销），不是在问知识、不是在查资料
 
 可用工具列表：
 {tools_text}
 
+可用流程模板列表：
+{workflows_text}
+
 用户查询：{rewritten_query}
 
 请输出结构化分类结果，包含 intent_type、confidence、reasoning 等字段。
-注意：target_tool 必须从可用工具列表中选择，不能编造不存在的工具名。"""
+注意：target_tool 必须从可用工具列表中选择，workflow_type 必须从可用流程模板列表中选择，都不能编造不存在的名字。"""
 
     structured_llm = llm.with_structured_output(IntentDetectionResult, method="json_mode")
     result: IntentDetectionResult = await structured_llm.ainvoke([HumanMessage(content=prompt)])
@@ -304,6 +336,29 @@ async def _detect_intent_with_llm(
     available_tool_names = {t.get("name", "") for t in available_tools}
     if result.target_tool and result.target_tool not in available_tool_names:
         result.target_tool = None  # 让子图自己选
+
+    # 验证 workflow_type 是否存在于可用流程模板列表中
+    available_workflow_types = {w.get("workflow_type", "") for w in available_workflows}
+    if result.workflow_type and result.workflow_type not in available_workflow_types:
+        result.workflow_type = None
+
+    # 小模型（如 qwen2.5:7b）的结构化输出偶尔会自相矛盾：workflow_type 已经准确
+    # 判断出来了（reasoning 里也明确点出是请假/报修等申请），但 intent_type 却
+    # 没有同步设成 "workflow"（常见误标成 "rag" 或 "clarify"）。workflow_type
+    # 是从受限枚举（可用流程列表）里选出来的，比自由文本的 intent_type 更可信，
+    # 出现这种矛盾时以 workflow_type 为准，否则用户明确说"我想请假"也会被当成
+    # 知识库问答处理。
+    if result.workflow_type and result.intent_type != "workflow":
+        result.intent_type = "workflow"
+
+    # workflow 意图但没能对应到一个合法类型，退回 rag，避免进入一个没有类型的死路
+    if result.intent_type == "workflow" and not result.workflow_type:
+        return IntentResult(
+            intent_type="rag",
+            rewritten_query=rewritten_query,
+            confidence=0.6,
+            reasoning="LLM 判断为 workflow 意图，但未能匹配到合法的流程类型，回退到 rag",
+        )
 
     # 置信度阈值
     if result.confidence < 0.5:
@@ -321,6 +376,7 @@ async def _detect_intent_with_llm(
         confidence=result.confidence,
         target_tool=result.target_tool,
         tool_args=result.tool_args_preview,
+        workflow_type=result.workflow_type,
         need_clarify=result.need_clarify,
         clarify_prompt=result.clarify_prompt,
         reasoning=result.reasoning,
@@ -330,16 +386,19 @@ async def _detect_intent_with_llm(
 def _detect_intent_rule_based(
     rewritten_query: str,
     available_tools: List[Dict[str, Any]] = None,
+    available_workflows: List[Dict[str, Any]] = None,
 ) -> IntentResult:
     """规则-based 意图分类（无 LLM 时的 fallback）。
-    
+
     策略：
     1. 先匹配具体工具关键词，返回对应工具名
-    2. 再匹配通用工具意图关键词，返回 tool 但不指定具体工具（让子图自选）
-    3. 默认 rag
+    2. 再匹配工作流关键词
+    3. 再匹配通用工具意图关键词，返回 tool 但不指定具体工具（让子图自选）
+    4. 默认 rag
     """
     query_lower = rewritten_query.lower()
     available_tool_names = {t.get("name", "") for t in (available_tools or [])}
+    available_workflow_types = {w.get("workflow_type", "") for w in (available_workflows or [])}
 
     # Step 1: 匹配具体工具关键词
     for tool_name, keywords in _TOOL_KEYWORDS.items():
@@ -356,7 +415,21 @@ def _detect_intent_rule_based(
                     reasoning=f"关键词匹配工具 '{tool_name}': {kw}",
                 )
 
-    # Step 2: 通用工具意图（不指定具体工具，让子图自己选）
+    # Step 2: 匹配工作流关键词（只推荐实际存在的模板类型）
+    for workflow_type, keywords in _WORKFLOW_KEYWORDS.items():
+        if workflow_type not in available_workflow_types:
+            continue
+        for kw in keywords:
+            if kw.lower() in query_lower:
+                return IntentResult(
+                    intent_type="workflow",
+                    rewritten_query=rewritten_query,
+                    confidence=0.75,
+                    workflow_type=workflow_type,
+                    reasoning=f"关键词匹配流程 '{workflow_type}': {kw}",
+                )
+
+    # Step 3: 通用工具意图（不指定具体工具，让子图自己选）
     for kw in _TOOL_INTENT_KEYWORDS:
         if kw.lower() in query_lower:
             return IntentResult(
@@ -372,7 +445,7 @@ def _detect_intent_rule_based(
         intent_type="rag",
         rewritten_query=rewritten_query,
         confidence=0.85,
-        reasoning="无工具关键词匹配，默认归类为知识库检索",
+        reasoning="无工具/流程关键词匹配，默认归类为知识库检索",
     )
 
 

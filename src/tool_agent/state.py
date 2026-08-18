@@ -25,6 +25,9 @@ class ToolSubgraphState(TypedDict, total=False):
     query: str
     target_tool: Optional[str]           # 主图指定的目标工具（可选，None 则自主决策）
     available_tools: List[Dict[str, Any]]  # 可用工具 schema（用于 think_node 的 LLM 决策）
+    user_id: str                         # 调用者身份，仅用于 tool_node 内部的 ACL 校验，
+                                          # 不会出现在 available_tools 的 schema 里，
+                                          # LLM 看不到也改不了这个值（见 tool_node）
     
     # === 内部状态（子图内部循环，不返回主图）===
     internal_messages: Annotated[List[AnyMessage], add_messages]

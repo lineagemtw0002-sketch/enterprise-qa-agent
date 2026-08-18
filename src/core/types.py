@@ -12,8 +12,8 @@
 - 类型安全：完整注解，利于静态分析与重构。
 """
 
-from dataclasses import dataclass, field, asdict
-from typing import Dict, Any, List, Optional
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional  # noqa: UP035
 
 
 @dataclass
@@ -29,16 +29,16 @@ class Document:
 - `metadata.images` 可记录图片 ID、路径、页码和占位偏移，
   便于后续定位同图多次出现等场景。
     """
-    
+
     id: str
     text: str
     metadata: Dict[str, Any] = field(default_factory=dict)
-    
+
     def __post_init__(self):
         """校验必需元数据字段。"""
         if "source_path" not in self.metadata:
             raise ValueError("Document metadata must contain 'source_path'")
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
         return asdict(self)

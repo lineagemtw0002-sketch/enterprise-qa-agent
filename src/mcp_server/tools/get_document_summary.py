@@ -23,6 +23,7 @@ from mcp import types
 if TYPE_CHECKING:
     from src.mcp_server.protocol_handler import ProtocolHandler
     from src.core.settings import Settings
+    from src.ragent_backend.user_store import UserStore
 
 logger = logging.getLogger(__name__)
 
@@ -139,17 +140,22 @@ class GetDocumentSummaryTool:
         self,
         settings: Optional[Settings] = None,
         config: Optional[GetDocumentSummaryConfig] = None,
+        user_store: Optional["UserStore"] = None,
     ) -> None:
         """Initialize GetDocumentSummaryTool.
-        
+
         Args:
             settings: Application settings. If None, loaded from default path.
             config: Tool configuration. If None, derived from settings.
+            user_store: Optional pre-configured UserStore, used to look up the
+                caller's allowed_collections for ACL checks. If None, lazily
+                creates its own.
         """
         self._settings = settings
         self._config = config
         self._chroma_client = None
-        
+        self._user_store = user_store
+
     @property
     def settings(self) -> Settings:
         """Get settings, loading if necessary."""
@@ -157,6 +163,14 @@ class GetDocumentSummaryTool:
             from src.core.settings import load_settings
             self._settings = load_settings()
         return self._settings
+
+    @property
+    def user_store(self) -> "UserStore":
+        """Get the UserStore used for ACL lookups, creating one if necessary."""
+        if self._user_store is None:
+            from src.ragent_backend.user_store import UserStore
+            self._user_store = UserStore()
+        return self._user_store
     
     @property
     def config(self) -> GetDocumentSummaryConfig:
@@ -561,18 +575,40 @@ class GetDocumentSummaryTool:
         self,
         doc_id: str,
         collection: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> types.CallToolResult:
         """Execute the get_document_summary tool.
-        
+
         Args:
             doc_id: Document ID to retrieve summary for.
             collection: Optional collection name.
-            
+            user_id: Caller identity for ACL checks. Only trust values that came
+                from the server-side request/state, never from LLM-supplied tool
+                arguments. None skips the check entirely.
+
         Returns:
             CallToolResult with formatted document summary or error.
         """
         logger.info(f"Executing get_document_summary (doc_id={doc_id}, collection={collection})")
-        
+
+        if user_id is not None:
+            from src.ragent_backend.acl import is_collection_allowed
+            effective_collection = collection or self.config.default_collection
+            allowed_collections = await self.user_store.get_allowed_collections(user_id)
+            if not is_collection_allowed(effective_collection, allowed_collections):
+                logger.warning(
+                    f"ACL denied: user_id={user_id} tried to access collection={effective_collection}"
+                )
+                return types.CallToolResult(
+                    content=[
+                        types.TextContent(
+                            type="text",
+                            text=f"无权访问集合 `{effective_collection}`，如需访问请联系管理员。",
+                        )
+                    ],
+                    isError=True,
+                )
+
         try:
             # Run blocking ChromaDB I/O in a thread to avoid blocking
             # the async event loop / MCP stdio transport

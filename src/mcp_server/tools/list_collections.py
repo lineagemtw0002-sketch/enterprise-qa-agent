@@ -22,6 +22,7 @@ from mcp import types
 if TYPE_CHECKING:
     from src.mcp_server.protocol_handler import ProtocolHandler
     from src.core.settings import Settings
+    from src.ragent_backend.user_store import UserStore
 
 logger = logging.getLogger(__name__)
 
@@ -107,16 +108,29 @@ class ListCollectionsTool:
         self,
         settings: Optional[Settings] = None,
         config: Optional[ListCollectionsConfig] = None,
+        user_store: Optional["UserStore"] = None,
     ) -> None:
         """Initialize ListCollectionsTool.
-        
+
         Args:
             settings: Application settings. If None, loaded from default path.
             config: Tool configuration. If None, derived from settings.
+            user_store: Optional pre-configured UserStore, used to look up the
+                caller's allowed_collections for ACL filtering. If None, lazily
+                creates its own.
         """
         self._settings = settings
         self._config = config
-        
+        self._user_store = user_store
+
+    @property
+    def user_store(self) -> "UserStore":
+        """Get the UserStore used for ACL lookups, creating one if necessary."""
+        if self._user_store is None:
+            from src.ragent_backend.user_store import UserStore
+            self._user_store = UserStore()
+        return self._user_store
+
     @property
     def settings(self) -> Settings:
         """Get settings, loading if necessary."""
@@ -273,23 +287,38 @@ class ListCollectionsTool:
     async def execute(
         self,
         include_stats: bool = True,
+        user_id: Optional[str] = None,
     ) -> types.CallToolResult:
         """Execute the list_collections tool.
-        
+
         Args:
             include_stats: Whether to include statistics for each collection.
-            
+            user_id: Caller identity for ACL filtering. Only trust values that
+                came from the server-side request/state, never from LLM-supplied
+                tool arguments. None skips filtering (no caller identity to check).
+
         Returns:
             CallToolResult with formatted collection list.
         """
         logger.info(f"Executing list_collections (include_stats={include_stats})")
-        
+
         try:
             # Run blocking ChromaDB I/O in a thread to avoid blocking
             # the async event loop / MCP stdio transport
             collections = await asyncio.to_thread(
                 self.list_collections, include_stats,
             )
+
+            if user_id is not None:
+                from src.ragent_backend.acl import filter_allowed_collections
+                allowed_collections = await self.user_store.get_allowed_collections(user_id)
+                allowed_names = set(
+                    filter_allowed_collections(
+                        [c.name for c in collections], allowed_collections
+                    )
+                )
+                collections = [c for c in collections if c.name in allowed_names]
+
             response_text = self.format_response(collections)
             
             return types.CallToolResult(

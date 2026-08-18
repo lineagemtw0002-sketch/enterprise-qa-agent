@@ -70,7 +70,7 @@
 │                                  ▼                     ▼          │   │
 │                           ┌────────────┐         ┌────────────┐  │   │
 │                           │ summarize  │         │  archive   │  │   │
-│                           │ (结果汇总)  │         │(MySQL归档)  │  │   │
+│                           │ (结果汇总)  │         │(PostgreSQL归档)│  │   │
 │                           └────────────┘         └────────────┘  │   │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
@@ -193,9 +193,9 @@ START → think_node → router → [tool_node | summarize_node | END(max_iter)]
 | 工作流编排 | LangGraph | 0.2.x |
 | LLM 框架 | LangChain | 0.3.x |
 | Web 框架 | FastAPI | 0.115+ |
-| 前端框架 | Vue 3 + Element Plus | - |
+| 前端框架 | React 18 + antd | - |
 | 向量数据库 | ChromaDB | - |
-| 关系数据库 | PostgreSQL / MySQL | - |
+| 关系数据库 | PostgreSQL | - |
 | 文档加载 | unstructured / python-docx / PyPDF2 | - |
 | 编码 | sentence-transformers + BM25 | - |
 
@@ -228,7 +228,7 @@ rag-pro/
 │   │   ├── tool_registry.py       # 工具注册表（含 MCP）
 │   │   ├── subgraph.py            # 工具子图（ReAct）
 │   │   └── mcp_client.py          # MCP 客户端
-│   └── frontend/                  # Vue 3 前端
+│   └── frontend/                  # React 18 前端
 │       ├── src/
 │       │   ├── App.vue            # 主聊天界面
 │       │   └── components/        # 可复用组件
@@ -453,7 +453,7 @@ ws.onmessage = (event) => {
 
 ## 前端界面
 
-基于 Vue 3 + Element Plus 构建的三栏式聊天界面：
+基于 React 18 + antd 构建的三栏式聊天界面：
 
 ### 左侧边栏
 

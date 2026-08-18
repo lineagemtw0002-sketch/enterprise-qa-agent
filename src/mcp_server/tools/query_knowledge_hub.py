@@ -29,6 +29,7 @@ from src.core.types import RetrievalResult
 if TYPE_CHECKING:
     from src.core.query_engine.hybrid_search import HybridSearch
     from src.core.query_engine.reranker import CoreReranker
+    from src.ragent_backend.user_store import UserStore
 
 logger = logging.getLogger(__name__)
 
@@ -109,15 +110,19 @@ class QueryKnowledgeHubTool:
         hybrid_search: Optional[HybridSearch] = None,
         reranker: Optional[CoreReranker] = None,
         response_builder: Optional[ResponseBuilder] = None,
+        user_store: Optional["UserStore"] = None,
     ) -> None:
         """Initialize QueryKnowledgeHubTool.
-        
+
         Args:
             settings: Application settings. If None, loaded from default path.
             config: Tool configuration. If None, uses defaults.
             hybrid_search: Optional pre-configured HybridSearch instance.
             reranker: Optional pre-configured CoreReranker instance.
             response_builder: Optional pre-configured ResponseBuilder instance.
+            user_store: Optional pre-configured UserStore, used to look up the
+                caller's allowed_collections for ACL checks. If None, lazily
+                creates its own (see `user_store` property).
         """
         self._settings = settings
         self.config = config or QueryKnowledgeHubConfig()
@@ -125,10 +130,19 @@ class QueryKnowledgeHubTool:
         self._reranker = reranker
         self._embedding_client = None
         self._response_builder = response_builder or ResponseBuilder()
-        
+        self._user_store = user_store
+
         # Track initialization state
         self._initialized = False
         self._current_collection: Optional[str] = None
+
+    @property
+    def user_store(self) -> "UserStore":
+        """Get the UserStore used for ACL lookups, creating one if necessary."""
+        if self._user_store is None:
+            from src.ragent_backend.user_store import UserStore
+            self._user_store = UserStore()
+        return self._user_store
     
     @property
     def settings(self) -> Settings:
@@ -221,31 +235,46 @@ class QueryKnowledgeHubTool:
         query: str,
         top_k: Optional[int] = None,
         collection: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> MCPToolResponse:
         """Execute the query_knowledge_hub tool.
-        
+
         Args:
             query: Search query string.
             top_k: Maximum results to return.
             collection: Target collection name.
-            
+            user_id: Caller identity for ACL checks. Only trust values that came
+                from the server-side request/state, never from LLM-supplied tool
+                arguments (see tool_agent/subgraph.py). None skips the check
+                entirely — used by callers (e.g. the standalone MCP server) that
+                have no caller identity to check against.
+
         Returns:
             MCPToolResponse with formatted content and citations.
-            
+
         Raises:
             ValueError: If query is empty or invalid.
         """
         # Validate query
         if not query or not query.strip():
             raise ValueError("Query cannot be empty")
-        
+
         # Apply defaults
         effective_top_k = min(
             top_k or self.config.default_top_k,
             self.config.max_top_k
         )
         effective_collection = collection or self.config.default_collection
-        
+
+        if user_id is not None:
+            from src.ragent_backend.acl import is_collection_allowed
+            allowed_collections = await self.user_store.get_allowed_collections(user_id)
+            if not is_collection_allowed(effective_collection, allowed_collections):
+                logger.warning(
+                    f"ACL denied: user_id={user_id} tried to query collection={effective_collection}"
+                )
+                return self._build_access_denied_response(query, effective_collection)
+
         logger.info(
             f"Executing query_knowledge_hub: query='{query[:50]}...', "
             f"top_k={effective_top_k}, collection={effective_collection}"
@@ -388,6 +417,36 @@ class QueryKnowledgeHubTool:
             logger.warning(f"Reranking failed, using original order: {e}")
             return results[:top_k]
     
+    def _build_access_denied_response(
+        self,
+        query: str,
+        collection: str,
+    ) -> MCPToolResponse:
+        """Build response for an ACL-denied query.
+
+        Args:
+            query: Original query.
+            collection: Collection the caller was denied access to.
+
+        Returns:
+            MCPToolResponse indicating the access was denied.
+        """
+        content = f"## 无权访问\n\n"
+        content += f"查询: **{query}**\n"
+        content += f"集合: `{collection}`\n\n"
+        content += "你没有权限访问这个知识库集合，如需访问请联系管理员。\n"
+
+        return MCPToolResponse(
+            content=content,
+            citations=[],
+            metadata={
+                "query": query,
+                "collection": collection,
+                "error": "access_denied",
+            },
+            is_empty=True,
+        )
+
     def _build_error_response(
         self,
         query: str,

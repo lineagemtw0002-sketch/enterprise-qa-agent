@@ -5,7 +5,7 @@ RAG 工作流 - 滑动窗口记忆版本
 1. 使用 Annotated + add_messages 管理消息列表
 2. 使用 RemoveMessage 实现滑动窗口压缩
 3. 滚动摘要：旧消息合并到 summary 中
-4. 分离 checkpoint（给模型）和 MySQL（给用户）
+4. 分离 checkpoint（给模型）和 PostgreSQL（给用户）
 """
 
 from __future__ import annotations
@@ -13,8 +13,10 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from datetime import date
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
+import pydantic
 from langchain_core.messages import HumanMessage, AIMessage, RemoveMessage, AnyMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, START, END
@@ -24,9 +26,14 @@ from src.ragent_backend.memory_manager import RollingMemoryManager
 from src.ragent_backend.store import ConversationArchiveStore
 from src.ragent_backend.intent import detect_intent, analyze_query
 from src.ragent_backend.ltm_store import LTMStore
+from src.ragent_backend.workflow_store import WorkflowStore
 from src.mcp_server.tools.query_knowledge_hub import QueryKnowledgeHubTool
 from src.tool_agent.tool_registry import ToolRegistry, get_default_registry
 from src.tool_agent.subgraph import build_tool_subgraph
+
+# 多轮收集阶段，用户想放弃当前工作流时的关键词（规则检测，不过 LLM，
+# 对齐 intent.py 里"模糊代词"这类硬规则检查的风格，见 work-flow.md 6.1 步骤 1）
+_WORKFLOW_CANCEL_KEYWORDS = ["取消", "算了", "不填了", "不申请了", "先不弄了"]
 
 
 class RAGWorkflow:
@@ -40,7 +47,7 @@ class RAGWorkflow:
     - messages 使用 Annotated[list, add_messages] 管理
     - 超出 max_messages 时，使用 RemoveMessage 删除旧消息
     - 被删除的消息合并到 summary 中
-    - 所有消息（包括本轮）异步归档到 MySQL
+    - 所有消息（包括本轮）异步归档到 PostgreSQL
     """
     
     def __init__(
@@ -52,11 +59,13 @@ class RAGWorkflow:
         keep_recent: int = 4,
         ltm_store: Optional[LTMStore] = None,
         tool_registry: Optional[ToolRegistry] = None,
+        workflow_store: Optional[WorkflowStore] = None,
     ) -> None:
         self._store = store
         self._llm = llm
         self._checkpointer = checkpointer
         self._ltm_store = ltm_store
+        self._workflow_store = workflow_store
         # asyncio only holds a *weak* reference to a task; one created and never
         # stored anywhere (as the archive/LTM background tasks below are) can be
         # garbage-collected before it finishes running. Keeping a strong reference
@@ -75,7 +84,7 @@ class RAGWorkflow:
         self._compiled = self._build_graph()
 
     def _build_graph(self):
-        """构建工作流图（三分支：clarify / rag / tool）"""
+        """构建工作流图（四分支：clarify / rag / tool / workflow）"""
         graph = StateGraph(RAGState)
 
         # 添加主图节点
@@ -84,6 +93,7 @@ class RAGWorkflow:
         graph.add_node("clarify", self._clarify_node)
         graph.add_node("retrieve", self._retrieve_node)
         graph.add_node("generate", self._generate_node)
+        graph.add_node("workflow", self._workflow_node)
         graph.add_node("memory_manage", self._memory_manage_node)
         graph.add_node("archive", self._archive_node)
 
@@ -102,28 +112,38 @@ class RAGWorkflow:
         graph.add_conditional_edges(
             "intent",
             self._route_after_intent,
-            {"clarify": "clarify", "retrieve": "retrieve", "tool_subgraph": "tool_subgraph"}
+            {"clarify": "clarify", "retrieve": "retrieve", "tool_subgraph": "tool_subgraph", "workflow": "workflow"}
         )
-        # 分支路由：rag/tool 需要 generate，clarify 直接跳过
+        # 分支路由：rag/tool 需要 generate，clarify/workflow 直接跳过
         graph.add_edge("retrieve", "generate")
         if self._llm is not None:
             graph.add_edge("tool_subgraph", "generate")
         graph.add_edge("generate", "memory_manage")
-        # clarify 直接到 memory_manage（跳过 generate，避免重复生成）
+        # clarify/workflow 直接到 memory_manage（跳过 generate，避免重复生成——
+        # 工作流的追问话术/提交确认语要精确到字段名/工单号，不能让通用生成节点
+        # 二次改写，见 work-flow.md 5.4 节）
         graph.add_edge("clarify", "memory_manage")
+        graph.add_edge("workflow", "memory_manage")
         graph.add_edge("memory_manage", "archive")
         graph.add_edge("archive", END)
 
         return graph.compile(checkpointer=self._checkpointer)
 
     def _route_after_intent(self, state: RAGState) -> str:
-        """根据意图判断结果决定下一步走向（三分支）"""
+        """根据意图判断结果决定下一步走向（四分支）"""
+        # 有未完成的工作流时，优先继续填表，不管这一轮意图分类器猜成什么——
+        # 分类器面对"事假"这种孤立词很容易误判成 clarify/rag，续填的确定性
+        # 应该压过通用分类结果（work-flow.md 5.4 节）。
+        if state.get("active_workflow"):
+            return "workflow"
         intent_type = state.get("intent_type", "rag")
         # need_clarify is the authoritative signal; intent_type=="clarify" alone is not
         # trustworthy on smaller local models, which sometimes set intent_type="clarify"
         # while need_clarify=False, causing a spurious short-circuit to an empty reply.
         if state.get("need_clarify"):
             return "clarify"
+        if intent_type == "workflow":
+            return "workflow"
         if intent_type == "tool":
             # 如果 LLM 不可用，无法运行 tool_subgraph，回退到 retrieve
             if self._llm is None:
@@ -311,12 +331,50 @@ class RAGWorkflow:
         return state
 
     async def _intent_node(self, state: RAGState) -> Any:
-        """意图识别节点：结构化 LLM 一次完成指代消解 + 子查询拆分 + 三分类"""
+        """意图识别节点：结构化 LLM 一次完成指代消解 + 子查询拆分 + 四分类"""
         self._emit_trace("intent", "node_start", "running")
-        
+
         query = state["query"]
         messages = state.get("messages", [])
-        
+
+        # 续填中的工作流：路由（_route_after_intent）会无条件把这一轮送进 workflow
+        # 节点，这里不需要重新做指代消解/分类，省两次 LLM 往返（work-flow.md 5.4 节
+        # "优化项"）。
+        if state.get("active_workflow"):
+            self._emit_trace("intent", "node_end", "success", {"skipped": "active_workflow_continuation"})
+            return {"rewritten_query": query}
+
+        # 前端"发起工作流"入口显式带了 workflow_type：跳过分类，直接确定意图
+        # （work-flow.md 5.1 节短路）。续填场景已经在上面被拦掉，这里只处理首次发起。
+        hint = state.get("workflow_type_hint")
+        if hint and self._workflow_store is not None:
+            template = await self._workflow_store.get_template_by_type(hint)
+            if template is not None:
+                self._emit_trace("intent", "node_end", "success", {
+                    "intent_type": "workflow", "workflow_type": hint, "source": "explicit_hint",
+                })
+                return {
+                    "rewritten_query": query,
+                    "sub_queries": [query],
+                    "intent_type": "workflow",
+                    "intent_confidence": 1.0,
+                    "need_clarify": False,
+                    "clarify_prompt": "",
+                    "target_tool": None,
+                    "tool_args": None,
+                    "target_workflow_type": hint,
+                    "available_tools": self._tool_registry.to_openai_tools() if self._tool_registry else [],
+                    "trace_events": [
+                        *state.get("trace_events", []),
+                        {
+                            "node": "intent", "ts": time.time(), "intent_type": "workflow",
+                            "workflow_type": hint, "reasoning": "前端显式指定，跳过分类",
+                        },
+                    ],
+                }
+            # hint 指向一个不存在/已下线的模板（前端缓存的类型列表过期了）——
+            # 不能假设前端传来的值一定合法，忽略 hint，退回下面的正常分类兜底
+
         # 单次结构化调用：重写 + 拆分
         self._emit_trace("intent", "query_rewrite", "running", {"original_query": query})
         try:
@@ -331,28 +389,47 @@ class RAGWorkflow:
             print(f"[Intent] Structured analysis failed: {e}")
             rewritten_query = query
             sub_queries = [query]
-        
-        # 意图识别（三分支：clarify / rag / tool）
+
+        # 意图识别（四分支：clarify / rag / tool / workflow）
         self._emit_trace("intent", "intent_detect", "running")
         # 从注册表获取可用工具 schema，供 LLM 判断 tool 意图
         available_tools = self._tool_registry.to_openai_tools() if self._tool_registry else []
+        # 从 WorkflowStore 获取可用流程模板，供 LLM 判断 workflow 意图
+        available_workflows: List[Dict[str, Any]] = []
+        if self._workflow_store is not None:
+            try:
+                templates = await self._workflow_store.list_templates()
+                available_workflows = [
+                    {"workflow_type": t.workflow_type, "display_name": t.display_name, "description": t.description}
+                    for t in templates
+                ]
+            except Exception as e:
+                print(f"[Intent] Failed to load workflow templates: {e}")
         intent = await detect_intent(
             rewritten_query=rewritten_query,
             llm=self._llm,
             available_tools=available_tools,
+            available_workflows=available_workflows,
         )
         self._emit_trace("intent", "intent_detect", "success", {
             "intent_type": intent.intent_type,
             "confidence": intent.confidence,
             "need_clarify": intent.need_clarify,
             "target_tool": intent.target_tool,
+            "workflow_type": intent.workflow_type,
         })
-        
-        # 如果 intent_type=tool，以 detect_intent 的结果为准（可能覆盖 analyze_query 的 sub_queries）
+
+        # 如果 intent_type=tool/workflow，以 detect_intent 的结果为准（可能覆盖 analyze_query 的 sub_queries）
         if intent.intent_type == "tool":
             sub_queries = [intent.rewritten_query]
             self._emit_trace("intent", "tool_intent", "running", {
                 "target_tool": intent.target_tool or "",
+                "reasoning": intent.reasoning or "",
+            })
+        elif intent.intent_type == "workflow":
+            sub_queries = [intent.rewritten_query]
+            self._emit_trace("intent", "workflow_intent", "running", {
+                "workflow_type": intent.workflow_type or "",
                 "reasoning": intent.reasoning or "",
             })
         elif intent.need_clarify:
@@ -360,7 +437,7 @@ class RAGWorkflow:
             self._emit_trace("intent", "clarify_shortcircuit", "running", {
                 "clarify_prompt": intent.clarify_prompt or "",
             })
-        
+
         update = {
             "rewritten_query": rewritten_query,
             "sub_queries": sub_queries,
@@ -370,6 +447,7 @@ class RAGWorkflow:
             "clarify_prompt": intent.clarify_prompt or "",
             "target_tool": intent.target_tool,
             "tool_args": intent.tool_args,
+            "target_workflow_type": intent.workflow_type,
             "available_tools": available_tools,
             "trace_events": [
                 *state.get("trace_events", []),
@@ -380,6 +458,7 @@ class RAGWorkflow:
                     "confidence": intent.confidence,
                     "need_clarify": intent.need_clarify,
                     "target_tool": intent.target_tool,
+                    "workflow_type": intent.workflow_type,
                     "sub_query_count": len(sub_queries),
                     "rewritten": rewritten_query != query,
                     "original_query": query,
@@ -387,12 +466,12 @@ class RAGWorkflow:
                 }
             ],
         }
-        
+
         # 如果需要澄清，提前设置 final_answer
         if intent.need_clarify:
             update["final_answer"] = intent.clarify_prompt or "请补充更多信息。"
             update["used_model"] = "intent-shortcircuit"
-        
+
         self._emit_trace("intent", "node_end", "success", {
             "intent_type": intent.intent_type,
             "need_clarify": intent.need_clarify,
@@ -419,6 +498,244 @@ class RAGWorkflow:
                 {"node": "clarify", "ts": time.time(), "ok": True}
             ],
         }
+
+    async def _workflow_node(self, state: RAGState) -> Dict[str, Any]:
+        """工作流节点：多轮收集结构化字段 -> 提交实例。风格对齐 `_clarify_node`
+        （短路直接给 final_answer，不经过 `_generate_node`），实现细节见
+        work-flow.md 第 6.1 节。"""
+        self._emit_trace("workflow", "node_start", "running")
+
+        query = state.get("query", "")
+        active = state.get("active_workflow")
+        user_id = state.get("user_id")
+        conversation_id = state.get("conversation_id")
+        trace_events = state.get("trace_events", [])
+
+        if self._workflow_store is None:
+            self._emit_trace("workflow", "node_end", "error", {"reason": "no_workflow_store"})
+            return {
+                "active_workflow": None,
+                "final_answer": "工作流功能暂时不可用，请稍后再试。",
+                "used_model": "workflow-unavailable",
+                "trace_events": [*trace_events, {"node": "workflow", "ts": time.time(), "ok": False}],
+            }
+
+        # 1. 取消检测（规则，不过 LLM）
+        if active and any(kw in query for kw in _WORKFLOW_CANCEL_KEYWORDS):
+            display_name = active.get("display_name", "")
+            self._emit_trace("workflow", "node_end", "success", {"event": "cancelled"})
+            return {
+                "active_workflow": None,
+                "final_answer": f"已取消本次「{display_name}」申请。",
+                "used_model": "workflow-cancelled",
+                "trace_events": [*trace_events, {"node": "workflow", "ts": time.time(), "event": "cancelled"}],
+            }
+
+        if active is None:
+            # 2. 首次发起：intent 节点已经确定了 target_workflow_type
+            workflow_type = state.get("target_workflow_type")
+            template = await self._workflow_store.get_template_by_type(workflow_type) if workflow_type else None
+            if template is None:
+                # 防御性兜底：路由已保证 intent_type=="workflow" 时 target_workflow_type
+                # 合法，正常不会走到这里
+                self._emit_trace("workflow", "node_end", "error", {"reason": "no_target_workflow_type"})
+                return {
+                    "final_answer": "抱歉，没识别出具体是哪种流程，能再说清楚一点吗？",
+                    "used_model": "workflow-fallback",
+                    "trace_events": [*trace_events, {"node": "workflow", "ts": time.time(), "ok": False}],
+                }
+
+            if not template.approver_role_id:
+                self._emit_trace("workflow", "node_end", "success", {"event": "blocked_no_approver"})
+                return {
+                    "final_answer": f"「{template.display_name}」暂未配置审批人，请联系管理员配置后再试。",
+                    "used_model": "workflow-blocked",
+                    "trace_events": [*trace_events, {"node": "workflow", "ts": time.time(), "event": "blocked_no_approver"}],
+                }
+
+            existing = await self._workflow_store.get_in_flight_instance(user_id, workflow_type)
+            if existing is not None:
+                status_label = "待审批" if existing.status == "pending_approval" else "已被打回，待补充材料"
+                self._emit_trace("workflow", "node_end", "success", {"event": "blocked_in_flight"})
+                return {
+                    "final_answer": (
+                        f"你有一条「{template.display_name}」申请正在处理中"
+                        f"（编号 #{existing.instance_id[:8]}，当前{status_label}），处理完再发起新的。"
+                    ),
+                    "used_model": "workflow-blocked",
+                    "trace_events": [*trace_events, {"node": "workflow", "ts": time.time(), "event": "blocked_in_flight"}],
+                }
+
+            extracted = await self._extract_workflow_fields(query, template.required_fields)
+            collected = {
+                k: v for k, v in extracted.items()
+                if self._validate_workflow_field(template.required_fields, k, v)
+            }
+        else:
+            # 3. 续填答复：只针对上一轮还缺的字段做抽取
+            template = await self._workflow_store.get_template_by_type(active["workflow_type"])
+            if template is None:
+                self._emit_trace("workflow", "node_end", "error", {"reason": "template_missing"})
+                return {
+                    "active_workflow": None,
+                    "final_answer": "抱歉，这条流程模板已经不存在了，本次申请已取消，请重新发起。",
+                    "used_model": "workflow-fallback",
+                    "trace_events": [*trace_events, {"node": "workflow", "ts": time.time(), "ok": False}],
+                }
+            fields_to_extract = [f for f in template.required_fields if f["key"] in active.get("missing_field_keys", [])]
+            extracted = await self._extract_workflow_fields(query, fields_to_extract)
+            collected = dict(active.get("collected_fields", {}))
+            for k, v in extracted.items():
+                if self._validate_workflow_field(template.required_fields, k, v):
+                    collected[k] = v
+
+        # 4. 计算还缺哪些必填字段
+        missing = self._compute_missing_workflow_fields(template.required_fields, collected)
+        total_required = sum(1 for f in template.required_fields if f.get("required"))
+        active_workflow = {
+            "workflow_type": template.workflow_type,
+            "display_name": template.display_name,
+            "collected_fields": collected,
+            "missing_field_keys": missing,
+            "awaiting_field_key": missing[0] if missing else None,
+            "total_required_count": total_required,
+        }
+
+        if missing:
+            # 5. 还缺字段：追问下一个（一次只问一个，体验更像聊天而不是表单）
+            field_def = next(f for f in template.required_fields if f["key"] == missing[0])
+            question = self._build_workflow_field_question(field_def)
+            self._emit_trace("workflow", "node_end", "success", {
+                "event": "collecting", "missing_count": len(missing), "total_count": total_required,
+            })
+            return {
+                "active_workflow": active_workflow,
+                "final_answer": question,
+                "used_model": "workflow-collect",
+                "trace_events": [
+                    *trace_events,
+                    {"node": "workflow", "ts": time.time(), "event": "collecting",
+                     "missing_count": len(missing), "awaiting_field_key": missing[0]},
+                ],
+            }
+
+        # 6. 字段齐了：提交
+        from src.ragent_backend.role_store import RoleStore
+        role_store = RoleStore()
+        try:
+            instance = await self._workflow_store.create_instance(
+                workflow_type=template.workflow_type,
+                requester_user_id=user_id,
+                conversation_id=conversation_id,
+                fields=collected,
+                role_store=role_store,
+            )
+        except ValueError as e:
+            # 竞态下"同类型只能一条在途"校验在提交这一刻才真正失败（比如同一用户
+            # 在另一个对话里几乎同时提交了同一类型）——不是常见路径，兜底给出
+            # 明确提示而不是让异常冒泡成 500。
+            self._emit_trace("workflow", "node_end", "error", {"reason": str(e)})
+            return {
+                "active_workflow": None,
+                "final_answer": f"提交失败：{e}",
+                "used_model": "workflow-blocked",
+                "trace_events": [*trace_events, {"node": "workflow", "ts": time.time(), "ok": False, "error": str(e)}],
+            }
+
+        confirm_lines = [f"已为你提交「{template.display_name}」申请（编号 #{instance.instance_id[:8]}）。"]
+        if template.attachments_note:
+            confirm_lines.append(template.attachments_note)
+        confirm_lines.append("已抄送审批人，材料不齐会被打回，结果会在对话里通知你。")
+
+        self._emit_trace("workflow", "node_end", "success", {
+            "event": "submitted", "instance_id": instance.instance_id,
+        })
+        return {
+            "active_workflow": None,
+            "final_answer": "\n".join(confirm_lines),
+            "used_model": "workflow-submitted",
+            "trace_events": [
+                *trace_events,
+                {"node": "workflow", "ts": time.time(), "event": "submitted", "instance_id": instance.instance_id},
+            ],
+        }
+
+    async def _extract_workflow_fields(
+        self, query: str, fields: List[Dict[str, Any]],
+    ) -> Dict[str, str]:
+        """用结构化 LLM 调用从这句话里抽取给定字段的值，抽不到的字段不出现在
+        返回结果里。没有 LLM 或没有要抽取的字段时直接返回空字典（work-flow.md
+        6.1 节步骤 2/3）。"""
+        if not fields or self._llm is None:
+            return {}
+
+        field_defs: Dict[str, Any] = {}
+        field_lines = []
+        for f in fields:
+            desc = f.get("description") or f["label"]
+            field_defs[f["key"]] = (Optional[str], pydantic.Field(default=None, description=desc))
+            line = f"- {f['key']}（{f['label']}）：{desc}"
+            if f.get("options"):
+                line += f"，可选值：{', '.join(f['options'])}"
+            field_lines.append(line)
+
+        model_cls = pydantic.create_model("WorkflowFieldExtraction", **field_defs)
+        today = date.today().isoformat()
+        prompt = f"""从下面这句话里抽取以下字段的值，能抽到就填，抽不到就留空（null）。
+今天的日期是 {today}，如果句子里出现"明天""下周一"这类相对日期表达，请换算成 YYYY-MM-DD 格式。
+枚举类字段必须原样输出给定的可选值之一，不要改写措辞。
+
+字段列表：
+{chr(10).join(field_lines)}
+
+这句话：{query}
+
+只输出 JSON，不要解释。"""
+
+        try:
+            structured_llm = self._llm.with_structured_output(model_cls, method="json_mode")
+            result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+            return {k: v for k, v in result.model_dump().items() if v}
+        except Exception as e:
+            print(f"[Workflow] Field extraction failed: {e}")
+            return {}
+
+    @staticmethod
+    def _validate_workflow_field(required_fields: List[Dict[str, Any]], key: str, value: Any) -> bool:
+        """日期/枚举/数字字段做基础格式校验，不合法的值当作"没抽到"，
+        重新计入缺失字段继续追问，避免脏数据落库（work-flow.md 6.1 步骤 4）。"""
+        if not value:
+            return False
+        field_def = next((f for f in required_fields if f["key"] == key), None)
+        if field_def is None:
+            return False
+        field_type = field_def.get("type")
+        if field_type == "date":
+            try:
+                date.fromisoformat(str(value))
+            except ValueError:
+                return False
+        elif field_type == "enum":
+            options = field_def.get("options") or []
+            if value not in options:
+                return False
+        elif field_type == "number":
+            try:
+                float(value)
+            except (TypeError, ValueError):
+                return False
+        return True
+
+    @staticmethod
+    def _compute_missing_workflow_fields(required_fields: List[Dict[str, Any]], collected: Dict[str, Any]) -> List[str]:
+        return [f["key"] for f in required_fields if f.get("required") and not collected.get(f["key"])]
+
+    @staticmethod
+    def _build_workflow_field_question(field_def: Dict[str, Any]) -> str:
+        label = field_def["label"]
+        if field_def.get("type") == "enum" and field_def.get("options"):
+            return f"{label}是？（{'/'.join(field_def['options'])}）"
+        return f"请补充一下：{label}"
 
     async def _retrieve_node(self, state: RAGState) -> Dict[str, Any]:
         """检索节点 - 接入真实的 RAG MCP 检索
@@ -554,7 +871,27 @@ class RAGWorkflow:
     async def _generate_node(self, state: RAGState) -> Dict[str, Any]:
         """生成回复节点（支持内部流式输出）"""
         self._emit_trace("generate", "node_start", "running")
-        
+
+        # ACL 拒绝的提示必须原样透传给用户，不能再交给 LLM"基于工具结果生成回答"——
+        # 那一步的 prompt 措辞（"请给出准确、有用的回答"）会诱导本地模型把明确的拒绝
+        # 重新包装成一段编造的正面回答，用户完全看不出自己被权限挡住了。这里直接跳过
+        # LLM 调用，保证拒绝原因原封不动地到达用户。
+        tool_summary = state.get("tool_summary", "")
+        if tool_summary.startswith("## 无权访问"):
+            if self._token_queue is not None:
+                await self._token_queue.put(tool_summary)
+            assistant_message = AIMessage(content=tool_summary)
+            self._emit_trace("generate", "node_end", "success", {"short_circuit": "access_denied"})
+            return {
+                "messages": [assistant_message],
+                "final_answer": tool_summary,
+                "used_model": "n/a (access denied, no LLM call)",
+                "trace_events": [
+                    *state.get("trace_events", []),
+                    {"node": "generate", "ts": time.time(), "model": "n/a"}
+                ],
+            }
+
         # 构建 prompt
         self._emit_trace("generate", "prompt_build", "running")
         prompt = self._build_prompt(state)
@@ -717,8 +1054,8 @@ class RAGWorkflow:
         归档节点
         
         总是运行，负责：
-        1. 将被压缩的消息归档到 MySQL
-        2. 将本轮新消息归档到 MySQL
+        1. 将被压缩的消息归档到 PostgreSQL
+        2. 将本轮新消息归档到 PostgreSQL
         3. 从本轮 Q&A 中提取长期记忆（LTM）
         
         使用 asyncio.create_task 异步执行，不阻塞响应
@@ -784,7 +1121,6 @@ class RAGWorkflow:
                 ltm_task = asyncio.create_task(_extract_and_save())
                 self._background_tasks.add(ltm_task)
                 ltm_task.add_done_callback(self._background_tasks.discard)
-                asyncio.create_task(_extract_and_save())
         
         # 添加追踪事件
         state.setdefault("trace_events", []).append(

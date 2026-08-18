@@ -44,6 +44,8 @@ dependencies = [
     "streamlit>=1.30.0",
     "ragas>=0.1.0",
     "datasets>=2.0.0",
+    "bcrypt>=4.0.0",
+    "pyjwt>=2.8.0",
 ]
 
 [project.optional-dependencies]

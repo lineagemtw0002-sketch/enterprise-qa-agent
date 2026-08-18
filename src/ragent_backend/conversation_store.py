@@ -26,6 +26,7 @@ class Conversation:
     title: str
     created_at: datetime
     updated_at: datetime
+    user_id: Optional[str] = None  # 归属用户；None 是迁移前的旧数据，视为无主（谁都不能访问）
     message_count: int = 0
     file_count: int = 0
     status: str = "active"  # active, archived, deleted
@@ -64,14 +65,21 @@ class ConversationStore:
                 )
                 """
             )
+            # 迁移：老表没有 user_id 列，加登录系统之前的历史数据会是 NULL（无主，谁都不能访问）
+            await conn.execute(
+                "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS user_id VARCHAR(64)"
+            )
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_conv_updated ON conversations(updated_at DESC)"
             )
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_conv_status ON conversations(status)"
             )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conv_user ON conversations(user_id)"
+            )
 
-    async def create_conversation(self, title: Optional[str] = None) -> Conversation:
+    async def create_conversation(self, user_id: str, title: Optional[str] = None) -> Conversation:
         """创建新对话"""
         conversation_id = f"conv_{uuid.uuid4().hex[:16]}"
         now = datetime.now()
@@ -82,6 +90,7 @@ class ConversationStore:
             title=title,
             created_at=now,
             updated_at=now,
+            user_id=user_id,
             message_count=0,
             file_count=0,
             status="active",
@@ -92,7 +101,7 @@ class ConversationStore:
         return conv
 
     async def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
-        """获取单个对话信息"""
+        """获取单个对话信息（不做归属校验，调用方需要自己比对 user_id）"""
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -103,21 +112,22 @@ class ConversationStore:
 
     async def list_conversations(
         self,
+        user_id: str,
         status: str = "active",
         limit: int = 100,
         offset: int = 0
     ) -> List[Conversation]:
-        """获取对话列表（按更新时间倒序）"""
+        """获取当前用户自己的对话列表（按更新时间倒序）"""
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
                 SELECT * FROM conversations
-                WHERE status = $1
+                WHERE status = $1 AND user_id = $2
                 ORDER BY updated_at DESC
-                LIMIT $2 OFFSET $3
+                LIMIT $3 OFFSET $4
                 """,
-                status, limit, offset,
+                status, user_id, limit, offset,
             )
             return [self._row_to_conversation(row) for row in rows]
 
@@ -164,8 +174,8 @@ class ConversationStore:
             await conn.execute(
                 """
                 INSERT INTO conversations
-                (conversation_id, title, created_at, updated_at, message_count, file_count, status, metadata)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                (conversation_id, title, created_at, updated_at, user_id, message_count, file_count, status, metadata)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (conversation_id) DO UPDATE SET
                     title = EXCLUDED.title,
                     updated_at = EXCLUDED.updated_at,
@@ -178,6 +188,7 @@ class ConversationStore:
                 conv.title,
                 conv.created_at,
                 conv.updated_at,
+                conv.user_id,
                 conv.message_count,
                 conv.file_count,
                 conv.status,
@@ -191,6 +202,7 @@ class ConversationStore:
             title=row["title"],
             created_at=row["created_at"] if isinstance(row["created_at"], datetime) else datetime.fromisoformat(str(row["created_at"])),
             updated_at=row["updated_at"] if isinstance(row["updated_at"], datetime) else datetime.fromisoformat(str(row["updated_at"])),
+            user_id=row["user_id"],
             message_count=row["message_count"],
             file_count=row["file_count"],
             status=row["status"],

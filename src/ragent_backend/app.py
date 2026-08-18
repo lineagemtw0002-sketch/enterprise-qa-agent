@@ -14,7 +14,7 @@ import asyncio
 import json
 import os
 import sys
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, List, Optional
 from pathlib import Path
 
 # Windows: psycopg async 需要 SelectorEventLoop，而不是 ProactorEventLoop
@@ -30,20 +30,33 @@ except ImportError:
     pass  # python-dotenv 未安装
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 # LangGraph checkpointer
 from langgraph.checkpoint.postgres import PostgresSaver
 
-from src.ragent_backend.schemas import ChatRequest, ChatResponse, RollbackRequest
+from src.ragent_backend.schemas import (
+    ChatRequest, ChatResponse, ActiveWorkflowSummary, RollbackRequest,
+    LoginRequest, LoginResponse, MeResponse, ChangePasswordRequest, RoleSummary,
+    AdminUserResponse, AdminCreateUserRequest,
+    RoleResponse, CreateRoleRequest, UpdateRoleRequest,
+    SetRoleCollectionsRequest, SetUserRolesRequest,
+    WorkflowTemplateResponse, CreateWorkflowTemplateRequest, UpdateWorkflowTemplateRequest,
+    WorkflowInstanceResponse, WorkflowActionRequest, WorkflowReturnRequest, WorkflowRejectRequest,
+    NotificationResponse,
+)
 from src.ragent_backend.store import build_archive_store, ConversationArchiveStore
 from src.ragent_backend.workflow import RAGWorkflow
 from src.ragent_backend.ltm_store import LTMStore
 from src.ragent_backend.file_store import build_file_store, ConversationFileStore
-from src.ragent_backend.conversation_store import build_conversation_store, ConversationStore
+from src.ragent_backend.conversation_store import build_conversation_store, ConversationStore, Conversation
+from src.ragent_backend.user_store import UserStore, User
+from src.ragent_backend.role_store import RoleStore, ROLE_SUPER_ADMIN
+from src.ragent_backend.workflow_store import WorkflowStore, WorkflowTemplate, WorkflowInstance
+from src.ragent_backend.auth import AuthenticatedUser, create_access_token, get_current_user, require_role
 from src.ingestion.pipeline import IngestionPipeline
 from src.core.settings import load_settings
 from src.tool_agent.tool_registry import ToolRegistry
@@ -223,13 +236,35 @@ async def ingest_file_task(
             )
 
 
+def _build_active_workflow_summary(active_workflow: Optional[dict]) -> Optional[ActiveWorkflowSummary]:
+    """把 RAGState.active_workflow（工作流节点自己维护的内部字典）投影成
+    ChatResponse/SSE 用的公开字段（work-flow.md 7 节）。None 表示这一轮结束后
+    没有进行中的工作流。"""
+    if not active_workflow:
+        return None
+    return ActiveWorkflowSummary(
+        workflow_type=active_workflow["workflow_type"],
+        display_name=active_workflow["display_name"],
+        missing_count=len(active_workflow.get("missing_field_keys", [])),
+        total_count=active_workflow.get("total_required_count", 0),
+    )
+
+
 def create_app() -> FastAPI:
     # 加载配置
     settings = load_settings()
 
+    # user_store 先建好，因为 ToolRegistry 里的工具要用它做 ACL 校验
+    user_store: UserStore = UserStore()
+    # role_store：角色 CRUD + 角色<->知识库/用户<->角色 关联；
+    # user_store.get_allowed_collections 内部会委托它算权限并集
+    role_store: RoleStore = RoleStore()
+    # workflow_store：流程模板 + 工作流实例 + 站内信（work-flow.md / work-flow-web.md）
+    workflow_store: WorkflowStore = WorkflowStore()
+
     # 初始化 ToolRegistry（内置工具 + MCP 外部工具）
     tool_registry = ToolRegistry()
-    register_builtin_tools(tool_registry)
+    register_builtin_tools(tool_registry, user_store=user_store, workflow_store=workflow_store)
     print(f"[Init] Registered {tool_registry.tool_count} built-in tools")
 
     # 初始化组件
@@ -237,7 +272,29 @@ def create_app() -> FastAPI:
     archive_store: ConversationArchiveStore = build_archive_store()
     file_store: ConversationFileStore = build_file_store()
     conversation_store: ConversationStore = build_conversation_store()
-    
+
+    async def _require_conversation_owner(
+        conversation_id: str, current_user: AuthenticatedUser
+    ) -> Conversation:
+        """校验对话存在且属于当前登录用户；不存在 404，存在但不是自己的 403。"""
+        conv = await conversation_store.get_conversation(conversation_id)
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        if conv.user_id != current_user.user_id:
+            raise HTTPException(status_code=403, detail="无权访问该对话")
+        return conv
+
+    async def _is_workflow_approver_for_conversation(conversation_id: str, user_id: str) -> bool:
+        """这个对话上有没有一条工作流实例，且当前用户持有它对应模板的审批角色。"""
+        instance = await workflow_store.get_latest_instance_by_conversation(conversation_id)
+        if instance is None:
+            return False
+        template = await workflow_store.get_template_by_type(instance.workflow_type)
+        if template is None or not template.approver_role_id:
+            return False
+        user_role_ids = {r.role_id for r in await role_store.get_user_roles(user_id)}
+        return template.approver_role_id in user_role_ids
+
     # 初始化 LLM（配置完全来自 settings.yaml + 环境变量覆盖）
     try:
         from langchain_openai import ChatOpenAI
@@ -278,6 +335,7 @@ def create_app() -> FastAPI:
         keep_recent=int(os.getenv("RAGENT_KEEP_RECENT", "4")),
         tool_registry=tool_registry,
         ltm_store=ltm_store,
+        workflow_store=workflow_store,
     )
 
     # lifespan：异步连接 MCP Servers（必须在 FastAPI 构造函数之前定义）
@@ -347,21 +405,532 @@ def create_app() -> FastAPI:
             ]
         }
 
+    # ==================== 鉴权 API ====================
+
+    @app.post("/api/v1/auth/login", response_model=LoginResponse)
+    async def login(request: LoginRequest) -> LoginResponse:
+        user = await user_store.authenticate(request.username, request.password)
+        if user is None:
+            raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+        token = create_access_token(user_id=user.user_id, username=user.username)
+        return LoginResponse(access_token=token, user_id=user.user_id, username=user.username)
+
+    @app.get("/api/v1/auth/me", response_model=MeResponse)
+    async def get_me(current_user: AuthenticatedUser = Depends(get_current_user)) -> MeResponse:
+        user = await user_store.get_user_by_id(current_user.user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        roles = await role_store.get_user_roles(user.user_id)
+        return MeResponse(
+            user_id=user.user_id,
+            username=user.username,
+            roles=[RoleSummary(role_id=r.role_id, name=r.name, display_name=r.display_name) for r in roles],
+            allowed_collections=await role_store.get_allowed_collections_for_user(user.user_id),
+            created_at=user.created_at,
+        )
+
+    @app.post("/api/v1/auth/change-password")
+    async def change_password(
+        request: ChangePasswordRequest,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> dict:
+        ok = await user_store.change_password(
+            current_user.user_id, request.old_password, request.new_password
+        )
+        if not ok:
+            raise HTTPException(status_code=400, detail="旧密码错误")
+        return {"success": True}
+
+    # ==================== 管理后台 API（仅超级管理员） ====================
+    # 人员管理：新增/查看/删除用户，角色分配。全部要求角色集合里有 super_admin，
+    # 且这个角色判断是每次请求都现查数据库（见 auth.require_role），不是信 token。
+
+    _require_super_admin = require_role(ROLE_SUPER_ADMIN)
+
+    async def _build_admin_user_response(user: User) -> AdminUserResponse:
+        roles = await role_store.get_user_roles(user.user_id)
+        return AdminUserResponse(
+            user_id=user.user_id,
+            username=user.username,
+            roles=[RoleSummary(role_id=r.role_id, name=r.name, display_name=r.display_name) for r in roles],
+            allowed_collections=await role_store.get_allowed_collections_for_user(user.user_id),
+            created_at=user.created_at,
+        )
+
+    @app.get("/api/v1/admin/users", response_model=List[AdminUserResponse])
+    async def admin_list_users(
+        _: AuthenticatedUser = Depends(_require_super_admin),
+    ) -> List[AdminUserResponse]:
+        users = await user_store.list_users()
+        return [await _build_admin_user_response(u) for u in users]
+
+    @app.post("/api/v1/admin/users", response_model=AdminUserResponse)
+    async def admin_create_user(
+        request: AdminCreateUserRequest,
+        _: AuthenticatedUser = Depends(_require_super_admin),
+    ) -> AdminUserResponse:
+        try:
+            user = await user_store.create_user(request.username, request.password)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if request.role_ids:
+            all_role_ids = {r.role_id for r in await role_store.list_roles()}
+            unknown = set(request.role_ids) - all_role_ids
+            if unknown:
+                raise HTTPException(status_code=400, detail=f"角色不存在: {sorted(unknown)}")
+            await role_store.assign_user_roles(user.user_id, request.role_ids)
+        return await _build_admin_user_response(user)
+
+    @app.delete("/api/v1/admin/users/{user_id}")
+    async def admin_delete_user(
+        user_id: str,
+        current_user: AuthenticatedUser = Depends(_require_super_admin),
+    ) -> dict:
+        if user_id == current_user.user_id:
+            raise HTTPException(status_code=400, detail="不能删除自己")
+        found = await user_store.delete_user(user_id)
+        if not found:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        return {"success": True}
+
+    @app.put("/api/v1/admin/users/{user_id}/roles", response_model=AdminUserResponse)
+    async def admin_set_user_roles(
+        user_id: str,
+        request: SetUserRolesRequest,
+        current_user: AuthenticatedUser = Depends(_require_super_admin),
+    ) -> AdminUserResponse:
+        user = await user_store.get_user_by_id(user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+
+        all_roles = {r.role_id: r for r in await role_store.list_roles()}
+        unknown = set(request.role_ids) - set(all_roles)
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"角色不存在: {sorted(unknown)}")
+
+        if user_id == current_user.user_id:
+            # 防止超级管理员误操作把自己的 super_admin 角色摘掉，导致管理后台再也进不去
+            super_admin_role_id = next(
+                (rid for rid, r in all_roles.items() if r.name == ROLE_SUPER_ADMIN), None
+            )
+            current_role_ids = {r.role_id for r in await role_store.get_user_roles(user_id)}
+            if (
+                super_admin_role_id
+                and super_admin_role_id in current_role_ids
+                and super_admin_role_id not in request.role_ids
+            ):
+                raise HTTPException(status_code=400, detail="不能取消自己的超级管理员角色")
+
+        await role_store.assign_user_roles(user_id, request.role_ids)
+        return await _build_admin_user_response(user)
+
+    # ==================== 角色管理 API（仅超级管理员） ====================
+
+    def _role_response(role_obj) -> RoleResponse:
+        return RoleResponse(
+            role_id=role_obj.role_id,
+            name=role_obj.name,
+            display_name=role_obj.display_name,
+            is_system=role_obj.is_system,
+            collection_names=getattr(role_obj, "collection_names", []),
+            created_at=role_obj.created_at,
+        )
+
+    @app.get("/api/v1/admin/roles", response_model=List[RoleResponse])
+    async def admin_list_roles(
+        _: AuthenticatedUser = Depends(_require_super_admin),
+    ) -> List[RoleResponse]:
+        roles = await role_store.list_roles()
+        return [_role_response(r) for r in roles]
+
+    @app.post("/api/v1/admin/roles", response_model=RoleResponse)
+    async def admin_create_role(
+        request: CreateRoleRequest,
+        _: AuthenticatedUser = Depends(_require_super_admin),
+    ) -> RoleResponse:
+        try:
+            role = await role_store.create_role(request.name, request.display_name)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return _role_response(role)
+
+    @app.patch("/api/v1/admin/roles/{role_id}", response_model=RoleResponse)
+    async def admin_update_role(
+        role_id: str,
+        request: UpdateRoleRequest,
+        _: AuthenticatedUser = Depends(_require_super_admin),
+    ) -> RoleResponse:
+        role = await role_store.update_role(role_id, request.display_name)
+        if role is None:
+            raise HTTPException(status_code=404, detail="角色不存在")
+        # update_role 返回的是不带 collection_names 的 Role；重新从 list_roles()
+        # 取一次带关联知识库的完整视图，避免响应把已有的知识库关联显示成空。
+        roles = await role_store.list_roles()
+        return _role_response(next(r for r in roles if r.role_id == role_id))
+
+    @app.delete("/api/v1/admin/roles/{role_id}")
+    async def admin_delete_role(
+        role_id: str,
+        _: AuthenticatedUser = Depends(_require_super_admin),
+    ) -> dict:
+        try:
+            found = await role_store.delete_role(role_id)
+        except ValueError as e:
+            raise HTTPException(status_code=403, detail=str(e))
+        if not found:
+            raise HTTPException(status_code=404, detail="角色不存在")
+        return {"success": True}
+
+    @app.put("/api/v1/admin/roles/{role_id}/collections", response_model=RoleResponse)
+    async def admin_set_role_collections(
+        role_id: str,
+        request: SetRoleCollectionsRequest,
+        _: AuthenticatedUser = Depends(_require_super_admin),
+    ) -> RoleResponse:
+        role = await role_store.get_role_by_id(role_id)
+        if role is None:
+            raise HTTPException(status_code=404, detail="角色不存在")
+        await role_store.set_role_collections(role_id, request.collection_names)
+        roles = await role_store.list_roles()
+        return _role_response(next(r for r in roles if r.role_id == role_id))
+
+    @app.get("/api/v1/admin/collections", response_model=List[str])
+    async def admin_list_collections(
+        _: AuthenticatedUser = Depends(_require_super_admin),
+    ) -> List[str]:
+        """列出 ChromaDB 现有 collection 名，供"配置知识库"多选框做数据源。
+        对话私有的 conv_{id} collection 不是可分配的共享知识库，排除掉。"""
+        from src.mcp_server.tools.list_collections import ListCollectionsTool
+
+        tool = ListCollectionsTool(settings=settings)
+        collections = await asyncio.to_thread(tool.list_collections, False)
+        return sorted(c.name for c in collections if not c.name.startswith("conv_"))
+
+    # ==================== 工作流模板管理 API（仅超级管理员） ====================
+    # work-flow.md 第 7 节：模板定义"某类流程需要哪些结构化字段"，附件材料只有
+    # 一句提醒文案（attachments_note），不逐条建模校验。
+
+    def _workflow_template_response(template: WorkflowTemplate) -> WorkflowTemplateResponse:
+        return WorkflowTemplateResponse(
+            template_id=template.template_id,
+            workflow_type=template.workflow_type,
+            display_name=template.display_name,
+            description=template.description,
+            required_fields=template.required_fields,
+            attachments_note=template.attachments_note,
+            approver_role_id=template.approver_role_id,
+            is_system=template.is_system,
+            created_at=template.created_at,
+        )
+
+    @app.get("/api/v1/admin/workflow-templates", response_model=List[WorkflowTemplateResponse])
+    async def admin_list_workflow_templates(
+        _: AuthenticatedUser = Depends(_require_super_admin),
+    ) -> List[WorkflowTemplateResponse]:
+        templates = await workflow_store.list_templates()
+        return [_workflow_template_response(t) for t in templates]
+
+    @app.post("/api/v1/admin/workflow-templates", response_model=WorkflowTemplateResponse)
+    async def admin_create_workflow_template(
+        request: CreateWorkflowTemplateRequest,
+        _: AuthenticatedUser = Depends(_require_super_admin),
+    ) -> WorkflowTemplateResponse:
+        try:
+            template = await workflow_store.create_template(
+                workflow_type=request.workflow_type,
+                display_name=request.display_name,
+                description=request.description,
+                required_fields=[f.model_dump() for f in request.required_fields],
+                attachments_note=request.attachments_note,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return _workflow_template_response(template)
+
+    @app.patch("/api/v1/admin/workflow-templates/{template_id}", response_model=WorkflowTemplateResponse)
+    async def admin_update_workflow_template(
+        template_id: str,
+        request: UpdateWorkflowTemplateRequest,
+        _: AuthenticatedUser = Depends(_require_super_admin),
+    ) -> WorkflowTemplateResponse:
+        # exclude_unset：区分"这次 PATCH 没传这个字段"和"显式传了 null"，
+        # approver_role_id 本身允许为 null（表示暂无审批人），两种情况不能混淆。
+        updates = request.model_dump(exclude_unset=True)
+        kwargs: dict = {}
+        if "display_name" in updates:
+            kwargs["display_name"] = updates["display_name"]
+        if "description" in updates:
+            kwargs["description"] = updates["description"]
+        if "required_fields" in updates:
+            kwargs["required_fields"] = updates["required_fields"]
+        if "attachments_note" in updates:
+            kwargs["attachments_note"] = updates["attachments_note"]
+        if "approver_role_id" in updates:
+            if updates["approver_role_id"] is not None:
+                role = await role_store.get_role_by_id(updates["approver_role_id"])
+                if role is None:
+                    raise HTTPException(status_code=400, detail="审批角色不存在")
+            kwargs["approver_role_id"] = updates["approver_role_id"]
+
+        template = await workflow_store.update_template(template_id, **kwargs)
+        if template is None:
+            raise HTTPException(status_code=404, detail="流程模板不存在")
+        return _workflow_template_response(template)
+
+    @app.delete("/api/v1/admin/workflow-templates/{template_id}")
+    async def admin_delete_workflow_template(
+        template_id: str,
+        _: AuthenticatedUser = Depends(_require_super_admin),
+    ) -> dict:
+        try:
+            found = await workflow_store.delete_template(template_id)
+        except ValueError as e:
+            raise HTTPException(status_code=403, detail=str(e))
+        if not found:
+            raise HTTPException(status_code=404, detail="流程模板不存在")
+        return {"success": True}
+
+    # ==================== 工作流 API ====================
+    # work-flow.md 第 7 节 + work-flow-web.md 第 3/6.2 节
+
+    @app.get("/api/v1/workflow-templates", response_model=List[WorkflowTemplateResponse])
+    async def list_workflow_templates(
+        _: AuthenticatedUser = Depends(get_current_user),
+    ) -> List[WorkflowTemplateResponse]:
+        """轻量列表，登录用户可调（不要求 super_admin），供前端"发起工作流"
+        入口的下拉框用。"""
+        templates = await workflow_store.list_templates()
+        return [_workflow_template_response(t) for t in templates]
+
+    @app.get("/api/v1/workflow-templates/approvable-types", response_model=List[WorkflowTemplateResponse])
+    async def list_approvable_workflow_types(
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> List[WorkflowTemplateResponse]:
+        """登录用户可调，只返回当前用户角色能审批的流程类型，用于"待我审批"
+        Tab 的可见性判断，不要求 super_admin。"""
+        role_ids = [r.role_id for r in await role_store.get_user_roles(current_user.user_id)]
+        templates = await workflow_store.approvable_templates_for_role_ids(role_ids)
+        return [_workflow_template_response(t) for t in templates]
+
+    async def _build_workflow_instance_response(instance: WorkflowInstance) -> WorkflowInstanceResponse:
+        template = await workflow_store.get_template_by_type(instance.workflow_type)
+        requester = await user_store.get_user_by_id(instance.requester_user_id)
+        return WorkflowInstanceResponse(
+            instance_id=instance.instance_id,
+            workflow_type=instance.workflow_type,
+            display_name=template.display_name if template else instance.workflow_type,
+            requester_user_id=instance.requester_user_id,
+            requester_username=requester.username if requester else None,
+            conversation_id=instance.conversation_id,
+            fields=instance.fields,
+            status=instance.status,
+            approver_user_id=instance.approver_user_id,
+            approval_comment=instance.approval_comment,
+            history=instance.history,
+            created_at=instance.created_at,
+            updated_at=instance.updated_at,
+        )
+
+    async def _require_workflow_access(
+        instance_id: str, current_user: AuthenticatedUser, mode: str,
+    ) -> WorkflowInstance:
+        """`mode`: "owner" 必须是发起人；"approver" 必须持有该实例所属模板的审批
+        角色；"owner_or_approver" 满足其一即可。审批角色是 per-模板动态的，不能
+        用静态的 `require_role(*names)` 工厂，运行期查模板后再判断（work-flow.md
+        第 7 节）。"""
+        instance = await workflow_store.get_instance(instance_id)
+        if instance is None:
+            raise HTTPException(status_code=404, detail="工作流不存在")
+
+        is_owner = instance.requester_user_id == current_user.user_id
+        if mode == "owner":
+            if not is_owner:
+                raise HTTPException(status_code=403, detail="无权访问该工作流")
+            return instance
+
+        template = await workflow_store.get_template_by_type(instance.workflow_type)
+        is_approver = False
+        if template is not None and template.approver_role_id:
+            role_ids = {r.role_id for r in await role_store.get_user_roles(current_user.user_id)}
+            is_approver = template.approver_role_id in role_ids
+
+        if mode == "approver":
+            if not is_approver:
+                raise HTTPException(status_code=403, detail="无权审批该工作流")
+            return instance
+
+        if not (is_owner or is_approver):
+            raise HTTPException(status_code=403, detail="无权访问该工作流")
+        return instance
+
+    async def _transition_workflow(
+        instance_id: str, new_status: str, actor_user_id: str, comment: Optional[str],
+    ) -> WorkflowInstance:
+        try:
+            updated = await workflow_store.transition(
+                instance_id, new_status, actor_user_id=actor_user_id, comment=comment, role_store=role_store,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if updated is None:
+            raise HTTPException(status_code=404, detail="工作流不存在")
+        return updated
+
+    @app.get("/api/v1/workflows", response_model=List[WorkflowInstanceResponse])
+    async def list_my_workflows(
+        status: Optional[str] = None,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> List[WorkflowInstanceResponse]:
+        """我发起的工作流列表。"""
+        instances = await workflow_store.list_instances_for_user(current_user.user_id, status=status)
+        return [await _build_workflow_instance_response(i) for i in instances]
+
+    @app.get("/api/v1/workflows/pending-approval", response_model=List[WorkflowInstanceResponse])
+    async def list_pending_approval_workflows(
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> List[WorkflowInstanceResponse]:
+        """我（按角色）能审批的待处理列表。"""
+        role_ids = [r.role_id for r in await role_store.get_user_roles(current_user.user_id)]
+        instances = await workflow_store.list_pending_for_role_ids(role_ids)
+        return [await _build_workflow_instance_response(i) for i in instances]
+
+    @app.get("/api/v1/workflows/{instance_id}", response_model=WorkflowInstanceResponse)
+    async def get_workflow(
+        instance_id: str,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> WorkflowInstanceResponse:
+        instance = await _require_workflow_access(instance_id, current_user, mode="owner_or_approver")
+        return await _build_workflow_instance_response(instance)
+
+    @app.post("/api/v1/workflows/{instance_id}/approve", response_model=WorkflowInstanceResponse)
+    async def approve_workflow(
+        instance_id: str,
+        request: WorkflowActionRequest,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> WorkflowInstanceResponse:
+        """材料齐全时用。"""
+        await _require_workflow_access(instance_id, current_user, mode="approver")
+        updated = await _transition_workflow(instance_id, "approved", current_user.user_id, request.comment)
+        return await _build_workflow_instance_response(updated)
+
+    @app.post("/api/v1/workflows/{instance_id}/return", response_model=WorkflowInstanceResponse)
+    async def return_workflow(
+        instance_id: str,
+        request: WorkflowReturnRequest,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> WorkflowInstanceResponse:
+        """材料不齐时用：打回补充材料，`pending_approval -> returned_for_revision`，
+        申请人补完可重新提交，不是终态。"""
+        await _require_workflow_access(instance_id, current_user, mode="approver")
+        updated = await _transition_workflow(instance_id, "returned_for_revision", current_user.user_id, request.comment)
+        return await _build_workflow_instance_response(updated)
+
+    @app.post("/api/v1/workflows/{instance_id}/reject", response_model=WorkflowInstanceResponse)
+    async def reject_workflow(
+        instance_id: str,
+        request: WorkflowRejectRequest,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> WorkflowInstanceResponse:
+        """申请本身不该批时用（不是材料问题），终态，不可恢复。"""
+        await _require_workflow_access(instance_id, current_user, mode="approver")
+        updated = await _transition_workflow(instance_id, "rejected", current_user.user_id, request.comment)
+        return await _build_workflow_instance_response(updated)
+
+    @app.post("/api/v1/workflows/{instance_id}/resubmit", response_model=WorkflowInstanceResponse)
+    async def resubmit_workflow_endpoint(
+        instance_id: str,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> WorkflowInstanceResponse:
+        """仅 `returned_for_revision` 状态可用，`-> pending_approval`。对话里由
+        `resubmit_workflow` 工具触发的是同一条转换（builtin_tools.py），这个
+        端点是给前端"我发起的"列表页用的等价入口。"""
+        await _require_workflow_access(instance_id, current_user, mode="owner")
+        updated = await _transition_workflow(instance_id, "pending_approval", current_user.user_id, None)
+        return await _build_workflow_instance_response(updated)
+
+    @app.post("/api/v1/workflows/{instance_id}/complete", response_model=WorkflowInstanceResponse)
+    async def complete_workflow(
+        instance_id: str,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> WorkflowInstanceResponse:
+        await _require_workflow_access(instance_id, current_user, mode="owner_or_approver")
+        updated = await _transition_workflow(instance_id, "completed", current_user.user_id, None)
+        return await _build_workflow_instance_response(updated)
+
+    @app.post("/api/v1/workflows/{instance_id}/cancel", response_model=WorkflowInstanceResponse)
+    async def cancel_workflow(
+        instance_id: str,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> WorkflowInstanceResponse:
+        """仅发起人可取消，仅 `pending_approval`/`returned_for_revision` 状态可用。"""
+        await _require_workflow_access(instance_id, current_user, mode="owner")
+        updated = await _transition_workflow(instance_id, "cancelled", current_user.user_id, None)
+        return await _build_workflow_instance_response(updated)
+
+    # ==================== 站内信 API ====================
+    # work-flow-web.md 第 6.2 节：通用的"事件 -> 提醒"投递，目前只有工作流状态
+    # 变化会触发（见 workflow_store.py 的 notify_requester/notify_approvers）。
+
+    @app.get("/api/v1/notifications", response_model=List[NotificationResponse])
+    async def list_notifications(
+        unread_only: bool = False,
+        limit: int = 20,
+        offset: int = 0,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> List[NotificationResponse]:
+        notifications = await workflow_store.list_notifications(
+            current_user.user_id, unread_only=unread_only, limit=limit, offset=offset,
+        )
+        return [
+            NotificationResponse(
+                notification_id=n.notification_id, type=n.type, title=n.title, body=n.body,
+                link=n.link, is_read=n.is_read, created_at=n.created_at,
+            )
+            for n in notifications
+        ]
+
+    @app.get("/api/v1/notifications/unread-count")
+    async def get_unread_notification_count(
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> dict:
+        count = await workflow_store.unread_count(current_user.user_id)
+        return {"count": count}
+
+    @app.post("/api/v1/notifications/{notification_id}/read")
+    async def mark_notification_read(
+        notification_id: str,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> dict:
+        found = await workflow_store.mark_read(notification_id, current_user.user_id)
+        if not found:
+            raise HTTPException(status_code=404, detail="通知不存在")
+        return {"success": True}
+
+    @app.post("/api/v1/notifications/mark-all-read")
+    async def mark_all_notifications_read(
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> dict:
+        count = await workflow_store.mark_all_read(current_user.user_id)
+        return {"success": True, "count": count}
+
     # ==================== 文件管理 API ====================
-    
+
     @app.post("/api/v1/conversations/{conversation_id}/files")
     async def upload_file(
         conversation_id: str,
         file: UploadFile = File(...),
+        current_user: AuthenticatedUser = Depends(get_current_user),
     ) -> dict:
         """
         上传文件到对话
-        
+
         文件会被：
         1. 保存到磁盘
         2. 记录到数据库
         3. 后台异步 ingest 到对话的 collection
         """
+        await _require_conversation_owner(conversation_id, current_user)
         try:
             # 读取文件内容
             content = await file.read()
@@ -428,8 +997,12 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=f"Failed to upload file: {e}")
     
     @app.get("/api/v1/conversations/{conversation_id}/files")
-    async def list_files(conversation_id: str) -> dict:
+    async def list_files(
+        conversation_id: str,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> dict:
         """列出对话的所有文件"""
+        await _require_conversation_owner(conversation_id, current_user)
         try:
             files = await file_store.list_files(conversation_id)
             return {
@@ -454,9 +1027,40 @@ def create_app() -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to list files: {e}")
     
+    @app.get("/api/v1/conversations/{conversation_id}/files/{file_id}/download")
+    async def download_file(
+        conversation_id: str,
+        file_id: str,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> FileResponse:
+        """下载对话里的原始文件。鉴权比普通的"仅对话所有者"宽一档：该对话关联的
+        工作流实例的审批人也能下载——审批人要能实际打开申请人传的材料才能判断
+        齐不齐全，不是可选项（work-flow.md 第 8 节风险）。"""
+        conv = await conversation_store.get_conversation(conversation_id)
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        if conv.user_id != current_user.user_id:
+            allowed = await _is_workflow_approver_for_conversation(conversation_id, current_user.user_id)
+            if not allowed:
+                raise HTTPException(status_code=403, detail="无权访问该对话的文件")
+
+        file_info = await file_store.get_file(conversation_id, file_id)
+        if file_info is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        return FileResponse(
+            path=file_info.file_path,
+            filename=file_info.original_name,
+            media_type=file_info.mime_type or "application/octet-stream",
+        )
+
     @app.delete("/api/v1/conversations/{conversation_id}/files/{file_id}")
-    async def delete_file(conversation_id: str, file_id: str) -> dict:
+    async def delete_file(
+        conversation_id: str,
+        file_id: str,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> dict:
         """删除对话中的文件"""
+        await _require_conversation_owner(conversation_id, current_user)
         try:
             success = await file_store.delete_file(conversation_id, file_id)
             if not success:
@@ -470,11 +1074,14 @@ def create_app() -> FastAPI:
     # ==================== 对话管理 API ====================
     
     @app.post("/api/v1/conversations")
-    async def create_conversation_endpoint(request: dict = None) -> dict:
+    async def create_conversation_endpoint(
+        request: dict = None,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> dict:
         """创建新对话"""
         try:
             title = request.get("title") if request else None
-            conv = await conversation_store.create_conversation(title=title)
+            conv = await conversation_store.create_conversation(user_id=current_user.user_id, title=title)
             return {
                 "conversation_id": conv.conversation_id,
                 "title": conv.title,
@@ -488,12 +1095,13 @@ def create_app() -> FastAPI:
     async def list_conversations_endpoint(
         status: str = "active",
         limit: int = 100,
-        offset: int = 0
+        offset: int = 0,
+        current_user: AuthenticatedUser = Depends(get_current_user),
     ) -> dict:
-        """获取对话列表（按更新时间倒序）"""
+        """获取当前登录用户自己的对话列表（按更新时间倒序）"""
         try:
             conversations = await conversation_store.list_conversations(
-                status=status, limit=limit, offset=offset
+                user_id=current_user.user_id, status=status, limit=limit, offset=offset
             )
             return {
                 "total": len(conversations),
@@ -514,12 +1122,13 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=f"Failed to list conversations: {e}")
     
     @app.get("/api/v1/conversations/{conversation_id}")
-    async def get_conversation_endpoint(conversation_id: str) -> dict:
+    async def get_conversation_endpoint(
+        conversation_id: str,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> dict:
         """获取单个对话详情"""
         try:
-            conv = await conversation_store.get_conversation(conversation_id)
-            if not conv:
-                raise HTTPException(status_code=404, detail="Conversation not found")
+            conv = await _require_conversation_owner(conversation_id, current_user)
             return {
                 "conversation_id": conv.conversation_id,
                 "title": conv.title,
@@ -535,8 +1144,13 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=f"Failed to get conversation: {e}")
     
     @app.patch("/api/v1/conversations/{conversation_id}")
-    async def update_conversation_endpoint(conversation_id: str, request: dict) -> dict:
+    async def update_conversation_endpoint(
+        conversation_id: str,
+        request: dict,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> dict:
         """更新对话信息（标题、状态等）"""
+        await _require_conversation_owner(conversation_id, current_user)
         try:
             success = await conversation_store.update_conversation(
                 conversation_id,
@@ -552,8 +1166,12 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=f"Failed to update conversation: {e}")
     
     @app.delete("/api/v1/conversations/{conversation_id}")
-    async def delete_conversation_endpoint(conversation_id: str) -> dict:
+    async def delete_conversation_endpoint(
+        conversation_id: str,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> dict:
         """删除对话（软删除）"""
+        await _require_conversation_owner(conversation_id, current_user)
         try:
             success = await conversation_store.delete_conversation(conversation_id)
             if not success:
@@ -569,51 +1187,58 @@ def create_app() -> FastAPI:
     # ==================== 对话 API ====================
     
     @app.post("/api/v1/chat", response_model=ChatResponse)
-    async def chat(request: ChatRequest) -> ChatResponse:
+    async def chat(
+        request: ChatRequest,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> ChatResponse:
         """
         对话接口
-        
+
         检索范围自动限定为当前对话的 collection（conv_{conversation_id}）
         """
         # 使用 conversation_id 作为 thread_id，或创建新对话
         if request.conversation_id:
             thread_id = request.conversation_id
-            conv = await conversation_store.get_conversation(thread_id)
-            if not conv:
-                raise HTTPException(status_code=404, detail="Conversation not found")
+            conv = await _require_conversation_owner(thread_id, current_user)
         else:
             # 创建新对话
-            conv = await conversation_store.create_conversation()
+            conv = await conversation_store.create_conversation(user_id=current_user.user_id)
             thread_id = conv.conversation_id
         
-        # 准备初始状态
+        # 准备初始状态（user_id 来自校验过的 token，不信任客户端请求体）
         initial_state = {
             "query": request.query,
-            "user_id": request.user_id,
+            "user_id": current_user.user_id,
             "conversation_id": thread_id,
             "task_id": request.task_id or os.urandom(8).hex(),
             "top_k": request.top_k,
+            "workflow_type_hint": request.workflow_type,
             # collection 由 workflow 内部自动构建为 f"conv_{thread_id}"
         }
-        
+
         # 运行工作流
         final_state = await workflow.run(initial_state, thread_id=thread_id)
-        
+
         # 更新对话消息计数
         await conversation_store.update_conversation(
             thread_id,
             message_count=conv.message_count + 2 if conv else 2,  # user + assistant
         )
-        
+
         return ChatResponse(
             conversation_id=final_state["conversation_id"],
             task_id=final_state["task_id"],
             answer=final_state.get("final_answer", ""),
             model_id=final_state.get("used_model", "unknown"),
+            active_workflow=_build_active_workflow_summary(final_state.get("active_workflow")),
         )
 
     @app.post("/api/v1/chat/stream")
-    async def chat_stream(request: ChatRequest, req: Request) -> StreamingResponse:
+    async def chat_stream(
+        request: ChatRequest,
+        req: Request,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> StreamingResponse:
         """真流式对话接口：token-by-token 输出，客户端断开时自动回滚脏 checkpoint"""
         
         async def event_stream() -> AsyncGenerator[str, None]:
@@ -624,18 +1249,22 @@ def create_app() -> FastAPI:
                 if not conv:
                     yield f"data: {json.dumps({'type': 'error', 'error': 'Conversation not found'}, ensure_ascii=False)}\n\n"
                     return
+                if conv.user_id != current_user.user_id:
+                    yield f"data: {json.dumps({'type': 'error', 'error': 'Forbidden'}, ensure_ascii=False)}\n\n"
+                    return
             else:
-                conv = await conversation_store.create_conversation()
+                conv = await conversation_store.create_conversation(user_id=current_user.user_id)
                 thread_id = conv.conversation_id
             
             initial_state = {
                 "query": request.query,
-                "user_id": request.user_id,
+                "user_id": current_user.user_id,
                 "conversation_id": thread_id,
                 "task_id": request.task_id or os.urandom(8).hex(),
                 "top_k": request.top_k,
+                "workflow_type_hint": request.workflow_type,
             }
-            
+
             # 2. 记录干净 checkpoint id（流式开始前）
             clean_checkpoint_id = None
             try:
@@ -717,6 +1346,7 @@ def create_app() -> FastAPI:
                 # 4. 正常结束：发送 done 并更新统计
                 if not interrupted and final_state:
                     memory_stats = workflow.get_memory_stats(final_state)
+                    active_workflow_summary = _build_active_workflow_summary(final_state.get("active_workflow"))
                     done_event = {
                         "type": "done",
                         "conversation_id": final_state.get("conversation_id"),
@@ -724,6 +1354,7 @@ def create_app() -> FastAPI:
                         "model_id": final_state.get("used_model"),
                         "trace": final_state.get("trace_events", []),
                         "memory_stats": memory_stats,
+                        "active_workflow": active_workflow_summary.model_dump() if active_workflow_summary else None,
                     }
                     yield f"data: {json.dumps(done_event, ensure_ascii=False)}\n\n"
                     
@@ -765,14 +1396,19 @@ def create_app() -> FastAPI:
                 active_trace_ws.pop(conversation_id, None)
 
     @app.post("/api/v1/conversations/{conversation_id}/rollback")
-    async def rollback_conversation(conversation_id: str, request: RollbackRequest) -> dict:
+    async def rollback_conversation(
+        conversation_id: str,
+        request: RollbackRequest,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> dict:
         """
         三位一体时间裁剪：回滚对话到指定消息边界。
         同时清理：
         1. LangGraph Checkpoint（状态层）
-        2. MySQL conversation_archive（存储层）
-        3. SQLite ltm.db（记忆层）
+        2. PostgreSQL conversation_archive（存储层）
+        3. PostgreSQL long_term_memories（记忆层）
         """
+        await _require_conversation_owner(conversation_id, current_user)
         # 1. 获取目标 turn
         turn_info = await archive_store.get_turn_by_message_id(conversation_id, request.target_message_id)
         if not turn_info:
@@ -870,11 +1506,15 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/api/v1/history/{conversation_id}")
-    async def get_history(conversation_id: str) -> dict:
+    async def get_history(
+        conversation_id: str,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> dict:
         """
-        获取完整对话历史（从 MySQL 加载）
+        获取完整对话历史（从 PostgreSQL 加载）
         这是用户可见的完整历史，不是 checkpoint 中的精简状态
         """
+        await _require_conversation_owner(conversation_id, current_user)
         try:
             history = await archive_store.load_full_history(conversation_id)
             return {
@@ -886,11 +1526,15 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=f"Failed to load history: {e}")
 
     @app.get("/api/v1/memory/{conversation_id}/stats")
-    async def get_memory_stats(conversation_id: str) -> dict:
+    async def get_memory_stats(
+        conversation_id: str,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> dict:
         """
         获取当前记忆的统计信息（调试用）
         这会从 checkpoint 加载并返回统计
         """
+        await _require_conversation_owner(conversation_id, current_user)
         config = {"configurable": {"thread_id": conversation_id}}
         try:
             if hasattr(checkpointer, 'aget'):
@@ -934,6 +1578,9 @@ def create_app() -> FastAPI:
         await archive_store.close()
         await file_store.close()
         await conversation_store.close()
+        await user_store.close()
+        await role_store.close()
+        await workflow_store.close()
 
     return app
 

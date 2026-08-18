@@ -113,10 +113,17 @@ def build_tool_subgraph(
         
         new_messages = []
         
+        user_id = state.get("user_id")
+
         for call in tool_calls:
             name = call.get("name", "")
-            args = call.get("arguments") or call.get("args") or {}
-            
+            args = dict(call.get("arguments") or call.get("args") or {})
+            if user_id:
+                # 服务端注入，覆盖任何 LLM 可能编造的同名参数——user_id 从不
+                # 出现在暴露给 LLM 的 tool schema 里，LLM 没有机会"正常"提供它，
+                # 这里的覆盖只是防御 LLM 瞎编的边界情况。
+                args["user_id"] = user_id
+
             t0 = time.monotonic()
             try:
                 result: ToolResult = await tool_registry.execute(name, args)
@@ -180,7 +187,21 @@ def build_tool_subgraph(
                 "tool_summary": "",
                 "tool_execution_trace": state.get("tool_execution_trace", []),
             }
-        
+
+        # ACL 拒绝的结果必须原样透传，不能交给 LLM "总结"——本地模型总结时
+        # 会把"无权访问"这种明确的拒绝，改写成一段看似合理但完全编造的
+        # 通用回答（真实观察到的现象：模型编了一套"合同审批流程"出来），
+        # 用户完全看不出自己其实是被权限挡住了。
+        denial_outputs = [
+            r["output"] for r in tool_results
+            if r.get("output", "").startswith("## 无权访问")
+        ]
+        if denial_outputs:
+            return {
+                "tool_summary": "\n\n".join(denial_outputs),
+                "tool_execution_trace": state.get("tool_execution_trace", []),
+            }
+
         # 使用 LLM 整理摘要（如果可用）
         if llm is not None:
             summary_prompt = _build_summary_prompt(query, tool_results, failed_tools)

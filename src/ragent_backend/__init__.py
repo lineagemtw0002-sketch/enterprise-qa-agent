@@ -4,7 +4,7 @@ Industrial RAG backend package based on FastAPI + LangGraph.
 核心特性：
 - 滑动窗口记忆管理（Rolling Memory）
 - 分离的 Checkpoint（给模型）和 Archive（给用户）
-- 异步归档到 MySQL
+- 异步归档到 PostgreSQL
 """
 
 from src.ragent_backend.schemas import ChatRequest, ChatResponse, RAGState

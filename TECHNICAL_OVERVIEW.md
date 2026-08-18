@@ -18,7 +18,7 @@
 | **文件摄取** | 完整 | PDF/TXT 解析 → 分块 → LLM Refine/Enrich/Caption → 向量化 |
 | **混合检索** | 完整 | Dense（语义）+ Sparse（BM25）+ RRF 融合 + Rerank |
 | **查询优化** | 完整 | 结构化 LLM 一次完成指代消解 + 子查询拆分 |
-| **记忆管理** | 完整 | 滑动窗口压缩 + 滚动摘要 + MySQL 归档 + LTM 长期记忆 |
+| **记忆管理** | 完整 | 滑动窗口压缩 + 滚动摘要 + PostgreSQL 归档 + LTM 长期记忆 |
 | **MCP 协议** | 完整 | stdio-based MCP Server，3 个 tools |
 | **可观测性** | 完整 | Trace 瀑布图 + Streamlit Dashboard + Ragas 评估 |
 | **多 Provider** | 完整 | OpenAI/Azure/DeepSeek/Ollama 可切换 |
@@ -53,7 +53,7 @@
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           检索与存储层                                       │
 │  - ChromaDB (dense vectors)  +  BM25 (sparse index)  +  ImageStorage        │
-│  - SQLite/Postgres (checkpoints)  +  MySQL (conversation archive)           │
+│  - PostgreSQL (checkpoints + conversation archive)                          │
 │  - SQLite (file store, LTM store, integrity checker)                        │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -104,7 +104,7 @@
 2. **配置加载**：`load_settings()` 从 `config/settings.yaml` 读取。
 3. **存储组件**：
    - `checkpointer`：优先 Postgres，回退 Sqlite（用于 LangGraph 状态持久化）
-   - `archive_store`：MySQL 对话归档
+   - `archive_store`：PostgreSQL 对话归档
    - `file_store`：SQLite 文件元数据管理
    - `conversation_store`：SQLite 对话元数据管理
 4. **LLM 初始化**：`ChatOpenAI`（默认 `qwen3.5-omni-flash`）
@@ -218,11 +218,11 @@ START → session → intent → [conditional] → retrieve → generate → mem
 - 保留最近 `keep_recent` 条消息（默认 4 条）
 - 将旧消息传给 LLM 生成摘要，与现有 `summary` 合并
 - 返回 `RemoveMessage(id=...)` 操作，LangGraph 自动从状态中移除这些消息
-- 被移除的消息标记到 `_to_archive`，供 `archive` 节点异步写入 MySQL
+- 被移除的消息标记到 `_to_archive`，供 `archive` 节点异步写入 PostgreSQL
 
 #### 4.2.6 `archive` 节点
 
-- **归档**：将被压缩的消息 + 本轮新消息（最后两条 user/assistant）异步写入 MySQL `archive_store`
+- **归档**：将被压缩的消息 + 本轮新消息（最后两条 user/assistant）异步写入 PostgreSQL `archive_store`
 - **LTM 提取**：如果配置了 `ltm_store`，异步调用 `extract_facts(query, answer, llm)`，提取结构化事实并持久化到 SQLite LTM 表
 - 两者均使用 `asyncio.create_task` 不阻塞主响应
 
@@ -454,7 +454,7 @@ Reranker 失败后也会 graceful fallback 到 RRF 融合结果。
 ├─────────────────┤
 │  滚动摘要        │  → 旧消息被压缩后存入 summary 字段（checkpoint 内）
 ├─────────────────┤
-│  对话归档        │  → MySQL（完整历史，供用户查看）
+│  对话归档        │  → PostgreSQL（完整历史，供用户查看）
 ├─────────────────┤
 │  长期记忆 (LTM)  │  → SQLite ltm.db（跨会话用户事实）
 └─────────────────┘
@@ -465,9 +465,9 @@ Reranker 失败后也会 graceful fallback 到 RRF 融合结果。
 - 优先尝试 `PostgresSaver`，如果连接失败则回退 `SqliteSaver`
 - 在 `chat_stream` 中，用户打断时会触发 checkpoint 物理回滚，保证状态一致性
 
-### 9.3 MySQL Archive Store
+### 9.3 PostgreSQL Archive Store
 
-`ConversationArchiveStore` 将每轮对话的 user query 和 assistant answer 异步写入 MySQL。这是"给用户看的历史记录"，与 LangGraph 内部状态分离。
+`ConversationArchiveStore` 将每轮对话的 user query 和 assistant answer 异步写入 PostgreSQL。这是"给用户看的历史记录"，与 LangGraph 内部状态分离。
 
 ### 9.4 LTM Store
 
@@ -577,7 +577,7 @@ Reranker 失败后也会 graceful fallback 到 RRF 融合结果。
 1. **Ingestion 大文件仍有延迟**：已增加 Semaphore 和 max_workers 控制，但 50+ 页 PDF 的 LLM transform 总量仍然可观。后续如需彻底解耦，应引入 Celery/Redis 持久化队列。
 2. **Transform 子阶段间串行**：`refiner → enricher → captioner` 存在数据依赖，无法简单并行。如需进一步优化，需将 `BaseLLM.chat` 改造为异步 `achat()`。
 3. **Embedding API 偶发超时**：DashScope 兼容模式下 embedding 超时问题与代码无关，需检查 API key 或切换 endpoint。
-4. **MySQL archive 任务取消**：`_archive_node` 使用 `asyncio.create_task` 写 MySQL，事件 loop 过早关闭时可能导致部分归档丢失。
+4. **PostgreSQL archive 任务取消**：`_archive_node` 使用 `asyncio.create_task` 写 PostgreSQL，事件 loop 过早关闭时可能导致部分归档丢失。
 
 ---
 
@@ -595,7 +595,7 @@ Reranker 失败后也会 graceful fallback 到 RRF 融合结果。
 | Embedding | OpenAI/Azure/DashScope 兼容 API |
 | LLM | OpenAI/Azure/DeepSeek/Ollama 可切换 |
 | Vision LLM | Azure OpenAI GPT-4V / Qwen-VL |
-| 存储 | SQLite (checkpoints, file store, LTM, integrity), MySQL (archive), Postgres (checkpoint fallback) |
+| 存储 | PostgreSQL (checkpoints, archive), SQLite (file store, LTM, integrity 等辅助场景) |
 | 可观测性 | Streamlit, JSONL trace logs, Ragas |
 | 协议 | MCP (stdio), SSE |
 | 评估 | Ragas, Custom Evaluator, pytest |

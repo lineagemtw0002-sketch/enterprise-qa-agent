@@ -20,7 +20,7 @@ class RollingMemoryManager:
     1. 保持消息列表在 max_messages 以内
     2. 当超出限制时，保留 keep_recent 条最新消息
     3. 其余消息合并到 summary 中
-    4. 异步归档被移除的消息到 MySQL
+    4. 异步归档被移除的消息到 PostgreSQL
     """
     
     def __init__(
@@ -67,7 +67,7 @@ class RollingMemoryManager:
             llm, current_summary, to_archive_msgs
         )
         
-        # 准备归档数据（用于 MySQL）
+        # 准备归档数据（用于 PostgreSQL）
         archived_data = [
             {
                 "role": "user" if isinstance(m, HumanMessage) else "assistant",
