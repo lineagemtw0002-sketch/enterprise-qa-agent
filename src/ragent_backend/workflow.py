@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import pydantic
@@ -583,7 +583,9 @@ class RAGWorkflow:
                     "trace_events": [*trace_events, {"node": "workflow", "ts": time.time(), "ok": False}],
                 }
             fields_to_extract = [f for f in template.required_fields if f["key"] in active.get("missing_field_keys", [])]
-            extracted = await self._extract_workflow_fields(query, fields_to_extract)
+            extracted = await self._extract_workflow_fields(
+                query, fields_to_extract, awaiting_field_key=active.get("awaiting_field_key"),
+            )
             collected = dict(active.get("collected_fields", {}))
             for k, v in extracted.items():
                 if self._validate_workflow_field(template.required_fields, k, v):
@@ -661,11 +663,19 @@ class RAGWorkflow:
         }
 
     async def _extract_workflow_fields(
-        self, query: str, fields: List[Dict[str, Any]],
+        self, query: str, fields: List[Dict[str, Any]], awaiting_field_key: Optional[str] = None,
     ) -> Dict[str, str]:
         """用结构化 LLM 调用从这句话里抽取给定字段的值，抽不到的字段不出现在
         返回结果里。没有 LLM 或没有要抽取的字段时直接返回空字典（work-flow.md
-        6.1 节步骤 2/3）。"""
+        6.1 节步骤 2/3）。
+
+        `awaiting_field_key`：续填轮次里，上一轮追问话术具体问的是哪个字段
+        （`_build_workflow_field_question` 生成问题时用的那个 `missing[0]`）。
+        续填时 `fields` 传入的是"当前还缺的全部字段"，不只是刚问的那一个——如果
+        用户的回复很短、本身脱离上下文根本看不出是在答哪个字段（比如追问"开始
+        日期是？"，用户就回一句"明天"），模型面对一堆候选字段时容易抽不出来，
+        白白回一句"明天"却没被识别、又被追问一遍同一个问题。显式点出"这轮问的
+        就是这个字段"，让模型有个锚点，而不是硬猜。"""
         if not fields or self._llm is None:
             return {}
 
@@ -680,10 +690,39 @@ class RAGWorkflow:
             field_lines.append(line)
 
         model_cls = pydantic.create_model("WorkflowFieldExtraction", **field_defs)
-        today = date.today().isoformat()
+        today_dt = date.today()
+        today = today_dt.isoformat()
+        # 光靠"今天日期是 X + 明天/下周一举例"不够可靠——小模型经常连"今天"本身
+        # 都换算不出来（把"今天请假"里的"今天"当成抽不到，继续追问日期）。这里
+        # 把最常用的几个相对日期直接算好、原样喂给模型当作对照表，不指望模型
+        # 自己心算日期加减，只有再往外的相对表达（"下周一""这个月底"之类）才
+        # 真的需要模型自己推算。
+        relative_dates = {
+            "前天": today_dt - timedelta(days=2),
+            "昨天": today_dt - timedelta(days=1),
+            "今天": today_dt,
+            "明天": today_dt + timedelta(days=1),
+            "后天": today_dt + timedelta(days=2),
+            "大后天": today_dt + timedelta(days=3),
+        }
+        relative_date_lines = "；".join(f"{label}={d.isoformat()}" for label, d in relative_dates.items())
+        awaiting_field_hint = ""
+        if awaiting_field_key:
+            awaiting_field = next((f for f in fields if f["key"] == awaiting_field_key), None)
+            if awaiting_field is not None:
+                awaiting_field_hint = (
+                    f"\n用户刚才被追问的是「{awaiting_field['label']}」这一项，这句话大概率就是在直接回答"
+                    f"这一项——如果这句话本身很短、看不出在说别的内容，就优先把它当成"
+                    f"{awaiting_field_key}（{awaiting_field['label']}）的答案；如果这句话里明显还带了其它"
+                    f"字段的信息，那些字段也一并抽取，不要漏。"
+                )
         prompt = f"""从下面这句话里抽取以下字段的值，能抽到就填，抽不到就留空（null）。
-今天的日期是 {today}，如果句子里出现"明天""下周一"这类相对日期表达，请换算成 YYYY-MM-DD 格式。
-枚举类字段必须原样输出给定的可选值之一，不要改写措辞。
+今天的日期是 {today}。句子里如果出现相对日期表达，请换算成 YYYY-MM-DD 格式，常见的对照如下（直接查表，不要自己心算）：
+{relative_date_lines}。
+这些相对日期一律以今天 {today} 为基准折算，不要以对话里之前已经填过的其它日期字段（比如已经填好的开始日期）为基准去累加——
+比如就算开始日期已经填了"明天"，用户接着说"后天"，"后天"仍然是 {relative_dates['后天'].isoformat()}（今天 + 2 天），不是"明天 + 2 天"。
+再往外的相对表达（如"下周一""这个月底"）同样只以今天 {today} 为基准推算，不要以其它已填日期为基准。
+枚举类字段必须原样输出给定的可选值之一，不要改写措辞。{awaiting_field_hint}
 
 字段列表：
 {chr(10).join(field_lines)}

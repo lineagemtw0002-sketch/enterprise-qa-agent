@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Table, Tag, Button, Empty, message } from 'antd'
+import { Paperclip } from 'lucide-react'
 import * as workflowApi from '../../api/workflow.js'
 import { workflowTypeMeta, workflowStatusMeta } from './workflowMeta.js'
 import WorkflowDetailDrawer from './WorkflowDetailDrawer.jsx'
@@ -54,6 +55,23 @@ export default function WorkflowApprovalInbox({ meUserId }) {
       },
     },
     {
+      title: '审批材料',
+      dataIndex: 'attachment_count',
+      key: 'attachment_count',
+      render: (count, row) => (
+        <span
+          style={{
+            display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer',
+            color: count > 0 ? 'var(--text-secondary, #555)' : 'var(--text-tertiary, #aaa)',
+          }}
+          onClick={() => setDetailId(row.instance_id)}
+        >
+          <Paperclip size={13} />
+          {count > 0 ? `${count} 份` : '无'}
+        </span>
+      ),
+    },
+    {
       title: '提交时间',
       dataIndex: 'created_at',
       key: 'created_at',
@@ -90,6 +108,7 @@ export default function WorkflowApprovalInbox({ meUserId }) {
         open={!!detailId}
         onClose={() => setDetailId(null)}
         meUserId={meUserId}
+        mode="approver"
         onChanged={load}
       />
     </div>

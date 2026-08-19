@@ -23,6 +23,20 @@ export function setUserRoles(userId, roleIds) {
   return axios.put(`${BASE}/users/${userId}/roles`, { role_ids: roleIds }).then((res) => res.data)
 }
 
+export function setUserOrganization(userId, orgId) {
+  return axios.put(`${BASE}/users/${userId}/organization`, { org_id: orgId }).then((res) => res.data)
+}
+
+// ==================== 组织管理 ====================
+
+export function listOrganizations() {
+  return axios.get(`${BASE}/organizations`).then((res) => res.data)
+}
+
+export function createOrganization(name) {
+  return axios.post(`${BASE}/organizations`, { name }).then((res) => res.data)
+}
+
 // ==================== 角色管理 ====================
 
 export function listRoles() {

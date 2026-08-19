@@ -30,8 +30,14 @@ if TYPE_CHECKING:
     from src.core.query_engine.hybrid_search import HybridSearch
     from src.core.query_engine.reranker import CoreReranker
     from src.ragent_backend.user_store import UserStore
+    from src.ragent_backend.org_store import OrgStore
+    from src.ragent_backend.tenant_connector_store import TenantConnectorStore, TenantConnector
 
 logger = logging.getLogger(__name__)
+
+# 委托超时阈值，跟 attendance-tenant-federation.md 的考勤委托路径用同一个数值，
+# 保持"企业系统响应多久算超时"的产品预期一致。
+REMOTE_SEARCH_TIMEOUT_SECONDS = 8.0
 
 
 # Tool metadata
@@ -111,6 +117,8 @@ class QueryKnowledgeHubTool:
         reranker: Optional[CoreReranker] = None,
         response_builder: Optional[ResponseBuilder] = None,
         user_store: Optional["UserStore"] = None,
+        org_store: Optional["OrgStore"] = None,
+        tenant_connector_store: Optional["TenantConnectorStore"] = None,
     ) -> None:
         """Initialize QueryKnowledgeHubTool.
 
@@ -123,6 +131,14 @@ class QueryKnowledgeHubTool:
             user_store: Optional pre-configured UserStore, used to look up the
                 caller's allowed_collections for ACL checks. If None, lazily
                 creates its own (see `user_store` property).
+            org_store: Optional pre-configured OrgStore, used to resolve which
+                organization the caller belongs to (see
+                `knowledge-base-tenant-federation.md` 第 5.1 节). If None,
+                lazily creates its own.
+            tenant_connector_store: Optional pre-configured TenantConnectorStore,
+                used to look up whether the caller's organization delegates
+                knowledge-base search to its own microservice. If None, lazily
+                creates its own.
         """
         self._settings = settings
         self.config = config or QueryKnowledgeHubConfig()
@@ -131,6 +147,8 @@ class QueryKnowledgeHubTool:
         self._embedding_client = None
         self._response_builder = response_builder or ResponseBuilder()
         self._user_store = user_store
+        self._org_store = org_store
+        self._tenant_connector_store = tenant_connector_store
 
         # Track initialization state
         self._initialized = False
@@ -143,7 +161,23 @@ class QueryKnowledgeHubTool:
             from src.ragent_backend.user_store import UserStore
             self._user_store = UserStore()
         return self._user_store
-    
+
+    @property
+    def org_store(self) -> "OrgStore":
+        """Get the OrgStore used to resolve caller org, creating one if necessary."""
+        if self._org_store is None:
+            from src.ragent_backend.org_store import OrgStore
+            self._org_store = OrgStore()
+        return self._org_store
+
+    @property
+    def tenant_connector_store(self) -> "TenantConnectorStore":
+        """Get the TenantConnectorStore, creating one if necessary."""
+        if self._tenant_connector_store is None:
+            from src.ragent_backend.tenant_connector_store import TenantConnectorStore
+            self._tenant_connector_store = TenantConnectorStore()
+        return self._tenant_connector_store
+
     @property
     def settings(self) -> Settings:
         """Get settings, loading if necessary."""
@@ -266,25 +300,51 @@ class QueryKnowledgeHubTool:
         )
         effective_collection = collection or self.config.default_collection
 
+        # 路由决策：这个用户属于哪家企业，这家企业的知识库能力有没有配置委托连接器
+        # （knowledge-base-tenant-federation.md 第 5.1 节）。没有 user_id 的调用方
+        # （如独立跑的 MCP server）跳过整个路由和 ACL 判断，直接走本地检索——保留
+        # 原有行为。
+        # 延迟导入：顶层导入 tenant_connector_store 会触发 `src.ragent_backend`
+        # 包初始化，而该包的 `workflow.py` 又导入本模块，形成循环导入。
+        from src.ragent_backend.tenant_connector_store import (
+            CAPABILITY_KNOWLEDGE_BASE,
+            CONNECTOR_TYPE_HTTP_API,
+            CONNECTOR_TYPE_INTERNAL_CHROMA,
+        )
+
+        connector = None
         if user_id is not None:
-            from src.ragent_backend.acl import is_collection_allowed
-            allowed_collections = await self.user_store.get_allowed_collections(user_id)
-            if not is_collection_allowed(effective_collection, allowed_collections):
-                logger.warning(
-                    f"ACL denied: user_id={user_id} tried to query collection={effective_collection}"
-                )
-                return self._build_access_denied_response(query, effective_collection)
+            org = await self.org_store.get_org_for_user(user_id)
+            if org is not None:
+                connector = await self.tenant_connector_store.get(org.org_id, CAPABILITY_KNOWLEDGE_BASE)
+
+            # 只有落在 internal_chroma（含未配置连接器的默认分支）时才走角色级 ACL——
+            # 一旦委托到企业自己的知识库微服务，细粒度权限判断转移给对方，见该文档
+            # 第 5.2 节。
+            if connector is None or connector.connector_type == CONNECTOR_TYPE_INTERNAL_CHROMA:
+                from src.ragent_backend.acl import is_collection_allowed
+                allowed_collections = await self.user_store.get_allowed_collections(user_id)
+                if not is_collection_allowed(effective_collection, allowed_collections):
+                    logger.warning(
+                        f"ACL denied: user_id={user_id} tried to query collection={effective_collection}"
+                    )
+                    return self._build_access_denied_response(query, effective_collection)
 
         logger.info(
             f"Executing query_knowledge_hub: query='{query[:50]}...', "
-            f"top_k={effective_top_k}, collection={effective_collection}"
+            f"top_k={effective_top_k}, collection={effective_collection}, "
+            f"connector_type={connector.connector_type if connector else 'internal_chroma'}"
         )
-        
+
         trace = TraceContext(trace_type="query")
         trace.metadata["query"] = query[:200]
         trace.metadata["top_k"] = effective_top_k
         trace.metadata["collection"] = effective_collection
         trace.metadata["source"] = "mcp"
+        trace.metadata["connector_type"] = connector.connector_type if connector else "internal_chroma"
+
+        if connector is not None and connector.connector_type == CONNECTOR_TYPE_HTTP_API:
+            return await self._execute_remote(query, effective_top_k, effective_collection, connector, trace)
 
         try:
             # Initialize components for collection
@@ -298,18 +358,18 @@ class QueryKnowledgeHubTool:
                 "collection": effective_collection,
                 "cold_start": _init_elapsed > 500,  # >500ms ≈ cold
             }, elapsed_ms=_init_elapsed)
-            
+
             # Perform hybrid search (blocking: embedding API + DB queries)
             results = await asyncio.to_thread(
                 self._perform_search, query, effective_top_k, trace,
             )
-            
+
             # Apply reranking if enabled (may call LLM API)
             if self.config.enable_rerank and results:
                 results = await asyncio.to_thread(
                     self._apply_rerank, query, results, effective_top_k, trace,
                 )
-            
+
             # Build response
             response = self._response_builder.build(
                 results=results,
@@ -417,6 +477,108 @@ class QueryKnowledgeHubTool:
             logger.warning(f"Reranking failed, using original order: {e}")
             return results[:top_k]
     
+    async def _execute_remote(
+        self,
+        query: str,
+        top_k: int,
+        collection: str,
+        connector: "TenantConnector",
+        trace: TraceContext,
+    ) -> MCPToolResponse:
+        """委托到企业自己的知识库微服务（统一 HTTP 契约，见
+        `knowledge-base-tenant-federation.md` 第 4 节）。
+
+        本地 hybrid search / rerank 完全不跑——企业自己的服务已经返回排好序的结果，
+        我们只负责转发请求、把响应转成 `MCPToolResponse`。
+        """
+        import httpx
+        import time as _time
+
+        org_id = connector.org_id
+        token = connector.auth_config.get("token", "")
+        t0 = _time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=REMOTE_SEARCH_TIMEOUT_SECONDS) as client:
+                resp = await client.post(
+                    f"{connector.endpoint.rstrip('/')}/v1/search",
+                    json={"query": query, "top_k": top_k, "collection": collection, "filters": {}},
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "X-Organization-Id": org_id,
+                        "Content-Type": "application/json",
+                    },
+                )
+            elapsed_ms = (_time.monotonic() - t0) * 1000.0
+
+            if resp.status_code in (401, 403):
+                trace.record_stage("remote_search", {"status": resp.status_code, "org_id": org_id}, elapsed_ms=elapsed_ms)
+                TraceCollector().collect(trace)
+                return self._build_remote_error_response(
+                    query, collection, "知识库鉴权失败，请联系管理员检查连接器配置。"
+                )
+            resp.raise_for_status()
+
+            results = self._parse_remote_results(resp.json())
+            trace.record_stage("remote_search", {
+                "status": resp.status_code, "org_id": org_id, "result_count": len(results),
+            }, elapsed_ms=elapsed_ms)
+
+            response = self._response_builder.build(results=results, query=query, collection=collection)
+            trace.metadata["final_results"] = [
+                {"chunk_id": r.chunk_id, "score": round(r.score, 4), "text": r.text or "",
+                 "source": r.metadata.get("source_path", ""), "title": r.metadata.get("title", "")}
+                for r in results
+            ]
+            TraceCollector().collect(trace)
+            return response
+
+        except (httpx.TimeoutException, httpx.ConnectError):
+            trace.record_stage("remote_search", {"error": "timeout_or_unreachable", "org_id": org_id})
+            TraceCollector().collect(trace)
+            return self._build_remote_error_response(
+                query, collection, "该企业知识库暂时无法访问，请稍后再试。"
+            )
+        except httpx.HTTPStatusError as e:
+            trace.record_stage("remote_search", {"error": str(e), "org_id": org_id})
+            TraceCollector().collect(trace)
+            return self._build_remote_error_response(
+                query, collection, "该企业知识库暂时无法访问，请稍后再试。"
+            )
+        except Exception as e:
+            logger.exception(f"query_knowledge_hub remote delegation failed: {e}")
+            trace.record_stage("remote_search", {"error": str(e), "org_id": org_id})
+            TraceCollector().collect(trace)
+            return self._build_error_response(query, collection, str(e))
+
+    @staticmethod
+    def _parse_remote_results(payload: Dict[str, Any]) -> List[RetrievalResult]:
+        """把企业知识库微服务的响应（第 4.2 节契约）转成本地 `RetrievalResult`。"""
+        results: List[RetrievalResult] = []
+        for i, item in enumerate(payload.get("results", [])):
+            metadata = dict(item.get("metadata") or {})
+            # CitationGenerator 认的字段名是 `source_path`（见 citation_generator.py），
+            # 不是契约响应体里的 `source`——这里做一次字段名转译。
+            metadata.setdefault("source_path", item.get("source", ""))
+            if item.get("page") is not None:
+                metadata.setdefault("page", item["page"])
+            results.append(RetrievalResult(
+                chunk_id=f"remote_{i}",
+                score=float(item.get("score", 0.0)),
+                text=item.get("content", ""),
+                metadata=metadata,
+            ))
+        return results
+
+    def _build_remote_error_response(self, query: str, collection: str, message: str) -> MCPToolResponse:
+        """企业知识库微服务不可用/鉴权失败时的统一降级响应（第 4.3 节）。"""
+        content = f"## 知识库暂不可用\n\n查询: **{query}**\n集合: `{collection}`\n\n{message}\n"
+        return MCPToolResponse(
+            content=content,
+            citations=[],
+            metadata={"query": query, "collection": collection, "error": "remote_unavailable"},
+            is_empty=True,
+        )
+
     def _build_access_denied_response(
         self,
         query: str,

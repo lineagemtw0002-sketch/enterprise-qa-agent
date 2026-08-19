@@ -41,7 +41,8 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from src.ragent_backend.schemas import (
     ChatRequest, ChatResponse, ActiveWorkflowSummary, RollbackRequest,
     LoginRequest, LoginResponse, MeResponse, ChangePasswordRequest, RoleSummary,
-    AdminUserResponse, AdminCreateUserRequest,
+    OrganizationSummary, AdminUserResponse, AdminCreateUserRequest,
+    AdminOrganizationResponse, AdminCreateOrganizationRequest, SetUserOrganizationRequest,
     RoleResponse, CreateRoleRequest, UpdateRoleRequest,
     SetRoleCollectionsRequest, SetUserRolesRequest,
     WorkflowTemplateResponse, CreateWorkflowTemplateRequest, UpdateWorkflowTemplateRequest,
@@ -56,7 +57,13 @@ from src.ragent_backend.conversation_store import build_conversation_store, Conv
 from src.ragent_backend.user_store import UserStore, User
 from src.ragent_backend.role_store import RoleStore, ROLE_SUPER_ADMIN
 from src.ragent_backend.workflow_store import WorkflowStore, WorkflowTemplate, WorkflowInstance
-from src.ragent_backend.auth import AuthenticatedUser, create_access_token, get_current_user, require_role
+from src.ragent_backend.attendance_store import AttendanceStore
+from src.ragent_backend.org_store import OrgStore
+from src.ragent_backend.tenant_connector_store import TenantConnectorStore
+from src.ragent_backend.auth import (
+    AuthenticatedUser, create_access_token, get_current_user, require_role,
+    require_same_org_or_platform, require_platform_admin,
+)
 from src.ingestion.pipeline import IngestionPipeline
 from src.core.settings import load_settings
 from src.tool_agent.tool_registry import ToolRegistry
@@ -261,10 +268,24 @@ def create_app() -> FastAPI:
     role_store: RoleStore = RoleStore()
     # workflow_store：流程模板 + 工作流实例 + 站内信（work-flow.md / work-flow-web.md）
     workflow_store: WorkflowStore = WorkflowStore()
+    # attendance_store：每日打卡记录，供 query_attendance 工具查询
+    attendance_store: AttendanceStore = AttendanceStore()
+    # org_store：组织（企业）归属 + 平台管理员判断（attendance-tenant-federation.md 第 8 节）
+    org_store: OrgStore = OrgStore()
+    # tenant_connector_store：某企业的某项能力（如 knowledge_base）委托给谁查
+    # （knowledge-base-tenant-federation.md 第 3 节）
+    tenant_connector_store: TenantConnectorStore = TenantConnectorStore()
 
     # 初始化 ToolRegistry（内置工具 + MCP 外部工具）
     tool_registry = ToolRegistry()
-    register_builtin_tools(tool_registry, user_store=user_store, workflow_store=workflow_store)
+    register_builtin_tools(
+        tool_registry,
+        user_store=user_store,
+        workflow_store=workflow_store,
+        attendance_store=attendance_store,
+        org_store=org_store,
+        tenant_connector_store=tenant_connector_store,
+    )
     print(f"[Init] Registered {tool_registry.tool_count} built-in tools")
 
     # 初始化组件
@@ -416,6 +437,12 @@ def create_app() -> FastAPI:
         token = create_access_token(user_id=user.user_id, username=user.username)
         return LoginResponse(access_token=token, user_id=user.user_id, username=user.username)
 
+    async def _org_summary_for_user(user_id: str) -> Optional[OrganizationSummary]:
+        org = await org_store.get_org_for_user(user_id)
+        if org is None:
+            return None
+        return OrganizationSummary(org_id=org.org_id, name=org.name, is_platform=org.is_platform)
+
     @app.get("/api/v1/auth/me", response_model=MeResponse)
     async def get_me(current_user: AuthenticatedUser = Depends(get_current_user)) -> MeResponse:
         user = await user_store.get_user_by_id(current_user.user_id)
@@ -427,6 +454,7 @@ def create_app() -> FastAPI:
             username=user.username,
             roles=[RoleSummary(role_id=r.role_id, name=r.name, display_name=r.display_name) for r in roles],
             allowed_collections=await role_store.get_allowed_collections_for_user(user.user_id),
+            organization=await _org_summary_for_user(user.user_id),
             created_at=user.created_at,
         )
 
@@ -455,20 +483,32 @@ def create_app() -> FastAPI:
             username=user.username,
             roles=[RoleSummary(role_id=r.role_id, name=r.name, display_name=r.display_name) for r in roles],
             allowed_collections=await role_store.get_allowed_collections_for_user(user.user_id),
+            organization=await _org_summary_for_user(user.user_id),
             created_at=user.created_at,
         )
 
     @app.get("/api/v1/admin/users", response_model=List[AdminUserResponse])
     async def admin_list_users(
-        _: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_super_admin),
     ) -> List[AdminUserResponse]:
         users = await user_store.list_users()
+        # 平台管理员看全部；普通企业管理员只看自己企业的——过滤发生在这里，
+        # 不是前端拿到全量再自己藏几行（attendance-tenant-federation.md 图4）。
+        if not await org_store.is_platform_admin(current_user.user_id):
+            actor_org = await org_store.get_org_for_user(current_user.user_id)
+            actor_org_id = actor_org.org_id if actor_org else None
+            filtered = []
+            for u in users:
+                user_org = await org_store.get_org_for_user(u.user_id)
+                if user_org is not None and user_org.org_id == actor_org_id:
+                    filtered.append(u)
+            users = filtered
         return [await _build_admin_user_response(u) for u in users]
 
     @app.post("/api/v1/admin/users", response_model=AdminUserResponse)
     async def admin_create_user(
         request: AdminCreateUserRequest,
-        _: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_super_admin),
     ) -> AdminUserResponse:
         try:
             user = await user_store.create_user(request.username, request.password)
@@ -480,12 +520,23 @@ def create_app() -> FastAPI:
             if unknown:
                 raise HTTPException(status_code=400, detail=f"角色不存在: {sorted(unknown)}")
             await role_store.assign_user_roles(user.user_id, request.role_ids)
+
+        # 平台管理员可以把新用户指派给任意企业（不传就落到自己所在的企业）；
+        # 非平台管理员不管请求体里传了什么 org_id，一律强制用自己的——不能靠
+        # 改请求体把新账号建到别的企业名下。
+        is_platform = await org_store.is_platform_admin(current_user.user_id)
+        actor_org = await org_store.get_org_for_user(current_user.user_id)
+        target_org_id = request.org_id if (is_platform and request.org_id) else (actor_org.org_id if actor_org else None)
+        if target_org_id:
+            await org_store.set_user_organization(user.user_id, target_org_id)
+
         return await _build_admin_user_response(user)
 
     @app.delete("/api/v1/admin/users/{user_id}")
     async def admin_delete_user(
         user_id: str,
         current_user: AuthenticatedUser = Depends(_require_super_admin),
+        _same_org: AuthenticatedUser = Depends(require_same_org_or_platform),
     ) -> dict:
         if user_id == current_user.user_id:
             raise HTTPException(status_code=400, detail="不能删除自己")
@@ -499,6 +550,7 @@ def create_app() -> FastAPI:
         user_id: str,
         request: SetUserRolesRequest,
         current_user: AuthenticatedUser = Depends(_require_super_admin),
+        _same_org: AuthenticatedUser = Depends(require_same_org_or_platform),
     ) -> AdminUserResponse:
         user = await user_store.get_user_by_id(user_id)
         if user is None:
@@ -524,6 +576,53 @@ def create_app() -> FastAPI:
 
         await role_store.assign_user_roles(user_id, request.role_ids)
         return await _build_admin_user_response(user)
+
+    @app.put("/api/v1/admin/users/{user_id}/organization", response_model=AdminUserResponse)
+    async def admin_set_user_organization(
+        user_id: str,
+        request: SetUserOrganizationRequest,
+        _: AuthenticatedUser = Depends(_require_super_admin),
+        __: AuthenticatedUser = Depends(require_platform_admin),
+    ) -> AdminUserResponse:
+        """改派用户所属企业，仅平台管理员——企业内 admin 不能把自己的员工过继给
+        别的企业，也不能把别的企业的人挖到自己企业名下。"""
+        user = await user_store.get_user_by_id(user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        if await org_store.get_organization(request.org_id) is None:
+            raise HTTPException(status_code=400, detail="组织不存在")
+        await org_store.set_user_organization(user_id, request.org_id)
+        return await _build_admin_user_response(user)
+
+    # ==================== 组织管理 API（仅平台管理员） ====================
+
+    def _org_response(org) -> AdminOrganizationResponse:
+        return AdminOrganizationResponse(
+            org_id=org.org_id, name=org.name, is_platform=org.is_platform, created_at=org.created_at,
+        )
+
+    @app.get("/api/v1/admin/organizations", response_model=List[AdminOrganizationResponse])
+    async def admin_list_organizations(
+        current_user: AuthenticatedUser = Depends(_require_super_admin),
+    ) -> List[AdminOrganizationResponse]:
+        # 平台管理员看全部组织；企业内 admin 只能看到自己那一条（给"新建用户"
+        # 弹窗、个人信息展示等场景确认自己企业的名字用，不是把组织列表当成
+        # 可浏览的目录露出去）。
+        if await org_store.is_platform_admin(current_user.user_id):
+            orgs = await org_store.list_organizations()
+        else:
+            own_org = await org_store.get_org_for_user(current_user.user_id)
+            orgs = [own_org] if own_org else []
+        return [_org_response(o) for o in orgs]
+
+    @app.post("/api/v1/admin/organizations", response_model=AdminOrganizationResponse)
+    async def admin_create_organization(
+        request: AdminCreateOrganizationRequest,
+        _: AuthenticatedUser = Depends(_require_super_admin),
+        __: AuthenticatedUser = Depends(require_platform_admin),
+    ) -> AdminOrganizationResponse:
+        org = await org_store.create_organization(request.name)
+        return _org_response(org)
 
     # ==================== 角色管理 API（仅超级管理员） ====================
 
@@ -716,6 +815,11 @@ def create_app() -> FastAPI:
     async def _build_workflow_instance_response(instance: WorkflowInstance) -> WorkflowInstanceResponse:
         template = await workflow_store.get_template_by_type(instance.workflow_type)
         requester = await user_store.get_user_by_id(instance.requester_user_id)
+        # 材料就是发起该工作流那条对话里传的文件（work-flow.md 6.2 节），列表页
+        # 展示"审批材料"这一列时不用再单独调一次接口，这里顺带把数量算出来。
+        attachment_count = 0
+        if instance.conversation_id:
+            attachment_count = len(await file_store.list_files(instance.conversation_id))
         return WorkflowInstanceResponse(
             instance_id=instance.instance_id,
             workflow_type=instance.workflow_type,
@@ -728,6 +832,7 @@ def create_app() -> FastAPI:
             approver_user_id=instance.approver_user_id,
             approval_comment=instance.approval_comment,
             history=instance.history,
+            attachment_count=attachment_count,
             created_at=instance.created_at,
             updated_at=instance.updated_at,
         )
@@ -863,7 +968,9 @@ def create_app() -> FastAPI:
         instance_id: str,
         current_user: AuthenticatedUser = Depends(get_current_user),
     ) -> WorkflowInstanceResponse:
-        """仅发起人可取消，仅 `pending_approval`/`returned_for_revision` 状态可用。"""
+        """仅发起人可取消，任何未到终态的状态都可用（`pending_approval`/
+        `returned_for_revision`/`approved`），到 `rejected`/`completed`/`cancelled`
+        之后不可再取消。"""
         await _require_workflow_access(instance_id, current_user, mode="owner")
         updated = await _transition_workflow(instance_id, "cancelled", current_user.user_id, None)
         return await _build_workflow_instance_response(updated)
@@ -1581,6 +1688,9 @@ def create_app() -> FastAPI:
         await user_store.close()
         await role_store.close()
         await workflow_store.close()
+        await attendance_store.close()
+        await org_store.close()
+        await tenant_connector_store.close()
 
     return app
 

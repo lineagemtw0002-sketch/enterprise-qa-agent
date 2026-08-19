@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Table, Tag, Button, Space, Empty, message } from 'antd'
+import { Paperclip } from 'lucide-react'
 import * as workflowApi from '../../api/workflow.js'
 import { workflowTypeMeta, workflowStatusMeta } from './workflowMeta.js'
 import WorkflowDetailDrawer from './WorkflowDetailDrawer.jsx'
@@ -49,6 +50,23 @@ export default function WorkflowMyRequests({ meUserId, onGoToChat }) {
       },
     },
     {
+      title: '审批材料',
+      dataIndex: 'attachment_count',
+      key: 'attachment_count',
+      render: (count, row) => (
+        <span
+          style={{
+            display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer',
+            color: count > 0 ? 'var(--text-secondary, #555)' : 'var(--text-tertiary, #aaa)',
+          }}
+          onClick={() => setDetailId(row.instance_id)}
+        >
+          <Paperclip size={13} />
+          {count > 0 ? `${count} 份` : '无'}
+        </span>
+      ),
+    },
+    {
       title: '提交时间',
       dataIndex: 'created_at',
       key: 'created_at',
@@ -66,11 +84,17 @@ export default function WorkflowMyRequests({ meUserId, onGoToChat }) {
       render: (_, row) => (
         <Space>
           <Button size="small" onClick={() => setDetailId(row.instance_id)}>查看详情</Button>
-          {row.status === 'returned_for_revision' && (
+          {/* 审批通过之前（pending_approval / returned_for_revision）都能补充材料，
+             不用等被打回才能传。打开详情抽屉直接传，不用跳转到对话窗口再自己找
+             上传入口——WorkflowDetailDrawer 里"关联材料"区域已经带了上传按钮
+             （见 canUpload 那段），抽屉底部仍留着"在原对话中查看 →"，想去聊天
+             里继续对话也走得通。approve 之后材料就不再影响这条申请，不提供
+             这个入口。 */}
+          {['pending_approval', 'returned_for_revision'].includes(row.status) && (
             <Button
               size="small"
               type="primary"
-              onClick={() => onGoToChat?.(row.conversation_id)}
+              onClick={() => setDetailId(row.instance_id)}
             >
               去补充材料
             </Button>
@@ -103,6 +127,7 @@ export default function WorkflowMyRequests({ meUserId, onGoToChat }) {
         open={!!detailId}
         onClose={() => setDetailId(null)}
         meUserId={meUserId}
+        mode="owner"
         onChanged={load}
       />
     </div>

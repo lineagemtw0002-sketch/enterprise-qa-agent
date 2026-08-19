@@ -67,10 +67,10 @@ flowchart TD
 | 操作 | 按状态动态出现：见下 |
 
 行内操作按状态分支：
-- `returned_for_revision` → "去补充材料"按钮：**不是**打开一个新表单，而是跳回发起该申请时的那个 `conversation_id`（`work-flow.md` 6.2 节：材料本来就传在那条对话里），复用 `App.jsx` 现成的 `switchConversation(convId)`。跳转后员工在聊天里传文件、说"材料补好了"，走 `work-flow.md` 6.2 设计的 `resubmit_workflow` 工具闭环，前端这个按钮只负责导航，不重新实现一遍提交逻辑。
-- `pending_approval` → "取消申请"按钮，`Popconfirm` 二次确认，调 `POST /workflows/{id}/cancel`。
+- `pending_approval`/`returned_for_revision` → "去补充材料"按钮：**不是**打开一个新表单，而是跳回发起该申请时的那个 `conversation_id`（`work-flow.md` 6.2 节：材料本来就传在那条对话里），复用 `App.jsx` 现成的 `switchConversation(convId)`。跳转后员工在聊天里传文件；两个状态下都可以传——`pending_approval` 是"还没审，先补充点材料"，直接留在原对话里就行，不需要任何状态转换；`returned_for_revision` 传完后再说一句"材料补好了"，走 `work-flow.md` 6.2 设计的 `resubmit_workflow` 工具闭环转回 `pending_approval`。审批一旦通过（`approved`）材料就不再影响这条申请，之后不再提供这个入口。前端这个按钮只负责导航，不重新实现一遍提交逻辑。
+- `pending_approval`/`returned_for_revision`/`approved` → "取消申请"按钮，`Popconfirm` 二次确认，调 `POST /workflows/{id}/cancel`——申请人只要还没到终态，随时可以反悔取消，不局限于"还没审"这一个状态：材料被打回之后想放弃、甚至已经审批通过但还没真正去办理，都能取消。
 - `approved` → "标记完成"按钮，调 `POST /workflows/{id}/complete`。
-- 其余状态（`rejected`/`completed`/`cancelled`）→ 无操作，只能查看详情。
+- 终态（`rejected`/`completed`/`cancelled`）→ 无操作，只能查看详情。
 
 **没有"新建"按钮**：按 `work-flow.md` 的设计，创建工作流只能通过聊天里的多轮信息收集完成，这里如果加一个表单式的"新建"入口，等于绕开了"AI 帮你把话说清楚、缺什么问什么"这个核心价值，还会导致两套创建路径（聊天 vs 表单）对不齐结构化字段规则。列表页顶部只放一句引导文案 + 按钮："发起新的申请，直接在聊天里说就行 →"，点击后新开一个对话（复用 `startNewChat()`）并自动带一句提示语填进输入框（不代发，只是预填，员工自己确认发送）。
 

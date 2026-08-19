@@ -208,6 +208,7 @@ stateDiagram-v2
     pending_approval --> cancelled: 申请人取消
     returned_for_revision --> pending_approval: 申请人补充材料后重新提交
     returned_for_revision --> cancelled: 申请人放弃，不再补充
+    approved --> cancelled: 申请人取消（通过后办理前，仍可反悔）
     approved --> completed: 审批人/申请人标记办理完成
     rejected --> [*]
     completed --> [*]
@@ -501,7 +502,7 @@ sequenceDiagram
 | `POST` | `/api/v1/workflows/{id}/reject` | 同上 | body: `{comment}`（必填）；申请本身不该批时用，终态，不可恢复 |
 | `POST` | `/api/v1/workflows/{id}/resubmit` | 发起人 | 仅 `returned_for_revision` 状态可用，`→ pending_approval`；对话里由 `resubmit_workflow` 工具调用，见 6.2 |
 | `POST` | `/api/v1/workflows/{id}/complete` | 审批人 或 发起人 | 标记办理完成（`approved → completed`） |
-| `POST` | `/api/v1/workflows/{id}/cancel` | 发起人 | `pending_approval` 或 `returned_for_revision` 状态可取消 |
+| `POST` | `/api/v1/workflows/{id}/cancel` | 发起人 | 只要还没到终态（`pending_approval`/`returned_for_revision`/`approved` 均可）就能取消，`rejected`/`completed`/`cancelled` 之后不可再取消 |
 
 **刻意不设计**"直接 POST 创建工作流实例"的端点——按用户需求，创建这件事应该只发生在对话里由 `workflow` 节点触发（信息补齐是核心价值），REST 层只负责查看/审批/管理生命周期。如果后续要支持"管理员代提交"之类的场景，再单独评估。
 

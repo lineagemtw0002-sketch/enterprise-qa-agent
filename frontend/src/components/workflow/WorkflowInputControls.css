@@ -11,7 +11,8 @@
   white-space: nowrap;
 }
 
-.workflow-status-pill-cancel {
+.workflow-status-pill-cancel,
+.workflow-status-pill-upload {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -23,6 +24,7 @@
   border-radius: 50%;
 }
 
-.workflow-status-pill-cancel:hover {
+.workflow-status-pill-cancel:hover,
+.workflow-status-pill-upload:hover {
   background: color-mix(in srgb, var(--accent, #6366f1) 20%, transparent);
 }

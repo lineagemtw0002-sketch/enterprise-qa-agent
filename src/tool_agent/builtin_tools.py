@@ -22,6 +22,9 @@ from src.tool_agent.tool_registry import ToolRegistry
 if TYPE_CHECKING:
     from src.ragent_backend.user_store import UserStore
     from src.ragent_backend.workflow_store import WorkflowStore
+    from src.ragent_backend.attendance_store import AttendanceStore
+    from src.ragent_backend.org_store import OrgStore
+    from src.ragent_backend.tenant_connector_store import TenantConnectorStore
 
 # 导入现有工具类
 from src.mcp_server.tools.query_knowledge_hub import (
@@ -60,6 +63,9 @@ def register_builtin_tools(
     registry: ToolRegistry,
     user_store: Optional["UserStore"] = None,
     workflow_store: Optional["WorkflowStore"] = None,
+    attendance_store: Optional["AttendanceStore"] = None,
+    org_store: Optional["OrgStore"] = None,
+    tenant_connector_store: Optional["TenantConnectorStore"] = None,
 ) -> None:
     """注册所有内置工具到 ToolRegistry。
 
@@ -71,18 +77,32 @@ def register_builtin_tools(
         workflow_store: 共享的 WorkflowStore，供工作流状态查询/重新提交两个
             工具用（work-flow.md 6.3 节）；不传则这两个工具不注册——工作流功能
             未初始化时，不应该让 LLM 看到一个调用了会报错的工具。
+        attendance_store: 共享的 AttendanceStore，供考勤查询工具用；不传则不
+            注册（同上，避免暴露一个会报错的工具）。
+        org_store: 共享的 OrgStore，供 query_knowledge_hub 判断调用者属于哪家
+            企业用（knowledge-base-tenant-federation.md 第 5.1 节）；不传时
+            工具会懒加载一个。
+        tenant_connector_store: 共享的 TenantConnectorStore，供 query_knowledge_hub
+            判断该企业知识库是否委托给自己的微服务；不传时工具会懒加载一个。
     """
-    _register_query_knowledge_hub(registry, user_store)
+    _register_query_knowledge_hub(registry, user_store, org_store, tenant_connector_store)
     _register_list_collections(registry, user_store)
     _register_get_document_summary(registry, user_store)
     if workflow_store is not None:
         _register_check_workflow_status(registry, workflow_store)
         _register_resubmit_workflow(registry, workflow_store)
+    if attendance_store is not None:
+        _register_query_attendance(registry, attendance_store)
 
 
-def _register_query_knowledge_hub(registry: ToolRegistry, user_store: Optional["UserStore"] = None) -> None:
+def _register_query_knowledge_hub(
+    registry: ToolRegistry,
+    user_store: Optional["UserStore"] = None,
+    org_store: Optional["OrgStore"] = None,
+    tenant_connector_store: Optional["TenantConnectorStore"] = None,
+) -> None:
     """注册 query_knowledge_hub 工具。"""
-    tool = QueryKnowledgeHubTool(user_store=user_store)
+    tool = QueryKnowledgeHubTool(user_store=user_store, org_store=org_store, tenant_connector_store=tenant_connector_store)
 
     async def handler(query: str, top_k: int = 5, collection: str = None, user_id: str = None) -> Any:
         return await tool.execute(query=query, top_k=top_k, collection=collection, user_id=user_id)
@@ -231,5 +251,113 @@ def _register_resubmit_workflow(registry: ToolRegistry, workflow_store: "Workflo
                     "不传 workflow_id 则取最近一条被打回的申请。",
         handler=handler,
         input_schema=RESUBMIT_WORKFLOW_SCHEMA,
+    )
+    registry.register(unified_tool)
+
+
+QUERY_ATTENDANCE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "date": {
+            "type": "string",
+            "description": "只查某一天时用这个，YYYY-MM-DD 格式（如 2026-07-01）",
+        },
+        "start_date": {
+            "type": "string",
+            "description": "查一段时间时的起始日期，YYYY-MM-DD 格式；查单日请用 date 参数",
+        },
+        "end_date": {
+            "type": "string",
+            "description": "查一段时间时的结束日期，YYYY-MM-DD 格式；配合 start_date 使用",
+        },
+    },
+    "required": [],
+}
+
+_ATTENDANCE_STATUS_LABELS: Dict[str, str] = {
+    "normal": "正常",
+    "late": "迟到",
+    "early_leave": "早退",
+    "late_and_early_leave": "迟到+早退",
+    "absent": "缺勤",
+    "leave": "请假",
+}
+
+
+def _register_query_attendance(registry: ToolRegistry, attendance_store: "AttendanceStore") -> None:
+    """注册 query_attendance 工具：查询自己的每日打卡记录（上下班时间/迟到早退/
+    请假缺勤），数据来自 attendance_records 表，跟工作流里的请假「申请」是两回事
+    ——这里是打卡的实际结果，不是审批流程。"""
+
+    from datetime import date as _date, datetime as _datetime, timedelta as _timedelta
+
+    def _parse_date(value: Optional[str]) -> Optional[_date]:
+        if not value:
+            return None
+        try:
+            return _datetime.strptime(value.strip(), "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    async def handler(
+        date: str = None, start_date: str = None, end_date: str = None, user_id: str = None, **_ignored: Any
+    ) -> Any:
+        if not user_id:
+            return "缺少身份信息，无法查询。"
+
+        # 小模型偶尔不按 schema 来，会传一个笼统的 "date" 而不是 start_date/
+        # end_date（实测 qwen2.5:7b 在本地 Ollama 上有这个行为）；单日查询就
+        # 把 date 当成 start_date/end_date 用，容错处理，不因为参数名不完全
+        # 匹配就让整次查询失败。
+        start_date = start_date or date
+        end_date = end_date or date
+
+        parsed_start = _parse_date(start_date)
+        parsed_end = _parse_date(end_date)
+
+        if start_date and parsed_start is None:
+            return f"日期格式看不懂：{start_date!r}，请用 YYYY-MM-DD 格式（如 2026-07-01）。"
+        if end_date and parsed_end is None:
+            return f"日期格式看不懂：{end_date!r}，请用 YYYY-MM-DD 格式（如 2026-07-01）。"
+
+        if parsed_start and not parsed_end:
+            parsed_end = parsed_start
+        elif parsed_end and not parsed_start:
+            parsed_start = parsed_end
+        elif not parsed_start and not parsed_end:
+            parsed_end = _date.today()
+            parsed_start = parsed_end - _timedelta(days=30)
+
+        if parsed_start > parsed_end:
+            parsed_start, parsed_end = parsed_end, parsed_start
+
+        records = await attendance_store.list_records(user_id, start_date=parsed_start, end_date=parsed_end)
+        if not records:
+            return f"{parsed_start} 至 {parsed_end} 期间没有查到你的考勤记录（周末不打卡，也可能是入职前）。"
+
+        lines = [f"{parsed_start} 至 {parsed_end} 的考勤记录（共 {len(records)} 天）："]
+        for r in records:
+            label = _ATTENDANCE_STATUS_LABELS.get(r.status, r.status)
+            if r.check_in_at is None:
+                lines.append(f"- {r.work_date}：{label}")
+                continue
+            check_in = _datetime.fromtimestamp(r.check_in_at).strftime("%H:%M")
+            check_out = (
+                _datetime.fromtimestamp(r.check_out_at).strftime("%H:%M") if r.check_out_at else "未打卡"
+            )
+            detail = f"- {r.work_date}：{label}，上班 {check_in}，下班 {check_out}"
+            if r.late_minutes:
+                detail += f"，迟到 {r.late_minutes} 分钟"
+            if r.early_leave_minutes:
+                detail += f"，早退 {r.early_leave_minutes} 分钟"
+            lines.append(detail)
+        return "\n".join(lines)
+
+    unified_tool = wrap_function_tool(
+        name="query_attendance",
+        description="查询我自己某一天或某段时间的考勤打卡记录（上下班时间、是否迟到/早退/请假/缺勤）。"
+                    "不传日期则默认查最近 30 天。",
+        handler=handler,
+        input_schema=QUERY_ATTENDANCE_SCHEMA,
     )
     registry.register(unified_tool)

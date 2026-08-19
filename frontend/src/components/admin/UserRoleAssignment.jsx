@@ -3,22 +3,35 @@ import { Table, Button, Modal, Input, Select, Tag, Space, Popconfirm, message, E
 import { Plus, Trash2 } from 'lucide-react'
 import * as adminApi from '../../api/admin.js'
 
-export default function UserRoleAssignment() {
+// meProfile 从 App.jsx 一路传下来（AdminPanel -> 这里），只用来读
+// meProfile.organization.is_platform：平台管理员能看到/改派所有企业的用户，
+// 普通企业管理员的列表后端已经按 org 过滤过，这里只是不给他们看到"改派企业"
+// 这个跨企业操作的入口（真正的拦截在后端 require_platform_admin，这里不给
+// 入口只是不让人以为点了有用）。
+export default function UserRoleAssignment({ meProfile }) {
+  const isPlatformAdmin = !!meProfile?.organization?.is_platform
+
   const [users, setUsers] = useState([])
   const [roles, setRoles] = useState([])
+  const [organizations, setOrganizations] = useState([])
   const [loading, setLoading] = useState(false)
   const [savingUserId, setSavingUserId] = useState(null)
 
   const [createVisible, setCreateVisible] = useState(false)
-  const [createForm, setCreateForm] = useState({ username: '', password: '', role_ids: [] })
+  const [createForm, setCreateForm] = useState({ username: '', password: '', role_ids: [], org_id: null })
   const [createLoading, setCreateLoading] = useState(false)
 
   async function loadAll() {
     setLoading(true)
     try {
-      const [userList, roleList] = await Promise.all([adminApi.listUsers(), adminApi.listRoles()])
+      const [userList, roleList, orgList] = await Promise.all([
+        adminApi.listUsers(),
+        adminApi.listRoles(),
+        adminApi.listOrganizations(),
+      ])
       setUsers(userList)
       setRoles(roleList)
+      setOrganizations(orgList)
     } catch (error) {
       message.error('加载用户列表失败: ' + (error.response?.data?.detail || error.message))
     } finally {
@@ -29,7 +42,7 @@ export default function UserRoleAssignment() {
   useEffect(() => { loadAll() }, [])
 
   function openCreate() {
-    setCreateForm({ username: '', password: '', role_ids: [] })
+    setCreateForm({ username: '', password: '', role_ids: [], org_id: null })
     setCreateVisible(true)
   }
 
@@ -44,6 +57,7 @@ export default function UserRoleAssignment() {
         username: createForm.username.trim(),
         password: createForm.password,
         role_ids: createForm.role_ids,
+        org_id: createForm.org_id || undefined,
       })
       message.success('用户创建成功')
       setCreateVisible(false)
@@ -69,6 +83,20 @@ export default function UserRoleAssignment() {
     }
   }
 
+  async function handleOrgChange(user, orgId) {
+    setSavingUserId(user.user_id)
+    try {
+      const updated = await adminApi.setUserOrganization(user.user_id, orgId)
+      setUsers((prev) => prev.map((u) => (u.user_id === user.user_id ? updated : u)))
+      message.success(`已把 ${user.username} 改派到新企业`)
+    } catch (error) {
+      message.error('改派失败: ' + (error.response?.data?.detail || error.message))
+      await loadAll()
+    } finally {
+      setSavingUserId(null)
+    }
+  }
+
   async function handleDelete(user) {
     try {
       await adminApi.deleteUser(user.user_id)
@@ -80,9 +108,28 @@ export default function UserRoleAssignment() {
   }
 
   const roleOptions = roles.map((r) => ({ label: r.display_name, value: r.role_id }))
+  const orgOptions = organizations.map((o) => ({ label: o.name, value: o.org_id }))
 
   const columns = [
     { title: '用户名', dataIndex: 'username', key: 'username' },
+    {
+      title: '所属企业',
+      key: 'organization',
+      width: 200,
+      render: (_, user) =>
+        isPlatformAdmin ? (
+          <Select
+            style={{ width: '100%' }}
+            placeholder="未分配企业"
+            value={user.organization?.org_id ?? undefined}
+            options={orgOptions}
+            loading={savingUserId === user.user_id}
+            onChange={(orgId) => handleOrgChange(user, orgId)}
+          />
+        ) : (
+          <span>{user.organization?.name ?? '—'}</span>
+        ),
+    },
     {
       title: '角色',
       key: 'roles',
@@ -188,6 +235,19 @@ export default function UserRoleAssignment() {
               onChange={(roleIds) => setCreateForm((prev) => ({ ...prev, role_ids: roleIds }))}
             />
           </div>
+          {isPlatformAdmin && (
+            <div>
+              <div style={{ marginBottom: 4 }}>所属企业（不选则默认归到你自己的企业）</div>
+              <Select
+                allowClear
+                style={{ width: '100%' }}
+                placeholder="默认所属自己的企业"
+                options={orgOptions}
+                value={createForm.org_id}
+                onChange={(orgId) => setCreateForm((prev) => ({ ...prev, org_id: orgId ?? null }))}
+              />
+            </div>
+          )}
         </div>
       </Modal>
     </div>

@@ -98,3 +98,46 @@ def require_role(*allowed_roles: str):
         return current_user
 
     return _dependency
+
+
+async def require_same_org_or_platform(
+    user_id: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> AuthenticatedUser:
+    """FastAPI 依赖：要求当前用户要么是平台管理员，要么和路径里的目标 `user_id`
+    属于同一家企业，否则 403。
+
+    这是叠加在 `require_role(ROLE_SUPER_ADMIN)` 之上的另一层判断，不是替代关系——
+    `require_role` 只回答"这个人是不是某种管理员"，这个依赖回答"这个管理员能不能碰
+    这个具体的目标用户"，两件事分开判断，路由上两个依赖一起挂（见 `app.py` 的
+    `admin_delete_user`/`admin_set_user_roles`）。
+
+    跟 `require_role` 同样的实时性原则：企业归属现查库，不信 token，管理员被
+    平台管理员改派了企业，下一次请求立刻按新的企业边界生效。
+    """
+    # 延迟导入，避免 auth.py 和 org_store.py 循环引用（跟 require_role 里对
+    # role_store 的处理方式一致）
+    from src.ragent_backend.org_store import OrgStore
+
+    store = OrgStore()
+    if await store.is_platform_admin(current_user.user_id):
+        return current_user
+
+    actor_org = await store.get_org_for_user(current_user.user_id)
+    target_org = await store.get_org_for_user(user_id)
+    if actor_org is None or target_org is None or actor_org.org_id != target_org.org_id:
+        raise HTTPException(status_code=403, detail="无权操作其他企业的用户")
+    return current_user
+
+
+async def require_platform_admin(
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> AuthenticatedUser:
+    """FastAPI 依赖：要求当前用户属于平台组织（`organizations.is_platform=TRUE`），
+    否则 403。给"建组织"、"改派用户所属企业"这类跨企业操作用——这两件事不能交给
+    某家客户企业自己的管理员做，只有我们自己（平台组织）能做。"""
+    from src.ragent_backend.org_store import OrgStore
+
+    if not await OrgStore().is_platform_admin(current_user.user_id):
+        raise HTTPException(status_code=403, detail="仅平台管理员可操作")
+    return current_user

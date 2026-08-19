@@ -75,6 +75,16 @@ export function listConversationFiles(conversationId) {
   return axios.get(`${BASE}/conversations/${conversationId}/files`).then((res) => res.data.files || [])
 }
 
+export function uploadConversationFile(conversationId, file) {
+  const formData = new FormData()
+  formData.append('file', file)
+  return axios
+    .post(`${BASE}/conversations/${conversationId}/files`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    .then((res) => res.data)
+}
+
 export async function downloadFile(conversationId, fileId, filename) {
   // 下载端点需要 Authorization header，普通 <a href> 拿不到 token，走 axios 取 blob
   // 再触发一次浏览器原生下载（标准做法，不是 App.jsx 现有代码里已有的模式，这里

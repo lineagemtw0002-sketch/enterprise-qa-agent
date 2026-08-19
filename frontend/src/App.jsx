@@ -271,6 +271,7 @@ export default function App() {
 
   function logout() {
     disconnectTraceWs()
+    setTraceEvents([])
     setAuthToken('')
     setCurrentUsername('')
     setMeProfile(null)
@@ -801,7 +802,7 @@ export default function App() {
         setView('workflow')
       }}
     >
-      {view === 'admin' && <AdminPanel />}
+      {view === 'admin' && <AdminPanel meProfile={meProfile} />}
 
       {view === 'workflow' && (
         <WorkflowPanel
@@ -932,6 +933,7 @@ export default function App() {
               <WorkflowStatusPill
                 activeWorkflow={activeWorkflow}
                 onCancel={() => doSend('取消')}
+                onUpload={() => fileInputRef.current?.click()}
               />
               <button
                 className={showTracePanel ? 'header-btn active' : 'header-btn'}
@@ -1116,6 +1118,18 @@ export default function App() {
         </div>
       </Modal>
 
+      {/* 隐藏的文件选择框，故意放在抽屉外层、常驻挂载——抽屉是
+         destroyOnHidden，装在里面的话关闭抽屉时这个 input 会被卸载，
+         WorkflowStatusPill 的"上传材料"按钮（不依赖抽屉打开）点了会拿到
+         null ref，直接失效。 */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        style={{ display: 'none' }}
+        accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx,.html,.htm,.json,.yaml,.yml"
+        onChange={handleFileSelect}
+      />
+
       {/* 知识库文件抽屉 */}
       <Drawer
         title="知识库文件"
@@ -1124,13 +1138,6 @@ export default function App() {
         width={360}
         destroyOnHidden
       >
-        <input
-          ref={fileInputRef}
-          type="file"
-          style={{ display: 'none' }}
-          accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx,.html,.htm,.json,.yaml,.yml"
-          onChange={handleFileSelect}
-        />
         <div className="upload-area" onClick={() => fileInputRef.current?.click()}>
           <UploadCloud className="upload-icon" size={28} />
           <div className="upload-text">

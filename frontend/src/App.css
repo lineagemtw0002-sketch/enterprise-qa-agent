@@ -1170,6 +1170,15 @@
   color: var(--text-primary);
 }
 
+.profile-org {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+  margin-top: 3px;
+}
+
 .profile-joined {
   font-size: 12px;
   color: var(--text-tertiary);

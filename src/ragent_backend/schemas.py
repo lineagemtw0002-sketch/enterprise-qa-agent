@@ -41,11 +41,18 @@ class RoleSummary(BaseModel):
     display_name: str
 
 
+class OrganizationSummary(BaseModel):
+    org_id: str
+    name: str
+    is_platform: bool = False
+
+
 class MeResponse(BaseModel):
     user_id: str
     username: str
     roles: List[RoleSummary]          # 原来是 role: str；一个用户可以有多个角色
     allowed_collections: List[str]    # 保留：后端算好的角色并集，前端不用二次拼接
+    organization: Optional[OrganizationSummary] = None
     created_at: float
 
 
@@ -61,6 +68,7 @@ class AdminUserResponse(BaseModel):
     username: str
     roles: List[RoleSummary]
     allowed_collections: List[str]
+    organization: Optional[OrganizationSummary] = None
     created_at: float
 
 
@@ -68,6 +76,27 @@ class AdminCreateUserRequest(BaseModel):
     username: str = Field(..., min_length=1)
     password: str = Field(..., min_length=6)
     role_ids: List[str] = Field(default_factory=list, description="初始分配的角色 id 列表")
+    org_id: Optional[str] = Field(
+        default=None,
+        description="所属企业；非平台管理员建号时后端会忽略这个字段，强制用调用者自己的 org_id",
+    )
+
+
+# ============== 组织管理 API（仅平台管理员） ==============
+
+class AdminOrganizationResponse(BaseModel):
+    org_id: str
+    name: str
+    is_platform: bool
+    created_at: float
+
+
+class AdminCreateOrganizationRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=128)
+
+
+class SetUserOrganizationRequest(BaseModel):
+    org_id: str = Field(..., min_length=1)
 
 
 # ============== 角色管理 API（仅 super_admin） ==============
@@ -187,6 +216,7 @@ class WorkflowInstanceResponse(BaseModel):
     approver_user_id: Optional[str] = None
     approval_comment: Optional[str] = None
     history: List[Dict[str, Any]]
+    attachment_count: int = 0
     created_at: float
     updated_at: float
 

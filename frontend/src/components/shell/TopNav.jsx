@@ -1,7 +1,7 @@
 import { Popover } from 'antd'
 import {
   Sparkles, ChevronDown, MessageSquare, ListChecks, ShieldCheck, Activity,
-  Cpu, Clock, Package, Scale, BookOpen, Sparkle, Files as FilesIcon,
+  Cpu, Clock, Package, Scale, BookOpen, Sparkle, Files as FilesIcon, Building2,
 } from 'lucide-react'
 import NotificationBell from '../workflow/NotificationBell.jsx'
 import './TopNav.css'
@@ -80,6 +80,11 @@ export default function TopNav({
         </div>
         <div>
           <div className="profile-name">{currentUsername}</div>
+          {meProfile?.organization && (
+            <div className="profile-org">
+              <Building2 size={11} /> {meProfile.organization.name}
+            </div>
+          )}
           {meProfile && <div className="profile-joined">加入于 {formatDate(meProfile.created_at)}</div>}
         </div>
       </div>

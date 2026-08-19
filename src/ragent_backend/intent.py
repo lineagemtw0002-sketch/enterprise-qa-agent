@@ -198,6 +198,9 @@ async def rewrite_query(query: str, messages: list, llm=None) -> str:
 # 工具意图关键词映射（规则 fallback 用）
 # 工具名必须与 ToolRegistry 中注册的实际名称完全一致
 _TOOL_KEYWORDS: Dict[str, List[str]] = {
+    # 考勤关键词放最前面：query_knowledge_hub 的"查询"太通用，
+    # 会抢先匹配到"查询xx日的考勤"这类句子，必须让更具体的关键词先判断
+    "query_attendance": ["考勤", "打卡", "迟到", "早退"],
     # 内置工具
     "query_knowledge_hub": ["文档", "文件", "知识库", "资料", "帮我找", "查询"],
     "list_collections": ["集合", "collection", "有哪些文件"],
@@ -215,6 +218,7 @@ _TOOL_INTENT_KEYWORDS: List[str] = [
     "计算", "等于", "公式", "算一下", "等于多少",
     "时间", "现在几点", "日期",
     "天气", "气温", "降水",
+    "考勤", "打卡", "迟到", "早退",
 ]
 
 # 工作流意图关键词映射（规则 fallback 用）——workflow_type 必须与
@@ -225,6 +229,46 @@ _WORKFLOW_KEYWORDS: Dict[str, List[str]] = {
     "business_trip": ["出差", "出差申请"],
     "expense_reimbursement": ["报销", "发票", "报销单"],
 }
+
+# detect_intent Step 1.5 用：动作型表达的前缀词，跟疑问句式天然可分
+# （"我想报销" vs "报销标准是什么"）。
+_WORKFLOW_ACTION_PREFIXES = ["我想", "我要", "我需要", "帮我", "帮忙", "麻烦"]
+# 出现这些词大概率是在问政策/流程本身，不是要发起——即使带了"我想"前缀
+# （比如"我想知道报销标准是什么"），也不该被规则短路，交给 LLM 判断更稳妥。
+_WORKFLOW_QUESTION_CUE_WORDS = [
+    "吗", "呢", "？", "?", "怎么", "如何", "什么", "多少", "标准", "规定", "政策", "流程是",
+]
+
+
+def _match_workflow_action_intent(
+    rewritten_query: str, available_workflows: List[Dict[str, Any]],
+) -> Optional[IntentResult]:
+    """detect_intent Step 1.5 的规则短路：只有"动作型前缀 + 流程关键词"同时命中、
+    且不带疑问句提示词时才短路成 workflow，避免把"我想知道报销标准是什么"这种
+    其实是在问政策的句子也误判成发起工作流——这个函数本身只做高精度的正向匹配，
+    不确定的情况一律返回 None，交回给 LLM/规则 fallback 走原来的判断路径。"""
+    if not any(p in rewritten_query for p in _WORKFLOW_ACTION_PREFIXES):
+        return None
+    if any(w in rewritten_query for w in _WORKFLOW_QUESTION_CUE_WORDS):
+        return None
+    available_workflow_types = {w.get("workflow_type", "") for w in available_workflows}
+    query_lower = rewritten_query.lower()
+    for workflow_type, keywords in _WORKFLOW_KEYWORDS.items():
+        if workflow_type not in available_workflow_types:
+            continue
+        for kw in keywords:
+            if kw.lower() in query_lower:
+                return IntentResult(
+                    intent_type="workflow",
+                    rewritten_query=rewritten_query,
+                    confidence=0.9,
+                    workflow_type=workflow_type,
+                    reasoning=(
+                        f"规则短路：动作型前缀 + 流程关键词 '{kw}' 命中，跳过 LLM 分类"
+                        f"（本地小模型面对这类短句容易被通用检索工具的描述带偏，误判成查文档）"
+                    ),
+                )
+    return None
 
 
 async def detect_intent(
@@ -238,6 +282,7 @@ async def detect_intent(
 
     策略：
     1. 先检查是否需要澄清（保留现有规则）
+    1.5. 明确的"我想/我要 + 流程关键词"动作型表达，规则直接短路成 workflow
     2. 如果有 LLM，用结构化调用做四分类（推荐）
     3. 无 LLM 时，回退到规则-based 分类
 
@@ -264,6 +309,19 @@ async def detect_intent(
             clarify_prompt="请补充更具体的信息，例如具体的产品名、文档名或业务指标。",
             reasoning="查询过短或包含模糊代词，需要澄清",
         )
+
+    # === Step 1.5：动作型表达规则短路（不经过 LLM）===
+    # "我想报销"这类短句交给 LLM 判断时，本项目用的本地小模型（qwen2.5:7b）
+    # 经常被 query_knowledge_hub 这个通用检索工具的描述带偏，判成"查文档"
+    # （intent_type=tool），完全跳过 workflow——概率性误判，不是能靠调整置信度
+    # 阈值解决的问题。"我想/我要/帮我"这类前缀 + 流程关键词是高精度信号：
+    # 真的在问政策的句子通常是"报销标准是什么""请假流程是怎样的"这种疑问句式，
+    # 不会用"我想"这种动作型前缀开头，两者句式上天然可分——命中这个模式时直接
+    # 判定 workflow，不必也不该让 LLM 去猜，省一次容易出错的分类调用，顺带省掉
+    # 误判后额外绕一圈 tool 子图（ReAct 循环里好几次 LLM 往返）的时间。
+    action_intent = _match_workflow_action_intent(rewritten_query, available_workflows or [])
+    if action_intent is not None:
+        return action_intent
 
     # === Step 2: LLM-based 四分类 ===
     if llm is not None:
@@ -333,7 +391,15 @@ async def _detect_intent_with_llm(
     result: IntentDetectionResult = await structured_llm.ainvoke([HumanMessage(content=prompt)])
 
     # 验证 target_tool 是否存在于可用工具列表中
-    available_tool_names = {t.get("name", "") for t in available_tools}
+    # available_tools 实际传入的是 OpenAI function-calling schema（见
+    # workflow.py 的 to_openai_tools()）：{"type": "function", "function":
+    # {"name": ...}}，name 嵌在 function 里，不是顶层字段——之前直接
+    # t.get("name") 永远拿到 None，导致 available_tool_names 恒为空集，
+    # target_tool 无论 LLM 判断得多准都会被这里清空。同时兼容顶层 name
+    # （规则 fallback 等场景可能直接传扁平字典）。
+    available_tool_names = {
+        (t.get("function") or {}).get("name") or t.get("name", "") for t in available_tools
+    }
     if result.target_tool and result.target_tool not in available_tool_names:
         result.target_tool = None  # 让子图自己选
 
@@ -350,6 +416,14 @@ async def _detect_intent_with_llm(
     # 知识库问答处理。
     if result.workflow_type and result.intent_type != "workflow":
         result.intent_type = "workflow"
+
+    # 同样的自相矛盾也会出现在 tool 上：target_tool 已经命中了一个真实存在的
+    # 工具（reasoning 里往往也点名了具体该调哪个工具），但 intent_type 被标成
+    # 了 "rag" 或别的。target_tool 是从受限枚举（可用工具列表）里选出来的，比
+    # intent_type 更可信，出现矛盾时以 target_tool 为准（workflow 优先级更高，
+    # 已经在上面处理过，这里不覆盖 workflow）。
+    if result.target_tool and result.intent_type not in ("tool", "workflow"):
+        result.intent_type = "tool"
 
     # workflow 意图但没能对应到一个合法类型，退回 rag，避免进入一个没有类型的死路
     if result.intent_type == "workflow" and not result.workflow_type:

@@ -19,6 +19,7 @@ Tool Subgraph — 工具子智能体的 LangGraph 实现。
 from __future__ import annotations
 
 import time
+from datetime import date
 from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
@@ -268,7 +269,12 @@ def _build_system_prompt(
     if target_tool:
         target_hint = f"\n\n【注意】主图已指定目标工具: {target_tool}，请优先使用此工具。"
     
+    today = date.today().isoformat()
+
     return f"""你是一个工具调用决策助手。你的任务是根据用户查询，决定是否需要调用工具，以及调用哪些工具。
+
+今天的日期是 {today}。如果查询里出现"明天""上周""7.1日"这类相对日期或省略年份的日期，
+调用工具时传的日期参数要先换算/补全成完整的 YYYY-MM-DD 格式。
 
 用户查询：{query}
 
