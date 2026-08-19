@@ -37,6 +37,16 @@ export function createOrganization(name) {
   return axios.post(`${BASE}/organizations`, { name }).then((res) => res.data)
 }
 
+// ==================== 租户连接器（知识库/考勤委托，仅平台管理员） ====================
+
+export function listTenantConnectors(orgId) {
+  return axios.get(`${BASE}/organizations/${orgId}/connectors`).then((res) => res.data)
+}
+
+export function upsertTenantConnector(orgId, capability, payload) {
+  return axios.put(`${BASE}/organizations/${orgId}/connectors/${capability}`, payload).then((res) => res.data)
+}
+
 // ==================== 角色管理 ====================
 
 export function listRoles() {

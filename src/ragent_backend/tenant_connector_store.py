@@ -36,6 +36,12 @@ CAPABILITY_ATTENDANCE = "attendance"
 CONNECTOR_TYPE_INTERNAL_CHROMA = "internal_chroma"
 CONNECTOR_TYPE_INTERNAL_POSTGRES = "internal_postgres"
 CONNECTOR_TYPE_HTTP_API = "http_api"
+# 考勤委托用的连接器类型（attendance-tenant-federation.md 第 2/3 节的"更轻的 HTTP
+# webhook 兜底路径"）——本次只落地这一种委托方式，不实现该文档设想的 mcp_sse，
+# 因为一个通用的、按租户懒加载/回收连接的 MCP client 管理器是独立的一大块基础
+# 设施，投入产出比在两个 demo 租户的验证场景下不划算；HTTP webhook 已经足以
+# 验证"委托路由 + 字段归一化 + 降级"这套核心机制是否成立。
+CONNECTOR_TYPE_HTTP_WEBHOOK = "http_webhook"
 
 
 @dataclass(frozen=True)

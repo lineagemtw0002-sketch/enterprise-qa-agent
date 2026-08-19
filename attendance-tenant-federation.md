@@ -1,6 +1,11 @@
 # 考勤数据多租户联邦查询（方案四）技术方案
 
-> 状态：设计方案（未实现）
+> 状态：核心路由已实现（`src/ragent_backend/tenant_identity_store.py`、
+> `src/tool_agent/builtin_tools.py::_register_query_attendance`、
+> `services/tenant_attendance_demo/`）——落地的是第 1.3 节决策 3 里"更轻的 HTTP
+> webhook 兜底路径"（`connector_type=http_webhook`），第 2 节设想的 `mcp_sse`
+> 委托方式（按租户懒加载/回收连接的通用 MCP client 管理器）未实现，见该文档
+> 第 2 节旁注。
 > 关联现状代码：`src/ragent_backend/attendance_store.py`、`src/tool_agent/builtin_tools.py`
 > （`query_attendance` 工具）、`src/tool_agent/mcp_client.py`、`src/ragent_backend/user_store.py`、
 > `config/settings.yaml`（`mcp:` 段）、`frontend/src/components/shell/TopNav.jsx`、
@@ -56,6 +61,16 @@ schema 的 `attendance_records` 表（在我们自己的 Postgres 里）。`user
 | 凭证存储 | 加密列（对接密钥管理），不是现在 `.env` 那种明文环境变量 | 每个租户一份独立凭证，安全边界跟现有单租户的假设不一样，必须单独设计 |
 | 连接管理 | 新增按租户懒加载、带超时回收的 MCP client 管理器 | 现有 `mcp_client.py` 是启动时连接一小撮写死的 server，不能扩展到"可能有几百个租户，每个都要能按需连接" |
 | 字段归一化 | 连接器配置里带一份"远端字段名 → 我方规范字段名"的映射 | 不同企业字段命名不同，归一化逻辑要配置化，不能写死在代码里 |
+
+**实现落地时的取舍（跟上表设想的差异，显式记录）**：
+- 只实现了 `http_webhook` 一条委托路径，`mcp_sse` 未实现——一个通用的、按租户
+  懒加载/超时回收连接的 MCP client 管理器是独立的一大块基础设施，两个 demo
+  租户的验证场景下投入产出比不划算，见 `tenant_connector_store.py` 里
+  `CONNECTOR_TYPE_HTTP_WEBHOOK` 常量旁的注释。
+- 凭证（`auth_config.token`）现在跟 `knowledge-base-tenant-federation.md` 的
+  委托 token 一样，明文存在 `tenant_connectors.auth_config` JSONB 列里，没有做
+  这里设想的加密列——数据库访问权限本身受限，暂时够用，但生产环境接入真实
+  企业凭证前应该补上。
 
 ---
 

@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from src.ragent_backend.attendance_store import AttendanceStore
     from src.ragent_backend.org_store import OrgStore
     from src.ragent_backend.tenant_connector_store import TenantConnectorStore
+    from src.ragent_backend.tenant_identity_store import TenantIdentityStore
 
 # 导入现有工具类
 from src.mcp_server.tools.query_knowledge_hub import (
@@ -66,6 +67,7 @@ def register_builtin_tools(
     attendance_store: Optional["AttendanceStore"] = None,
     org_store: Optional["OrgStore"] = None,
     tenant_connector_store: Optional["TenantConnectorStore"] = None,
+    tenant_identity_store: Optional["TenantIdentityStore"] = None,
 ) -> None:
     """注册所有内置工具到 ToolRegistry。
 
@@ -82,8 +84,13 @@ def register_builtin_tools(
         org_store: 共享的 OrgStore，供 query_knowledge_hub 判断调用者属于哪家
             企业用（knowledge-base-tenant-federation.md 第 5.1 节）；不传时
             工具会懒加载一个。
-        tenant_connector_store: 共享的 TenantConnectorStore，供 query_knowledge_hub
-            判断该企业知识库是否委托给自己的微服务；不传时工具会懒加载一个。
+        tenant_connector_store: 共享的 TenantConnectorStore，供 query_knowledge_hub /
+            query_attendance 判断该企业是否把这项能力委托给自己的微服务；不传时
+            工具会懒加载一个。
+        tenant_identity_store: 共享的 TenantIdentityStore，供 query_attendance 把
+            我方 user_id 映射成企业考勤系统认得的工号（仅委托考勤查询时用到，见
+            attendance-tenant-federation.md 第 3 节）；不传时委托考勤查询会直接
+            提示"未关联工号"（因为没有身份映射数据源可查）。
     """
     _register_query_knowledge_hub(registry, user_store, org_store, tenant_connector_store)
     _register_list_collections(registry, user_store)
@@ -92,7 +99,7 @@ def register_builtin_tools(
         _register_check_workflow_status(registry, workflow_store)
         _register_resubmit_workflow(registry, workflow_store)
     if attendance_store is not None:
-        _register_query_attendance(registry, attendance_store)
+        _register_query_attendance(registry, attendance_store, org_store, tenant_connector_store, tenant_identity_store)
 
 
 def _register_query_knowledge_hub(
@@ -284,12 +291,79 @@ _ATTENDANCE_STATUS_LABELS: Dict[str, str] = {
 }
 
 
-def _register_query_attendance(registry: ToolRegistry, attendance_store: "AttendanceStore") -> None:
+def _format_attendance_lines(records: List[Any], parsed_start: Any, parsed_end: Any) -> str:
+    """把考勤记录格式化成自然语言列表。`records` 里的每一项只要有
+    `work_date`/`status`/`check_in_at`/`check_out_at`/`late_minutes`/
+    `early_leave_minutes` 这几个属性就行——内置路径传 `AttendanceRecord`，
+    委托路径传归一化后的 `SimpleNamespace`（见 `_normalize_remote_attendance`），
+    两条路径共用这一份格式化逻辑，不重复写。"""
+    from datetime import datetime as _datetime
+
+    if not records:
+        return f"{parsed_start} 至 {parsed_end} 期间没有查到你的考勤记录（周末不打卡，也可能是入职前）。"
+
+    lines = [f"{parsed_start} 至 {parsed_end} 的考勤记录（共 {len(records)} 天）："]
+    for r in records:
+        label = _ATTENDANCE_STATUS_LABELS.get(r.status, r.status)
+        if r.check_in_at is None:
+            lines.append(f"- {r.work_date}：{label}")
+            continue
+        check_in = _datetime.fromtimestamp(r.check_in_at).strftime("%H:%M")
+        check_out = (
+            _datetime.fromtimestamp(r.check_out_at).strftime("%H:%M") if r.check_out_at else "未打卡"
+        )
+        detail = f"- {r.work_date}：{label}，上班 {check_in}，下班 {check_out}"
+        if r.late_minutes:
+            detail += f"，迟到 {r.late_minutes} 分钟"
+        if r.early_leave_minutes:
+            detail += f"，早退 {r.early_leave_minutes} 分钟"
+        lines.append(detail)
+    return "\n".join(lines)
+
+
+def _normalize_remote_attendance(raw_records: List[Dict[str, Any]], field_mapping: Dict[str, str]) -> List[Any]:
+    """把企业考勤 webhook 返回的原始记录（字段名是对方系统自己的命名）按
+    `tenant_connectors.field_mapping` 归一化成我方规范字段名
+    （attendance-tenant-federation.md 第 2 节"字段归一化"）。"""
+    from types import SimpleNamespace
+
+    normalized = []
+    for raw in raw_records:
+        mapped = {field_mapping.get(k, k): v for k, v in raw.items()}
+        normalized.append(SimpleNamespace(
+            work_date=mapped.get("work_date"),
+            status=mapped.get("status", "normal"),
+            check_in_at=mapped.get("check_in_at"),
+            check_out_at=mapped.get("check_out_at"),
+            late_minutes=mapped.get("late_minutes", 0) or 0,
+            early_leave_minutes=mapped.get("early_leave_minutes", 0) or 0,
+        ))
+    return normalized
+
+
+def _register_query_attendance(
+    registry: ToolRegistry,
+    attendance_store: "AttendanceStore",
+    org_store: Optional["OrgStore"] = None,
+    tenant_connector_store: Optional["TenantConnectorStore"] = None,
+    tenant_identity_store: Optional["TenantIdentityStore"] = None,
+) -> None:
     """注册 query_attendance 工具：查询自己的每日打卡记录（上下班时间/迟到早退/
-    请假缺勤），数据来自 attendance_records 表，跟工作流里的请假「申请」是两回事
-    ——这里是打卡的实际结果，不是审批流程。"""
+    请假缺勤），跟工作流里的请假「申请」是两回事——这里是打卡的实际结果，不是
+    审批流程。
+
+    路由逻辑跟 query_knowledge_hub 同一套骨架（见 knowledge-base-tenant-federation.md
+    第 5.1 节）：调用者所属企业没配连接器、或配的是 internal_postgres，走现有的
+    `attendance_store` 本地路径；配的是 http_webhook，委托到企业自己的考勤系统
+    （attendance-tenant-federation.md 第 2/4 节）。
+    """
+    import httpx
 
     from datetime import date as _date, datetime as _datetime, timedelta as _timedelta
+
+    from src.ragent_backend.tenant_connector_store import CAPABILITY_ATTENDANCE, CONNECTOR_TYPE_HTTP_WEBHOOK
+
+    REMOTE_TIMEOUT_SECONDS = 8.0
 
     def _parse_date(value: Optional[str]) -> Optional[_date]:
         if not value:
@@ -331,27 +405,48 @@ def _register_query_attendance(registry: ToolRegistry, attendance_store: "Attend
         if parsed_start > parsed_end:
             parsed_start, parsed_end = parsed_end, parsed_start
 
-        records = await attendance_store.list_records(user_id, start_date=parsed_start, end_date=parsed_end)
-        if not records:
-            return f"{parsed_start} 至 {parsed_end} 期间没有查到你的考勤记录（周末不打卡，也可能是入职前）。"
+        connector = None
+        if org_store is not None and tenant_connector_store is not None:
+            org = await org_store.get_org_for_user(user_id)
+            if org is not None:
+                connector = await tenant_connector_store.get(org.org_id, CAPABILITY_ATTENDANCE)
 
-        lines = [f"{parsed_start} 至 {parsed_end} 的考勤记录（共 {len(records)} 天）："]
-        for r in records:
-            label = _ATTENDANCE_STATUS_LABELS.get(r.status, r.status)
-            if r.check_in_at is None:
-                lines.append(f"- {r.work_date}：{label}")
-                continue
-            check_in = _datetime.fromtimestamp(r.check_in_at).strftime("%H:%M")
-            check_out = (
-                _datetime.fromtimestamp(r.check_out_at).strftime("%H:%M") if r.check_out_at else "未打卡"
-            )
-            detail = f"- {r.work_date}：{label}，上班 {check_in}，下班 {check_out}"
-            if r.late_minutes:
-                detail += f"，迟到 {r.late_minutes} 分钟"
-            if r.early_leave_minutes:
-                detail += f"，早退 {r.early_leave_minutes} 分钟"
-            lines.append(detail)
-        return "\n".join(lines)
+        if connector is not None and connector.connector_type == CONNECTOR_TYPE_HTTP_WEBHOOK:
+            if tenant_identity_store is None:
+                return "你的账号还没有关联考勤系统里的工号，请联系管理员配置（身份映射服务未初始化）。"
+            external_id = await tenant_identity_store.get_external_id(user_id, CAPABILITY_ATTENDANCE)
+            if external_id is None:
+                return "你的账号还没有关联考勤系统里的工号，请联系管理员配置。"
+
+            token = connector.auth_config.get("token", "")
+            try:
+                async with httpx.AsyncClient(timeout=REMOTE_TIMEOUT_SECONDS) as client:
+                    resp = await client.post(
+                        f"{connector.endpoint.rstrip('/')}/webhook/attendance",
+                        json={
+                            "employee_id": external_id,
+                            "start_date": str(parsed_start),
+                            "end_date": str(parsed_end),
+                        },
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "X-Organization-Id": connector.org_id,
+                            "Content-Type": "application/json",
+                        },
+                    )
+                if resp.status_code in (401, 403):
+                    return "考勤查询鉴权失败，请联系管理员检查连接器配置。"
+                resp.raise_for_status()
+                raw_records = resp.json().get("records", [])
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError):
+                return "该企业考勤系统暂时无法访问，请稍后再试。"
+
+            records = _normalize_remote_attendance(raw_records, connector.field_mapping)
+            return _format_attendance_lines(records, parsed_start, parsed_end)
+
+        # 默认路径：没配连接器 / 配的是 internal_postgres —— 走现有的 AttendanceStore。
+        records = await attendance_store.list_records(user_id, start_date=parsed_start, end_date=parsed_end)
+        return _format_attendance_lines(records, parsed_start, parsed_end)
 
     unified_tool = wrap_function_tool(
         name="query_attendance",

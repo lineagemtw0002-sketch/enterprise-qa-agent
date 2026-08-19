@@ -99,6 +99,33 @@ class SetUserOrganizationRequest(BaseModel):
     org_id: str = Field(..., min_length=1)
 
 
+# ============== 租户连接器 API（仅平台管理员，见 knowledge-base-tenant-federation.md /
+# attendance-tenant-federation.md）==============
+
+class TenantConnectorResponse(BaseModel):
+    connector_id: str
+    org_id: str
+    capability: str
+    connector_type: str
+    endpoint: Optional[str]
+    # 出于安全考虑不回传原始 token，只回传"是否已配置"——前端据此显示
+    # "已配置凭证"还是"未配置"，编辑时留空表示不修改现有 token。
+    has_token: bool
+    remote_tool_name: Optional[str]
+    field_mapping: Dict[str, Any]
+    is_active: bool
+    created_at: float
+
+
+class UpsertTenantConnectorRequest(BaseModel):
+    connector_type: str = Field(..., min_length=1)
+    endpoint: Optional[str] = None
+    token: Optional[str] = Field(default=None, description="留空表示不修改现有 token")
+    remote_tool_name: Optional[str] = None
+    field_mapping: Dict[str, Any] = Field(default_factory=dict)
+    is_active: bool = True
+
+
 # ============== 角色管理 API（仅 super_admin） ==============
 
 class RoleResponse(BaseModel):

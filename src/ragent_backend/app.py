@@ -43,6 +43,7 @@ from src.ragent_backend.schemas import (
     LoginRequest, LoginResponse, MeResponse, ChangePasswordRequest, RoleSummary,
     OrganizationSummary, AdminUserResponse, AdminCreateUserRequest,
     AdminOrganizationResponse, AdminCreateOrganizationRequest, SetUserOrganizationRequest,
+    TenantConnectorResponse, UpsertTenantConnectorRequest,
     RoleResponse, CreateRoleRequest, UpdateRoleRequest,
     SetRoleCollectionsRequest, SetUserRolesRequest,
     WorkflowTemplateResponse, CreateWorkflowTemplateRequest, UpdateWorkflowTemplateRequest,
@@ -60,6 +61,7 @@ from src.ragent_backend.workflow_store import WorkflowStore, WorkflowTemplate, W
 from src.ragent_backend.attendance_store import AttendanceStore
 from src.ragent_backend.org_store import OrgStore
 from src.ragent_backend.tenant_connector_store import TenantConnectorStore
+from src.ragent_backend.tenant_identity_store import TenantIdentityStore
 from src.ragent_backend.auth import (
     AuthenticatedUser, create_access_token, get_current_user, require_role,
     require_same_org_or_platform, require_platform_admin,
@@ -272,9 +274,12 @@ def create_app() -> FastAPI:
     attendance_store: AttendanceStore = AttendanceStore()
     # org_store：组织（企业）归属 + 平台管理员判断（attendance-tenant-federation.md 第 8 节）
     org_store: OrgStore = OrgStore()
-    # tenant_connector_store：某企业的某项能力（如 knowledge_base）委托给谁查
-    # （knowledge-base-tenant-federation.md 第 3 节）
+    # tenant_connector_store：某企业的某项能力（如 knowledge_base/attendance）委托给谁查
+    # （knowledge-base-tenant-federation.md 第 3 节 / attendance-tenant-federation.md 第 3 节）
     tenant_connector_store: TenantConnectorStore = TenantConnectorStore()
+    # tenant_identity_store：我方 user_id <-> 企业考勤系统工号的映射，只有委托考勤
+    # 查询用得到（attendance-tenant-federation.md 第 3 节）
+    tenant_identity_store: TenantIdentityStore = TenantIdentityStore()
 
     # 初始化 ToolRegistry（内置工具 + MCP 外部工具）
     tool_registry = ToolRegistry()
@@ -285,6 +290,7 @@ def create_app() -> FastAPI:
         attendance_store=attendance_store,
         org_store=org_store,
         tenant_connector_store=tenant_connector_store,
+        tenant_identity_store=tenant_identity_store,
     )
     print(f"[Init] Registered {tool_registry.tool_count} built-in tools")
 
@@ -623,6 +629,72 @@ def create_app() -> FastAPI:
     ) -> AdminOrganizationResponse:
         org = await org_store.create_organization(request.name)
         return _org_response(org)
+
+    # ==================== 租户连接器 API（仅平台管理员） ====================
+    # 见 knowledge-base-tenant-federation.md 第 3 节 / attendance-tenant-federation.md
+    # 第 3 节——连接器配置里带 API token，只有平台管理员能看/改，企业内 admin 看不到，
+    # 跟 admin_set_user_organization 用同一套双重网关（超级管理员 + 平台管理员）。
+
+    def _connector_response(c) -> TenantConnectorResponse:
+        return TenantConnectorResponse(
+            connector_id=c.connector_id, org_id=c.org_id, capability=c.capability,
+            connector_type=c.connector_type, endpoint=c.endpoint,
+            has_token=bool(c.auth_config.get("token")),
+            remote_tool_name=c.remote_tool_name, field_mapping=c.field_mapping,
+            is_active=c.is_active, created_at=c.created_at,
+        )
+
+    @app.get("/api/v1/admin/organizations/{org_id}/connectors", response_model=List[TenantConnectorResponse])
+    async def admin_list_tenant_connectors(
+        org_id: str,
+        _: AuthenticatedUser = Depends(_require_super_admin),
+        __: AuthenticatedUser = Depends(require_platform_admin),
+    ) -> List[TenantConnectorResponse]:
+        if await org_store.get_organization(org_id) is None:
+            raise HTTPException(status_code=404, detail="组织不存在")
+        connectors = await tenant_connector_store.list_for_org(org_id)
+        return [_connector_response(c) for c in connectors]
+
+    @app.put(
+        "/api/v1/admin/organizations/{org_id}/connectors/{capability}",
+        response_model=TenantConnectorResponse,
+    )
+    async def admin_upsert_tenant_connector(
+        org_id: str,
+        capability: str,
+        request: UpsertTenantConnectorRequest,
+        _: AuthenticatedUser = Depends(_require_super_admin),
+        __: AuthenticatedUser = Depends(require_platform_admin),
+    ) -> TenantConnectorResponse:
+        if await org_store.get_organization(org_id) is None:
+            raise HTTPException(status_code=404, detail="组织不存在")
+
+        # token 留空表示"不修改现有凭证"——沿用已有连接器里存的那份，不是清空。
+        auth_config: dict = {}
+        if request.token:
+            auth_config = {"token": request.token}
+        else:
+            # 用 list_for_org 而不是 get()——get() 会过滤 is_active=FALSE 的行，
+            # 而这里恰恰可能是在重新启用一个之前被停用的连接器，此时也要找回
+            # 它原来存的 token，不能因为 is_active 过滤查不到就把凭证清空。
+            existing = next(
+                (c for c in await tenant_connector_store.list_for_org(org_id) if c.capability == capability),
+                None,
+            )
+            if existing is not None:
+                auth_config = existing.auth_config
+
+        connector = await tenant_connector_store.upsert(
+            org_id=org_id,
+            capability=capability,
+            connector_type=request.connector_type,
+            endpoint=request.endpoint,
+            auth_config=auth_config,
+            remote_tool_name=request.remote_tool_name,
+            field_mapping=request.field_mapping,
+            is_active=request.is_active,
+        )
+        return _connector_response(connector)
 
     # ==================== 角色管理 API（仅超级管理员） ====================
 
@@ -1691,6 +1763,7 @@ def create_app() -> FastAPI:
         await attendance_store.close()
         await org_store.close()
         await tenant_connector_store.close()
+        await tenant_identity_store.close()
 
     return app
 
