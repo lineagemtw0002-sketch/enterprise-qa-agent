@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Table, Button, Modal, Drawer, Input, Select, Switch, Tag, Space, message, Empty } from 'antd'
 import { Plus, Plug } from 'lucide-react'
 import * as adminApi from '../../api/admin.js'
+import { HealthBadge } from './connectorHealth.jsx'
 
 // 两个能力目前各自支持的连接器类型，跟后端 tenant_connector_store.py 里的
 // CONNECTOR_TYPE_* 常量、knowledge-base-tenant-federation.md /
@@ -90,26 +91,32 @@ function ConnectorCapabilityCard({ orgId, capability, meta, connector, onSaved }
 
   return (
     <div style={{ border: '1px solid var(--border-color, #e5e5e5)', borderRadius: 8, padding: 16, marginBottom: 16 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
         <strong>{meta.label}</strong>
-        <Space>
-          {connector ? (
-            <>
-              <Tag color={connector.connector_type.startsWith('internal') ? 'default' : 'blue'}>
-                {connector.connector_type}
-              </Tag>
-              <Tag color={connector.has_token ? 'green' : 'orange'}>
-                {connector.has_token ? '已配置凭证' : '未配置凭证'}
-              </Tag>
-              <Tag color={connector.is_active ? 'success' : 'default'}>
-                {connector.is_active ? '启用中' : '已停用'}
-              </Tag>
-            </>
-          ) : (
-            <Tag>未配置连接器（走内置默认实现）</Tag>
-          )}
-        </Space>
+        <HealthBadge status={connector?.health_status ?? 'internal'} />
       </div>
+
+      {connector && (
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ fontSize: 12, color: 'var(--text-tertiary, #888)', marginBottom: 6 }}>
+            <code>{connector.endpoint || '（未设置 endpoint）'}</code>
+          </div>
+          <Space>
+            <Tag color={connector.connector_type.startsWith('internal') ? 'default' : 'blue'}>
+              {connector.connector_type}
+            </Tag>
+            <Tag color={connector.has_token ? 'green' : 'orange'}>
+              {connector.has_token ? '已配置凭证' : '未配置凭证'}
+            </Tag>
+            <Tag color={connector.is_active ? 'success' : 'default'}>
+              {connector.is_active ? '启用中' : '已停用'}
+            </Tag>
+          </Space>
+        </div>
+      )}
+      {!connector && (
+        <Tag style={{ marginBottom: 12 }}>未配置连接器（走内置默认实现）</Tag>
+      )}
 
       <div style={{ display: 'grid', gap: 8 }}>
         <div>

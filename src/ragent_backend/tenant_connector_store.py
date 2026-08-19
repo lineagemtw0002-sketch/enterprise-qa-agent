@@ -56,6 +56,15 @@ class TenantConnector:
     field_mapping: Dict[str, Any] = field(default_factory=dict)
     is_active: bool = True
     created_at: float = 0.0
+    # 运行时调用指标（网关监控页用，见 app.py 的 /api/v1/admin/gateway/connectors）——
+    # 每次委托请求结束后由调用方（query_knowledge_hub._execute_remote /
+    # builtin_tools._register_query_attendance）调用 record_call() 累加，不是配置的
+    # 一部分，只是恰好也存在这张表里（避免为了 4 个计数器单开一张表）。
+    call_count: int = 0
+    failure_count: int = 0
+    last_called_at: Optional[float] = None
+    last_latency_ms: Optional[float] = None
+    last_error: Optional[str] = None
 
 
 class TenantConnectorStore:
@@ -91,6 +100,20 @@ class TenantConnectorStore:
                 )
                 """
             )
+            for ddl in (
+                "ALTER TABLE tenant_connectors ADD COLUMN IF NOT EXISTS call_count BIGINT NOT NULL DEFAULT 0",
+                "ALTER TABLE tenant_connectors ADD COLUMN IF NOT EXISTS failure_count BIGINT NOT NULL DEFAULT 0",
+                "ALTER TABLE tenant_connectors ADD COLUMN IF NOT EXISTS last_called_at DOUBLE PRECISION",
+                "ALTER TABLE tenant_connectors ADD COLUMN IF NOT EXISTS last_latency_ms DOUBLE PRECISION",
+                "ALTER TABLE tenant_connectors ADD COLUMN IF NOT EXISTS last_error TEXT",
+            ):
+                await conn.execute(ddl)
+
+    _COLUMNS = (
+        "id, org_id, capability, connector_type, endpoint, auth_config, remote_tool_name, "
+        "field_mapping, is_active, created_at, call_count, failure_count, last_called_at, "
+        "last_latency_ms, last_error"
+    )
 
     @staticmethod
     def _row_to_connector(row: asyncpg.Record) -> TenantConnector:
@@ -107,6 +130,11 @@ class TenantConnectorStore:
             field_mapping=json.loads(field_mapping) if isinstance(field_mapping, str) else dict(field_mapping),
             is_active=row["is_active"],
             created_at=row["created_at"],
+            call_count=row["call_count"],
+            failure_count=row["failure_count"],
+            last_called_at=row["last_called_at"],
+            last_latency_ms=row["last_latency_ms"],
+            last_error=row["last_error"],
         )
 
     async def get(self, org_id: str, capability: str) -> Optional[TenantConnector]:
@@ -114,12 +142,8 @@ class TenantConnectorStore:
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                """
-                SELECT id, org_id, capability, connector_type, endpoint,
-                       auth_config, remote_tool_name, field_mapping, is_active, created_at
-                FROM tenant_connectors
-                WHERE org_id = $1 AND capability = $2 AND is_active = TRUE
-                """,
+                f"SELECT {self._COLUMNS} FROM tenant_connectors "
+                "WHERE org_id = $1 AND capability = $2 AND is_active = TRUE",
                 org_id, capability,
             )
         return self._row_to_connector(row) if row else None
@@ -128,14 +152,38 @@ class TenantConnectorStore:
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                """
-                SELECT id, org_id, capability, connector_type, endpoint,
-                       auth_config, remote_tool_name, field_mapping, is_active, created_at
-                FROM tenant_connectors WHERE org_id = $1 ORDER BY created_at ASC
-                """,
+                f"SELECT {self._COLUMNS} FROM tenant_connectors WHERE org_id = $1 ORDER BY created_at ASC",
                 org_id,
             )
         return [self._row_to_connector(r) for r in rows]
+
+    async def list_all(self) -> List[TenantConnector]:
+        """跨所有组织列出全部连接器——网关监控页用（`admin_gateway_connectors`）。"""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(f"SELECT {self._COLUMNS} FROM tenant_connectors ORDER BY org_id, capability")
+        return [self._row_to_connector(r) for r in rows]
+
+    async def record_call(
+        self, connector_id: str, success: bool, latency_ms: Optional[float], error: Optional[str] = None,
+    ) -> None:
+        """委托请求结束后记一笔调用——网关监控页的调用/失败计数来源。失败也要记
+        （`failure_count` 才有意义），所以调用方在每一条退出路径（成功/超时/鉴权
+        失败/5xx）都要调这个方法，不能只在成功路径调。"""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE tenant_connectors SET
+                    call_count = call_count + 1,
+                    failure_count = failure_count + CASE WHEN $2 THEN 0 ELSE 1 END,
+                    last_called_at = $3,
+                    last_latency_ms = $4,
+                    last_error = $5
+                WHERE id = $1
+                """,
+                connector_id, success, time.time(), latency_ms, (None if success else error),
+            )
 
     async def upsert(
         self,
@@ -156,7 +204,7 @@ class TenantConnectorStore:
         field_mapping = field_mapping or {}
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                """
+                f"""
                 INSERT INTO tenant_connectors
                     (id, org_id, capability, connector_type, endpoint,
                      auth_config, remote_tool_name, field_mapping, is_active, created_at)
@@ -168,8 +216,7 @@ class TenantConnectorStore:
                     remote_tool_name = EXCLUDED.remote_tool_name,
                     field_mapping = EXCLUDED.field_mapping,
                     is_active = EXCLUDED.is_active
-                RETURNING id, org_id, capability, connector_type, endpoint,
-                          auth_config, remote_tool_name, field_mapping, is_active, created_at
+                RETURNING {self._COLUMNS}
                 """,
                 connector_id, org_id, capability, connector_type, endpoint,
                 json.dumps(auth_config), remote_tool_name, json.dumps(field_mapping), is_active, now,

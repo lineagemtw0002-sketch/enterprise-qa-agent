@@ -4,10 +4,10 @@ import { Plus, Trash2 } from 'lucide-react'
 import * as adminApi from '../../api/admin.js'
 
 // meProfile 从 App.jsx 一路传下来（AdminPanel -> 这里），只用来读
-// meProfile.organization.is_platform：平台管理员能看到/改派所有企业的用户，
-// 普通企业管理员的列表后端已经按 org 过滤过，这里只是不给他们看到"改派企业"
-// 这个跨企业操作的入口（真正的拦截在后端 require_platform_admin，这里不给
-// 入口只是不让人以为点了有用）。
+// meProfile.organization.is_platform：平台管理员能看到/新建所有企业的用户
+// （新建时可选所属企业），企业管理员的列表后端已经按 org 过滤过，新建的用户
+// 也强制落在自己企业下。用户一旦创建，所属企业不能再改派（没有对应的操作
+// 入口，也没有对应的后端端点）——见 app.py 里 admin_create_user 旁的注释。
 export default function UserRoleAssignment({ meProfile }) {
   const isPlatformAdmin = !!meProfile?.organization?.is_platform
 
@@ -83,20 +83,6 @@ export default function UserRoleAssignment({ meProfile }) {
     }
   }
 
-  async function handleOrgChange(user, orgId) {
-    setSavingUserId(user.user_id)
-    try {
-      const updated = await adminApi.setUserOrganization(user.user_id, orgId)
-      setUsers((prev) => prev.map((u) => (u.user_id === user.user_id ? updated : u)))
-      message.success(`已把 ${user.username} 改派到新企业`)
-    } catch (error) {
-      message.error('改派失败: ' + (error.response?.data?.detail || error.message))
-      await loadAll()
-    } finally {
-      setSavingUserId(null)
-    }
-  }
-
   async function handleDelete(user) {
     try {
       await adminApi.deleteUser(user.user_id)
@@ -115,20 +101,10 @@ export default function UserRoleAssignment({ meProfile }) {
     {
       title: '所属企业',
       key: 'organization',
-      width: 200,
-      render: (_, user) =>
-        isPlatformAdmin ? (
-          <Select
-            style={{ width: '100%' }}
-            placeholder="未分配企业"
-            value={user.organization?.org_id ?? undefined}
-            options={orgOptions}
-            loading={savingUserId === user.user_id}
-            onChange={(orgId) => handleOrgChange(user, orgId)}
-          />
-        ) : (
-          <span>{user.organization?.name ?? '—'}</span>
-        ),
+      width: 160,
+      // 只读——员工归属在创建时定死，任何管理员（包括平台管理员）都不能事后
+      // 改派，见组件顶部注释。
+      render: (_, user) => <span>{user.organization?.name ?? '—'}</span>,
     },
     {
       title: '角色',

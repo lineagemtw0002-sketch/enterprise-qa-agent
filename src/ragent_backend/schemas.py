@@ -95,10 +95,6 @@ class AdminCreateOrganizationRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=128)
 
 
-class SetUserOrganizationRequest(BaseModel):
-    org_id: str = Field(..., min_length=1)
-
-
 # ============== 租户连接器 API（仅平台管理员，见 knowledge-base-tenant-federation.md /
 # attendance-tenant-federation.md）==============
 
@@ -115,6 +111,9 @@ class TenantConnectorResponse(BaseModel):
     field_mapping: Dict[str, Any]
     is_active: bool
     created_at: float
+    # 打开连接器面板时现查的存活状态，不是存量字段——见 app.py 里
+    # `_check_connector_health`。取值：connected / unreachable / disabled / internal。
+    health_status: str
 
 
 class UpsertTenantConnectorRequest(BaseModel):
@@ -124,6 +123,23 @@ class UpsertTenantConnectorRequest(BaseModel):
     remote_tool_name: Optional[str] = None
     field_mapping: Dict[str, Any] = Field(default_factory=dict)
     is_active: bool = True
+
+
+class GatewayConnectorResponse(BaseModel):
+    """网关监控页一行——跨所有企业的连接器 + 运行时调用指标，仅平台管理员可见。"""
+    connector_id: str
+    org_id: str
+    org_name: str
+    capability: str
+    connector_type: str
+    endpoint: Optional[str]
+    is_active: bool
+    health_status: str
+    call_count: int
+    failure_count: int
+    last_called_at: Optional[float]
+    last_latency_ms: Optional[float]
+    last_error: Optional[str]
 
 
 # ============== 角色管理 API（仅 super_admin） ==============

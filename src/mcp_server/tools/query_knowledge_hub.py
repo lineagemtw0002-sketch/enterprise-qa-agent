@@ -497,6 +497,18 @@ class QueryKnowledgeHubTool:
         org_id = connector.org_id
         token = connector.auth_config.get("token", "")
         t0 = _time.monotonic()
+
+        async def _record(success: bool, error: Optional[str] = None) -> float:
+            elapsed = (_time.monotonic() - t0) * 1000.0
+            # 网关监控页的调用/失败计数来源——每条退出路径都要记，不只是成功路径
+            # （见 tenant_connector_store.record_call 的 docstring）。指标记录失败
+            # 不应该影响本次查询结果，静默吞掉。
+            try:
+                await self.tenant_connector_store.record_call(connector.connector_id, success, elapsed, error)
+            except Exception:
+                logger.warning("record_call failed", exc_info=True)
+            return elapsed
+
         try:
             async with httpx.AsyncClient(timeout=REMOTE_SEARCH_TIMEOUT_SECONDS) as client:
                 resp = await client.post(
@@ -508,9 +520,9 @@ class QueryKnowledgeHubTool:
                         "Content-Type": "application/json",
                     },
                 )
-            elapsed_ms = (_time.monotonic() - t0) * 1000.0
 
             if resp.status_code in (401, 403):
+                elapsed_ms = await _record(False, f"HTTP {resp.status_code}")
                 trace.record_stage("remote_search", {"status": resp.status_code, "org_id": org_id}, elapsed_ms=elapsed_ms)
                 TraceCollector().collect(trace)
                 return self._build_remote_error_response(
@@ -519,6 +531,7 @@ class QueryKnowledgeHubTool:
             resp.raise_for_status()
 
             results = self._parse_remote_results(resp.json())
+            elapsed_ms = await _record(True)
             trace.record_stage("remote_search", {
                 "status": resp.status_code, "org_id": org_id, "result_count": len(results),
             }, elapsed_ms=elapsed_ms)
@@ -532,21 +545,24 @@ class QueryKnowledgeHubTool:
             TraceCollector().collect(trace)
             return response
 
-        except (httpx.TimeoutException, httpx.ConnectError):
-            trace.record_stage("remote_search", {"error": "timeout_or_unreachable", "org_id": org_id})
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            elapsed_ms = await _record(False, "timeout_or_unreachable")
+            trace.record_stage("remote_search", {"error": "timeout_or_unreachable", "org_id": org_id}, elapsed_ms=elapsed_ms)
             TraceCollector().collect(trace)
             return self._build_remote_error_response(
                 query, collection, "该企业知识库暂时无法访问，请稍后再试。"
             )
         except httpx.HTTPStatusError as e:
-            trace.record_stage("remote_search", {"error": str(e), "org_id": org_id})
+            elapsed_ms = await _record(False, str(e))
+            trace.record_stage("remote_search", {"error": str(e), "org_id": org_id}, elapsed_ms=elapsed_ms)
             TraceCollector().collect(trace)
             return self._build_remote_error_response(
                 query, collection, "该企业知识库暂时无法访问，请稍后再试。"
             )
         except Exception as e:
             logger.exception(f"query_knowledge_hub remote delegation failed: {e}")
-            trace.record_stage("remote_search", {"error": str(e), "org_id": org_id})
+            elapsed_ms = await _record(False, str(e))
+            trace.record_stage("remote_search", {"error": str(e), "org_id": org_id}, elapsed_ms=elapsed_ms)
             TraceCollector().collect(trace)
             return self._build_error_response(query, collection, str(e))
 

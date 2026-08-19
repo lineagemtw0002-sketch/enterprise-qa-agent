@@ -419,6 +419,19 @@ def _register_query_attendance(
                 return "你的账号还没有关联考勤系统里的工号，请联系管理员配置。"
 
             token = connector.auth_config.get("token", "")
+            _t0 = _datetime.now().timestamp()
+
+            async def _record(success: bool, error: Optional[str] = None) -> None:
+                # 网关监控页的调用/失败计数来源，跟 query_knowledge_hub._execute_remote
+                # 同一套记账方式；指标记录本身失败不影响本次查询结果，静默吞掉。
+                if tenant_connector_store is None:
+                    return
+                elapsed_ms = (_datetime.now().timestamp() - _t0) * 1000.0
+                try:
+                    await tenant_connector_store.record_call(connector.connector_id, success, elapsed_ms, error)
+                except Exception:
+                    pass
+
             try:
                 async with httpx.AsyncClient(timeout=REMOTE_TIMEOUT_SECONDS) as client:
                     resp = await client.post(
@@ -435,10 +448,13 @@ def _register_query_attendance(
                         },
                     )
                 if resp.status_code in (401, 403):
+                    await _record(False, f"HTTP {resp.status_code}")
                     return "考勤查询鉴权失败，请联系管理员检查连接器配置。"
                 resp.raise_for_status()
                 raw_records = resp.json().get("records", [])
-            except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError):
+                await _record(True)
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError) as e:
+                await _record(False, str(e))
                 return "该企业考勤系统暂时无法访问，请稍后再试。"
 
             records = _normalize_remote_attendance(raw_records, connector.field_mapping)

@@ -23,10 +23,6 @@ export function setUserRoles(userId, roleIds) {
   return axios.put(`${BASE}/users/${userId}/roles`, { role_ids: roleIds }).then((res) => res.data)
 }
 
-export function setUserOrganization(userId, orgId) {
-  return axios.put(`${BASE}/users/${userId}/organization`, { org_id: orgId }).then((res) => res.data)
-}
-
 // ==================== 组织管理 ====================
 
 export function listOrganizations() {
@@ -45,6 +41,12 @@ export function listTenantConnectors(orgId) {
 
 export function upsertTenantConnector(orgId, capability, payload) {
   return axios.put(`${BASE}/organizations/${orgId}/connectors/${capability}`, payload).then((res) => res.data)
+}
+
+// ==================== 网关监控（仅平台管理员） ====================
+
+export function listGatewayConnectors() {
+  return axios.get(`${BASE}/gateway/connectors`).then((res) => res.data)
 }
 
 // ==================== 角色管理 ====================

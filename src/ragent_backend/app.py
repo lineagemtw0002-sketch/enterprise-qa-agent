@@ -11,6 +11,7 @@ RAG Backend API - 会话级知识库版本
 from __future__ import annotations
 
 import asyncio
+import httpx
 import json
 import os
 import sys
@@ -42,8 +43,8 @@ from src.ragent_backend.schemas import (
     ChatRequest, ChatResponse, ActiveWorkflowSummary, RollbackRequest,
     LoginRequest, LoginResponse, MeResponse, ChangePasswordRequest, RoleSummary,
     OrganizationSummary, AdminUserResponse, AdminCreateUserRequest,
-    AdminOrganizationResponse, AdminCreateOrganizationRequest, SetUserOrganizationRequest,
-    TenantConnectorResponse, UpsertTenantConnectorRequest,
+    AdminOrganizationResponse, AdminCreateOrganizationRequest,
+    TenantConnectorResponse, UpsertTenantConnectorRequest, GatewayConnectorResponse,
     RoleResponse, CreateRoleRequest, UpdateRoleRequest,
     SetRoleCollectionsRequest, SetUserRolesRequest,
     WorkflowTemplateResponse, CreateWorkflowTemplateRequest, UpdateWorkflowTemplateRequest,
@@ -56,7 +57,7 @@ from src.ragent_backend.ltm_store import LTMStore
 from src.ragent_backend.file_store import build_file_store, ConversationFileStore
 from src.ragent_backend.conversation_store import build_conversation_store, ConversationStore, Conversation
 from src.ragent_backend.user_store import UserStore, User
-from src.ragent_backend.role_store import RoleStore, ROLE_SUPER_ADMIN
+from src.ragent_backend.role_store import RoleStore, ROLE_SUPER_ADMIN, ROLE_ADMIN
 from src.ragent_backend.workflow_store import WorkflowStore, WorkflowTemplate, WorkflowInstance
 from src.ragent_backend.attendance_store import AttendanceStore
 from src.ragent_backend.org_store import OrgStore
@@ -476,11 +477,30 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="旧密码错误")
         return {"success": True}
 
-    # ==================== 管理后台 API（仅超级管理员） ====================
-    # 人员管理：新增/查看/删除用户，角色分配。全部要求角色集合里有 super_admin，
-    # 且这个角色判断是每次请求都现查数据库（见 auth.require_role），不是信 token。
+    # ==================== 管理后台 API ====================
+    # 人员管理（增/查/删/分配角色）对 super_admin 和 admin（企业管理员）都开放——
+    # 企业管理员只能管自己企业内的人（下面每个端点内部按 org 过滤/校验），
+    # super_admin 不受此限。组织管理、连接器配置、角色定义、工作流模板这类跨
+    # 企业/平台级操作仍然只对 super_admin 开放（各自的 Depends 没有改）。
+    # 角色判断是每次请求都现查数据库（见 auth.require_role），不是信 token。
 
     _require_super_admin = require_role(ROLE_SUPER_ADMIN)
+    _require_admin_or_super = require_role(ROLE_ADMIN, ROLE_SUPER_ADMIN)
+
+    async def _reject_privilege_escalation(actor: AuthenticatedUser, role_ids: List[str]) -> None:
+        """企业管理员（非 super_admin）不能把 admin/super_admin 角色发给任何人
+        （包括新建用户时）——不然"只有平台管理员能新增企业管理员"这条边界就
+        形同虚设，企业管理员可以自己再造一个企业管理员甚至超级管理员出来。"""
+        actor_role_names = {r.name for r in await role_store.get_user_roles(actor.user_id)}
+        if ROLE_SUPER_ADMIN in actor_role_names:
+            return
+        all_roles = {r.role_id: r for r in await role_store.list_roles()}
+        escalating = {
+            rid for rid in role_ids
+            if rid in all_roles and all_roles[rid].name in (ROLE_ADMIN, ROLE_SUPER_ADMIN)
+        }
+        if escalating:
+            raise HTTPException(status_code=403, detail="企业管理员不能授予管理员/超级管理员角色，只有平台管理员能做")
 
     async def _build_admin_user_response(user: User) -> AdminUserResponse:
         roles = await role_store.get_user_roles(user.user_id)
@@ -495,7 +515,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/v1/admin/users", response_model=List[AdminUserResponse])
     async def admin_list_users(
-        current_user: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_admin_or_super),
     ) -> List[AdminUserResponse]:
         users = await user_store.list_users()
         # 平台管理员看全部；普通企业管理员只看自己企业的——过滤发生在这里，
@@ -514,8 +534,10 @@ def create_app() -> FastAPI:
     @app.post("/api/v1/admin/users", response_model=AdminUserResponse)
     async def admin_create_user(
         request: AdminCreateUserRequest,
-        current_user: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_admin_or_super),
     ) -> AdminUserResponse:
+        if request.role_ids:
+            await _reject_privilege_escalation(current_user, request.role_ids)
         try:
             user = await user_store.create_user(request.username, request.password)
         except ValueError as e:
@@ -541,7 +563,7 @@ def create_app() -> FastAPI:
     @app.delete("/api/v1/admin/users/{user_id}")
     async def admin_delete_user(
         user_id: str,
-        current_user: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_admin_or_super),
         _same_org: AuthenticatedUser = Depends(require_same_org_or_platform),
     ) -> dict:
         if user_id == current_user.user_id:
@@ -555,7 +577,7 @@ def create_app() -> FastAPI:
     async def admin_set_user_roles(
         user_id: str,
         request: SetUserRolesRequest,
-        current_user: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_admin_or_super),
         _same_org: AuthenticatedUser = Depends(require_same_org_or_platform),
     ) -> AdminUserResponse:
         user = await user_store.get_user_by_id(user_id)
@@ -566,6 +588,8 @@ def create_app() -> FastAPI:
         unknown = set(request.role_ids) - set(all_roles)
         if unknown:
             raise HTTPException(status_code=400, detail=f"角色不存在: {sorted(unknown)}")
+
+        await _reject_privilege_escalation(current_user, request.role_ids)
 
         if user_id == current_user.user_id:
             # 防止超级管理员误操作把自己的 super_admin 角色摘掉，导致管理后台再也进不去
@@ -583,22 +607,11 @@ def create_app() -> FastAPI:
         await role_store.assign_user_roles(user_id, request.role_ids)
         return await _build_admin_user_response(user)
 
-    @app.put("/api/v1/admin/users/{user_id}/organization", response_model=AdminUserResponse)
-    async def admin_set_user_organization(
-        user_id: str,
-        request: SetUserOrganizationRequest,
-        _: AuthenticatedUser = Depends(_require_super_admin),
-        __: AuthenticatedUser = Depends(require_platform_admin),
-    ) -> AdminUserResponse:
-        """改派用户所属企业，仅平台管理员——企业内 admin 不能把自己的员工过继给
-        别的企业，也不能把别的企业的人挖到自己企业名下。"""
-        user = await user_store.get_user_by_id(user_id)
-        if user is None:
-            raise HTTPException(status_code=404, detail="用户不存在")
-        if await org_store.get_organization(request.org_id) is None:
-            raise HTTPException(status_code=400, detail="组织不存在")
-        await org_store.set_user_organization(user_id, request.org_id)
-        return await _build_admin_user_response(user)
+    # 注意：没有"改派用户所属企业"的端点——员工的企业归属只在创建时确定一次
+    # （见 admin_create_user），创建之后任何管理员（包括平台管理员）都不能再
+    # 改派，用户如果确实换了公司，只能删除旧账号、在新企业下重新创建。这是
+    # 有意的产品决策：避免"企业 A 的管理员看着看着一个用户突然从列表里消失，
+    # 因为被平台管理员偷偷过继给了企业 B"这类容易误解的操作。
 
     # ==================== 组织管理 API（仅平台管理员） ====================
 
@@ -635,13 +648,31 @@ def create_app() -> FastAPI:
     # 第 3 节——连接器配置里带 API token，只有平台管理员能看/改，企业内 admin 看不到，
     # 跟 admin_set_user_organization 用同一套双重网关（超级管理员 + 平台管理员）。
 
-    def _connector_response(c) -> TenantConnectorResponse:
+    async def _check_connector_health(c) -> str:
+        """打开连接器面板时现查一次存活状态——不落库，纯展示用（第 5 节网关页
+        的调用/失败计数才是持久化的运行时指标，这里只回答"这个 endpoint 现在
+        通不通"）。internal_* 连接器没有独立的远端服务，不需要探活。"""
+        if c.connector_type.startswith("internal"):
+            return "internal"
+        if not c.is_active:
+            return "disabled"
+        if not c.endpoint:
+            return "unreachable"
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                resp = await client.get(f"{c.endpoint.rstrip('/')}/healthz")
+            return "connected" if resp.status_code < 400 else "unreachable"
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPError):
+            return "unreachable"
+
+    async def _connector_response(c) -> TenantConnectorResponse:
         return TenantConnectorResponse(
             connector_id=c.connector_id, org_id=c.org_id, capability=c.capability,
             connector_type=c.connector_type, endpoint=c.endpoint,
             has_token=bool(c.auth_config.get("token")),
             remote_tool_name=c.remote_tool_name, field_mapping=c.field_mapping,
             is_active=c.is_active, created_at=c.created_at,
+            health_status=await _check_connector_health(c),
         )
 
     @app.get("/api/v1/admin/organizations/{org_id}/connectors", response_model=List[TenantConnectorResponse])
@@ -653,7 +684,7 @@ def create_app() -> FastAPI:
         if await org_store.get_organization(org_id) is None:
             raise HTTPException(status_code=404, detail="组织不存在")
         connectors = await tenant_connector_store.list_for_org(org_id)
-        return [_connector_response(c) for c in connectors]
+        return [await _connector_response(c) for c in connectors]
 
     @app.put(
         "/api/v1/admin/organizations/{org_id}/connectors/{capability}",
@@ -694,7 +725,36 @@ def create_app() -> FastAPI:
             field_mapping=request.field_mapping,
             is_active=request.is_active,
         )
-        return _connector_response(connector)
+        return await _connector_response(connector)
+
+    # ==================== 网关监控 API（仅平台管理员） ====================
+    # "网关"这个说法呼应 plan.md 里"API 网关"的设计初衷——我们自己并不跑一个
+    # 物理网关进程，这里是数据面：把所有企业配置的外部微服务连接器（知识库/
+    # 考勤）横向列出来，配合各自的存活状态和调用/失败计数，给平台运维一个
+    # "现在有哪些外部微服务接进来了、健不健康、调用量多大"的全局视图。
+
+    @app.get("/api/v1/admin/gateway/connectors", response_model=List[GatewayConnectorResponse])
+    async def admin_gateway_connectors(
+        _: AuthenticatedUser = Depends(_require_super_admin),
+        __: AuthenticatedUser = Depends(require_platform_admin),
+    ) -> List[GatewayConnectorResponse]:
+        connectors = await tenant_connector_store.list_all()
+        # 内置连接器（internal_chroma/internal_postgres）不是独立微服务，网关页
+        # 只关心真正对外发请求的那些。
+        connectors = [c for c in connectors if not c.connector_type.startswith("internal")]
+        org_names = {o.org_id: o.name for o in await org_store.list_organizations()}
+
+        results = []
+        for c in connectors:
+            results.append(GatewayConnectorResponse(
+                connector_id=c.connector_id, org_id=c.org_id,
+                org_name=org_names.get(c.org_id, c.org_id),
+                capability=c.capability, connector_type=c.connector_type, endpoint=c.endpoint,
+                is_active=c.is_active, health_status=await _check_connector_health(c),
+                call_count=c.call_count, failure_count=c.failure_count,
+                last_called_at=c.last_called_at, last_latency_ms=c.last_latency_ms, last_error=c.last_error,
+            ))
+        return results
 
     # ==================== 角色管理 API（仅超级管理员） ====================
 
