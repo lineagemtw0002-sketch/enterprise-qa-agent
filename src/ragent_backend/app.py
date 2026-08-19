@@ -57,7 +57,7 @@ from src.ragent_backend.ltm_store import LTMStore
 from src.ragent_backend.file_store import build_file_store, ConversationFileStore
 from src.ragent_backend.conversation_store import build_conversation_store, ConversationStore, Conversation
 from src.ragent_backend.user_store import UserStore, User
-from src.ragent_backend.role_store import RoleStore, ROLE_SUPER_ADMIN, ROLE_ADMIN
+from src.ragent_backend.role_store import RoleStore, ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_ORG_ADMIN, ROLE_USER
 from src.ragent_backend.workflow_store import WorkflowStore, WorkflowTemplate, WorkflowInstance
 from src.ragent_backend.attendance_store import AttendanceStore
 from src.ragent_backend.org_store import OrgStore
@@ -478,29 +478,63 @@ def create_app() -> FastAPI:
         return {"success": True}
 
     # ==================== 管理后台 API ====================
-    # 人员管理（增/查/删/分配角色）对 super_admin 和 admin（企业管理员）都开放——
-    # 企业管理员只能管自己企业内的人（下面每个端点内部按 org 过滤/校验），
-    # super_admin 不受此限。组织管理、连接器配置、角色定义、工作流模板这类跨
-    # 企业/平台级操作仍然只对 super_admin 开放（各自的 Depends 没有改）。
+    # 三层角色模型：
+    #   super_admin / admin —— 平台运营方，管平台本身（建企业、配连接器、定义
+    #     角色……），但不了解客户企业内部的部门架构，所以对某个客户企业能做的
+    #     唯一一件事是"任命谁是这家企业的 org_admin"，不直接管理该企业内部的
+    #     员工角色/知识库权限。admin 由 super_admin 任命，权限跟 super_admin
+    #     在人员管理这块基本对等，唯一区别是不能再往外发 admin/super_admin。
+    #   org_admin（企业管理员）—— 客户企业侧，被平台层任命后，管理自己企业
+    #     内部的员工（增/删/查/分配角色，含知识库权限角色），管不到别的企业，
+    #     也不能任命新的 org_admin（那还是平台层的事）。
+    # 人员管理（增/查/删/分配角色）三层角色都能碰，具体边界由
+    # `_validate_role_assignment` 按"谁在给哪家企业的人分配什么角色"判断，不是
+    # 简单的"有没有权限调这个接口"能表达清楚的，所以拆成单独的校验函数。
+    # 组织管理、连接器配置、角色定义、工作流模板这类跨企业/平台级操作仍然只对
+    # super_admin 开放（各自的 Depends 没有改）。
     # 角色判断是每次请求都现查数据库（见 auth.require_role），不是信 token。
 
     _require_super_admin = require_role(ROLE_SUPER_ADMIN)
-    _require_admin_or_super = require_role(ROLE_ADMIN, ROLE_SUPER_ADMIN)
+    _require_user_admin_tier = require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_ORG_ADMIN)
 
-    async def _reject_privilege_escalation(actor: AuthenticatedUser, role_ids: List[str]) -> None:
-        """企业管理员（非 super_admin）不能把 admin/super_admin 角色发给任何人
-        （包括新建用户时）——不然"只有平台管理员能新增企业管理员"这条边界就
-        形同虚设，企业管理员可以自己再造一个企业管理员甚至超级管理员出来。"""
+    async def _validate_role_assignment(
+        actor: AuthenticatedUser, target_org_id: Optional[str], role_ids: List[str],
+    ) -> None:
+        """校验 `actor` 能不能把 `role_ids` 这组角色发给 `target_org_id` 这家企业的
+        某个用户，三条边界见本节顶部的角色模型说明：
+
+        1. admin/super_admin 这两个平台角色只有 super_admin 自己能授予——防止
+           admin 自我提权或互相提权。
+        2. org_admin（企业管理员）角色只有平台层（admin/super_admin）能授予——
+           这是"任命企业管理员"这个动作本身，企业管理员不能任命同事、不能给
+           自己续任。
+        3. 平台层账号（super_admin/admin）如果是在给客户企业（非平台组织）的
+           用户分配角色，只能分配 user/org_admin 这两种——不能替客户企业分配
+           具体的知识库/部门角色，因为他们不了解客户企业内部架构，那是该企业
+           org_admin 被任命后自己的事。
+        """
         actor_role_names = {r.name for r in await role_store.get_user_roles(actor.user_id)}
-        if ROLE_SUPER_ADMIN in actor_role_names:
-            return
+        is_platform_tier = bool({ROLE_SUPER_ADMIN, ROLE_ADMIN} & actor_role_names)
+
         all_roles = {r.role_id: r for r in await role_store.list_roles()}
-        escalating = {
-            rid for rid in role_ids
-            if rid in all_roles and all_roles[rid].name in (ROLE_ADMIN, ROLE_SUPER_ADMIN)
-        }
-        if escalating:
-            raise HTTPException(status_code=403, detail="企业管理员不能授予管理员/超级管理员角色，只有平台管理员能做")
+        requested_names = {all_roles[rid].name for rid in role_ids if rid in all_roles}
+
+        if requested_names & {ROLE_ADMIN, ROLE_SUPER_ADMIN} and ROLE_SUPER_ADMIN not in actor_role_names:
+            raise HTTPException(status_code=403, detail="只有超级管理员能授予管理员/超级管理员角色")
+
+        if ROLE_ORG_ADMIN in requested_names and not is_platform_tier:
+            raise HTTPException(status_code=403, detail="只有平台管理员（超级管理员/管理员）能任命企业管理员")
+
+        if is_platform_tier and target_org_id is not None:
+            target_org = await org_store.get_organization(target_org_id)
+            if target_org is not None and not target_org.is_platform:
+                disallowed = requested_names - {ROLE_USER, ROLE_ORG_ADMIN}
+                if disallowed:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="平台管理员不了解客户企业内部架构，只能任命该企业的企业管理员，"
+                               "具体的员工角色/知识库权限请由该企业的企业管理员分配",
+                    )
 
     async def _build_admin_user_response(user: User) -> AdminUserResponse:
         roles = await role_store.get_user_roles(user.user_id)
@@ -515,7 +549,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/v1/admin/users", response_model=List[AdminUserResponse])
     async def admin_list_users(
-        current_user: AuthenticatedUser = Depends(_require_admin_or_super),
+        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
     ) -> List[AdminUserResponse]:
         users = await user_store.list_users()
         # 平台管理员看全部；普通企业管理员只看自己企业的——过滤发生在这里，
@@ -534,27 +568,30 @@ def create_app() -> FastAPI:
     @app.post("/api/v1/admin/users", response_model=AdminUserResponse)
     async def admin_create_user(
         request: AdminCreateUserRequest,
-        current_user: AuthenticatedUser = Depends(_require_admin_or_super),
+        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
     ) -> AdminUserResponse:
+        # 平台管理员可以把新用户指派给任意企业（不传就落到自己所在的企业）；
+        # 企业管理员不管请求体里传了什么 org_id，一律强制用自己的——不能靠
+        # 改请求体把新账号建到别的企业名下。目标企业要先算出来，因为角色校验
+        # （能不能给这家企业的人分配这些角色）依赖这个结果。
+        is_platform = await org_store.is_platform_admin(current_user.user_id)
+        actor_org = await org_store.get_org_for_user(current_user.user_id)
+        target_org_id = request.org_id if (is_platform and request.org_id) else (actor_org.org_id if actor_org else None)
+
         if request.role_ids:
-            await _reject_privilege_escalation(current_user, request.role_ids)
-        try:
-            user = await user_store.create_user(request.username, request.password)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        if request.role_ids:
+            await _validate_role_assignment(current_user, target_org_id, request.role_ids)
             all_role_ids = {r.role_id for r in await role_store.list_roles()}
             unknown = set(request.role_ids) - all_role_ids
             if unknown:
                 raise HTTPException(status_code=400, detail=f"角色不存在: {sorted(unknown)}")
-            await role_store.assign_user_roles(user.user_id, request.role_ids)
 
-        # 平台管理员可以把新用户指派给任意企业（不传就落到自己所在的企业）；
-        # 非平台管理员不管请求体里传了什么 org_id，一律强制用自己的——不能靠
-        # 改请求体把新账号建到别的企业名下。
-        is_platform = await org_store.is_platform_admin(current_user.user_id)
-        actor_org = await org_store.get_org_for_user(current_user.user_id)
-        target_org_id = request.org_id if (is_platform and request.org_id) else (actor_org.org_id if actor_org else None)
+        try:
+            user = await user_store.create_user(request.username, request.password)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        if request.role_ids:
+            await role_store.assign_user_roles(user.user_id, request.role_ids)
         if target_org_id:
             await org_store.set_user_organization(user.user_id, target_org_id)
 
@@ -563,7 +600,7 @@ def create_app() -> FastAPI:
     @app.delete("/api/v1/admin/users/{user_id}")
     async def admin_delete_user(
         user_id: str,
-        current_user: AuthenticatedUser = Depends(_require_admin_or_super),
+        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
         _same_org: AuthenticatedUser = Depends(require_same_org_or_platform),
     ) -> dict:
         if user_id == current_user.user_id:
@@ -577,7 +614,7 @@ def create_app() -> FastAPI:
     async def admin_set_user_roles(
         user_id: str,
         request: SetUserRolesRequest,
-        current_user: AuthenticatedUser = Depends(_require_admin_or_super),
+        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
         _same_org: AuthenticatedUser = Depends(require_same_org_or_platform),
     ) -> AdminUserResponse:
         user = await user_store.get_user_by_id(user_id)
@@ -589,7 +626,8 @@ def create_app() -> FastAPI:
         if unknown:
             raise HTTPException(status_code=400, detail=f"角色不存在: {sorted(unknown)}")
 
-        await _reject_privilege_escalation(current_user, request.role_ids)
+        target_org = await org_store.get_org_for_user(user_id)
+        await _validate_role_assignment(current_user, target_org.org_id if target_org else None, request.role_ids)
 
         if user_id == current_user.user_id:
             # 防止超级管理员误操作把自己的 super_admin 角色摘掉，导致管理后台再也进不去

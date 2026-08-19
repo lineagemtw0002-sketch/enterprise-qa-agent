@@ -330,6 +330,22 @@ class QueryKnowledgeHubTool:
                     )
                     return self._build_access_denied_response(query, effective_collection)
 
+        # 显式兜底：不管上面 ACL 判断结果如何（包括平台管理员的 allowed_collections
+        # 通配符 "*"），本地 internal_chroma 检索都不允许碰 `tenant_{name}_kb` 这个
+        # 命名——这是各企业委托微服务专属的 collection 命名约定
+        # （scripts/ingest_tenant_kb_corpus.py），这些企业的知识库物理上根本没有
+        # 摄入到本地共享 Chroma 库里（不同 persist_directory），本来就查不到；这层
+        # 检查把"物理隔离导致查不到"变成"显式拒绝并留日志"，防止未来有人改动
+        # 存储布局时悄悄破坏这个保证——平台运营方账号（super_admin/admin）不该、
+        # 也不能查到任何客户企业的知识库内容。
+        if not (connector is not None and connector.connector_type == CONNECTOR_TYPE_HTTP_API):
+            if effective_collection.startswith("tenant_") and effective_collection.endswith("_kb"):
+                logger.warning(
+                    f"Blocked local access to tenant-reserved collection '{effective_collection}' "
+                    f"(user_id={user_id})"
+                )
+                return self._build_access_denied_response(query, effective_collection)
+
         logger.info(
             f"Executing query_knowledge_hub: query='{query[:50]}...', "
             f"top_k={effective_top_k}, collection={effective_collection}, "

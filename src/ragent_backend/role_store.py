@@ -12,8 +12,12 @@
 - 用户身份/密码（那是 user_store.py 的事）
 - ACL 判定本身（那是 acl.py 的事，它只认 List[str]，不关心数据怎么来的）
 
-三个内置系统角色（super_admin/admin/user）由 `_ensure_schema` 种子写入，
-`is_system=True`，不可删除、不可改名（`name`），语义与老的 users.role 字段完全一致。
+四个内置系统角色（super_admin/admin/org_admin/user）由 `_ensure_schema` 种子写入，
+`is_system=True`，不可删除、不可改名（`name`）。其中 super_admin/admin 是平台运营方
+角色，org_admin（企业管理员）是客户企业侧角色——平台管理员能管平台（建企业、建
+连接器、任命某企业的 org_admin），但不了解客户企业内部的部门架构，所以不直接管理
+某个企业内部的员工角色/知识库权限，那是 org_admin 被任命后自己的事（见 app.py
+`_validate_role_assignment` 里的权限边界判断）。
 """
 
 from __future__ import annotations
@@ -28,10 +32,12 @@ import asyncpg
 
 ROLE_SUPER_ADMIN = "super_admin"
 ROLE_ADMIN = "admin"
+ROLE_ORG_ADMIN = "org_admin"
 ROLE_USER = "user"
 SYSTEM_ROLE_SEEDS = (
     (ROLE_SUPER_ADMIN, "超级管理员"),
     (ROLE_ADMIN, "管理员"),
+    (ROLE_ORG_ADMIN, "企业管理员"),
     (ROLE_USER, "普通用户"),
 )
 
