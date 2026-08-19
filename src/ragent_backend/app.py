@@ -735,8 +735,22 @@ def create_app() -> FastAPI:
         _: AuthenticatedUser = Depends(_require_super_admin),
         __: AuthenticatedUser = Depends(require_platform_admin),
     ) -> TenantConnectorResponse:
-        if await org_store.get_organization(org_id) is None:
+        org = await org_store.get_organization(org_id)
+        if org is None:
             raise HTTPException(status_code=404, detail="组织不存在")
+
+        # 平台自己这个组织，任何能力都不允许配置成委托外部服务（http_api/
+        # http_webhook/...）——只能用 internal_* 这类本地实现。这不是"防止误配
+        # 到某个客户企业"这么窄的事：平台运营方压根不应该有能力把自己的知识库/
+        # 考勤查询委托给任何外部端点，包括客户自己的微服务——那等于让平台账号
+        # 绕过 query_knowledge_hub.py 里"本地路径拒绝 tenant_*_kb"那道显式拦截，
+        # 从"查询时拦"退化成只靠"没人这么配"兜底。这里在连接器配置这一层就把
+        # 口子焊死，而不是指望调用方每次都拦对。
+        if org.is_platform and not request.connector_type.startswith("internal"):
+            raise HTTPException(
+                status_code=403,
+                detail="平台自身组织不能把任何能力委托给外部服务，只能使用 internal_* 类型的本地实现",
+            )
 
         # token 留空表示"不修改现有凭证"——沿用已有连接器里存的那份，不是清空。
         auth_config: dict = {}
