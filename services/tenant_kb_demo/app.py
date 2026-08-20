@@ -53,6 +53,51 @@ TENANT_DATA_DIR = os.getenv("TENANT_DATA_DIR", f"data/tenant_demo/{TENANT_NAME}"
 # 做了持久化目录级别的物理隔离（见下方 `_ensure_ready`）。
 TENANT_COLLECTION = os.getenv("TENANT_COLLECTION", f"tenant_{TENANT_NAME}_kb")
 
+# 演示语料按 kb_corpus/<category>/*.txt 分目录组织（见
+# scripts/generate_tenant_kb_corpus.py），摄入时这个目录名原样落进每个 chunk
+# 的 source_path 里——这里从命中结果的 source_path 反推出它属于哪个子类目，
+# 转成人话标签通过 metadata.kb_name 报给平台。这是第 4.2 节契约里的可选字段：
+# 平台自己不认识"任何企业内部知识库该怎么分类"，只能由企业自己的服务（最懂自己
+# 内部结构的一方）决定要不要、以及怎么把这层粒度透出来；不提供这个字段的企业
+# （契约的必选部分只有 content/score/source）跟现在完全一样，UI 上退回展示笼统
+# 的"本企业知识库"，不会因为这个可选字段缺失而报错或降级。
+CATEGORY_LABELS: Dict[str, str] = {
+    "hr": "人力资源",
+    "onboarding": "入职指南",
+    "troubleshoot": "故障排查",
+    "support": "客户支持",
+    "security": "安全合规",
+    "product": "产品知识",
+    "cloud_infra": "云基础设施",
+    "data_governance": "数据治理",
+    "dev_process": "研发流程",
+    "meeting": "会议纪要",
+    "vendor": "供应商管理",
+    "customer_service": "客户服务",
+    "customs": "海关与合规",
+    "safety": "安全生产",
+    "supply_chain": "供应链",
+    "procurement": "采购",
+    "fleet": "车队管理",
+    "warehouse": "仓储物流",
+}
+
+
+def _category_label(source_path: str) -> str:
+    """从 `.../kb_corpus/<category>/文件名` 反推 category，查不到已知标签时
+    原样返回目录名（好过完全不展示）；source_path 为空或不含 kb_corpus 时
+    返回空字符串，调用方据此决定要不要省略 kb_name 字段。"""
+    if not source_path:
+        return ""
+    parts = Path(source_path).parts
+    if "kb_corpus" not in parts:
+        return ""
+    idx = parts.index("kb_corpus")
+    if idx + 1 >= len(parts):
+        return ""
+    category = parts[idx + 1]
+    return CATEGORY_LABELS.get(category, category)
+
 
 class SearchRequest(BaseModel):
     query: str
@@ -73,13 +118,27 @@ class SearchResponse(BaseModel):
     results: List[SearchResultItem]
 
 
+# 第 7 节"检索质量完全依赖企业自己的实现"这条设计决策的直接后果：平台的
+# `_execute_remote` 只负责转发、从不重排/从不判断这边结果是否真的相关（见
+# query_knowledge_hub.py `_execute_remote` 的说明）——质量控制的责任在这一侧。
+# 这里"企业自己的实现"就是这个参考实现本身，所以真实踩过的坑（问一句跟语料
+# 毫不相关的话，比如"iPhone16 是否配套充电器"，混合检索依然会凑出几条"矬子里
+# 最高"的候选，score 看起来还不低）要在这一层堵住，不能指望平台那边兜底。
+# 阈值/理由跟平台本地部门知识库用的是同一套校准（query_knowledge_hub.py 的
+# MIN_RELEVANCE_SCORE 旁有完整说明）：cross-encoder 重排后，真正相关的命中
+# 稳定在 0.13 以上，完全不相关的问题稳定卡在 0.03 以下，0.1 是两者之间有
+# 安全余量的分界线。
+MIN_RELEVANCE_SCORE = 0.1
+
+
 class _HybridSearchEngine:
-    """懒加载封装：首次查询时才建 embedding client / vector store / BM25 索引。"""
+    """懒加载封装：首次查询时才建 embedding client / vector store / BM25 索引 / reranker。"""
 
     def __init__(self, data_dir: str, collection: str) -> None:
         self._data_dir = data_dir
         self._collection = collection
         self._hybrid_search = None
+        self._reranker = None
 
     def _ensure_ready(self) -> None:
         if self._hybrid_search is not None:
@@ -89,6 +148,7 @@ class _HybridSearchEngine:
         from src.core.query_engine.hybrid_search import create_hybrid_search
         from src.core.query_engine.query_processor import QueryProcessor
         from src.core.query_engine.sparse_retriever import create_sparse_retriever
+        from src.core.query_engine.reranker import create_core_reranker
         from src.ingestion.storage.bm25_indexer import BM25Indexer
         from src.libs.embedding.embedding_factory import EmbeddingFactory
         from src.libs.vector_store.vector_store_factory import VectorStoreFactory
@@ -116,11 +176,27 @@ class _HybridSearchEngine:
             dense_retriever=dense_retriever,
             sparse_retriever=sparse_retriever,
         )
+        self._reranker = create_core_reranker(settings=settings)
 
     def search(self, query: str, top_k: int) -> List["Any"]:
         self._ensure_ready()
-        results = self._hybrid_search.search(query=query, top_k=top_k, filters=None, return_details=False)
-        return results if isinstance(results, list) else results.results
+        # 多召回一些候选给 reranker 挑，跟平台本地路径的 initial_top_k 是
+        # 同一个思路（query_knowledge_hub.py _search_with）。
+        results = self._hybrid_search.search(query=query, top_k=top_k * 2, filters=None, return_details=False)
+        results = results if isinstance(results, list) else results.results
+        if not results:
+            return results
+
+        if self._reranker is not None and self._reranker.is_enabled:
+            try:
+                rerank_result = self._reranker.rerank(query=query, results=results, top_k=top_k)
+                if not rerank_result.used_fallback:
+                    return [r for r in rerank_result.results if r.score >= MIN_RELEVANCE_SCORE]
+                results = rerank_result.results
+            except Exception:
+                pass
+
+        return results[:top_k]
 
 
 _engine = _HybridSearchEngine(TENANT_DATA_DIR, TENANT_COLLECTION)
@@ -156,14 +232,18 @@ def search(
         f"-> {len(raw_results)} results in {elapsed_ms:.0f}ms"
     )
 
-    items = [
-        SearchResultItem(
+    items = []
+    for r in raw_results:
+        source_path = r.metadata.get("source_path", r.metadata.get("source", ""))
+        result_metadata: Dict[str, Any] = {"title": r.metadata.get("title", ""), "tenant": TENANT_NAME}
+        kb_name = _category_label(source_path)
+        if kb_name:
+            result_metadata["kb_name"] = kb_name
+        items.append(SearchResultItem(
             content=r.text or "",
             score=float(r.score),
-            source=r.metadata.get("source_path", r.metadata.get("source", "")),
+            source=source_path,
             page=r.metadata.get("page") or r.metadata.get("page_num"),
-            metadata={"title": r.metadata.get("title", ""), "tenant": TENANT_NAME},
-        )
-        for r in raw_results
-    ]
+            metadata=result_metadata,
+        ))
     return SearchResponse(results=items)

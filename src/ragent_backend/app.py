@@ -15,7 +15,7 @@ import httpx
 import json
 import os
 import sys
-from typing import AsyncGenerator, List, Optional
+from typing import AsyncGenerator, FrozenSet, List, Optional
 from pathlib import Path
 
 # Windows: psycopg async 需要 SelectorEventLoop，而不是 ProactorEventLoop
@@ -47,6 +47,7 @@ from src.ragent_backend.schemas import (
     TenantConnectorResponse, UpsertTenantConnectorRequest, GatewayConnectorResponse,
     RoleResponse, CreateRoleRequest, UpdateRoleRequest,
     SetRoleCollectionsRequest, SetUserRolesRequest,
+    CollectionResponse, CreateCollectionRequest,
     WorkflowTemplateResponse, CreateWorkflowTemplateRequest, UpdateWorkflowTemplateRequest,
     WorkflowInstanceResponse, WorkflowActionRequest, WorkflowReturnRequest, WorkflowRejectRequest,
     NotificationResponse,
@@ -61,7 +62,8 @@ from src.ragent_backend.role_store import RoleStore, ROLE_SUPER_ADMIN, ROLE_ADMI
 from src.ragent_backend.workflow_store import WorkflowStore, WorkflowTemplate, WorkflowInstance
 from src.ragent_backend.attendance_store import AttendanceStore
 from src.ragent_backend.org_store import OrgStore
-from src.ragent_backend.tenant_connector_store import TenantConnectorStore
+from src.ragent_backend.tenant_connector_store import TenantConnectorStore, CAPABILITY_KNOWLEDGE_BASE, CONNECTOR_TYPE_HTTP_API
+from src.ragent_backend.collection_store import OrgCollectionStore
 from src.ragent_backend.tenant_identity_store import TenantIdentityStore
 from src.ragent_backend.auth import (
     AuthenticatedUser, create_access_token, get_current_user, require_role,
@@ -278,6 +280,9 @@ def create_app() -> FastAPI:
     # tenant_connector_store：某企业的某项能力（如 knowledge_base/attendance）委托给谁查
     # （knowledge-base-tenant-federation.md 第 3 节 / attendance-tenant-federation.md 第 3 节）
     tenant_connector_store: TenantConnectorStore = TenantConnectorStore()
+    # org_collection_store：企业自建知识库的归属登记（只针对本地检索的企业，
+    # 见 collection_store.py 顶部说明）
+    org_collection_store: OrgCollectionStore = OrgCollectionStore()
     # tenant_identity_store：我方 user_id <-> 企业考勤系统工号的映射，只有委托考勤
     # 查询用得到（attendance-tenant-federation.md 第 3 节）
     tenant_identity_store: TenantIdentityStore = TenantIdentityStore()
@@ -496,9 +501,16 @@ def create_app() -> FastAPI:
 
     _require_super_admin = require_role(ROLE_SUPER_ADMIN)
     _require_user_admin_tier = require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_ORG_ADMIN)
+    # 企业自建知识库（新增/列出）只对 org_admin 开放，platform 管理员（super_admin/
+    # admin）不在允许名单里——不是"看不全"，是这两个端点对他们直接 403，企业
+    # 内部的知识库归属信息平台运营方压根碰不到（跟"角色管理"页面不展示知识库、
+    # 「用户与角色分配」平台视角不展示"可访问知识库"列是同一个边界，见对应组件
+    # 顶部注释）。
+    _require_org_admin = require_role(ROLE_ORG_ADMIN)
 
     async def _validate_role_assignment(
         actor: AuthenticatedUser, target_org_id: Optional[str], role_ids: List[str],
+        existing_role_names: FrozenSet[str] = frozenset(),
     ) -> None:
         """校验 `actor` 能不能把 `role_ids` 这组角色发给 `target_org_id` 这家企业的
         某个用户，三条边界见本节顶部的角色模型说明：
@@ -512,23 +524,34 @@ def create_app() -> FastAPI:
            用户分配角色，只能分配 user/org_admin 这两种——不能替客户企业分配
            具体的知识库/部门角色，因为他们不了解客户企业内部架构，那是该企业
            org_admin 被任命后自己的事。
+
+        以上三条只审查"新授予"的角色（`role_ids` 里目标用户原本没有的部分，
+        由调用方通过 `existing_role_names` 传入目标用户当前已有的角色名）。
+        企业管理员/管理员在企业内本就是最高权限，编辑自己或同事时，Select
+        提交的是完整角色集合，必然带着自己已有的 org_admin/admin——如果连
+        "保留自己已有的角色"都按"新任命"的标准审查，企业管理员/管理员会
+        连自己的其他权限（比如加一个部门角色）都改不了，等于企业内最高权限
+        者反而管不了自己。只有目标用户原本没有、这次新加进来的角色，才真的
+        构成"任命"，才需要走上面三条边界。新建用户时 `existing_role_names`
+        传空集，等价于所有角色都是"新授予"，跟原来的校验强度一致。
         """
         actor_role_names = {r.name for r in await role_store.get_user_roles(actor.user_id)}
         is_platform_tier = bool({ROLE_SUPER_ADMIN, ROLE_ADMIN} & actor_role_names)
 
         all_roles = {r.role_id: r for r in await role_store.list_roles()}
         requested_names = {all_roles[rid].name for rid in role_ids if rid in all_roles}
+        newly_granted_names = requested_names - existing_role_names
 
-        if requested_names & {ROLE_ADMIN, ROLE_SUPER_ADMIN} and ROLE_SUPER_ADMIN not in actor_role_names:
+        if newly_granted_names & {ROLE_ADMIN, ROLE_SUPER_ADMIN} and ROLE_SUPER_ADMIN not in actor_role_names:
             raise HTTPException(status_code=403, detail="只有超级管理员能授予管理员/超级管理员角色")
 
-        if ROLE_ORG_ADMIN in requested_names and not is_platform_tier:
+        if ROLE_ORG_ADMIN in newly_granted_names and not is_platform_tier:
             raise HTTPException(status_code=403, detail="只有平台管理员（超级管理员/管理员）能任命企业管理员")
 
         if is_platform_tier and target_org_id is not None:
             target_org = await org_store.get_organization(target_org_id)
             if target_org is not None and not target_org.is_platform:
-                disallowed = requested_names - {ROLE_USER, ROLE_ORG_ADMIN}
+                disallowed = newly_granted_names - {ROLE_USER, ROLE_ORG_ADMIN}
                 if disallowed:
                     raise HTTPException(
                         status_code=403,
@@ -578,6 +601,13 @@ def create_app() -> FastAPI:
         actor_org = await org_store.get_org_for_user(current_user.user_id)
         target_org_id = request.org_id if (is_platform and request.org_id) else (actor_org.org_id if actor_org else None)
 
+        # 一人一角色：业务规则改成单角色制之后，user_roles 表结构本身不变
+        # （多对多，历史遗留的多角色用户不强制迁移，见 role_store.py 顶部
+        # 说明），但新的写路径一律只接受 0 或 1 个 role_id——UI 也同步从
+        # 多选框改成单选框，这里是后端兜底，不信任前端不会被绕过。
+        if len(request.role_ids) > 1:
+            raise HTTPException(status_code=400, detail="每个用户只能有一个角色，请只选一个")
+
         if request.role_ids:
             await _validate_role_assignment(current_user, target_org_id, request.role_ids)
             all_role_ids = {r.role_id for r in await role_store.list_roles()}
@@ -617,6 +647,12 @@ def create_app() -> FastAPI:
         current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
         _same_org: AuthenticatedUser = Depends(require_same_org_or_platform),
     ) -> AdminUserResponse:
+        # 一人一角色，见上面 admin_create_user 旁的说明——历史遗留的多角色
+        # 用户（如种子数据里的 bob）不强制清理，但下一次有人经这个端点改动
+        # 他的角色，就只能落到 0 或 1 个，不能带着老的多角色继续加新角色。
+        if len(request.role_ids) > 1:
+            raise HTTPException(status_code=400, detail="每个用户只能有一个角色，请只选一个")
+
         user = await user_store.get_user_by_id(user_id)
         if user is None:
             raise HTTPException(status_code=404, detail="用户不存在")
@@ -627,14 +663,19 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=f"角色不存在: {sorted(unknown)}")
 
         target_org = await org_store.get_org_for_user(user_id)
-        await _validate_role_assignment(current_user, target_org.org_id if target_org else None, request.role_ids)
+        current_roles = await role_store.get_user_roles(user_id)
+        current_role_ids = {r.role_id for r in current_roles}
+        existing_role_names = frozenset(r.name for r in current_roles)
+        await _validate_role_assignment(
+            current_user, target_org.org_id if target_org else None, request.role_ids,
+            existing_role_names=existing_role_names,
+        )
 
         if user_id == current_user.user_id:
             # 防止超级管理员误操作把自己的 super_admin 角色摘掉，导致管理后台再也进不去
             super_admin_role_id = next(
                 (rid for rid, r in all_roles.items() if r.name == ROLE_SUPER_ADMIN), None
             )
-            current_role_ids = {r.role_id for r in await role_store.get_user_roles(user_id)}
             if (
                 super_admin_role_id
                 and super_admin_role_id in current_role_ids
@@ -660,11 +701,14 @@ def create_app() -> FastAPI:
 
     @app.get("/api/v1/admin/organizations", response_model=List[AdminOrganizationResponse])
     async def admin_list_organizations(
-        current_user: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
     ) -> List[AdminOrganizationResponse]:
-        # 平台管理员看全部组织；企业内 admin 只能看到自己那一条（给"新建用户"
-        # 弹窗、个人信息展示等场景确认自己企业的名字用，不是把组织列表当成
-        # 可浏览的目录露出去）。
+        # 平台管理员看全部组织；企业内 admin（含 org_admin）只能看到自己那一条
+        # （给"新建用户"弹窗、个人信息展示等场景确认自己企业的名字用，不是把
+        # 组织列表当成可浏览的目录露出去）。UserRoleAssignment.jsx 的
+        # loadAll() 会无条件拉这个端点，之前网关只放 super_admin 进来，导致
+        # org_admin 一进"用户与角色分配"页就在 Promise.all 里被这一路 403
+        # 拖垮整体加载——网关本该跟下面的分支逻辑一样宽。
         if await org_store.is_platform_admin(current_user.user_id):
             orgs = await org_store.list_organizations()
         else:
@@ -808,7 +852,12 @@ def create_app() -> FastAPI:
             ))
         return results
 
-    # ==================== 角色管理 API（仅超级管理员） ====================
+    # ==================== 角色管理 API ====================
+    # 角色的新建/重命名/删除仍然只对 super_admin 开放（角色是全平台共享的词表，
+    # 没有按企业隔离，交给企业管理员建/删会有跨企业改到别人角色、name 唯一约束
+    # 互相冲突等问题，这次不做，见需求确认时选定的"轻量版"）。企业管理员能碰的
+    # 只有"给本企业员工已经持有的角色配置关联知识库"这一件事——见下面
+    # admin_list_company_roles / admin_set_role_collections 里的权限边界。
 
     def _role_response(role_obj) -> RoleResponse:
         return RoleResponse(
@@ -822,9 +871,28 @@ def create_app() -> FastAPI:
 
     @app.get("/api/v1/admin/roles", response_model=List[RoleResponse])
     async def admin_list_roles(
-        _: AuthenticatedUser = Depends(_require_super_admin),
+        # 企业管理员给自己企业员工分配角色时，前端要拿完整角色列表填多选框的选项
+        # （谁能不能真的把某个角色发出去，由 admin_set_user_roles /
+        # admin_create_user 里的 _validate_role_assignment 负责拦，这里只是读
+        # 列表，读了不代表能用）。角色的增/删/改（下面几个端点）仍然只对
+        # super_admin 开放。
+        _: AuthenticatedUser = Depends(_require_user_admin_tier),
     ) -> List[RoleResponse]:
         roles = await role_store.list_roles()
+        return [_role_response(r) for r in roles]
+
+    @app.get("/api/v1/admin/roles/company", response_model=List[RoleResponse])
+    async def admin_list_company_roles(
+        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
+    ) -> List[RoleResponse]:
+        """企业管理员「知识库权限」页面专用：只列出本企业员工实际持有的部门角色。
+        跟上面 `GET /admin/roles` 的区别——那个端点是给"用户与角色分配"页面的
+        角色多选框用的，要看到全平台角色目录（哪怕本企业员工还没人持有过），
+        职责不同，不能合并成一个端点两种截断逻辑。"""
+        org = await org_store.get_org_for_user(current_user.user_id)
+        if org is None:
+            return []
+        roles = await role_store.list_roles_used_by_org(org.org_id)
         return [_role_response(r) for r in roles]
 
     @app.post("/api/v1/admin/roles", response_model=RoleResponse)
@@ -869,26 +937,106 @@ def create_app() -> FastAPI:
     async def admin_set_role_collections(
         role_id: str,
         request: SetRoleCollectionsRequest,
-        _: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
     ) -> RoleResponse:
         role = await role_store.get_role_by_id(role_id)
         if role is None:
             raise HTTPException(status_code=404, detail="角色不存在")
+
+        # 不管调用方是哪一层管理员，一律只能配置"自己所属企业的员工实际持有"的
+        # 角色（role_store.py list_roles_used_by_org 的判定标准，跟
+        # admin_list_company_roles 用的是同一个方法，读/写口径必须一致）——
+        # 之前平台管理员（super_admin/admin）有特殊豁免，能不受这层限制改任意
+        # 企业的角色知识库关联，这跟"平台运营方不该碰任何企业内部知识库配置"
+        # 的边界矛盾，这次去掉这个豁免。平台管理员自己所属 org_platform 也会走
+        # 这同一套逻辑——list_roles_used_by_org(org_platform) 天然包含平台自己
+        # 那几个部门角色，所以平台管理员管理自己组织的知识库关联不受影响，只是
+        # 不能再碰别的企业的。
+        org = await org_store.get_org_for_user(current_user.user_id)
+        allowed_role_ids = (
+            {r.role_id for r in await role_store.list_roles_used_by_org(org.org_id)} if org else set()
+        )
+        if role_id not in allowed_role_ids:
+            raise HTTPException(status_code=403, detail="只能配置本企业员工持有的角色的知识库关联")
+
         await role_store.set_role_collections(role_id, request.collection_names)
         roles = await role_store.list_roles()
         return _role_response(next(r for r in roles if r.role_id == role_id))
 
-    @app.get("/api/v1/admin/collections", response_model=List[str])
-    async def admin_list_collections(
-        _: AuthenticatedUser = Depends(_require_super_admin),
-    ) -> List[str]:
-        """列出 ChromaDB 现有 collection 名，供"配置知识库"多选框做数据源。
-        对话私有的 conv_{id} collection 不是可分配的共享知识库，排除掉。"""
-        from src.mcp_server.tools.list_collections import ListCollectionsTool
+    async def _require_local_retrieval_org(current_user: AuthenticatedUser):
+        """企业自建知识库只对"走本地 Chroma 检索"的企业开放（跟平台自己的 6 个
+        部门库同一套检索机制）——像 Acme/Globex 这类把 knowledge_base 能力委托
+        给自己微服务的企业（`tenant_connectors` 里配了 http_api 连接器），本地
+        新建/关联的 collection 对它们的实际问答毫无意义（`query_knowledge_hub.py`
+        的 `is_remote` 分支完全绕开本地检索，见该模块说明），所以在这里就地
+        拒绝，报出清楚的原因，而不是让管理员建了一堆库、配了半天角色，结果
+        员工提问永远用不上，自己也不知道为什么。返回调用方所属的 Organization，
+        避免调用方再查一次。"""
+        org = await org_store.get_org_for_user(current_user.user_id)
+        if org is None:
+            raise HTTPException(status_code=403, detail="账号未关联任何企业")
+        connector = await tenant_connector_store.get(org.org_id, CAPABILITY_KNOWLEDGE_BASE)
+        if connector is not None and connector.connector_type == CONNECTOR_TYPE_HTTP_API:
+            raise HTTPException(
+                status_code=400,
+                detail="该企业的知识库检索已委托给企业自己的系统管理，不支持在平台内新增/配置知识库",
+            )
+        return org
 
-        tool = ListCollectionsTool(settings=settings)
-        collections = await asyncio.to_thread(tool.list_collections, False)
-        return sorted(c.name for c in collections if not c.name.startswith("conv_"))
+    @app.get("/api/v1/admin/collections", response_model=List[CollectionResponse])
+    async def admin_list_collections(
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> List[CollectionResponse]:
+        """列出本企业自建的知识库，供「知识库权限」页面"配置知识库"多选框、以及
+        「新增知识库」页面的已有列表用。只对 org_admin 开放，且只返回调用方
+        自己企业名下登记过的 collection（org_collections 表，见 collection_store.py）
+        ——平台的 6 个固定部门库不在这张表里，也不会出现在这个列表中；别的
+        企业自建的知识库同理看不到。委托模式企业（Acme/Globex）调这个端点会
+        被 `_require_local_retrieval_org` 拒绝，报出清楚原因。"""
+        org = await _require_local_retrieval_org(current_user)
+        owned = await org_collection_store.list_for_org(org.org_id)
+        return [
+            CollectionResponse(collection_name=c.collection_name, display_name=c.display_name, created_at=c.created_at)
+            for c in owned
+        ]
+
+    @app.post("/api/v1/admin/collections", response_model=CollectionResponse)
+    async def admin_create_collection(
+        request: CreateCollectionRequest,
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> CollectionResponse:
+        """企业管理员新增一个知识库——只登记名字和归属企业，不做物理摄入（见
+        collection_store.py 顶部说明，文档摄入仍走现有的摄入脚本/流程）。"""
+        org = await _require_local_retrieval_org(current_user)
+
+        # 内部标识不能撞平台自己的保留名——DEPARTMENT_KB_COLLECTIONS 那 6 个
+        # 固定部门库、`tenant_*_kb`（委托模式企业专属命名约定）、`default`
+        # （历史遗留、不该有人再摄入内容的库，见 query_knowledge_hub.py 顶部
+        # 说明）、`conv_*`（每个对话私有）。这里不查 org_collections 表里存不存在
+        # ——存在的话下面 create() 的唯一约束自然会报错，不用在这里重复判断。
+        from src.mcp_server.tools.query_knowledge_hub import DEPARTMENT_KB_COLLECTIONS
+        name = request.collection_name.strip()
+        reserved = (
+            name in DEPARTMENT_KB_COLLECTIONS
+            or name == "default"
+            or name.startswith("conv_")
+            or (name.startswith("tenant_") and name.endswith("_kb"))
+        )
+        if reserved:
+            raise HTTPException(status_code=400, detail=f"'{name}' 是平台保留的知识库标识，换一个试试")
+
+        try:
+            created = await org_collection_store.create(
+                org_id=org.org_id,
+                collection_name=request.collection_name.strip(),
+                display_name=request.display_name.strip(),
+                created_by=current_user.user_id,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return CollectionResponse(
+            collection_name=created.collection_name, display_name=created.display_name, created_at=created.created_at,
+        )
 
     # ==================== 工作流模板管理 API（仅超级管理员） ====================
     # work-flow.md 第 7 节：模板定义"某类流程需要哪些结构化字段"，附件材料只有
@@ -1522,6 +1670,7 @@ def create_app() -> FastAPI:
             answer=final_state.get("final_answer", ""),
             model_id=final_state.get("used_model", "unknown"),
             active_workflow=_build_active_workflow_summary(final_state.get("active_workflow")),
+            kb_sources=final_state.get("kb_sources", []),
         )
 
     @app.post("/api/v1/chat/stream")
@@ -1646,6 +1795,7 @@ def create_app() -> FastAPI:
                         "trace": final_state.get("trace_events", []),
                         "memory_stats": memory_stats,
                         "active_workflow": active_workflow_summary.model_dump() if active_workflow_summary else None,
+                        "kb_sources": final_state.get("kb_sources", []),
                     }
                     yield f"data: {json.dumps(done_event, ensure_ascii=False)}\n\n"
                     

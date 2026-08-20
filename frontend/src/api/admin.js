@@ -55,6 +55,11 @@ export function listRoles() {
   return axios.get(`${BASE}/roles`).then((res) => res.data)
 }
 
+// 企业管理员「知识库权限」页面专用：只返回本企业员工实际持有的部门角色。
+export function listCompanyRoles() {
+  return axios.get(`${BASE}/roles/company`).then((res) => res.data)
+}
+
 export function createRole({ name, display_name }) {
   return axios.post(`${BASE}/roles`, { name, display_name }).then((res) => res.data)
 }
@@ -71,8 +76,12 @@ export function setRoleCollections(roleId, collectionNames) {
   return axios.put(`${BASE}/roles/${roleId}/collections`, { collection_names: collectionNames }).then((res) => res.data)
 }
 
-// ==================== 知识库 ====================
+// ==================== 知识库（仅企业管理员，只能看/建自己企业名下的） ====================
 
 export function listCollections() {
   return axios.get(`${BASE}/collections`).then((res) => res.data)
+}
+
+export function createCollection({ collection_name, display_name }) {
+  return axios.post(`${BASE}/collections`, { collection_name, display_name }).then((res) => res.data)
 }

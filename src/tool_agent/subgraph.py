@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import time
 from datetime import date
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END
@@ -38,18 +38,32 @@ def build_tool_subgraph(
     tool_registry: ToolRegistry,
     llm: Any,
     max_iterations: int = 5,
+    emit_trace: Optional[Callable[[str, str, str, Optional[Dict[str, Any]]], None]] = None,
 ) -> Any:
     """构建工具子智能体子图。
-    
+
     Args:
         tool_registry: 工具注册表
         llm: LangChain LLM 实例（需要支持 with_structured_output）
         max_iterations: ReAct 最大迭代次数
-        
+        emit_trace: 可选的埋点回调，签名同 RAGWorkflow._emit_trace(node, step,
+            status, payload)——传入的话，think/tool/summarize 每一步的起止都会
+            推到 TracePanel，"工具调用"这个节点原来只有整体 start/end（见
+            workflow.py `_tool_subgraph_node` 旁的说明），看不出耗时具体花在
+            哪一轮的 think 还是 tool 还是 summarize；不传（比如独立跑的 MCP
+            server 场景）就是纯 no-op，子图行为不受影响。这个子图本身在
+            RAGWorkflow 构造时只编译一次，不是每次请求都重新 build，所以不能
+            直接闭包捕获某一次请求的 trace_queue，只能接收调用方（RAGWorkflow
+            实例方法）作为回调，由调用方自己在每次请求时决定往哪个队列推——
+            具体见 workflow.py 里 `self._emit_trace` 的传参方式。
+
     Returns:
         编译后的 LangGraph（可作为子图节点加入主图）
     """
-    
+    def _trace(node: str, step: str, status: str = "running", payload: Optional[Dict[str, Any]] = None) -> None:
+        if emit_trace is not None:
+            emit_trace(node, step, status, payload)
+
     # ------------------------------------------------------------------
     # think_node: LLM 决策下一步动作
     # ------------------------------------------------------------------
@@ -74,6 +88,7 @@ def build_tool_subgraph(
             messages.append(HumanMessage(content="基于上述工具执行结果，请决定下一步行动（继续调用工具或结束）。直接输出 JSON。"))
         
         # LLM 结构化决策
+        _trace("tool_subgraph", f"think[{iteration}]", "running", {"目的": "决定是否调用工具/该调哪个"})
         try:
             structured_llm = llm.with_structured_output(ToolDecision, method="json_mode")
             decision: ToolDecision = await structured_llm.ainvoke(messages)
@@ -84,7 +99,8 @@ def build_tool_subgraph(
                 action="finish",
                 reasoning="fallback due to structured output error",
             )
-        
+        _trace("tool_subgraph", f"think[{iteration}]", "success", {"action": decision.action, "thought": decision.thought[:100]})
+
         # 记录 AI 的思考过程到 internal_messages
         ai_msg = AIMessage(content=f"Thought: {decision.thought}\nAction: {decision.action}")
         
@@ -126,12 +142,16 @@ def build_tool_subgraph(
                 args["user_id"] = user_id
 
             t0 = time.monotonic()
+            _trace("tool_subgraph", f"tool[{name}]", "running", {"args": {k: v for k, v in args.items() if k != "user_id"}})
             try:
                 result: ToolResult = await tool_registry.execute(name, args)
             except Exception as e:
                 result = ToolResult.from_error(str(e))
-            
+
             latency_ms = (time.monotonic() - t0) * 1000
+            _trace("tool_subgraph", f"tool[{name}]", "success" if result.success else "error", {
+                "latency_ms": round(latency_ms), "success": result.success,
+            })
             result.latency_ms = latency_ms
             
             # 记录 ToolMessage（LangGraph 格式）
@@ -152,7 +172,44 @@ def build_tool_subgraph(
                 "latency_ms": latency_ms,
             })
             
-            # 记录 trace
+            # 记录 trace——collection 顺手带上，供 workflow.py 的 _generate_node
+            # 提取"这次回答用了哪个知识库"，UI 上展示来源角标用。MCPToolResponse
+            # 自带 to_dict()，adapters.py 的 wrap_function_tool 优先用它填
+            # result.structured_data（而不是拿 .metadata 摊平），实际形状是
+            # {"content":..., "structuredContent": {"metadata": {"collection": ...,
+            # "result_count": ...}, "isEmpty": ...}}，不是顶层 "collection"，取的
+            # 时候要按这个嵌套结构来。
+            #
+            # 检索/委托查询"这个 collection 确实查过"和"这个 collection 里确实有
+            # 命中内容"是两件事——命中 0 条（isEmpty=True 或 result_count=0）时
+            # MCPToolResponse.metadata 里的 collection 字段照样会填（见
+            # response_builder.py _build_empty_response/_build_metadata），如果
+            # 这时候还把它算进 kb_sources，UI 上的知识库来源角标会挂在一个"其实
+            # 什么都没查到、回答是模型自己编的"的回复上，看起来像是有依据实际上
+            # 没有——发现的真实案例：企业员工问了一个只有平台自己 IT 部知识库才有
+            # 的问题，本企业知识库检索不到任何相关内容，模型转而编了一段通用建议，
+            # 角标却照样显示"通用知识库"，误导用户以为这是查出来的。只有命中过
+            # 真实结果的 collection 才计入 kb_sources。
+            # "全库混合召回"（query_knowledge_hub._execute_local_multi）合并了
+            # 多个 collection 的候选结果再统一重排，最终结果可能来自不止一个
+            # 部门知识库，response_builder._build_metadata 相应地会在 metadata
+            # 里多写一个 "collections"（复数，list）——优先取这个；没有就说明
+            # 是老的单 collection 路径（委托模式/显式指定 collection），退回单
+            # 数 "collection" 包一层 list，两条路径最终都归一成 list，下面统一
+            # 处理。
+            structured = result.structured_data or {}
+            structured_content = structured.get("structuredContent") or {}
+            result_metadata = structured_content.get("metadata") or {}
+            attempted_collections = result_metadata.get("collections")
+            if not attempted_collections:
+                single = result_metadata.get("collection")
+                attempted_collections = [single] if single else []
+            # "查过哪些库"（attempted_collections，不管有没有查到东西，_generate_node
+            # 用来在"知识库里确实没有"这句话里报出具体库名）和"哪些库真的查到了
+            # 有用内容"（collections，isEmpty/result_count=0 时清空，UI 来源角标
+            # 只认这个）是两件事，都要留着，缺一个都不够 _generate_node 组装
+            # "抱歉模板"用。
+            collections = [] if (structured_content.get("isEmpty") or not result_metadata.get("result_count")) else attempted_collections
             tool_execution_trace.append({
                 "tool_name": name,
                 "args": args,
@@ -161,6 +218,8 @@ def build_tool_subgraph(
                 "success": result.success,
                 "iteration": state.get("iteration_count", 0),
                 "timestamp": time.time(),
+                "collections": collections,
+                "attempted_collections": attempted_collections,
             })
             
             if not result.success:
@@ -179,7 +238,6 @@ def build_tool_subgraph(
     async def summarize_node(state: ToolSubgraphState) -> Dict[str, Any]:
         """将多轮工具执行结果整理为结构化摘要。"""
         tool_results = state.get("tool_results", [])
-        query = state["query"]
         failed_tools = state.get("failed_tools", [])
         
         # 如果没有任何工具结果（如 LLM 直接 finish），返回空摘要
@@ -203,17 +261,20 @@ def build_tool_subgraph(
                 "tool_execution_trace": state.get("tool_execution_trace", []),
             }
 
-        # 使用 LLM 整理摘要（如果可用）
-        if llm is not None:
-            summary_prompt = _build_summary_prompt(query, tool_results, failed_tools)
-            try:
-                response = await llm.ainvoke([HumanMessage(content=summary_prompt)])
-                summary = response.content.strip()
-            except Exception as e:
-                summary = _build_fallback_summary(tool_results, failed_tools)
-        else:
-            summary = _build_fallback_summary(tool_results, failed_tools)
-        
+        # 不再单独用 LLM 总结工具结果——这一步原来是"总结" + 后面 generate 节点
+        # 再"基于总结生成回答"两次串行 LLM 往返，实测这一步单独就要 7 秒多。
+        # generate 节点本来就是一次 LLM 调用，本来就在"综合信息、组织语言"，
+        # 直接把工具原始结果（用户建议的做法，见下面 _build_fallback_summary
+        # 已经做好的按工具分段 + 每条截 800 字的格式化）交给它一次做完，不需要
+        # 先经过另一次 LLM 改写成"摘要"再改写成"回答"——多数 RAG 系统检索后
+        # 也是直接把原始片段交给生成模型，不会先摘要一遍。ACL 拒绝分支（上面）
+        # 原样透传不受影响；如果以后发现 generate 面对未摘要的原始结果质量
+        # 下降（比如多个工具结果、内容很长时），再考虑恢复这一步或者调整
+        # generate 的 prompt，不要重新加回一次独立的 LLM 摘要调用。
+        _trace("tool_subgraph", "summarize", "running", {"tool_result_count": len(tool_results)})
+        summary = _build_fallback_summary(tool_results, failed_tools)
+        _trace("tool_subgraph", "summarize", "success", {"summary_length": len(summary)})
+
         return {
             "tool_summary": summary,
             "tool_execution_trace": state.get("tool_execution_trace", []),
@@ -235,9 +296,54 @@ def build_tool_subgraph(
         lambda state: "summarize" if state.get("iteration_count", 0) >= state.get("max_iterations", max_iterations) else state.get("next_node", "summarize"),
         {"tool": "tool", "summarize": "summarize"}
     )
-    graph.add_edge("tool", "think")  # 循环回到 think
+    def _route_after_tool(state: ToolSubgraphState) -> str:
+        """工具执行完之后，要不要再问模型一次"接下来怎么办"，还是直接进
+        summarize——原来无条件回 think，实测这一轮 LLM 往返在"查一次知识库/
+        考勤就够了"这种最常见的场景里，模型 100 次里 99 次都是回答 finish，
+        白白多等几秒。
+
+        只在满足下面全部条件时才跳过这轮确认，缩小到最没有歧义的场景，工具
+        链式调用（先查 A 再拿 A 的结果去查 B）一律不碰，交给模型自己判断：
+        1. 主图（意图分类）已经指定了唯一的目标工具（target_tool）——说明
+           这本来就是"查一个东西"的单步意图，不是模型自己在探索该用哪个/
+           要不要链式调用别的工具。
+        2. 这一轮只调了一个工具，且正是这个目标工具——没有并列调用多个工具，
+           没有跑偏调别的工具。
+        3. 这个工具调用成功了——失败了必须让模型看到错误信息自己决定要不要
+           换一种方式重试，不能替它做主直接收尾。
+        """
+        if state.get("iteration_count", 0) >= state.get("max_iterations", max_iterations):
+            return "summarize"
+
+        target_tool = state.get("target_tool")
+        tool_calls = state.get("tool_calls") or []
+        tool_results = state.get("tool_results") or []
+
+        if (
+            target_tool
+            and len(tool_calls) == 1
+            and tool_calls[0].get("name") == target_tool
+            and tool_results
+            and tool_results[-1].get("name") == target_tool
+            and tool_results[-1].get("success")
+        ):
+            # 不在这里调 _trace：LangGraph 对同步的条件边路由函数走的是线程池
+            # execute（跟其他节点的 async def 不一样），这个函数体运行时没有
+            # 当前线程的 event loop，_trace 内部的 asyncio.create_task 会直接
+            # 抛 RuntimeError: no running event loop，整条请求都会跟着崩掉
+            # （已经实测踩过一次）。跳过与否从 trace 时间线上"tool 之后有没有
+            # 紧跟着一次 think[N]"就能看出来，不额外埋点也不影响可观测性。
+            return "summarize"
+
+        return "think"
+
+    graph.add_conditional_edges(
+        "tool",
+        _route_after_tool,
+        {"think": "think", "summarize": "summarize"},
+    )
     graph.add_edge("summarize", END)
-    
+
     return graph.compile()
 
 
@@ -296,39 +402,6 @@ def _build_system_prompt(
   "tool_calls": [{{"name": "工具名", "arguments": {{"参数名": "参数值"}}}}],
   "reasoning": "决策理由"
 }}"""
-
-
-def _build_summary_prompt(
-    query: str,
-    tool_results: List[Dict[str, Any]],
-    failed_tools: List[str],
-) -> str:
-    """构建 summarize_node 的提示。"""
-    results_text = ""
-    for i, r in enumerate(tool_results, 1):
-        status = "✅ 成功" if r.get("success") else "❌ 失败"
-        results_text += f"\n[{i}] 工具: {r['name']}\n"
-        results_text += f"    状态: {status}\n"
-        results_text += f"    结果: {r.get('output', '')[:500]}\n"
-        if r.get("error"):
-            results_text += f"    错误: {r['error']}\n"
-    
-    failed_text = ""
-    if failed_tools:
-        failed_text = f"\n\n执行失败的工具: {', '.join(failed_tools)}"
-    
-    return f"""请将以下工具执行结果整理为结构化的摘要，供主智能体生成最终回答使用。
-
-原始查询：{query}
-
-工具执行结果：
-{results_text}{failed_text}
-
-摘要要求：
-1. 简明扼要，突出关键信息
-2. 标注数据来源（工具名）
-3. 如果工具失败，说明失败原因
-4. 使用 Markdown 格式"""
 
 
 def _build_fallback_summary(

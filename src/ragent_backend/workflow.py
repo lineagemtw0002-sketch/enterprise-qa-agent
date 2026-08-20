@@ -99,12 +99,25 @@ class RAGWorkflow:
 
         # 添加工具子图节点（子图编译后作为一个节点）
         if self._llm is not None:
-            tool_subgraph = build_tool_subgraph(
+            self._tool_subgraph = build_tool_subgraph(
                 tool_registry=self._tool_registry,
                 llm=self._llm,
                 max_iterations=5,
+                # think/tool/summarize 每一步的起止都推给 TracePanel（见
+                # subgraph.py build_tool_subgraph 的 emit_trace 参数说明）——
+                # self._emit_trace 是绑定方法，子图虽然在这里（构造期）只编译
+                # 一次，但每次调用时读的是当次请求实时设置的 self._trace_queue，
+                # 不会把某一次请求的队列锁死进闭包里，多个并发请求互不串。
+                emit_trace=self._emit_trace,
             )
-            graph.add_node("tool_subgraph", tool_subgraph)
+            # 不直接把编译后的子图注册成节点——子图内部（think_node/tool_node/
+            # summarize_node，见 src/tool_agent/subgraph.py）原来完全没有埋点，
+            # TracePanel 只能看到它前面的"意图解析"和后面的"最终生成"，中间这段（通常是全链路
+            # 最长的一段：ReAct 决策 + 实际检索/工具调用，可能好几轮）在前端一直
+            # 显示成"待处理"，看起来像是卡在意图解析或者凭空消失了十几秒。这里用一层
+            # 薄包装补上子图整体的 start/end 埋点（不改子图内部逻辑），至少能在
+            # TracePanel 上看到"工具调用"这一步真实的起止时间和耗时。
+            graph.add_node("tool_subgraph", self._tool_subgraph_node)
 
         # 添加边
         graph.add_edge(START, "session")
@@ -149,6 +162,22 @@ class RAGWorkflow:
             if self._llm is None:
                 return "retrieve"
             return "tool_subgraph"
+        if intent_type == "clarify":
+            # 走到这里说明上面 need_clarify 那道拦截没触发（need_clarify=False），
+            # 即分类器自己也不确定、输出了自相矛盾的结果——这不是"真的要澄清"，
+            # 是分类失败。原来无差别 fall through 到最下面的 return "retrieve"，
+            # 隐含假设是"当分类器判不准，八成是在问自己上传的文件"，但两次真实
+            # 复现（"入职第一天怎么办""收到钓鱼邮件应该怎么处理"）都是明显该查
+            # 企业知识库的问题，retrieve 只查这次对话自己上传的附件（多数场景
+            # 压根没传过文件），查到 0 条后 generate 会在没有任何检索依据的情况
+            # 下凭自己的训练知识编一段看似合理的通用回答——用户完全看不出这不是
+            # 知识库查出来的。分类器判不准时，交给工具子图，让它按可用工具列表
+            # （包含 query_knowledge_hub）自己再判断一次要不要查企业知识库，是
+            # 更安全的默认；真正该走"针对自己上传文件提问"的场景，用户措辞通常
+            # 会明确提到"这份文档""我上传的"，分类器对这类表述判得比较准，不容易
+            # 踩进这个自相矛盾的分支。
+            if self._llm is not None:
+                return "tool_subgraph"
         return "retrieve"
 
     def _emit_trace(
@@ -307,6 +336,18 @@ class RAGWorkflow:
         state.setdefault("memories", [])
         # 每轮都生成新的 turn_id，用于后续三层时间裁剪回滚
         state["current_turn_id"] = str(uuid.uuid4())
+
+        # 每轮清空上一轮遗留的工具执行轨迹——tool_execution_trace 是普通字段
+        # （没有 Annotated 累加 reducer），会被 checkpointer 原样带到下一轮；
+        # tool_subgraph 的 tool_node 是"读出来再 append"（见 subgraph.py
+        # tool_node），如果这里不清空，本轮之前任何一轮（甚至是很久以前，
+        # 比如企业知识库委托连接器还没配好时打到 "default" 库、或者委托模式
+        # 打到 tenant_*_kb 的那次）残留的调用记录会一直留在这里，被
+        # _generate_node 的 kb_sources（本轮"来源知识库"角标，见该节点的
+        # 说明）当成"这轮也查了这个库"一并渲染出来——用户这一轮问题明明只命中
+        # 了一个部门知识库，角标却会多出好几个跟本轮回答毫无关系的库。
+        state["tool_execution_trace"] = []
+        state["tool_summary"] = ""
         
         # 召回长期记忆（跨会话认知连续）
         if self._ltm_store and state.get("user_id"):
@@ -376,6 +417,14 @@ class RAGWorkflow:
             # 不能假设前端传来的值一定合法，忽略 hint，退回下面的正常分类兜底
 
         # 单次结构化调用：重写 + 拆分
+        #
+        # 这里本来想合并成一次 LLM 调用（省一次往返，见 intent.py 里还留着的
+        # analyze_and_route()），线上验证发现合并后本地小模型（qwen2.5:7b）
+        # 分类质量明显变差——"新员工入职怎么办"这类问题，两次独立调用稳定判成
+        # "tool"（查知识库），合并成一次调用后 3/3 次全部误判成 "clarify"（还
+        # 反而更自信，confidence=1.0），调整过 prompt 措辞也没能纠正。省下来的
+        # 几秒钟不值得拿分类准确率去换，所以保留两次调用，analyze_and_route()
+        # 留在 intent.py 里不接线，后续想再尝试合并可以从那份代码继续。
         self._emit_trace("intent", "query_rewrite", "running", {"original_query": query})
         try:
             analysis = await analyze_query(
@@ -419,7 +468,9 @@ class RAGWorkflow:
             "workflow_type": intent.workflow_type,
         })
 
-        # 如果 intent_type=tool/workflow，以 detect_intent 的结果为准（可能覆盖 analyze_query 的 sub_queries）
+        # 如果 intent_type=tool/workflow/clarify，收窄成单一 query，不用 LLM 拆出来的
+        # sub_queries 列表——工具调用/工作流表单填写/澄清追问都是针对这一整句原始
+        # 意图操作，拆分出的并列子查询在这三种分支里没有意义（只对 rag 检索有用）。
         if intent.intent_type == "tool":
             sub_queries = [intent.rewritten_query]
             self._emit_trace("intent", "tool_intent", "running", {
@@ -478,6 +529,20 @@ class RAGWorkflow:
             "sub_query_count": len(sub_queries),
         })
         return update
+
+    async def _tool_subgraph_node(self, state: RAGState) -> Any:
+        """`self._tool_subgraph`（ReAct 工具子图：think → tool → summarize，最多
+        5 轮）的埋点包装——子图内部节点不产生任何 `_emit_trace` 事件，直接把编译
+        后的子图注册成主图节点会导致 TracePanel 上"工具调用"这一步全程显示成
+        "待处理"，看不出它什么时候开始、跑了多久，实际耗时全部无声地发生在这
+        两条 trace 之间（见 `_build_graph` 里改用这个包装方法的说明）。"""
+        self._emit_trace("tool_subgraph", "node_start", "running")
+        result = await self._tool_subgraph.ainvoke(state)
+        self._emit_trace("tool_subgraph", "node_end", "success", {
+            "target_tool": state.get("target_tool"),
+            "iteration_count": result.get("iteration_count") if isinstance(result, dict) else None,
+        })
+        return result
 
     async def _clarify_node(self, state: RAGState) -> Dict[str, Any]:
         """澄清节点：当意图为 clarify 时，生成澄清提示并准备进入 generate。"""
@@ -911,6 +976,19 @@ class RAGWorkflow:
         """生成回复节点（支持内部流式输出）"""
         self._emit_trace("generate", "node_start", "running")
 
+        # 这轮回答实际用到了哪些知识库——从 tool_subgraph 留下的
+        # tool_execution_trace 里挑 query_knowledge_hub 且真的查到结果的那几条
+        # （result.structured_data.get("collection")，见 subgraph.py tool_node
+        # 旁的说明），去重后给前端渲染"来源知识库"角标用。检索失败/ACL 拒绝的
+        # 那次调用不会有 collection（MCPToolResponse._build_metadata 只在有
+        # collection 参数时才写入，空结果/拒绝走的是另一个分支），不会误标。
+        kb_sources = sorted({
+            c
+            for t in state.get("tool_execution_trace", [])
+            if t.get("tool_name") == "query_knowledge_hub"
+            for c in (t.get("collections") or [])
+        })
+
         # ACL 拒绝的提示必须原样透传给用户，不能再交给 LLM"基于工具结果生成回答"——
         # 那一步的 prompt 措辞（"请给出准确、有用的回答"）会诱导本地模型把明确的拒绝
         # 重新包装成一段编造的正面回答，用户完全看不出自己被权限挡住了。这里直接跳过
@@ -925,6 +1003,7 @@ class RAGWorkflow:
                 "messages": [assistant_message],
                 "final_answer": tool_summary,
                 "used_model": "n/a (access denied, no LLM call)",
+                "kb_sources": kb_sources,
                 "trace_events": [
                     *state.get("trace_events", []),
                     {"node": "generate", "ts": time.time(), "model": "n/a"}
@@ -964,6 +1043,7 @@ class RAGWorkflow:
             "messages": [assistant_message],  # add_messages 会追加
             "final_answer": answer,
             "used_model": model_name,
+            "kb_sources": kb_sources,
             "trace_events": [
                 *state.get("trace_events", []),
                 {"node": "generate", "ts": time.time(), "model": model_name}
@@ -972,10 +1052,10 @@ class RAGWorkflow:
 
     def _build_prompt(self, state: RAGState) -> str:
         """构建生成 prompt"""
-        
+
         # 格式化最近对话历史（仅用于展示，实际 history 通过 messages 传递）
         recent_history = self._format_recent_messages(state.get("messages", []))
-        
+
         # 判断是否有工具执行结果需要注入
         tool_summary = state.get("tool_summary", "")
         tool_section = ""
@@ -984,7 +1064,60 @@ class RAGWorkflow:
 【工具执行结果】
 {tool_summary}
 """
-        
+
+        # 意图分类判定这是该查公司知识库的问题（target_tool=query_knowledge_hub），
+        # 但最终没能拿到任何有用的知识库内容时，明确要求 LLM 用固定模板告知
+        # 用户——不能像之前那样，不管有没有查到、查没查过，都照样生成一段看起来
+        # 像是"查出来的"通用建议（真实踩过的坑：VPN/钓鱼邮件那两次复现，见调试
+        # 记录）。这里没查到有用内容分两种情况，都要覆盖：
+        # 1. 真的查了但没查到相关的（attempted_collections 非空、collections
+        #    空，两个字段的区别见 subgraph.py tool_node 旁的说明）——能报出
+        #    具体查了哪几个知识库。
+        # 2. 工具子图的 think 节点自己判断"这个问题不像是知识库能答的"，压根
+        #    没调用 query_knowledge_hub（tool_execution_trace 里连一条
+        #    query_knowledge_hub 记录都没有）——报不出具体查了哪个库，只能
+        #    笼统说"公司知识库"。
+        # 只处理 query_knowledge_hub 这一个工具，_retrieve_node（用户自己上传
+        # 文件的 rag 分支）不在这个模板范围内，两者语义不同，不能共用一套措辞。
+        empty_kb_notice = ""
+        if state.get("target_tool") == "query_knowledge_hub":
+            kb_trace_entries = [
+                t for t in state.get("tool_execution_trace", [])
+                if t.get("tool_name") == "query_knowledge_hub"
+            ]
+            attempted = sorted({c for t in kb_trace_entries for c in (t.get("attempted_collections") or [])})
+            hit = sorted({c for t in kb_trace_entries for c in (t.get("collections") or [])})
+            if not hit:
+                if attempted:
+                    from src.mcp_server.tools.query_knowledge_hub import DEPARTMENT_KB_COLLECTIONS
+
+                    def _kb_label(c: str) -> str:
+                        if c in DEPARTMENT_KB_COLLECTIONS:
+                            return DEPARTMENT_KB_COLLECTIONS[c]
+                        # 委托模式（tenant_{org_id}_kb[:子库标签]）——原始 slug 带着
+                        # 企业的 org_id（一串 UUID），直接展示会很生硬，退回跟前端
+                        # kbMeta() 一致的"本企业知识库"泛称（见 TopNav.jsx）。
+                        if c.startswith("tenant_") and "_kb" in c:
+                            sub_label = c.split(":", 1)[1] if ":" in c else ""
+                            return f"本企业知识库 · {sub_label}" if sub_label else "本企业知识库"
+                        return c
+
+                    labels = [_kb_label(c) for c in attempted]
+                    labels_text = "、".join(f"【{label}】" for label in labels)
+                else:
+                    # 工具压根没被调用，报不出具体库名，用泛称
+                    labels_text = "【公司知识库】"
+                original_query = state.get("query", "")
+                empty_kb_notice = f"""
+【重要】公司知识库（{labels_text}）里没有查到跟用户问题直接相关的内容。你的回答必须
+严格按下面的格式组织，不能把接下来给的通用建议包装成"知识库里查到的"内容：
+1. 第一句明确说："抱歉，在公司内部{labels_text}中未找到关于"{original_query}"的直接相关内容。"
+2. 空一行，另起一段以"🔍 基于行业通用经验，您可以尝试以下方向："开头，给 2-3 条通用性建议
+   （只给业界通用的常识性做法，不要编造具体的公司制度、流程、联系方式或网址）。
+3. 这两部分之间不要出现"根据检索结果""知识库显示""公司规定"之类暗示这是公司内部
+   资料的措辞——用户必须能一眼看出第二部分是你自己的通用知识，不是公司知识库内容。
+"""
+
         prompt = ChatPromptTemplate.from_template("""你是企业级知识库助手，基于检索结果、工具执行结果、对话历史和用户长期记忆回答用户问题。
 
 【用户长期记忆】
@@ -996,13 +1129,17 @@ class RAGWorkflow:
 【最近对话】
 {recent_history}
 {tool_section}
+{empty_kb_notice}
 【检索上下文】
 {context}
 
 【用户问题】
 {query}
 
-请给出准确、有用的回答：""")
+请给出准确、有用的回答。如果回答内容是结构化/规则化的多条记录（比如考勤打卡记录、
+多天/多个对象的数据罗列，每条记录字段相同），用 Markdown 表格呈现，不要写成
+一条条并列的自然语言句子；只有一两条零散信息、或者内容本身不是表格结构时，
+照常用普通文字或列表回答，不要为了用表格而硬凑表格：""")
 
         memories_text = "\n".join(f"- {m}" for m in state.get("memories", [])) or "无"
         return prompt.format(
@@ -1010,6 +1147,7 @@ class RAGWorkflow:
             summary=state.get("summary", ""),
             recent_history=recent_history,
             tool_section=tool_section,
+            empty_kb_notice=empty_kb_notice,
             context=state.get("retrieval_context", ""),
             query=state.get("query", ""),
         )

@@ -1,11 +1,14 @@
 import { useEffect, useState } from 'react'
-import { Table, Button, Modal, Input, Checkbox, Tag, Space, Popconfirm, message, Empty } from 'antd'
-import { Plus, Database, Pencil, Trash2 } from 'lucide-react'
+import { Table, Button, Modal, Input, Tag, Space, Popconfirm, message, Empty } from 'antd'
+import { Plus, Pencil, Trash2 } from 'lucide-react'
 import * as adminApi from '../../api/admin.js'
 
+// 平台运营方不管理任何企业的知识库内容（跟 UserRoleAssignment.jsx"可访问
+// 知识库"列同一个结论），所以这个页面只管角色目录本身（建/改名/删），不出现
+// 知识库的选择和展示——"给角色配知识库"是企业管理员在自己的「知识库权限」
+// 页面（CompanyKbPermissions.jsx）做的事，两边职责不重叠。
 export default function RoleManagement() {
   const [roles, setRoles] = useState([])
-  const [collections, setCollections] = useState([])
   const [loading, setLoading] = useState(false)
 
   const [createVisible, setCreateVisible] = useState(false)
@@ -17,20 +20,16 @@ export default function RoleManagement() {
   const [renameValue, setRenameValue] = useState('')
   const [renameLoading, setRenameLoading] = useState(false)
 
-  const [collectionsVisible, setCollectionsVisible] = useState(false)
-  const [collectionsTarget, setCollectionsTarget] = useState(null)
-  const [selectedCollections, setSelectedCollections] = useState([])
-  const [collectionsLoading, setCollectionsLoading] = useState(false)
-
   async function loadAll() {
     setLoading(true)
     try {
-      const [roleList, collectionList] = await Promise.all([
-        adminApi.listRoles(),
-        adminApi.listCollections(),
-      ])
-      setRoles(roleList)
-      setCollections(collectionList)
+      const roleList = await adminApi.listRoles()
+      // "全部知识库"（内部标识 all_kb）不是一个真正的角色——它是老数据模型
+      // 迁移时为了把 allowed_collections=["*"] 的用户接到新角色表上，临时
+      // 造的一个系统角色壳子（见 scripts/migrate_to_roles.py），本质是
+      // "知识库通配符权限"，不是一个有身份含义的角色，不该跟 IT部/法务部
+      // 这类真正的角色混在一张表里管理。
+      setRoles(roleList.filter((r) => r.name !== 'all_kb'))
     } catch (error) {
       message.error('加载角色列表失败: ' + (error.response?.data?.detail || error.message))
     } finally {
@@ -87,26 +86,6 @@ export default function RoleManagement() {
     }
   }
 
-  function openCollections(role) {
-    setCollectionsTarget(role)
-    setSelectedCollections(role.collection_names || [])
-    setCollectionsVisible(true)
-  }
-
-  async function submitCollections() {
-    setCollectionsLoading(true)
-    try {
-      await adminApi.setRoleCollections(collectionsTarget.role_id, selectedCollections)
-      message.success('知识库权限已保存')
-      setCollectionsVisible(false)
-      await loadAll()
-    } catch (error) {
-      message.error('保存失败: ' + (error.response?.data?.detail || error.message))
-    } finally {
-      setCollectionsLoading(false)
-    }
-  }
-
   async function handleDelete(role) {
     try {
       await adminApi.deleteRole(role.role_id)
@@ -131,33 +110,15 @@ export default function RoleManagement() {
     },
     { title: '内部标识', dataIndex: 'name', key: 'name', render: (t) => <code>{t}</code> },
     {
-      title: '关联知识库',
-      dataIndex: 'collection_names',
-      key: 'collection_names',
-      render: (names) =>
-        names && names.length ? (
-          names.includes('*') ? (
-            <Tag color="purple">不限</Tag>
-          ) : (
-            <Space size={[0, 4]} wrap>
-              {names.map((n) => <Tag key={n}>{n}</Tag>)}
-            </Space>
-          )
-        ) : (
-          <span style={{ color: 'var(--text-tertiary, #999)' }}>未配置</span>
-        ),
-    },
-    {
       title: '操作',
       key: 'actions',
-      width: 220,
+      width: 180,
       render: (_, role) => (
         <Space>
           <Button size="small" icon={<Pencil size={14} />} onClick={() => openRename(role)}>重命名</Button>
-          <Button size="small" icon={<Database size={14} />} onClick={() => openCollections(role)}>配置知识库</Button>
           <Popconfirm
             title="删除角色"
-            description="删除后，绑定该角色的用户将立刻失去其关联的知识库访问权限，此操作不可逆。"
+            description="删除后，绑定该角色的用户会立刻失去这个角色，此操作不可逆。"
             okText="确认删除"
             cancelText="取消"
             okButtonProps={{ danger: true }}
@@ -175,7 +136,7 @@ export default function RoleManagement() {
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
         <p style={{ margin: 0, color: 'var(--text-tertiary, #888)' }}>
-          角色是知识库授权的分组单元：给角色配知识库，再把角色分配给用户，用户能访问的知识库是他所有角色的并集。
+          角色目录：新建/重命名/删除角色。角色关联哪些知识库，由各企业的企业管理员在自己的「知识库权限」页面配置，平台不管理知识库内容。
         </p>
         <Button type="primary" icon={<Plus size={16} />} onClick={openCreate}>新建角色</Button>
       </div>
@@ -228,27 +189,6 @@ export default function RoleManagement() {
         cancelText="取消"
       >
         <Input value={renameValue} onChange={(e) => setRenameValue(e.target.value)} />
-      </Modal>
-
-      <Modal
-        title={`配置知识库 · ${collectionsTarget?.display_name || ''}`}
-        open={collectionsVisible}
-        onCancel={() => setCollectionsVisible(false)}
-        onOk={submitCollections}
-        confirmLoading={collectionsLoading}
-        okText="保存"
-        cancelText="取消"
-      >
-        {collections.length === 0 ? (
-          <Empty description="暂无可用知识库" />
-        ) : (
-          <Checkbox.Group
-            style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
-            value={selectedCollections}
-            onChange={setSelectedCollections}
-            options={collections.map((c) => ({ label: c, value: c }))}
-          />
-        )}
       </Modal>
     </div>
   )

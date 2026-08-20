@@ -166,6 +166,19 @@ class SetRoleCollectionsRequest(BaseModel):
     collection_names: List[str] = Field(default_factory=list)
 
 
+# ============== 企业自建知识库 API（仅 org_admin，见 collection_store.py） ==============
+
+class CollectionResponse(BaseModel):
+    collection_name: str
+    display_name: str
+    created_at: float
+
+
+class CreateCollectionRequest(BaseModel):
+    collection_name: str = Field(..., min_length=1, max_length=64)
+    display_name: str = Field(..., min_length=1, max_length=128)
+
+
 class SetUserRolesRequest(BaseModel):
     role_ids: List[str] = Field(default_factory=list)
 
@@ -186,6 +199,7 @@ class ChatResponse(BaseModel):
     answer: str
     model_id: str
     active_workflow: Optional[ActiveWorkflowSummary] = None
+    kb_sources: List[str] = Field(default_factory=list)
 
 
 class RollbackRequest(BaseModel):
@@ -362,6 +376,7 @@ class RAGState(TypedDict, total=False):
     # === 生成结果 ===
     final_answer: str
     used_model: str
+    kb_sources: List[str]  # 本轮回答实际用到的知识库 collection 名（去重），UI 来源角标用
     
     # === 长期记忆（跨会话认知连续）===
     memories: List[str]

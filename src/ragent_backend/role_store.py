@@ -301,7 +301,19 @@ class RoleStore:
         return [row["user_id"] for row in rows]
 
     async def get_allowed_collections_for_user(self, user_id: str) -> List[str]:
-        """并集去重；任一角色关联了通配符 "*"，直接返回 ["*"]。"""
+        """并集去重；任一角色关联了通配符 "*"，直接返回 ["*"]。
+
+        持有 org_admin 角色的用户也视为通配符——企业管理员管理"本企业员工能看
+        哪些知识库"（CompanyKbPermissions.jsx），但 org_admin 这个系统角色本身
+        从来不会被塞进 role_collections（它不是一个"部门角色"，前端"用户与角色
+        分配"页面的假设一直是"企业管理员=企业内全部知识库"，见 UserRoleAssignment.jsx
+        对应注释）；不加这条特判的话，一个只有 org_admin、没有额外部门角色的
+        企业管理员自己提问会被 query_knowledge_hub 判定成"没有任何可访问部门库"
+        直接拒绝——跟前端展示的"企业内全部知识库"自相矛盾。这里的"*"最终会在
+        query_knowledge_hub.py 里被收窄成"这家企业自己名下的 collection"（不是
+        字面意义的"全平台任何 collection"），所以不会导致企业管理员看到别的
+        企业的知识库内容。
+        """
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
@@ -313,10 +325,65 @@ class RoleStore:
                 """,
                 user_id,
             )
+            role_name_rows = await conn.fetch(
+                """
+                SELECT r.name
+                FROM roles r
+                JOIN user_roles ur ON ur.role_id = r.id
+                WHERE ur.user_id = $1
+                """,
+                user_id,
+            )
+        if ROLE_ORG_ADMIN in {row["name"] for row in role_name_rows}:
+            return [_WILDCARD]
         collection_names = [row["collection_name"] for row in rows]
         if _WILDCARD in collection_names:
             return [_WILDCARD]
         return collection_names
+
+    async def list_roles_used_by_org(self, org_id: str) -> List[RoleWithCollections]:
+        """企业管理员「知识库权限」轻量页面专用：只返回本企业员工实际持有的
+        非系统角色（部门角色），配合 `set_role_collections` 让企业管理员勾选/
+        取消关联的知识库。
+
+        `roles` 表本身没有 org_id（角色是全平台共享的词表，这是刻意的轻量方案，
+        不做按企业隔离角色表的 schema 迁移），所以这里用"是否被本企业员工持有"
+        代替"归属哪家企业"——是唯一不需要动 schema 就能让企业管理员管不到别的
+        企业角色的判定方式，调用方（app.py `admin_set_role_collections`）用同一个
+        方法的返回集合做写权限校验，标准要统一。系统角色（super_admin/admin/
+        org_admin/user/以及迁移遗留的 all_kb）恒被排除，企业管理员不该看到也
+        不该改这几个。
+        """
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            role_rows = await conn.fetch(
+                """
+                SELECT DISTINCT r.id, r.name, r.display_name, r.is_system, r.created_at
+                FROM roles r
+                JOIN user_roles ur ON ur.role_id = r.id
+                JOIN users u ON u.id = ur.user_id
+                WHERE u.org_id = $1 AND r.is_system = FALSE
+                ORDER BY r.created_at ASC
+                """,
+                org_id,
+            )
+            collection_rows = await conn.fetch("SELECT role_id, collection_name FROM role_collections")
+
+        collections_by_role: dict[str, List[str]] = {}
+        for row in collection_rows:
+            collections_by_role.setdefault(row["role_id"], []).append(row["collection_name"])
+
+        return [
+            RoleWithCollections(
+                role_id=row["id"],
+                name=row["name"],
+                display_name=row["display_name"],
+                is_system=row["is_system"],
+                created_at=row["created_at"],
+                collection_names=sorted(collections_by_role.get(row["id"], [])),
+            )
+            for row in role_rows
+        ]
 
     async def list_all_collection_names_from_roles(self) -> List[str]:
         """管理界面用：所有角色曾经关联过的 collection 名去重列表（不含通配符）。"""

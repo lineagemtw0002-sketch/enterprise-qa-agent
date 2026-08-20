@@ -554,8 +554,30 @@
   color: white;
 }
 
+.avatar.assistant {
+  background: #eaf5f2;
+  border-color: #cfe8e2;
+}
+
 .message-content-wrapper {
+  position: relative;
   max-width: calc(100% - 56px);
+}
+
+/* 知识库来源角标：贴在回复内容框右上角，标注这条回复检索自哪个知识库 */
+.message-kb-badge {
+  position: absolute;
+  top: -10px;
+  right: 10px;
+  z-index: 1;
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.message-kb-badge .tag--kb {
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
 }
 
 .message-content {
@@ -829,6 +851,97 @@
   color: #1f2937;
 }
 
+.message-content pre code {
+  background: none;
+  color: inherit;
+  padding: 0;
+}
+
+/* Markdown 结构元素——换成真正的 GFM 解析器之后（见 App.jsx renderMarkdown）
+   标题/列表/表格/引用/链接才真的是 HTML 元素而不是原样吐出来的符号，这里补
+   上对应样式。段落间距用 margin 不用 <br>，marked 自己处理换行（breaks:true）。*/
+.message-content p {
+  margin: 0 0 10px;
+}
+.message-content p:last-child {
+  margin-bottom: 0;
+}
+
+.message-content h1, .message-content h2, .message-content h3, .message-content h4 {
+  margin: 18px 0 8px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+.message-content h1:first-child, .message-content h2:first-child,
+.message-content h3:first-child, .message-content h4:first-child {
+  margin-top: 0;
+}
+.message-content h1 { font-size: 18px; }
+.message-content h2 { font-size: 16.5px; }
+.message-content h3 { font-size: 15px; }
+.message-content h4 { font-size: 14.5px; }
+
+.message-content ul, .message-content ol {
+  margin: 8px 0;
+  padding-left: 22px;
+}
+.message-content li {
+  margin: 4px 0;
+}
+.message-content li > p {
+  margin: 0;
+}
+
+.message-content blockquote {
+  margin: 10px 0;
+  padding: 4px 14px;
+  border-left: 3px solid var(--border-color);
+  color: var(--text-secondary);
+}
+
+.message-content a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.message-content hr {
+  border: none;
+  border-top: 1px solid var(--border-color);
+  margin: 14px 0;
+}
+
+/* 规则化数据（考勤记录这类）用表格呈现，这里给一个干净、克制的表格样式；
+   外面套一层 overflow-x: auto，列多的表格在窄的聊天气泡里能横向滚动，
+   不会把整个页面撑宽（讲道理不应该发生，但保险起见跟别处宽内容容器一个
+   处理方式）。*/
+.message-content-wrapper .message-content {
+  overflow-x: auto;
+}
+
+.message-content table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0;
+  font-size: 13.5px;
+}
+
+.message-content th, .message-content td {
+  border: 1px solid var(--border-color);
+  padding: 6px 12px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.message-content th {
+  background: var(--bg-subtle);
+  font-weight: 600;
+}
+
+.message-content tr:nth-child(even) td {
+  background: color-mix(in srgb, var(--bg-subtle) 45%, transparent);
+}
+
 /* 侧边追踪面板 */
 .trace-sidebar {
   width: 360px;
@@ -1078,6 +1191,27 @@
 
 .login-input-wrap input::placeholder {
   color: var(--text-tertiary);
+}
+
+.login-input-reveal-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  padding: 4px;
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  border-radius: 4px;
+  /* 按住看密码是瞬时交互，选中态高亮/文字选区会让手感很奇怪 */
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+
+.login-input-reveal-btn:hover {
+  color: var(--text-primary);
 }
 
 .login-submit-btn {

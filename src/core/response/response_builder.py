@@ -154,7 +154,7 @@ class ResponseBuilder:
         self,
         results: List[RetrievalResult],
         query: str,
-        collection: Optional[str] = None,
+        collection: Optional[Any] = None,
         include_images: bool = True,
     ) -> MCPToolResponse:
         """Build MCP response from retrieval results.
@@ -184,7 +184,12 @@ class ResponseBuilder:
         # Assemble image content if enabled
         image_contents: List[types.ImageContent] = []
         if self.enable_multimodal and include_images:
-            image_blocks = self.multimodal_assembler.assemble(results, collection)
+            # multimodal_assembler 按单个 collection 名解析图片文件路径，"全库
+            # 混合召回"传进来的是多个 collection 合并召回后的列表——这种跨库
+            # 场景下没法用一个路径前缀覆盖所有来源，直接不解析图片（当前这几个
+            # 部门知识库都是纯文本，不影响现状；单 collection 调用不受影响）。
+            assemble_collection = collection if isinstance(collection, str) else None
+            image_blocks = self.multimodal_assembler.assemble(results, assemble_collection)
             # Filter to only ImageContent blocks
             image_contents = [
                 block for block in image_blocks
@@ -205,22 +210,27 @@ class ResponseBuilder:
     def _build_empty_response(
         self,
         query: str,
-        collection: Optional[str] = None,
+        collection: Optional[Any] = None,
     ) -> MCPToolResponse:
         """Build response for empty results.
-        
+
         Args:
             query: Original user query.
-            collection: Optional collection name.
-            
+            collection: Optional collection name, or a list of collection names
+                that were searched (all came back empty) — see the "全库混合
+                召回" path in query_knowledge_hub.py.
+
         Returns:
             MCPToolResponse indicating no results found.
         """
         content = f"## 未找到相关结果\n\n"
         content += f"查询: **{query}**\n\n"
-        
-        if collection:
-            content += f"在集合 `{collection}` 中未找到与查询相关的文档。\n\n"
+
+        collection_names = (
+            list(collection) if isinstance(collection, (list, tuple, set)) else ([collection] if collection else [])
+        )
+        if collection_names:
+            content += f"在集合 `{'`、`'.join(collection_names)}` 中未找到与查询相关的文档。\n\n"
         else:
             content += "未找到与查询相关的文档。\n\n"
         
@@ -298,23 +308,35 @@ class ResponseBuilder:
     def _build_metadata(
         self,
         query: str,
-        collection: Optional[str],
+        collection: Optional[Any],
         result_count: int,
     ) -> Dict[str, Any]:
         """Build response metadata.
-        
+
         Args:
             query: Original query.
-            collection: Collection name.
+            collection: Collection name, or a list of collection names when the
+                caller fanned a query out across several collections in parallel
+                (see query_knowledge_hub.py's "全库混合召回" path) and the final
+                (post-rerank) top results were drawn from more than one of them.
             result_count: Number of results.
-            
+
         Returns:
-            Metadata dictionary.
+            Metadata dictionary. `collection` is always a single string (first/
+            primary one) for backward compatibility with callers that only ever
+            read that key; `collections` (plural, list) is added alongside it
+            whenever more than one collection actually contributed.
         """
         metadata = {
             "query": query,
             "result_count": result_count,
         }
+        if isinstance(collection, (list, tuple, set)):
+            collection_list = sorted(c for c in collection if c)
+            if collection_list:
+                metadata["collection"] = collection_list[0]
+                metadata["collections"] = collection_list
+            return metadata
         if collection:
             metadata["collection"] = collection
         return metadata

@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import axios from 'axios'
+import { marked } from 'marked'
+import DOMPurify from 'dompurify'
 import { message, Modal, Drawer } from 'antd'
 import {
   Sparkles, Plus, History, ChevronDown, RefreshCw, MessageCircle, MessageSquare, Trash2,
   Files as FilesIcon, UploadCloud, Box, FileText, BarChart2, LayoutDashboard, Link as LinkIcon,
-  Activity, Settings, User, Bot, Send, XCircle, Info, Lock, UserRound,
+  Activity, Settings, User, Send, XCircle, Info, Lock, UserRound, Eye, EyeOff,
 } from 'lucide-react'
 import AppShell from './components/shell/AppShell.jsx'
+import { KbTag } from './components/shell/TopNav.jsx'
 import TracePanel from './components/TracePanel.jsx'
 import AdminPanel from './components/admin/AdminPanel.jsx'
 import WorkflowPanel from './components/workflow/WorkflowPanel.jsx'
@@ -14,7 +17,26 @@ import WorkflowStatusPill from './components/workflow/WorkflowStatusPill.jsx'
 import OpsPlaceholder from './components/ops/OpsPlaceholder.jsx'
 import './App.css'
 
-const ADMIN_ROLE_NAMES = new Set(['admin', 'super_admin'])
+const ADMIN_ROLE_NAMES = new Set(['admin', 'super_admin', 'org_admin'])
+
+// 客服形象头像：用来替换 assistant 消息原来的 <Bot> 图标（线框机器人不太像
+// "在跟人对话"）。纯 SVG 画一个极简的女性客服半身像（发型+耳麦+肩膀），
+// 不用外部图片资源，跟头像圆形背景（.avatar CSS）叠在一起显示。
+function AssistantAvatarIcon({ size = 20 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <path d="M4 34c0-8 6.3-13 14-13s14 5 14 13" fill="#0f7d6b" />
+      <rect x="14" y="19" width="8" height="6" rx="3" fill="#f3c2a0" />
+      <circle cx="18" cy="14" r="10" fill="#4a3327" />
+      <circle cx="18" cy="15" r="8" fill="#f6cba3" />
+      <path d="M10 13a8 8 0 0 1 16 0c0 1.3-.5 1.8-1 1.8-.3-2-1.8-3.1-3-3.5.3 1.3-.2 2.5-1 3.1-.4-1.5-1.7-2.7-3-2.9-1.3.2-2.6 1.4-3 2.9-.8-.6-1.3-1.8-1-3.1-1.2.4-2.7 1.5-3 3.5-.5 0-1-.5-1-1.8z" fill="#4a3327" />
+      <path d="M9 14a9 9 0 0 1 18 0" fill="none" stroke="#334155" strokeWidth="1.8" strokeLinecap="round" />
+      <circle cx="26.5" cy="15.5" r="2.2" fill="#334155" />
+      <path d="M26 17.5c-.8 2.5-3 4-5.5 4" fill="none" stroke="#334155" strokeWidth="1.4" strokeLinecap="round" />
+      <circle cx="20.3" cy="21.6" r="1.1" fill="#0f7d6b" />
+    </svg>
+  )
+}
 
 // 页面刷新时（authToken 的初始值来自 localStorage）要在任何组件挂载之前就把
 // token 挂到 axios 默认头上——如果指望下面组件里的 useEffect 去做这件事，
@@ -89,13 +111,17 @@ function getFileIcon(filename) {
   return FILE_ICONS[ext] || FileText
 }
 
+// 之前是手写正则、只认加粗/斜体/行内代码/代码块，标题、列表、表格这些 LLM
+// 回答里常出现的语法全部原样吐出文字（比如字面量 "## 标题" "| a | b |"）。
+// 换成真正的 GFM 解析器（表格是这次要接的需求，标题/列表顺带修好，不然表格
+// 单独工作、周围的文字还是一堆没渲染的符号，观感更割裂）。dangerouslySetInnerHTML
+// 吃的是模型输出，理论上不会有恶意脚本，但用户自己的提问文本可能被模型原样
+// 引用回复里，过一遍 DOMPurify 兜底，不white-list 也不信任生成内容。
+marked.setOptions({ gfm: true, breaks: true })
+
 function renderMarkdown(text) {
-  return (text || '')
-    .replace(/\n/g, '<br>')
-    .replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+  const html = marked.parse(text || '')
+  return DOMPurify.sanitize(html)
 }
 
 export default function App() {
@@ -104,6 +130,7 @@ export default function App() {
   const [currentUsername, setCurrentUsername] = useState(localStorage.getItem('ragent_username') || '')
   // 本地开发方便：默认填好测试账号，省得每次手动输入
   const [loginForm, setLoginForm] = useState({ username: 'alice', password: 'alice123' })
+  const [showPassword, setShowPassword] = useState(false)
   const [loginLoading, setLoginLoading] = useState(false)
 
   // ==================== 个人信息 / 头像 ====================
@@ -467,7 +494,7 @@ export default function App() {
       setActiveWorkflow(data.active_workflow || null)
       setMessages((prev) => [
         ...prev,
-        { role: 'assistant', content: data.answer, time: new Date(), sources: data.retrieval_sources },
+        { role: 'assistant', content: data.answer, time: new Date(), kbSources: data.kb_sources || [] },
       ])
     } catch (error) {
       message.error('发送失败: ' + (error.response?.data?.error?.message || error.message))
@@ -524,7 +551,7 @@ export default function App() {
     setTraceEvents([])
     if (conversationIdRef.current) connectTraceWs(conversationIdRef.current)
 
-    const assistantMessage = { role: 'assistant', content: '', time: new Date(), sources: [] }
+    const assistantMessage = { role: 'assistant', content: '', time: new Date(), kbSources: [] }
     setMessages((prev) => [...prev, assistantMessage])
 
     abortControllerRef.current = new AbortController()
@@ -579,6 +606,8 @@ export default function App() {
 
               if (data.type === 'done') {
                 setActiveWorkflow(data.active_workflow || null)
+                assistantMessage.kbSources = data.kb_sources || []
+                setMessages((prev) => [...prev])
               }
 
               if (data.error) throw new Error(data.error)
@@ -772,11 +801,24 @@ export default function App() {
             <div className="login-input-wrap">
               <Lock size={16} className="login-input-icon" />
               <input
-                type="password"
+                type={showPassword ? 'text' : 'password'}
                 placeholder="密码"
                 value={loginForm.password}
                 onChange={(e) => setLoginForm((prev) => ({ ...prev, password: e.target.value }))}
               />
+              <button
+                type="button"
+                className="login-input-reveal-btn"
+                aria-label="按住查看密码"
+                onPointerDown={() => setShowPassword(true)}
+                onPointerUp={() => setShowPassword(false)}
+                onPointerLeave={() => setShowPassword(false)}
+                onPointerCancel={() => setShowPassword(false)}
+                onKeyDown={(e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); setShowPassword(true) } }}
+                onKeyUp={(e) => { if (e.key === ' ' || e.key === 'Enter') setShowPassword(false) }}
+              >
+                {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+              </button>
             </div>
             <button type="submit" className="login-submit-btn" disabled={loginLoading}>
               {loginLoading ? '登录中…' : '登录'}
@@ -988,11 +1030,26 @@ export default function App() {
                     <div key={mIndex} className={`message ${msg.role}`}>
                       <div className="message-avatar">
                         <div className={`avatar ${msg.role}`}>
-                          {msg.role === 'user' ? <User size={18} /> : <Bot size={18} />}
+                          {msg.role === 'user' ? <User size={18} /> : <AssistantAvatarIcon size={20} />}
                         </div>
                       </div>
                       <div className="message-content-wrapper">
-                        <div className="message-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
+                        {/* 知识库来源角标临时隐藏——短回复时角标会跟正文遮挡，等想好新的展示方式再打开（保留 kbSources 数据和下面的渲染逻辑不动，去掉 `&& false` 即可恢复）。*/}
+                        {false && msg.role === 'assistant' && msg.kbSources && msg.kbSources.length > 0 && (
+                          <div className="message-kb-badge">
+                            {msg.kbSources.map((slug) => <KbTag key={slug} slug={slug} />)}
+                          </div>
+                        )}
+                        {msg.role === 'assistant' && msg.content === '' && isTyping ? (
+                          // 流式回复还没吐出第一个 token 前，这个占位气泡本身就是
+                          // "正在生成"的唯一提示（不再额外叠加一个单独的 typing 气泡，
+                          // 见下面 isTyping && !settings.streaming 旁的注释）。
+                          <div className="typing-indicator">
+                            <span></span><span></span><span></span>
+                          </div>
+                        ) : (
+                          <div className="message-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
+                        )}
                         <div className="message-time">{formatTime(msg.time)}</div>
 
                         {msg.sources && msg.sources.length > 0 && (
@@ -1016,10 +1073,17 @@ export default function App() {
               </div>
             ))}
 
-            {isTyping && (
+            {/* 流式模式下 sendStreamMessage 一开始就把一个空 content 的 assistant
+                消息推进了 messages（上面 messageTurns 已经在渲染它），这里的
+                "正在输入" 气泡如果不加 !settings.streaming 判断，会跟那个空气泡
+                同时显示成两个空白框——回答生成完、isTyping 变 false 后，才会
+                剩下真正有内容的那一个，表现就是"消失了一个空白框"。非流式模式
+                （sendNormalMessage）在拿到完整回答前不会预先塞占位消息，这个
+                气泡才是唯一的等待态提示，继续保留。 */}
+            {isTyping && !settings.streaming && (
               <div className="message assistant typing">
                 <div className="message-avatar">
-                  <div className="avatar assistant"><Bot size={18} /></div>
+                  <div className="avatar assistant"><AssistantAvatarIcon size={20} /></div>
                 </div>
                 <div className="typing-indicator">
                   <span></span><span></span><span></span>
