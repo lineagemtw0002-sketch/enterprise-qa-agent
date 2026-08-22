@@ -98,8 +98,14 @@ export default function UserRoleAssignment({ meProfile }) {
   // 系统角色壳子（见 scripts/migrate_to_roles.py），本质是"知识库通配符权限"
   // 而不是"这个人是什么身份"。留着它出现在角色选择框里，管理员会误以为可以
   // 把"全部知识库"当角色发给人，所以这里过滤掉，不让它进新的分配操作。
-  // 已经持有它的用户不受影响（下面 getAssignableRoleOptions 会按行把已有值
-  // 补回去，保证 Select 还能正常显示/取消这个历史标签，只是不能再新指派）。
+  //
+  // hr_admin_kb/finance_kb 等 6 个角色 2026-08-22 起不再过滤——它们原来是
+  // 平台自己固定部门知识库的专属角色壳子，跟 all_kb 是同一类问题；现在平台
+  // 那 6 个本地部门库已经下线，这几个角色改成委托模式企业（Acme/Globex）的
+  // 类目过滤角色（见 query_knowledge_hub.py DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES），
+  // 是委托企业员工需要被正常分配的真实角色，不能再挡在分配入口外面——之前
+  // 这条过滤规则没跟着一起改，会导致管理员在 UI 上完全没法把这些角色分给
+  // 委托企业员工，只能绕过前端直接改数据库。
   const NON_ASSIGNABLE_ROLE_NAMES = new Set(['all_kb'])
   // 系统角色（决定能不能进后台、是平台管理员还是企业管理员）跟"客户公司
   // 内部角色"（IT部/考勤部/后勤部/法务部这类部门角色，决定能看哪些知识库）

@@ -85,3 +85,53 @@ export function listCollections() {
 export function createCollection({ collection_name, display_name }) {
   return axios.post(`${BASE}/collections`, { collection_name, display_name }).then((res) => res.data)
 }
+
+// ==================== 运营仪表盘（仅平台管理员） ====================
+
+export function getDashboardOverview(window) {
+  return axios.get(`${BASE}/dashboard/overview`, { params: { window } }).then((res) => res.data)
+}
+
+export function getDashboardTrend(metric, window) {
+  return axios.get(`${BASE}/dashboard/trend`, { params: { metric, window } }).then((res) => res.data)
+}
+
+// ==================== 成本与质量可观测性（仅平台管理员） ====================
+
+export function getCostOverview(window) {
+  return axios.get(`${BASE}/dashboard/cost-overview`, { params: { window } }).then((res) => res.data)
+}
+
+export function getCostTrend(metric, window) {
+  return axios.get(`${BASE}/dashboard/cost-trend`, { params: { metric, window } }).then((res) => res.data)
+}
+
+// ==================== 【测试专用，正式上线前删除】知识库超权测试查询 ====================
+// 见 app.py admin_test_query_knowledge_base 端点旁的说明。
+
+export function adminTestQueryKnowledgeBase({ org_id, query, top_k }) {
+  return axios.post(`${BASE}/test/knowledge-query`, { org_id, query, top_k }).then((res) => res.data)
+}
+
+// 临时测试便利功能：查看/清空某企业知识库，方便反复测试"导入知识库->查询知识库"。
+// 同样是【测试专用，正式上线前删除】的一部分。
+
+export function adminTestListKbCollections(org_id) {
+  return axios.get(`${BASE}/test/knowledge-query/collections`, { params: { org_id } }).then((res) => res.data)
+}
+
+export function adminTestListKbChunks({ org_id, collection, limit = 50 }) {
+  return axios.get(`${BASE}/test/knowledge-query/chunks`, { params: { org_id, collection, limit } }).then((res) => res.data)
+}
+
+export function adminTestClearKbCollection({ org_id, collection }) {
+  return axios.delete(`${BASE}/test/knowledge-query/collection`, { params: { org_id, collection } }).then((res) => res.data)
+}
+
+// ==================== 审计日志（治理与合规） ====================
+// 平台管理员能看全平台记录（可选 org_id 过滤某一家企业）；企业管理员只能看
+// 自己企业的（后端强制，不管这里传不传 org_id 都会被忽略/覆盖）。
+
+export function listAuditLogs(params) {
+  return axios.get(`${BASE}/audit-logs`, { params }).then((res) => res.data)
+}

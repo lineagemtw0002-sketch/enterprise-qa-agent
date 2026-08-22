@@ -40,25 +40,18 @@ logger = logging.getLogger(__name__)
 # 保持"企业系统响应多久算超时"的产品预期一致。
 REMOTE_SEARCH_TIMEOUT_SECONDS = 8.0
 
-# 平台自己组织（internal_chroma 本地检索）的固定部门知识库清单——原来没有这个
-# 固定清单时，LLM 调用工具从不主动填 collection 参数，`effective_collection`
-# 永远回退到硬编码的 "default"（一个开发阶段误摄入了项目自己 README 的
-# collection，不是任何业务知识库），导致本地检索的用户不管问什么、不管角色
-# 实际关联了哪些知识库，查的都是同一个不相关的库。修复方式不是让 LLM 更准地
-# 猜该填哪个 collection（同一个本地小模型在意图分类那几轮已经证明不可靠，
-# 见 intent.py/workflow.py 里几处"分类器判不准"的修复记录），而是压根不依赖
-# 它选：调用方不显式指定 collection 时，直接对用户角色关联的全部部门知识库
-# 做"全库混合召回 + 重排"（见 execute() 里的 _execute_local_multi）——每个库
-# 并行跑一次 dense+sparse 混合检索，候选结果合并后统一过一次 cross-encoder
-# 重排，取最终 top_k，不用猜"该查哪个库"，让检索结果自己说话。
-DEPARTMENT_KB_COLLECTIONS: Dict[str, str] = {
-    "hr_admin_kb": "人力资源与行政知识库",
-    "finance_kb": "财务与报销制度知识库",
-    "it_support_kb": "IT 支持与技术运维知识库",
-    "sales_marketing_kb": "销售话术与市场知识库",
-    "rd_product_kb": "研发与产品代码知识库",
-    "customer_success_kb": "客户成功与售后服务知识库",
-}
+# 平台自己组织（org_platform）不再有任何本地业务知识库——2026-08-22 起平台
+# 运营方只负责用户/角色/审计/运营仪表盘这类系统管理，不代表任何一家具体企业，
+# 挂着"财务政策""销售话术"这类业务知识库本身就名不正言不顺。原来这里有一份
+# `DEPARTMENT_KB_COLLECTIONS`（6 个固定部门库，物理上是平台自己本地共享的
+# Chroma collection），已经连同 role_collections 关联、BM25 索引一并下线——
+# 那 6 个部门角色名字（hr_admin_kb/finance_kb/...）还在，但现在只用于委托模式
+# 企业的类目过滤（见下面 DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES），跟"平台自己
+# 有没有本地库"是两件不相关的事。之前误摄入 README 的 "default" collection、
+# 以及迁移前的 4 个老单文档部门库（it_kb/attendance_kb/logistics_kb/legal_kb）
+# 也是同一天一起下线的。`it_dept`/`attendance_dept`/`logistics_dept`/`legal_dept`
+# 这几个系统角色本身还在（没有下线角色），持有它们的用户本地检索这条路径查不到
+# 任何部门库，这是预期结果，不是 bug——平台压根没有本地部门库可查了。
 
 # cross-encoder 重排分数的相关性下限——向量/BM25 混合检索的 top_k 本质是"矬子
 # 里拔将军"：不管问题跟语料实际有多不相关，永远会返回 k 个"矬子里最高"的结果，
@@ -71,6 +64,46 @@ DEPARTMENT_KB_COLLECTIONS: Dict[str, str] = {
 # 禁用/降级 fallback 时的分数量级跟这个不是一回事，不能拿这个阈值卡。
 MIN_RELEVANCE_SCORE: float = 0.1
 
+# 委托模式（企业自己的知识库微服务，如 Acme/Globex）下的部门级过滤——2026-08-22
+# 从 bob_acme（IT部）问出财务/供应商发票内容这个真实案例排查出来的缺口：委托
+# 模式一旦命中 `_execute_remote`，之前完全没有任何按角色/部门的过滤，同一家
+# 企业不同部门的人查到的内容是一样的（`collection` 参数对委托模式下的访问控制
+# 毫无作用，只影响转发到哪个企业自己的服务，不影响返回什么内容）。
+#
+# 这里用企业自己知识库微服务上报的可选字段 metadata.kb_name（见
+# services/tenant_kb_demo/app.py `_category_label`，参考实现确实上报了，真实
+# 客户接入时不一定会）在我们这一侧做二次过滤——不是本地检索那套 collection
+# 级 ACL（那套只认本地 collection 名，管不到委托企业自己的分类体系）。
+#
+# 这份角色 -> 可见类目中文标签的映射是我们自己按"角色名字面意思 + Acme/Globex
+# 演示语料的类目名"推断出来的默认策略，不是企业自己配的（后台还没有让企业管理员
+# 自定义这份映射的入口，后续要加真实客户接入时再补）。org_admin 不查这份映射，
+# 视为企业内部无限制（跟本地检索路径 `get_allowed_collections_for_user` 对
+# org_admin 的特判是同一个语义："企业管理员=企业内全部知识库"）。
+#
+# 没有上报 kb_name 的结果、或者角色不在这份映射里（包括压根没有部门角色的账号）
+# 一律拦下（fail-closed）而不是放行——委托企业如果压根不上报分类，非管理员员工
+# 在这条路径上会看到"无权访问"而不是内容，这是刻意的：宁可员工发现自己好像
+# 用不了、去找管理员，也不要在权限判断不出来的时候默认放行。
+#
+# 2026-08-22 第二次改版：委托企业(Acme/Globex)的语料改成跟平台之前那 6 个
+# 本地部门知识库同一套分类（人力资源与行政/财务与报销制度/IT支持与技术运维/
+# 销售话术与市场/研发与产品代码/客户成功与售后服务，见 services/tenant_kb_demo/app.py
+# 的 CATEGORY_LABELS、scripts/generate_tenant_kb_corpus.py），跟角色名是严格
+# 一对一——不再需要老版本那种"一个角色对应好几个类目、类目名跟角色名对不上"
+# 的模糊映射。旧的 Acme/Globex 专属分类（故障排查/供应链/报关…）已经随语料
+# 一起重新生成，不再存在。legal_dept/attendance_dept/logistics_dept/it_dept
+# 这几个平台本地遗留角色不在新分类体系里，持有它们、且没有额外角色的委托企业
+# 员工在这条路径上会查不到任何内容（fail-closed 的自然结果，不是 bug）。
+DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES: Dict[str, List[str]] = {
+    "hr_admin_kb": ["人力资源与行政"],
+    "finance_kb": ["财务与报销制度"],
+    "it_support_kb": ["IT支持与技术运维"],
+    "sales_marketing_kb": ["销售话术与市场"],
+    "rd_product_kb": ["研发与产品代码"],
+    "customer_success_kb": ["客户成功与售后服务"],
+}
+
 
 # Tool metadata
 TOOL_NAME = "query_knowledge_hub"
@@ -80,13 +113,14 @@ This tool uses hybrid search (semantic + keyword) to find the most relevant
 documents matching your query, then reranks them. Results include source
 citations for reference.
 
-The knowledge base is organized into fixed department libraries (HR & Admin,
-Finance & Reimbursement, IT Support & Ops, Sales & Marketing, R&D & Product,
-Customer Success & After-sales). You do NOT need to pick which one to search —
-leave `collection` unset and the tool searches across all department libraries
-the caller has access to in parallel, merges the candidates, and reranks them.
-Only set `collection` if you already know the exact internal collection name
-and want to restrict the search to just that one.
+Your organization's knowledge base may be split into several department
+libraries (e.g. HR & Admin, Finance & Reimbursement, IT Support & Ops, Sales &
+Marketing, R&D & Product, Customer Success & After-sales). You do NOT need to
+pick which one to search — leave `collection` unset and the tool searches
+across all department libraries the caller has access to in parallel, merges
+the candidates, and reranks them. Only set `collection` if you already know
+the exact internal collection name and want to restrict the search to just
+that one.
 
 Parameters:
 - query: Your search question or keywords
@@ -233,21 +267,19 @@ class QueryKnowledgeHubTool:
         候选集、以及显式指定 collection 时 ACL 校验的公共基准（见 execute() 里
         两处调用），确保两条路径的"我能查哪些库"口径完全一致。
 
-        - `org` 是平台自己的组织（org_platform）：固定就是
-          DEPARTMENT_KB_COLLECTIONS 那 6 个（跟改造前行为完全一致，不受这次
-          企业自建知识库改造影响）。
+        - `org` 是平台自己的组织（org_platform）：空列表——平台运营方不代表任何
+          一家具体企业，2026-08-22 起不再有任何本地业务知识库（原来的 6 个部门
+          库连同更早下线的老 5 个部门库，都已经物理删除，见模块顶部说明）。
         - `org` 是别的（本地检索）企业：`org_collections` 表里登记的、这家企业
-          自己创建的知识库（见 collection_store.py）——不会把平台的 6 个部门库
-          或者别的企业自己建的库混进来，这正是"平台管理员/别的企业看不到、也
-          查不到这家企业知识库内容"（见 knowledge-base-tenant-federation.md 相关
-          权限边界讨论）在检索层的落地。
+          自己创建的知识库（见 collection_store.py）——不会把别的企业自己建的
+          库混进来，这正是"别的企业看不到、也查不到这家企业知识库内容"（见
+          knowledge-base-tenant-federation.md 相关权限边界讨论）在检索层的落地。
         - 没有 user_id/查不到 org（老的独立 MCP server 调用方，没有身份概念）：
-          退回 DEPARTMENT_KB_COLLECTIONS，保留改造前的行为，不引入新的隐式收紧。
+          同样返回空列表——没有身份就无法判断"该给哪家企业的库"，不能再假定
+          是平台的库（平台现在压根没有本地库）。
         """
-        if org is None:
-            return list(DEPARTMENT_KB_COLLECTIONS)
-        if org.is_platform:
-            return list(DEPARTMENT_KB_COLLECTIONS)
+        if org is None or org.is_platform:
+            return []
         owned = await self.org_collection_store.list_for_org(org.org_id)
         return [c.collection_name for c in owned]
 
@@ -386,11 +418,30 @@ class QueryKnowledgeHubTool:
 
         is_remote = connector is not None and connector.connector_type == CONNECTOR_TYPE_HTTP_API
 
+        # 委托模式下按部门角色过滤的可见类目集合——只在这里（remote 分支）用，
+        # 跟上面 `allowed_collections`（本地 collection ACL）是两个不同的概念，
+        # 不复用同一个变量：None 表示"不过滤"（org_admin，或没有 user_id 的老
+        # 调用方，保留原有行为），空集合表示"这个人没有任何部门角色能匹配上
+        # 已知类目，过滤到一条不剩"，不是"跳过过滤"。见 DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES
+        # 旁边的完整说明。
+        remote_allowed_categories: Optional[set] = None
+        if is_remote and user_id is not None:
+            from src.ragent_backend.role_store import RoleStore, ROLE_ORG_ADMIN
+
+            role_names = {r.name for r in await RoleStore().get_user_roles(user_id)}
+            if ROLE_ORG_ADMIN not in role_names:
+                remote_allowed_categories = set()
+                for role_name in role_names:
+                    remote_allowed_categories.update(DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES.get(role_name, []))
+
         # 委托模式（企业自己的知识库微服务）：这几个固定部门知识库是本地
         # internal_chroma 专属的概念，委托出去的查询不受影响，沿用老逻辑——
         # 单一 collection，默认值取 "default"（企业微服务自己决定怎么理解
-        # 这个值，见 knowledge-base-tenant-federation.md 第 5.2 节，委托模式下
-        # 细粒度权限本来就转移给对方了）。
+        # 这个值，见 knowledge-base-tenant-federation.md 第 5.2 节）。检索质量
+        # /召回策略仍然完全交给对方（我们不重排、不判断相关性，见
+        # `_execute_remote` 说明），但访问控制不再是"委托模式=我们完全不管"——
+        # 上面算出的 `remote_allowed_categories` 会在 `_execute_remote` 里按
+        # 对方上报的 metadata.kb_name 做二次过滤，见该方法内的说明。
         if is_remote:
             # 委托模式下这个值只用来展示（塞进请求体的 collection 字段企业自己
             # 的知识库微服务压根不读，见 services/tenant_kb_demo/app.py——它
@@ -410,7 +461,9 @@ class QueryKnowledgeHubTool:
             trace.metadata["collection"] = effective_collection
             trace.metadata["source"] = "mcp"
             trace.metadata["connector_type"] = connector.connector_type
-            return await self._execute_remote(query, effective_top_k, effective_collection, connector, trace)
+            return await self._execute_remote(
+                query, effective_top_k, effective_collection, connector, trace, remote_allowed_categories,
+            )
 
         # 本地 internal_chroma：调用方显式指定了 collection——老的单 collection
         # 路径原样保留（ACL 校验 + tenant_ 前缀硬拦截，见下面注释），不受"全库
@@ -511,6 +564,273 @@ class QueryKnowledgeHubTool:
             TraceCollector().collect(trace)
             return self._build_error_response(query, ",".join(candidate_collections), str(e))
 
+    # ============================================================
+    # 【测试专用，正式上线前删除】管理员知识库测试查询
+    # ============================================================
+    async def execute_admin_bypass(
+        self, query: str, org_id: str, top_k: Optional[int] = None,
+    ) -> MCPToolResponse:
+        """管理员测试页专用（app.py `admin_test_query_knowledge_base`）——绕过任何
+        用户级 ACL，直接对指定企业名下的知识库能力做一次查询，用来验证"这家企业
+        的知识库到底能查到什么、内容对不对"，不代表任何真实用户的实际可见范围。
+
+        调用方必须在路由层用 super_admin 权限守住，这个方法本身不做任何权限
+        判断——它存在的意义就是绕开 execute() 里那一整套 ACL，仅供内部测试工具
+        使用，不能注册成 MCP 工具或暴露给任何非管理员路径。
+
+        跟 execute() 共用同一套本地/委托检索实现（_org_owned_collections /
+        _execute_local_multi / _execute_remote），只是候选集直接取"这家企业名下
+        全部 collection"，不跟任何用户的 allowed_collections 取交集。
+
+        这是一次性测试工具，正式上线前应当整体删除：本方法、app.py 里对应的
+        /api/v1/admin/test/knowledge-query 端点、schemas.py 里的
+        AdminTestKBQueryRequest/Response、前端 KnowledgeBaseTestQuery.jsx 及其
+        在 OperationsDashboard.jsx 里的入口。
+        """
+        from src.ragent_backend.tenant_connector_store import (
+            CAPABILITY_KNOWLEDGE_BASE,
+            CONNECTOR_TYPE_HTTP_API,
+        )
+
+        if not query or not query.strip():
+            raise ValueError("Query cannot be empty")
+
+        effective_top_k = min(top_k or self.config.default_top_k, self.config.max_top_k)
+
+        org = await self.org_store.get_organization(org_id)
+        if org is None:
+            raise ValueError(f"Organization '{org_id}' not found")
+
+        connector = await self.tenant_connector_store.get(org_id, CAPABILITY_KNOWLEDGE_BASE)
+        if connector is not None and connector.connector_type == CONNECTOR_TYPE_HTTP_API:
+            effective_collection = f"tenant_{org_id}_kb"
+            trace = TraceContext(trace_type="query")
+            trace.metadata["query"] = query[:200]
+            trace.metadata["top_k"] = effective_top_k
+            trace.metadata["collection"] = effective_collection
+            trace.metadata["source"] = "admin_test_bypass"
+            trace.metadata["connector_type"] = connector.connector_type
+            return await self._execute_remote(query, effective_top_k, effective_collection, connector, trace)
+
+        candidate_collections = await self._org_owned_collections(org)
+        if not candidate_collections:
+            return self._build_empty_response_for_org(query, org_id)
+
+        trace = TraceContext(trace_type="query")
+        trace.metadata["query"] = query[:200]
+        trace.metadata["top_k"] = effective_top_k
+        trace.metadata["candidate_collections"] = candidate_collections
+        trace.metadata["source"] = "admin_test_bypass"
+        trace.metadata["connector_type"] = "internal_chroma"
+        try:
+            response = await self._execute_local_multi(query, effective_top_k, candidate_collections, trace)
+            TraceCollector().collect(trace)
+            return response
+        except Exception as e:
+            logger.exception(f"execute_admin_bypass (parallel recall) failed: {e}")
+            TraceCollector().collect(trace)
+            return self._build_error_response(query, ",".join(candidate_collections), str(e))
+
+    # ==================== 内部 QA 测试用：清空/查看某企业知识库 ====================
+    # 跟 execute_admin_bypass 是同一批"绕过正常权限边界的内部工具"，调用方（app.py）
+    # 已经用 super_admin + platform_admin + RAGENT_DEBUG=true 三层守住，这里不
+    # 重复做权限判断。本地检索企业直接读写共享 Chroma/BM25；委托模式企业代理到
+    # 企业自己知识库微服务的管理端点（见 services/tenant_kb_demo/app.py 的
+    # /v1/collection/*，那几个端点本身也不是统一契约的一部分，只是参考实现
+    # 额外加的测试入口，真实客户接入的服务不需要实现它们）。
+
+    async def _resolve_org_and_connector(self, org_id: str):
+        from src.ragent_backend.tenant_connector_store import CAPABILITY_KNOWLEDGE_BASE, CONNECTOR_TYPE_HTTP_API
+
+        org = await self.org_store.get_organization(org_id)
+        if org is None:
+            raise ValueError(f"Organization '{org_id}' not found")
+        connector = await self.tenant_connector_store.get(org_id, CAPABILITY_KNOWLEDGE_BASE)
+        is_remote = connector is not None and connector.connector_type == CONNECTOR_TYPE_HTTP_API
+        return org, (connector if is_remote else None)
+
+    async def list_org_collection_stats(self, org_id: str) -> List[Dict[str, Any]]:
+        org, connector = await self._resolve_org_and_connector(org_id)
+        if connector is not None:
+            stats = await self._remote_collection_stats(connector)
+            categories = stats.get("categories") or []
+            if not categories:
+                # 企业没上报分类信息（categories 为空，比如接的是没实现这个
+                # 可选统计端点的老版本参考实现）时的兜底：退回整个 collection
+                # 一条，保留改这次之前的行为，不因为这个可选字段缺失就什么都
+                # 看不到。真的没有任何数据（chunk_count=0）时不展示这一条。
+                return [{
+                    "collection_name": stats["collection"], "display_name": "本企业委托知识库",
+                    "source": "delegated", "chunk_count": stats.get("chunk_count", 0),
+                }] if stats.get("chunk_count", 0) else []
+            # 每个类目一行——`collection_name` 编成 "{tenant_collection}:{分类}"
+            # 这个形状（跟 `_execute_remote` 给结果打 collection 标签用的是
+            # 同一个约定），查看 chunk / 清空时原样传回来，靠这个拆出具体分类，
+            # 不需要另外发明一套"分类 id"。
+            return [{
+                "collection_name": f"{stats['collection']}:{c['category']}",
+                "display_name": c["category"],
+                "source": "delegated", "chunk_count": c["chunk_count"],
+            } for c in categories]
+        if org.is_platform:
+            return []
+        owned = await self.org_collection_store.list_for_org(org_id)
+        results = []
+        for c in owned:
+            results.append({
+                "collection_name": c.collection_name, "display_name": c.display_name,
+                "source": "local", "chunk_count": await self._local_collection_count(c.collection_name),
+            })
+        return results
+
+    @staticmethod
+    def _split_remote_category(collection: str) -> Optional[str]:
+        """从 list_org_collection_stats 拼出的 "{tenant_collection}:{分类}"
+        里取出分类部分——没有冒号时说明是"没分类信息"兜底的整库那一条，
+        返回 None 表示不按分类过滤/清空，行为等同于改这次之前。"""
+        return collection.split(":", 1)[1] if ":" in collection else None
+
+    async def list_org_collection_chunks(self, org_id: str, collection: str, limit: int = 50) -> List[Dict[str, Any]]:
+        org, connector = await self._resolve_org_and_connector(org_id)
+        if connector is not None:
+            category = self._split_remote_category(collection)
+            return await self._remote_collection_chunks(connector, limit, category=category)
+        await self._assert_local_collection_owned(org, collection)
+        return await self._local_collection_chunks(collection, limit)
+
+    async def clear_org_collection(self, org_id: str, collection: str) -> int:
+        org, connector = await self._resolve_org_and_connector(org_id)
+        if connector is not None:
+            category = self._split_remote_category(collection)
+            return await self._remote_collection_clear(connector, category=category)
+        await self._assert_local_collection_owned(org, collection)
+        return await self._local_collection_clear(collection)
+
+    async def _assert_local_collection_owned(self, org, collection: str) -> None:
+        """防止拼一个别的企业的 collection 名字，用这家企业的 org_id 清空/查看
+        到别人的知识库——跟 execute() 里 tenant_ 前缀硬拦截、org_owned 二次校验
+        是同一个"企业边界不能靠调用方老实"的思路。"""
+        owned_names = {c.collection_name for c in await self.org_collection_store.list_for_org(org.org_id)}
+        if collection not in owned_names:
+            raise ValueError(f"'{collection}' 不属于企业 '{org.org_id}'")
+
+    @staticmethod
+    async def _local_collection_count(collection_name: str) -> int:
+        from src.libs.vector_store.vector_store_factory import VectorStoreFactory
+
+        def _sync() -> int:
+            store = VectorStoreFactory.create(load_settings(), collection_name=collection_name)
+            return store.get_collection_stats()["count"]
+
+        return await asyncio.to_thread(_sync)
+
+    @staticmethod
+    async def _local_collection_chunks(collection_name: str, limit: int) -> List[Dict[str, Any]]:
+        from src.libs.vector_store.vector_store_factory import VectorStoreFactory
+
+        def _sync() -> List[Dict[str, Any]]:
+            store = VectorStoreFactory.create(load_settings(), collection_name=collection_name)
+            raw = store.collection.get(limit=limit, include=["metadatas", "documents"])
+            items = []
+            for i, chunk_id in enumerate(raw.get("ids", [])):
+                metadata = (raw.get("metadatas") or [{}])[i] or {}
+                document = (raw.get("documents") or [""])[i] or ""
+                items.append({
+                    "chunk_id": chunk_id, "text": document,
+                    "source_path": metadata.get("source_path", ""), "kb_name": None,
+                })
+            return items
+
+        return await asyncio.to_thread(_sync)
+
+    @staticmethod
+    async def _local_collection_clear(collection_name: str) -> int:
+        """跟这次会话里手动清理老部门库用的是同一套三步（Chroma collection +
+        BM25 索引目录 + ingestion_history/chunk_content_index 记录），这里把它
+        收进代码而不是留在临时脚本里，供页面反复调用。"""
+        import shutil
+
+        from src.libs.vector_store.vector_store_factory import VectorStoreFactory
+
+        def _sync() -> int:
+            store = VectorStoreFactory.create(load_settings(), collection_name=collection_name)
+            cleared = store.get_collection_stats()["count"]
+            store.client.delete_collection(collection_name)
+
+            bm25_dir = resolve_path(f"data/db/bm25/{collection_name}")
+            if bm25_dir.exists():
+                shutil.rmtree(bm25_dir)
+
+            import sqlite3
+            history_db = resolve_path("data/db/ingestion_history.db")
+            if history_db.exists():
+                conn = sqlite3.connect(str(history_db))
+                try:
+                    conn.execute("DELETE FROM ingestion_history WHERE collection = ?", (collection_name,))
+                    conn.execute("DELETE FROM chunk_content_index WHERE collection = ?", (collection_name,))
+                    conn.commit()
+                finally:
+                    conn.close()
+            return cleared
+
+        return await asyncio.to_thread(_sync)
+
+    async def _remote_collection_stats(self, connector: "TenantConnector") -> Dict[str, Any]:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=REMOTE_SEARCH_TIMEOUT_SECONDS) as client:
+            resp = await client.get(
+                f"{connector.endpoint.rstrip('/')}/v1/collection/stats",
+                headers={"Authorization": f"Bearer {connector.auth_config.get('token', '')}"},
+            )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def _remote_collection_chunks(
+        self, connector: "TenantConnector", limit: int, category: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        import httpx
+
+        params: Dict[str, Any] = {"limit": limit}
+        if category:
+            params["category"] = category
+        async with httpx.AsyncClient(timeout=REMOTE_SEARCH_TIMEOUT_SECONDS) as client:
+            resp = await client.get(
+                f"{connector.endpoint.rstrip('/')}/v1/collection/chunks",
+                params=params,
+                headers={"Authorization": f"Bearer {connector.auth_config.get('token', '')}"},
+            )
+        resp.raise_for_status()
+        return resp.json().get("chunks", [])
+
+    async def _remote_collection_clear(
+        self, connector: "TenantConnector", category: Optional[str] = None,
+    ) -> int:
+        import httpx
+
+        params: Dict[str, Any] = {"category": category} if category else {}
+        async with httpx.AsyncClient(timeout=REMOTE_SEARCH_TIMEOUT_SECONDS) as client:
+            resp = await client.delete(
+                f"{connector.endpoint.rstrip('/')}/v1/collection",
+                params=params,
+                headers={"Authorization": f"Bearer {connector.auth_config.get('token', '')}"},
+            )
+        resp.raise_for_status()
+        return resp.json().get("cleared_chunks", 0)
+
+    @staticmethod
+    def _build_empty_response_for_org(query: str, org_id: str) -> MCPToolResponse:
+        """管理员测试页专用：这家企业压根没有登记任何知识库 collection 时的提示，
+        跟 _build_access_denied_response 语义不同（不是权限问题，是这家企业还
+        没建过库）。"""
+        content = f"## 该企业暂无知识库\n\n查询: **{query}**\n企业: `{org_id}`\n\n这家企业名下还没有登记任何知识库 collection。\n"
+        return MCPToolResponse(
+            content=content,
+            citations=[],
+            metadata={"query": query, "org_id": org_id, "error": "no_collections"},
+            is_empty=True,
+        )
+
     async def _execute_local_single(
         self, query: str, effective_top_k: int, effective_collection: str, trace: TraceContext,
     ) -> MCPToolResponse:
@@ -601,11 +921,17 @@ class QueryKnowledgeHubTool:
         query: str,
         top_k: int,
         trace: Optional[Any] = None,
+        filters: Optional[Dict[str, Any]] = None,
     ) -> List[RetrievalResult]:
         """跟 _perform_search 逻辑一样，但接收显式传入的 HybridSearch 实例，
         不读 self._hybrid_search——"全库混合召回"并发查多个 collection 时，
         每个 collection 自己的 HybridSearch 局部变量互不干扰，靠的就是这个
-        方法不碰共享的 self 状态（见 _build_hybrid_search_for 的说明）。"""
+        方法不碰共享的 self 状态（见 _build_hybrid_search_for 的说明）。
+
+        filters 透传给 HybridSearch.search()——层次化检索粗筛后按
+        {"source_ref": [doc_id, ...]} 收窄到摘要层选中的那几份文档时用
+        （见 _execute_local_multi），默认 None 保持原有的"整个 collection
+        都是候选池"行为不变。"""
         # Use a larger initial retrieval for reranking
         initial_top_k = top_k * 2 if self.config.enable_rerank else top_k
 
@@ -613,7 +939,7 @@ class QueryKnowledgeHubTool:
             results = hybrid_search.search(
                 query=query,
                 top_k=initial_top_k,
-                filters=None,
+                filters=filters,
                 trace=trace,
                 return_details=False,
             )
@@ -688,6 +1014,74 @@ class QueryKnowledgeHubTool:
         走 ResponseBuilder 已有的空结果分支，不需要额外处理。"""
         return [r for r in results if r.score >= MIN_RELEVANCE_SCORE]
 
+    async def _narrow_by_document_summary(
+        self, query: str, candidate_collections: List[str],
+    ) -> Dict[str, List[str]]:
+        """层次化检索的"粗筛"阶段——见 ingestion/hierarchy/doc_summary.py 顶部
+        说明。在每个候选 collection 的 `{collection}__summary` 摘要层各查一次
+        （只做向量相似度，不跑 BM25/rerank，这一层要的是"大致相关"的快速信号，
+        不是精确排序），把全部候选 collection 的摘要命中合并、按分数取整体
+        前 N 份文档，按它们各自所属的 collection 分组返回。
+
+        返回空 dict 表示"摘要层没有可用信号"（可能是这几个 collection 都还
+        没有任何文档摘要——比如这个功能上线前就已经摄入的老数据），调用方
+        （_execute_local_multi）据此决定要不要整体退回原来的平铺检索，不是
+        把空结果当成"真的查无相关文档"处理。
+        """
+        from src.ingestion.hierarchy.doc_summary import summary_collection_name
+        from src.libs.embedding.embedding_factory import EmbeddingFactory
+        from src.libs.vector_store.vector_store_factory import VectorStoreFactory
+
+        if self._embedding_client is None:
+            self._embedding_client = EmbeddingFactory.create(self.settings)
+
+        top_docs = getattr(getattr(self.settings, "ingestion", None), "doc_summary", None) or {}
+        top_docs = top_docs.get("top_docs", 5)
+
+        # 跟 _execute_local_multi 建 HybridSearch 时同一个坑：并发 new 多个
+        # PersistentClient 指向同一个 persist_directory 不是线程安全的，必须
+        # 先串行建好每个 collection 的 client，再并行查询。
+        def _build_stores_sync() -> Dict[str, Any]:
+            stores = {}
+            for c in candidate_collections:
+                try:
+                    stores[c] = VectorStoreFactory.create(self.settings, collection_name=summary_collection_name(c))
+                except Exception as e:
+                    logger.warning(f"Failed to open summary store for '{c}': {e}")
+            return stores
+
+        summary_stores = await asyncio.to_thread(_build_stores_sync)
+        if not summary_stores:
+            return {}
+
+        query_vector = (await asyncio.to_thread(self._embedding_client.embed, [query]))[0]
+
+        def _query_one_sync(collection: str) -> List[Dict[str, Any]]:
+            try:
+                hits = summary_stores[collection].query(vector=query_vector, top_k=top_docs)
+            except Exception as e:
+                logger.warning(f"Summary query failed for '{collection}': {e}")
+                return []
+            for h in hits:
+                h["_collection"] = collection
+            return hits
+
+        per_collection_hits = await asyncio.gather(
+            *[asyncio.to_thread(_query_one_sync, c) for c in summary_stores],
+        )
+        all_hits = [h for sub in per_collection_hits for h in sub]
+        if not all_hits:
+            return {}
+
+        all_hits.sort(key=lambda h: h.get("score", 0.0), reverse=True)
+        narrowed: Dict[str, List[str]] = {}
+        for h in all_hits[:top_docs]:
+            doc_id = h.get("metadata", {}).get("doc_id") or h.get("id")
+            if not doc_id:
+                continue
+            narrowed.setdefault(h["_collection"], []).append(doc_id)
+        return narrowed
+
     async def _execute_local_multi(
         self,
         query: str,
@@ -701,7 +1095,15 @@ class QueryKnowledgeHubTool:
         清单里的那几个）逐个并发跑一次 dense+sparse 混合检索，候选结果合并后
         统一过一次 cross-encoder 重排，取最终 top_k——不用猜"该查哪个库"，也
         不需要 LLM 参与这个决策。
+
+        在真正的全量并行召回之前，先过一遍层次化检索的文档级粗筛（见
+        `_narrow_by_document_summary`）——摘要层有信号时，把接下来的
+        hybrid search 收窄到"只在这几份文档范围内"（通过 source_ref 过滤，
+        见下面 _search_one_sync），减少候选池里跟查询没关系的文档稀释精排
+        结果；摘要层没信号（老数据没有摘要）就整体退回原来的行为，不做任何
+        收窄，保证这个功能是纯增量的，不会让还没补摘要的旧数据查不到东西。
         """
+        narrowed = await self._narrow_by_document_summary(query, candidate_collections)
         # 先把每个 collection 的 HybridSearch（内部会各自新建一个指向同一个
         # persist_directory 的 chromadb.PersistentClient）串行建好，再并行跑
         # 查询——实测踩过坑：6 个 collection 各自在不同线程里并发 new 一个
@@ -713,15 +1115,25 @@ class QueryKnowledgeHubTool:
         # client 一旦建好之后，用已建好的 client 并发查询是安全的（SQLite
         # WAL 模式支持并发读），所以只把"建 client"这一步收窄成串行，真正
         # 耗时的 embedding + 检索这部分保留并行，不牺牲全库并行召回的速度。
+        # 摘要层有信号就只在命中的那几个 collection 里查（且带 source_ref
+        # 过滤，收窄到具体那几份文档）；没信号（narrowed 为空）就是老行为——
+        # 全部候选 collection、不加文档级过滤。
+        search_collections = list(narrowed.keys()) if narrowed else candidate_collections
+        if narrowed:
+            trace.record_stage("hierarchy_narrow", {
+                "narrowed_collections": {c: docs for c, docs in narrowed.items()},
+            })
+
         def _build_all_sync() -> Dict[str, "HybridSearch"]:
-            return {c: self._build_hybrid_search_for(c) for c in candidate_collections}
+            return {c: self._build_hybrid_search_for(c) for c in search_collections}
 
         hybrid_searches = await asyncio.to_thread(_build_all_sync)
 
         def _search_one_sync(collection: str) -> List[RetrievalResult]:
             hybrid_search = hybrid_searches[collection]
             initial_top_k = top_k * 2 if self.config.enable_rerank else top_k
-            results = self._search_with(hybrid_search, query, initial_top_k, trace=None)
+            doc_filter = {"source_ref": narrowed[collection]} if collection in narrowed else None
+            results = self._search_with(hybrid_search, query, initial_top_k, trace=None, filters=doc_filter)
             # 打上来源标记，供合并后统计"最终结果实际来自哪几个库"（response
             # metadata 的 collections 字段，UI 来源角标用），以及排查问题时
             # 一眼看出某条结果是从哪个库召回的。
@@ -731,12 +1143,12 @@ class QueryKnowledgeHubTool:
             return results
 
         per_collection_results = await asyncio.gather(
-            *[asyncio.to_thread(_search_one_sync, c) for c in candidate_collections],
+            *[asyncio.to_thread(_search_one_sync, c) for c in search_collections],
             return_exceptions=True,
         )
 
         merged: List[RetrievalResult] = []
-        for collection, sub_results in zip(candidate_collections, per_collection_results):
+        for collection, sub_results in zip(search_collections, per_collection_results):
             if isinstance(sub_results, Exception):
                 logger.warning(f"Search failed for collection '{collection}': {sub_results}")
                 continue
@@ -776,7 +1188,7 @@ class QueryKnowledgeHubTool:
         return self._response_builder.build(
             results=merged,
             query=query,
-            collection=contributing_collections or candidate_collections,
+            collection=contributing_collections or search_collections,
         )
     
     async def _execute_remote(
@@ -786,6 +1198,7 @@ class QueryKnowledgeHubTool:
         collection: str,
         connector: "TenantConnector",
         trace: TraceContext,
+        remote_allowed_categories: Optional[set] = None,
     ) -> MCPToolResponse:
         """委托到企业自己的知识库微服务（统一 HTTP 契约，见
         `knowledge-base-tenant-federation.md` 第 4 节）。
@@ -851,6 +1264,23 @@ class QueryKnowledgeHubTool:
             for r in results:
                 kb_name = r.metadata.get("remote_kb_name")
                 r.metadata["collection"] = f"{collection}:{kb_name}" if kb_name else collection
+
+            # 部门级过滤——见 DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES 旁边的说明。
+            # None 表示不过滤（org_admin 或没有 user_id 的老调用方）；否则只保留
+            # kb_name 命中允许类目集合的结果，企业没上报 kb_name 的结果一律拦下
+            # （fail-closed，不是"看不出类目就放行"）。这一步只发生在委托模式，
+            # 不影响本地检索路径的 ACL。
+            if remote_allowed_categories is not None:
+                before_filter = len(results)
+                results = [r for r in results if r.metadata.get("remote_kb_name") in remote_allowed_categories]
+                if before_filter and not results:
+                    logger.warning(
+                        f"Remote KB results filtered out by department scope: org_id={org_id}, "
+                        f"allowed_categories={sorted(remote_allowed_categories)}"
+                    )
+                    TraceCollector().collect(trace)
+                    return self._build_access_denied_response(query, collection)
+
             contributing = sorted({r.metadata["collection"] for r in results}) or [collection]
 
             response = self._response_builder.build(results=results, query=query, collection=contributing)

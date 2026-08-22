@@ -5,8 +5,10 @@
 2. 文档加载（PDF -> Document）。
 3. 文本切块（Document -> Chunk 列表）。
 4. 变换处理（精炼 + 元数据增强 + 图片描述）。
-5. 编码向量化（Dense + Sparse）。
-6. 存储落盘（向量库 + BM25 索引 + 图片索引）。
+5. 片段级去重（基于内容指纹，跳过库里已存在的重复片段）。
+6. 编码向量化（Dense + Sparse）。
+7. 存储落盘（向量库 + BM25 索引 + 图片索引）。
+8. 层次化索引（生成文档级摘要，供检索时先粗筛文档再精排片段）。
 
 设计原则：
 - 配置驱动：核心参数来自 settings.yaml。
@@ -16,7 +18,7 @@
 """
 
 from pathlib import Path
-from typing import Callable, List, Optional, Dict, Any
+from typing import Callable, List, Optional, Dict, Any, Tuple
 import time
 
 from src.core.settings import Settings, load_settings, resolve_path
@@ -35,6 +37,8 @@ from src.ingestion.chunking.document_chunker import DocumentChunker
 from src.ingestion.transform.chunk_refiner import ChunkRefiner
 from src.ingestion.transform.metadata_enricher import MetadataEnricher
 from src.ingestion.transform.image_captioner import ImageCaptioner
+from src.ingestion.dedup.chunk_dedup import ChunkDedupIndex, compute_content_hash
+from src.ingestion.hierarchy.doc_summary import DocumentSummarizer, summary_collection_name
 from src.ingestion.embedding.dense_encoder import DenseEncoder
 from src.ingestion.embedding.sparse_encoder import SparseEncoder
 from src.ingestion.embedding.batch_processor import BatchProcessor
@@ -70,6 +74,7 @@ class PipelineResult:
         error: Optional[str] = None,
         stages: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        duplicate_chunk_count: int = 0,
     ):
         self.success = success
         self.file_path = file_path
@@ -80,7 +85,11 @@ class PipelineResult:
         self.error = error
         self.stages = stages or {}
         self.metadata = metadata or {}
-    
+        # 跟 chunk_count 不是一回事：chunk_count 是"最终真正入库的片段数"，
+        # 这个是"切完之后发现内容跟库里已有片段重复、被跳过没入库的片段数"
+        # （见 dedup/chunk_dedup.py）——两者相加才是切分阶段产出的总片段数。
+        self.duplicate_chunk_count = duplicate_chunk_count
+
     def to_dict(self) -> Dict[str, Any]:
         """转换为可序列化字典（用于 API 返回或日志输出）。"""
         return {
@@ -88,6 +97,7 @@ class PipelineResult:
             "file_path": self.file_path,
             "doc_id": self.doc_id,
             "chunk_count": self.chunk_count,
+            "duplicate_chunk_count": self.duplicate_chunk_count,
             "image_count": self.image_count,
             "vector_ids_count": len(self.vector_ids),
             "error": self.error,
@@ -140,6 +150,12 @@ class IngestionPipeline:
         # 阶段 1：文件完整性检查
         self.integrity_checker = SQLiteIntegrityChecker(db_path=str(resolve_path("data/db/ingestion_history.db")))
         logger.info("  ✓ FileIntegrityChecker initialized")
+
+        # 片段级去重——跟上面的文件级完整性检查共用同一个 SQLite 文件，表不同
+        # （见 dedup/chunk_dedup.py 顶部说明：文件级去重管不到"两份不同文件里
+        # 切出内容相同的 chunk"这种情况）。
+        self.chunk_dedup = ChunkDedupIndex(db_path=str(resolve_path("data/db/ingestion_history.db")))
+        logger.info("  ✓ ChunkDedupIndex initialized")
         
         # 阶段 2：文档加载（通用 loader，支持 PDF/DOCX/XLSX/PPTX/TXT/MD/HTML 等）
         self.loader = UniversalLoader(
@@ -189,7 +205,7 @@ class IngestionPipeline:
         )
         logger.info(f"  ✓ BatchProcessor initialized (batch_size={batch_size})")
         
-        # 阶段 6：存储
+        # 阶段 7：存储
         # - vector_upserter: 将 dense 向量写入向量库（用于语义检索）
         # - bm25_indexer: 写入稀疏索引（用于关键词检索）
         # - image_storage: 维护图片索引（用于图片资产追踪与后续引用）
@@ -204,7 +220,17 @@ class IngestionPipeline:
             images_root=str(resolve_path("data/images"))
         )
         logger.info("  ✓ ImageStorage initialized")
-        
+
+        # 阶段 8：层次化索引——文档级摘要单独存一个 collection（跟正文
+        # chunk 物理分开，见 hierarchy/doc_summary.py 顶部说明），复用同一个
+        # DenseEncoder（跟正文用同一个 embedding 模型/维度，检索时才能互相
+        # 比较分数）。
+        self.doc_summarizer = DocumentSummarizer(settings)
+        self.summary_vector_store = VectorStoreFactory.create(
+            settings, collection_name=summary_collection_name(collection)
+        )
+        logger.info(f"  ✓ DocumentSummarizer initialized (use_llm={self.doc_summarizer.use_llm})")
+
         logger.info("Pipeline initialization complete!")
     
     def run(
@@ -227,7 +253,7 @@ class IngestionPipeline:
         # 统一转 Path，避免后续重复做字符串/路径转换。
         file_path = Path(file_path)
         stages: Dict[str, Any] = {}
-        _total_stages = 6
+        _total_stages = 8
 
         def _notify(stage_name: str, step: int) -> None:
             # 将阶段完成事件回调给上层（CLI / UI / WebSocket 等）。
@@ -403,12 +429,73 @@ class IngestionPipeline:
                         for c in chunks
                     ],
                 }, elapsed_ms=_elapsed_transform)
-            
+
             # ─────────────────────────────────────────────────────────────
-            # 阶段 5：编码
+            # 阶段 5：片段级去重
             # ─────────────────────────────────────────────────────────────
-            logger.info("\n🔢 Stage 5: Encoding")
-            _notify("embed", 5)
+            # 放在精炼/增强之后、embedding 之前——用的是最终会入库的文本算指纹，
+            # 且在最耗资源的 embedding 调用之前就把重复片段筛掉，不浪费 API 调用
+            # （见 dedup/chunk_dedup.py 顶部说明：跟文件级去重是两个粒度）。
+            logger.info("\n🧹 Stage 5: Chunk Dedup")
+            _notify("dedup", 5)
+
+            _t0_dedup = time.monotonic()
+            _unique_chunks: List[Chunk] = []
+            _duplicate_of: List[Tuple[Chunk, str]] = []  # 记录被跳过的 chunk 和它重复的对象
+            _seen_hashes: set = set()
+            for c in chunks:
+                content_hash = compute_content_hash(c.text)
+                # force=True 时不查库里已有记录——跟阶段 1 文件级去重的
+                # `if not self.force` 是同一个语义：force 就是"我明确要求这份
+                # 文件的内容重新走一遍摄入（比如换了 embedding 模型要重新编码），
+                # 不该被"内容其实没变"拦下来"。同一批内部的重复（比如每页都有
+                # 的页脚）不受 force 影响，任何时候都该去重——这跟"要不要重新
+                # 处理这份文件"无关，纯粹是同一次摄入里不该把同一段内容存两份。
+                existing = None if self.force else self.chunk_dedup.find_existing(content_hash, self.collection)
+                if existing is not None or content_hash in _seen_hashes:
+                    _duplicate_of.append((c, existing or "(本次摄入内部重复)"))
+                    continue
+                _seen_hashes.add(content_hash)
+                c.metadata["content_hash"] = content_hash
+                _unique_chunks.append(c)
+            duplicate_chunk_count = len(_duplicate_of)
+            chunks = _unique_chunks
+            _elapsed_dedup = (time.monotonic() - _t0_dedup) * 1000.0
+
+            logger.info(f"  Unique chunks: {len(chunks)}, duplicates skipped: {duplicate_chunk_count}")
+            stages["dedup"] = {"unique_count": len(chunks), "duplicate_count": duplicate_chunk_count}
+            if trace is not None:
+                trace.record_stage("dedup", {
+                    "method": "content_hash",
+                    "unique_count": len(chunks),
+                    "duplicate_count": duplicate_chunk_count,
+                    "duplicates": [
+                        {"chunk_id": c.id, "text_preview": c.text[:80], "duplicate_of": ref}
+                        for c, ref in _duplicate_of
+                    ],
+                }, elapsed_ms=_elapsed_dedup)
+
+            if not chunks:
+                # 切出来的片段全部跟库里已有内容重复——这份文件对这个 collection
+                # 来说没有新增任何东西，不算失败，跟"整份文件之前摄入过"
+                # （文件级去重那条 early return）是同一个语义，直接判定成功收尾。
+                logger.info("  ⏭️  All chunks are duplicates, nothing new to store")
+                self.integrity_checker.mark_success(file_hash, str(file_path), self.collection)
+                return PipelineResult(
+                    success=True,
+                    file_path=str(file_path),
+                    doc_id=document.id,
+                    chunk_count=0,
+                    duplicate_chunk_count=duplicate_chunk_count,
+                    stages=stages,
+                    metadata=document.metadata,
+                )
+
+            # ─────────────────────────────────────────────────────────────
+            # 阶段 6：编码
+            # ─────────────────────────────────────────────────────────────
+            logger.info("\n🔢 Stage 6: Encoding")
+            _notify("embed", 6)
             
             # 通过 BatchProcessor 统一调度 dense/sparse 编码，
             # 以批处理方式降低请求开销并提升吞吐。
@@ -468,10 +555,10 @@ class IngestionPipeline:
                 }, elapsed_ms=_elapsed)
             
             # ─────────────────────────────────────────────────────────────
-            # 阶段 6：存储
+            # 阶段 7：存储
             # ─────────────────────────────────────────────────────────────
-            logger.info("\n💾 Stage 6: Storage")
-            _notify("upsert", 6)
+            logger.info("\n💾 Stage 7: Storage")
+            _notify("upsert", 7)
             
             # 6a: 向量入库（ChromaDB）
             logger.info("  6a. Vector Storage (ChromaDB)...")
@@ -542,6 +629,7 @@ class IngestionPipeline:
                     for img in images
                 ]
                 trace.record_stage("upsert", {
+                    "method": "chroma+bm25+image_index",
                     "dense_store": {
                         "backend": "ChromaDB",
                         "collection": self.collection,
@@ -561,25 +649,73 @@ class IngestionPipeline:
                     },
                     "chunk_mapping": chunk_storage,
                 }, elapsed_ms=_elapsed_storage)
-            
+
+            # ─────────────────────────────────────────────────────────────
+            # 阶段 8：层次化索引（文档级摘要）
+            # ─────────────────────────────────────────────────────────────
+            # 见 src/ingestion/hierarchy/doc_summary.py 顶部说明：给这份文档单独
+            # 生成一条摘要，存进 `{collection}__summary` 专属 collection，供
+            # query_knowledge_hub.py 检索时先做"文档级粗筛"再进 chunk 精排。
+            # 这一步失败不该拖垮整次摄入——摘要层是检索优化，不是正文数据，
+            # 缺了它退化成之前的纯平铺检索，不影响本次摄入的成败判定。
+            logger.info("\n🗂️  Stage 8: Hierarchical Index (Document Summary)")
+            _notify("hierarchy", 8)
+            _t0_hierarchy = time.monotonic()
+            try:
+                summary_text = self.doc_summarizer.summarize(document, chunks)
+                summary_vector = self.dense_encoder.encode([
+                    Chunk(
+                        id=f"{document.id}_summary", text=summary_text,
+                        metadata={"source_path": document.metadata.get("source_path", str(file_path))},
+                    )
+                ])[0]
+                self.summary_vector_store.upsert([{
+                    "id": document.id,
+                    "vector": summary_vector,
+                    "metadata": {
+                        "text": summary_text,
+                        "doc_id": document.id,
+                        "source_path": document.metadata.get("source_path", str(file_path)),
+                        "title": chunks[0].metadata.get("title", ""),
+                    },
+                }])
+                stages["hierarchy"] = {"summary_stored": True, "summary_length": len(summary_text)}
+                logger.info(f"  Summary stored ({len(summary_text)} chars) -> {summary_collection_name(self.collection)}")
+            except Exception as e:
+                # 降级：摘要层出问题只记日志，不影响本次摄入判定成功——见上面的说明。
+                logger.warning(f"  ⚠️  Document summary indexing failed (non-fatal): {e}")
+                stages["hierarchy"] = {"summary_stored": False, "error": str(e)}
+            _elapsed_hierarchy = (time.monotonic() - _t0_hierarchy) * 1000.0
+            if trace is not None:
+                trace.record_stage("hierarchy", stages["hierarchy"], elapsed_ms=_elapsed_hierarchy)
+
             # ─────────────────────────────────────────────────────────────
             # 成功收尾
             # ─────────────────────────────────────────────────────────────
-            # 只有当全部阶段完成后才标记成功，避免出现“部分成功但状态已提交”。
+            # 只有当全部阶段完成后才标记成功，避免出现"部分成功但状态已提交"。
             self.integrity_checker.mark_success(file_hash, str(file_path), self.collection)
-            
+
+            # 去重指纹也在这里才登记，不在阶段 5 筛完就登记——道理跟上面文件级
+            # 完整性检查一致：真正写入向量库/BM25 之前，这几个片段还谈不上
+            # "已经存在于这个 collection 里"，万一后面 embedding/存储阶段失败，
+            # 不该把它们当成"已收录"记下来，否则重跑这份文件时会被误判成重复
+            # 而漏摄入。
+            for c in chunks:
+                self.chunk_dedup.register(c.metadata["content_hash"], self.collection, c.id, document.id)
+
             logger.info("\n" + "=" * 60)
             logger.info("✅ Pipeline completed successfully!")
-            logger.info(f"   Chunks: {len(chunks)}")
+            logger.info(f"   Chunks: {len(chunks)} (duplicates skipped: {duplicate_chunk_count})")
             logger.info(f"   Vectors: {len(vector_ids)}")
             logger.info(f"   Images: {len(images)}")
             logger.info("=" * 60)
-            
+
             return PipelineResult(
                 success=True,
                 file_path=str(file_path),
                 doc_id=file_hash,
                 chunk_count=len(chunks),
+                duplicate_chunk_count=duplicate_chunk_count,
                 image_count=len(images),
                 vector_ids=vector_ids,
                 stages=stages,

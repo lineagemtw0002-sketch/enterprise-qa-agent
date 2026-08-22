@@ -7,6 +7,7 @@ export default function AppShell({
   view,
   onNavigate,
   isAdmin,
+  isPlatformAdmin,
   currentUsername,
   meProfile,
   onLogout,
@@ -20,6 +21,7 @@ export default function AppShell({
         view={view}
         onNavigate={onNavigate}
         isAdmin={isAdmin}
+        isPlatformAdmin={isPlatformAdmin}
         currentUsername={currentUsername}
         meProfile={meProfile}
         onLogout={onLogout}

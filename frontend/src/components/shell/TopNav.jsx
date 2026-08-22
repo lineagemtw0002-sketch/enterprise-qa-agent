@@ -1,8 +1,7 @@
 import { Popover } from 'antd'
 import {
   Sparkles, ChevronDown, MessageSquare, ListChecks, ShieldCheck, Activity,
-  Cpu, Clock, Package, Scale, BookOpen, Sparkle, Files as FilesIcon, Building2,
-  Users, Wallet, Wrench, Megaphone, Code2, HeartHandshake,
+  Sparkle, Files as FilesIcon, Building2, LayoutDashboard,
 } from 'lucide-react'
 import NotificationBell from '../workflow/NotificationBell.jsx'
 import './TopNav.css'
@@ -10,24 +9,13 @@ import './TopNav.css'
 // 知识库 slug -> 中文展示名 + 图标 + 主题色（从 App.jsx 挪过来，只有个人信息卡
 // 里的"可访问知识库"用得到，搬到顶部导航就不用在 App.jsx 里保留一份了）。
 //
-// it_kb/attendance_kb/logistics_kb/legal_kb 是老的单文档部门库（迁移遗留，
-// 见 role.md 迁移记录），hr_admin_kb 起下面这 6 个才是"全库混合召回"改造后
-// 固定下来的部门知识库清单（跟 query_knowledge_hub.py 的 DEPARTMENT_KB_COLLECTIONS
-// 一一对应，图标/颜色只是前端展示用，不影响检索）。两组并存，没有互相替代，
-// 老的 4 个目前还没清理掉。
-const KB_META = {
-  default: { label: '通用知识库', icon: BookOpen, color: '#6b7280' },
-  it_kb: { label: 'IT 知识库', icon: Cpu, color: '#3b82f6' },
-  attendance_kb: { label: '考勤知识库', icon: Clock, color: '#f59e0b' },
-  logistics_kb: { label: '后勤知识库', icon: Package, color: '#10b981' },
-  legal_kb: { label: '法务知识库', icon: Scale, color: '#ef4444' },
-  hr_admin_kb: { label: '人力资源与行政知识库', icon: Users, color: '#8b5cf6' },
-  finance_kb: { label: '财务与报销制度知识库', icon: Wallet, color: '#059669' },
-  it_support_kb: { label: 'IT 支持与技术运维知识库', icon: Wrench, color: '#2563eb' },
-  sales_marketing_kb: { label: '销售话术与市场知识库', icon: Megaphone, color: '#f97316' },
-  rd_product_kb: { label: '研发与产品代码知识库', icon: Code2, color: '#6366f1' },
-  customer_success_kb: { label: '客户成功与售后服务知识库', icon: HeartHandshake, color: '#ec4899' },
-}
+// 平台自己（org_platform）2026-08-22 起不再有任何本地业务知识库——原来这里
+// 固定写死的 6 个部门库（hr_admin_kb 等，对应 query_knowledge_hub.py 曾经的
+// DEPARTMENT_KB_COLLECTIONS）连同更早下线的 4 个老部门库 + default 一起删掉
+// 了，这张表暂时是空的。企业自建知识库的 slug（比如 product_req_kb）本来就
+// 没在这张表里登记过，一直是走下面的 KB_META_FALLBACK 展示成通用文件图标 +
+// 原始 slug 文本——不需要为了平台这次下线特意改动它们的展示逻辑。
+const KB_META = {}
 const KB_META_FALLBACK = { icon: FilesIcon, color: '#6b7280' }
 const KB_META_UNLIMITED = { label: '不限', icon: Sparkle, color: '#8b5cf6' }
 
@@ -88,6 +76,12 @@ function formatDate(timestamp) {
 const MODULES = [
   { key: 'chat', label: '智能问答', icon: MessageSquare },
   { key: 'workflow', label: '工作流', icon: ListChecks },
+  // 只对平台运营方的超级管理员/管理员开放（platformOnly，比 adminOnly 更严格——
+  // 后者连企业管理员 org_admin 也算，这个不算），是独立的顶层模块，不挂在
+  // 「权限系统」下面：运营指标（会话数/消息数/活跃用户/响应耗时）是平台整体
+  // 运维数据，跟"权限系统"里角色/用户/知识库这类权限配置性质不同，混在一起
+  // 会让企业管理员以为这也是权限相关的东西（见 App.jsx isPlatformAdmin 的说明）。
+  { key: 'dashboard', label: '运营仪表盘', icon: LayoutDashboard, platformOnly: true },
   { key: 'admin', label: '权限系统', icon: ShieldCheck, adminOnly: true },
   { key: 'ops', label: '智能运维', icon: Activity, soon: true },
 ]
@@ -98,6 +92,7 @@ export default function TopNav({
   view,
   onNavigate,
   isAdmin,
+  isPlatformAdmin,
   currentUsername,
   meProfile,
   onLogout,
@@ -124,13 +119,25 @@ export default function TopNav({
       <div className="profile-section">
         <div className="profile-section-label">角色</div>
         <div className="profile-collections">
-          {meProfile?.roles?.length ? (
-            meProfile.roles.map((r) => (
-              <span key={r.role_id} className="tag tag--primary">{r.display_name}</span>
-            ))
-          ) : (
-            <span className="profile-empty-hint">未分配角色</span>
-          )}
+          {(() => {
+            // "普通用户"（内部标识 user）是角色系统改造前给所有账号打的基础
+            // 角色，改造后新账号也就一个角色（UserRoleAssignment.jsx"一人一
+            // 角色"），但老账号（比如 admin）还留着当年的 user + super_admin
+            // 两个角色——同时挂着"超级管理员"和"普通用户"两个标签会让人以为
+            // 权限判断有问题，其实只是历史数据没清理。user 本身不携带任何
+            // 额外信息（不比"没有更具体的角色"多说明什么），只要还有别的角色
+            // 在，就不展示它；真的只剩 user 一个角色时才照常显示"普通用户"。
+            const displayRoles = meProfile?.roles?.length > 1
+              ? meProfile.roles.filter((r) => r.name !== 'user')
+              : meProfile?.roles ?? []
+            return displayRoles.length ? (
+              displayRoles.map((r) => (
+                <span key={r.role_id} className="tag tag--primary">{r.display_name}</span>
+              ))
+            ) : (
+              <span className="profile-empty-hint">未分配角色</span>
+            )
+          })()}
         </div>
       </div>
 
@@ -182,7 +189,7 @@ export default function TopNav({
       </div>
 
       <div className="nav-modules">
-        {MODULES.filter((m) => !m.adminOnly || isAdmin).map((m) => (
+        {MODULES.filter((m) => (!m.adminOnly || isAdmin) && (!m.platformOnly || isPlatformAdmin)).map((m) => (
           <div
             key={m.key}
             className={[

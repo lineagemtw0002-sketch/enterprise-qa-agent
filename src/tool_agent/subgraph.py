@@ -31,6 +31,33 @@ from src.tool_agent.unified_tool import ToolDecision, ToolResult
 
 
 # =============================================================================
+# 多智能体协作编排：按职责把工具拆给两个专家 Agent
+# =============================================================================
+# 检索类工具（知识库/文档摘要/考勤查询，全部只读）交给"检索专家 Agent"，
+# 工作流类工具（状态查询/重新提交，会触发实际的流程操作）交给"执行专家
+# Agent"——两类工具关注点不同，分开描述能让 LLM 的决策 prompt 更聚焦，也让
+# trace/审计日志能看出"这一轮是哪个专家 Agent 在处理"，而不是像改造前那样
+# 一个 Agent 面对全部工具用同一套 system prompt 决策。MCP 工具会带
+# "{server_name}." 前缀，用 _bare_tool_name 取裸工具名再匹配；未出现在任一
+# 集合里的工具（外部 MCP 工具、未来新增工具）归入"协调 Agent"，两类工具都
+# 能看到，行为跟改造前完全一致，不会因为分类遗漏导致访问不到。
+RETRIEVAL_TOOLS = {"query_knowledge_hub", "list_collections", "get_document_summary", "query_attendance"}
+ACTION_TOOLS = {"check_workflow_status", "resubmit_workflow"}
+
+AGENT_PERSONAS = {
+    "retrieval_agent": "你是「检索专家 Agent」，专注于从知识库、文档摘要、考勤记录等数据源中查找信息，只处理只读查询，不执行任何工作流操作。",
+    "action_agent": "你是「执行专家 Agent」，专注于工作流状态查询与操作（如查询审批进度、重新提交流程），不处理知识库检索类问题。",
+    "general_agent": "你是「协调 Agent」，可以根据需要综合使用检索类和执行类工具。",
+}
+
+
+def _bare_tool_name(name: str) -> str:
+    """MCP 工具名带 "{server_name}." 前缀，内置工具没有——统一取最后一段
+    用于分类匹配（见 RETRIEVAL_TOOLS/ACTION_TOOLS 旁的说明）。"""
+    return name.rsplit(".", 1)[-1] if name else name
+
+
+# =============================================================================
 # Builder
 # =============================================================================
 
@@ -39,6 +66,7 @@ def build_tool_subgraph(
     llm: Any,
     max_iterations: int = 5,
     emit_trace: Optional[Callable[[str, str, str, Optional[Dict[str, Any]]], None]] = None,
+    audit_log: Optional[Callable[..., Any]] = None,
 ) -> Any:
     """构建工具子智能体子图。
 
@@ -56,13 +84,49 @@ def build_tool_subgraph(
             直接闭包捕获某一次请求的 trace_queue，只能接收调用方（RAGWorkflow
             实例方法）作为回调，由调用方自己在每次请求时决定往哪个队列推——
             具体见 workflow.py 里 `self._emit_trace` 的传参方式。
-
+        audit_log: 可选的审计日志回调，签名
+            `async def audit_log(user_id, action, resource_type, resource_id,
+            detail, success) -> None`——每次真实的工具调用后都会 await 这个
+            回调一次（见 tool_node），治理与合规要求"记录谁在何时查询了哪个
+            知识库/触发了哪个工具"。None 表示不需要审计，是纯 no-op。
     Returns:
         编译后的 LangGraph（可作为子图节点加入主图）
     """
     def _trace(node: str, step: str, status: str = "running", payload: Optional[Dict[str, Any]] = None) -> None:
         if emit_trace is not None:
             emit_trace(node, step, status, payload)
+
+    # ------------------------------------------------------------------
+    # supervisor_node: 多智能体协作编排的调度入口
+    # ------------------------------------------------------------------
+    async def supervisor_node(state: ToolSubgraphState) -> Dict[str, Any]:
+        """决定这一轮交给哪个专家 Agent 处理：优先看主图（意图分类）是否已经
+        指定了唯一目标工具，没有的话退而看这次请求实际可用的工具集合里有没有
+        动作类工具——两类都有或者都没有（比如只有外部 MCP 工具）就交给通用的
+        「协调 Agent」，覆盖全部工具，行为退化成改造前的样子。"""
+        target_tool = state.get("target_tool")
+        available_tools = state.get("available_tools", [])
+        available_names = {
+            _bare_tool_name((t.get("function") or {}).get("name", ""))
+            for t in available_tools
+        }
+
+        if target_tool and _bare_tool_name(target_tool) in ACTION_TOOLS:
+            agent = "action_agent"
+        elif target_tool and _bare_tool_name(target_tool) in RETRIEVAL_TOOLS:
+            agent = "retrieval_agent"
+        else:
+            has_action = bool(available_names & ACTION_TOOLS)
+            has_retrieval = bool(available_names & RETRIEVAL_TOOLS)
+            if has_action and not has_retrieval:
+                agent = "action_agent"
+            elif has_retrieval and not has_action:
+                agent = "retrieval_agent"
+            else:
+                agent = "general_agent"
+
+        _trace("tool_subgraph", "supervisor", "success", {"agent": agent, "target_tool": target_tool})
+        return {"active_agent": agent}
 
     # ------------------------------------------------------------------
     # think_node: LLM 决策下一步动作
@@ -74,10 +138,11 @@ def build_tool_subgraph(
         target_tool = state.get("target_tool")
         available_tools = state.get("available_tools", [])
         internal_messages = state.get("internal_messages", [])
-        
+        agent_role = state.get("active_agent", "general_agent")
+
         # 构建 messages（百炼 API 要求必须有 user 角色消息）
         if iteration == 0:
-            system_prompt = _build_system_prompt(query, available_tools, target_tool)
+            system_prompt = _build_system_prompt(query, available_tools, target_tool, agent_role)
             messages = [
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=f"用户查询：{query}\n\n请根据上述查询和可用工具列表，做出工具调用决策。直接输出 JSON。"),
@@ -129,8 +194,9 @@ def build_tool_subgraph(
         tool_execution_trace = list(state.get("tool_execution_trace", []))
         
         new_messages = []
-        
+
         user_id = state.get("user_id")
+        agent_role = state.get("active_agent", "general_agent")
 
         for call in tool_calls:
             name = call.get("name", "")
@@ -220,10 +286,37 @@ def build_tool_subgraph(
                 "timestamp": time.time(),
                 "collections": collections,
                 "attempted_collections": attempted_collections,
+                # 多智能体协作编排——这次调用是由哪个专家 Agent 发起的，见
+                # supervisor_node/AGENT_PERSONAS 旁的说明。
+                "agent": agent_role,
             })
-            
+
             if not result.success:
                 failed_tools.append(name)
+
+            # 治理与合规：每次真实的工具调用都落一条审计记录（谁在何时触发了
+            # 哪个工具，命中/委托了哪个知识库）——audit_log 为 None（没有传，
+            # 比如独立跑的 MCP server 场景）时是纯 no-op。失败不重试、不影响
+            # 工具调用本身的结果，跟 audit_store.record 内部的异常吞掉是同一个
+            # "审计是旁路能力"的原则（见 audit_store.py record() 旁的说明）。
+            if audit_log is not None:
+                try:
+                    await audit_log(
+                        user_id=user_id,
+                        action="tool_call",
+                        resource_type=name,
+                        resource_id=(collections[0] if collections else None),
+                        detail={
+                            "args": {k: v for k, v in args.items() if k != "user_id"},
+                            "success": result.success,
+                            "latency_ms": round(latency_ms),
+                            "agent": agent_role,
+                            "collections": collections,
+                        },
+                        success=result.success,
+                    )
+                except Exception as e:
+                    print(f"[ToolSubgraph] audit_log callback failed: {e}")
         
         return {
             "internal_messages": new_messages,
@@ -284,13 +377,16 @@ def build_tool_subgraph(
     # 构建图
     # =================================================================
     graph = StateGraph(ToolSubgraphState)
-    
+
+    graph.add_node("supervisor", supervisor_node)
     graph.add_node("think", think_node)
     graph.add_node("tool", tool_node)
     graph.add_node("summarize", summarize_node)
-    
-    # 边：think 直接路由到 tool 或 summarize（根据 think_node 写入的 next_node）
-    graph.add_edge(START, "think")
+
+    # 边：supervisor 先分派专家 Agent，再进 think；think 直接路由到 tool 或
+    # summarize（根据 think_node 写入的 next_node）
+    graph.add_edge(START, "supervisor")
+    graph.add_edge("supervisor", "think")
     graph.add_conditional_edges(
         "think",
         lambda state: "summarize" if state.get("iteration_count", 0) >= state.get("max_iterations", max_iterations) else state.get("next_node", "summarize"),
@@ -355,13 +451,34 @@ def _build_system_prompt(
     query: str,
     available_tools: List[Dict[str, Any]],
     target_tool: Optional[str] = None,
+    agent_role: str = "general_agent",
 ) -> str:
-    """构建 think_node 的系统提示。"""
-    
+    """构建 think_node 的系统提示。
+
+    agent_role 由 supervisor_node 分派（多智能体协作编排，见本文件顶部
+    AGENT_PERSONAS 旁的说明）——retrieval_agent/action_agent 只看到自己
+    职责范围内的工具，防止决策 prompt 被无关工具的描述稀释；general_agent
+    （没法明确归类到某一类，比如外部 MCP 工具混在里面）仍然看到全部工具，
+    行为等价于改造前。"""
+
+    category = RETRIEVAL_TOOLS if agent_role == "retrieval_agent" else (
+        ACTION_TOOLS if agent_role == "action_agent" else None
+    )
+    scoped_tools = (
+        [t for t in available_tools if _bare_tool_name((t.get("function") or {}).get("name", "")) in category]
+        if category is not None
+        else available_tools
+    )
+    # 专家 Agent 分到的工具集合恰好是空（比如这次可用工具里根本没有该类别的
+    # 任何工具）——退回全量工具，避免 LLM 拿着一份空列表决策，比因为分类
+    # 逻辑的边界情况导致"明明有工具能用却看不到"更安全。
+    if category is not None and not scoped_tools:
+        scoped_tools = available_tools
+
     tools_desc = ""
-    if available_tools:
+    if scoped_tools:
         lines = []
-        for t in available_tools:
+        for t in scoped_tools:
             # OpenAI schema: {"type": "function", "function": {"name": ..., "description": ...}}
             func = t.get("function") or {}
             name = func.get("name") or t.get("name", "unknown")
@@ -370,14 +487,15 @@ def _build_system_prompt(
         tools_desc = "\n".join(lines)
     else:
         tools_desc = "（当前无可用工具）"
-    
+
     target_hint = ""
     if target_tool:
         target_hint = f"\n\n【注意】主图已指定目标工具: {target_tool}，请优先使用此工具。"
-    
-    today = date.today().isoformat()
 
-    return f"""你是一个工具调用决策助手。你的任务是根据用户查询，决定是否需要调用工具，以及调用哪些工具。
+    today = date.today().isoformat()
+    persona = AGENT_PERSONAS.get(agent_role, AGENT_PERSONAS["general_agent"])
+
+    return f"""{persona}你的任务是根据用户查询，决定是否需要调用工具，以及调用哪些工具。
 
 今天的日期是 {today}。如果查询里出现"明天""上周""7.1日"这类相对日期或省略年份的日期，
 调用工具时传的日期参数要先换算/补全成完整的 YYYY-MM-DD 格式。

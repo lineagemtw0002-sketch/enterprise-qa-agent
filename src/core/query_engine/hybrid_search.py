@@ -748,6 +748,14 @@ class HybridSearch:
                 source = metadata.get("source_path", "")
                 if value not in source:
                     return False
+            elif isinstance(value, list):
+                # 未知字段但过滤值是列表——按"在列表里"匹配（IN 语义），跟
+                # 上面 tags 是同一个思路但适用于任意字段，不局限于 tags。
+                # 目前的实际用途：query_knowledge_hub.py 层次化检索narrowing
+                # 阶段传 {"doc_id": [id1, id2, ...]}，把chunk精排范围收窄到
+                # 摘要层选中的那几份文档，而不是整个 collection。
+                if metadata.get(key) not in value:
+                    return False
             else:
                 # 其他字段默认使用精确匹配。
                 if metadata.get(key) != value:

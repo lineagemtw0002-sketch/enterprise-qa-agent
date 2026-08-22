@@ -7,6 +7,15 @@ import * as adminApi from '../../api/admin.js'
 // 知识库"列同一个结论），所以这个页面只管角色目录本身（建/改名/删），不出现
 // 知识库的选择和展示——"给角色配知识库"是企业管理员在自己的「知识库权限」
 // 页面（CompanyKbPermissions.jsx）做的事，两边职责不重叠。
+//
+// hr_admin_kb/finance_kb 等 6 个角色以前在这张表里被过滤掉不显示——那时候
+// 它们是平台自己固定部门知识库的专属角色壳子，跟 all_kb 是同一类"不是真正
+// 角色"的问题。2026-08-22 起平台那 6 个本地部门库已经下线，这几个角色改成
+// 委托模式企业（Acme/Globex）的类目过滤角色（见 query_knowledge_hub.py
+// DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES），是需要正常管理（改展示名等）的
+// 真实角色了，不再从这张表里过滤——跟 UserRoleAssignment.jsx 那边同步放开
+// 分配入口是同一次改动，两处必须保持一致。
+
 export default function RoleManagement() {
   const [roles, setRoles] = useState([])
   const [loading, setLoading] = useState(false)
@@ -28,7 +37,10 @@ export default function RoleManagement() {
       // 迁移时为了把 allowed_collections=["*"] 的用户接到新角色表上，临时
       // 造的一个系统角色壳子（见 scripts/migrate_to_roles.py），本质是
       // "知识库通配符权限"，不是一个有身份含义的角色，不该跟 IT部/法务部
-      // 这类真正的角色混在一张表里管理。
+      // 这类真正的角色混在一张表里管理——过滤掉不影响它继续被分配给用户
+      // （「用户与角色分配」页面读的是同一个 GET /admin/roles，这里的过滤
+      // 只在这个组件内部生效，不改后端返回），也不影响 bob 这类已经持有它
+      // 的账号，只是不再出现在这张"角色目录"管理表格里。
       setRoles(roleList.filter((r) => r.name !== 'all_kb'))
     } catch (error) {
       message.error('加载角色列表失败: ' + (error.response?.data?.detail || error.message))

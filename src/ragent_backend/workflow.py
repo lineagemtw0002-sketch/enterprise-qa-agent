@@ -35,6 +35,62 @@ from src.tool_agent.subgraph import build_tool_subgraph
 # 对齐 intent.py 里"模糊代词"这类硬规则检查的风格，见 work-flow.md 6.1 步骤 1）
 _WORKFLOW_CANCEL_KEYWORDS = ["取消", "算了", "不填了", "不申请了", "先不弄了"]
 
+# 用户有权限查的知识库里没查到相关内容时的固定回复——"安全第一的万能模糊回复"
+# 策略：既不生硬地断言"没有"（可能是权限范围内确实没有这份资料，也可能是关键词
+# 没对上），也不暴露具体查了哪些库/库里有什么（避免间接确认某类敏感资料的存在
+# 与否）。原来是让 LLM 基于这句话再展开一段"行业通用经验建议"，但那一步本质上
+# 是把免责声明的严谨措辞交给本地小模型自由发挥，即使 prompt 里反复强调"不要
+# 编造具体的公司制度"，也无法完全杜绝模型把两部分说漏嘴说串——固定模板 + 短路
+# 跳过 LLM 调用，是更安全的做法，跟下面 ACL 拒绝那句短路走的是同一个模式。
+_KB_EMPTY_HIT_MESSAGE = (
+    "抱歉，在您当前可访问的知识库范围内，未检索到相关内容。"
+    "请确认关键词是否正确，或联系管理员确认您的知识库访问权限。"
+)
+
+
+def _estimate_token_count(text: str) -> int:
+    """LLM 没有回传真实 usage_metadata 时的粗略估算（本地 Ollama 模型目前
+    走这条路径）。中文字符大致 1 字符 = 1 token，其余字符（英文/数字/标点）
+    大致 4 字符 = 1 token——不追求精确计费，只求量级正确，供运营仪表盘的
+    token 用量趋势图用（见 dashboard_stats.py），仪表盘会明确标注"预估"。"""
+    if not text:
+        return 0
+    cjk_count = sum(1 for ch in text if "一" <= ch <= "鿿")
+    other_count = len(text) - cjk_count
+    return max(1, cjk_count + other_count // 4)
+
+
+def _extract_token_usage(chunks: List[Any], prompt: str, answer: str) -> Dict[str, Any]:
+    """优先用 LLM 流式响应里真实回传的 usage_metadata（多数云端 OpenAI 兼容
+    API 会在最后一个 chunk 里带上）；拿不到（比如本地 Ollama）就退化成按
+    字符数估算，并标记 estimated=True，不能让仪表盘把估算值当成精确计费
+    展示——这是本项目一贯的"优雅降级 + 明确标注"风格（跟 hybrid_search 单路
+    降级、memory_manager LLM 不可用时 fallback 拼接同一个思路）。"""
+    for chunk in reversed(chunks):
+        usage = getattr(chunk, "usage_metadata", None)
+        if usage:
+            prompt_tokens = usage.get("input_tokens")
+            completion_tokens = usage.get("output_tokens")
+            total = usage.get("total_tokens") or (
+                (prompt_tokens or 0) + (completion_tokens or 0) if prompt_tokens or completion_tokens else None
+            )
+            if total:
+                return {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total,
+                    "estimated": False,
+                }
+
+    prompt_tokens = _estimate_token_count(prompt)
+    completion_tokens = _estimate_token_count(answer)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "estimated": True,
+    }
+
 
 class RAGWorkflow:
     """
@@ -60,12 +116,18 @@ class RAGWorkflow:
         ltm_store: Optional[LTMStore] = None,
         tool_registry: Optional[ToolRegistry] = None,
         workflow_store: Optional[WorkflowStore] = None,
+        audit_log: Optional[Any] = None,
     ) -> None:
         self._store = store
         self._llm = llm
         self._checkpointer = checkpointer
         self._ltm_store = ltm_store
         self._workflow_store = workflow_store
+        # 审计日志回调（治理与合规），签名见 app.py `_audit_log`——工具子图
+        # 里每次真实的工具调用（知识库检索/考勤查询/工作流操作……）都会经这个
+        # 回调落一条审计记录。None 表示调用方（比如独立跑的 MCP server 场景）
+        # 不需要审计，传给子图后是纯 no-op。
+        self._audit_log = audit_log
         # asyncio only holds a *weak* reference to a task; one created and never
         # stored anywhere (as the archive/LTM background tasks below are) can be
         # garbage-collected before it finishes running. Keeping a strong reference
@@ -109,6 +171,7 @@ class RAGWorkflow:
                 # 一次，但每次调用时读的是当次请求实时设置的 self._trace_queue，
                 # 不会把某一次请求的队列锁死进闭包里，多个并发请求互不串。
                 emit_trace=self._emit_trace,
+                audit_log=self._audit_log,
             )
             # 不直接把编译后的子图注册成节点——子图内部（think_node/tool_node/
             # summarize_node，见 src/tool_agent/subgraph.py）原来完全没有埋点，
@@ -336,6 +399,16 @@ class RAGWorkflow:
         state.setdefault("memories", [])
         # 每轮都生成新的 turn_id，用于后续三层时间裁剪回滚
         state["current_turn_id"] = str(uuid.uuid4())
+        # 这一轮真正开始处理的时刻（图执行的第一个节点）——_archive_node 拿它
+        # 跟归档时刻相减，算出这一轮的端到端响应耗时，写进 assistant 消息的
+        # latency_ms（运营仪表盘用，见 dashboard_stats.py）。不能用
+        # conversation_archive 里 user/assistant 两条消息的 created_at 相减
+        # 近似——那两个时间戳是 _archive_node 同一个循环里前后脚打上去的
+        # time.time()，都是"归档时刻"，量级对不上真实响应耗时（真实踩过的坑，
+        # 见 store.py latency_ms 列旁的说明）。每轮都无条件覆盖，不用像
+        # tool_execution_trace 那样额外清空——跟 current_turn_id 是同一个
+        # "每轮开头就重置，本轮内自然会被用到/覆盖，不需要收尾清理"的模式。
+        state["_turn_start_ts"] = time.time()
 
         # 每轮清空上一轮遗留的工具执行轨迹——tool_execution_trace 是普通字段
         # （没有 Annotated 累加 reducer），会被 checkpointer 原样带到下一轮；
@@ -541,6 +614,10 @@ class RAGWorkflow:
         self._emit_trace("tool_subgraph", "node_end", "success", {
             "target_tool": state.get("target_tool"),
             "iteration_count": result.get("iteration_count") if isinstance(result, dict) else None,
+            # 多智能体协作编排（supervisor_node 分派给的专家 Agent），见
+            # subgraph.py AGENT_TOOL_CATEGORIES 旁的说明——TracePanel 的
+            # STATE INSPECTOR 直接展示这个字段就够了，不需要单独加 UI。
+            "active_agent": result.get("active_agent") if isinstance(result, dict) else None,
         })
         return result
 
@@ -1010,6 +1087,39 @@ class RAGWorkflow:
                 ],
             }
 
+        # 意图分类判定这是该查公司知识库的问题（target_tool=query_knowledge_hub），
+        # 但最终没能拿到任何有用的知识库内容时，直接短路成固定的模糊免责声明，
+        # 不再交给 LLM 生成——理由同上面 ACL 拒绝短路。这里没查到有用内容分两种
+        # 情况，都要覆盖：真的查了但没查到相关的（tool_execution_trace 里有
+        # query_knowledge_hub 记录，但 collections 为空）、以及工具子图的 think
+        # 节点自己判断"这个问题不像是知识库能答的"、压根没调用 query_knowledge_hub
+        # （tool_execution_trace 里连一条 query_knowledge_hub 记录都没有）——两种
+        # 情况下用户能确定的信息应该是一样的（"当前可访问范围内没查到"），不需要
+        # 也不应该区分哪种，避免间接暴露"到底查没查过""查了哪个库"这些细节。
+        # 只处理 query_knowledge_hub 这一个工具，_retrieve_node（用户自己上传
+        # 文件的 rag 分支）不在这个模板范围内，两者语义不同，不能共用一套措辞。
+        if state.get("target_tool") == "query_knowledge_hub":
+            kb_hit = any(
+                t.get("collections")
+                for t in state.get("tool_execution_trace", [])
+                if t.get("tool_name") == "query_knowledge_hub"
+            )
+            if not kb_hit:
+                if self._token_queue is not None:
+                    await self._token_queue.put(_KB_EMPTY_HIT_MESSAGE)
+                assistant_message = AIMessage(content=_KB_EMPTY_HIT_MESSAGE)
+                self._emit_trace("generate", "node_end", "success", {"short_circuit": "empty_kb_hit"})
+                return {
+                    "messages": [assistant_message],
+                    "final_answer": _KB_EMPTY_HIT_MESSAGE,
+                    "used_model": "n/a (empty kb hit, no LLM call)",
+                    "kb_sources": kb_sources,
+                    "trace_events": [
+                        *state.get("trace_events", []),
+                        {"node": "generate", "ts": time.time(), "model": "n/a"}
+                    ],
+                }
+
         # 构建 prompt
         self._emit_trace("generate", "prompt_build", "running")
         prompt = self._build_prompt(state)
@@ -1017,15 +1127,17 @@ class RAGWorkflow:
         
         # 调用 LLM（流式收集，同时透传 token）
         self._emit_trace("generate", "llm_stream", "running")
+        token_usage: Optional[Dict[str, Any]] = None
         try:
             chunks = []
             async for chunk in self._llm.astream([HumanMessage(content=prompt)]):
                 chunks.append(chunk)
                 if self._token_queue is not None:
                     await self._token_queue.put(chunk.content)
-            
+
             answer = "".join(c.content for c in chunks)
             model_name = getattr(self._llm, "model_name", "unknown")
+            token_usage = _extract_token_usage(chunks, prompt, answer)
             self._emit_trace("generate", "llm_stream", "success", {
                 "model": model_name,
                 "token_count": len(chunks),
@@ -1034,16 +1146,17 @@ class RAGWorkflow:
             answer = f"生成失败：{str(e)}"
             model_name = "error"
             self._emit_trace("generate", "llm_stream", "error", {"error": str(e)})
-        
+
         # 添加助手回复到 messages
         assistant_message = AIMessage(content=answer)
-        
+
         self._emit_trace("generate", "node_end", "success" if model_name != "error" else "error")
         return {
             "messages": [assistant_message],  # add_messages 会追加
             "final_answer": answer,
             "used_model": model_name,
             "kb_sources": kb_sources,
+            "last_turn_tokens": token_usage,
             "trace_events": [
                 *state.get("trace_events", []),
                 {"node": "generate", "ts": time.time(), "model": model_name}
@@ -1065,59 +1178,6 @@ class RAGWorkflow:
 {tool_summary}
 """
 
-        # 意图分类判定这是该查公司知识库的问题（target_tool=query_knowledge_hub），
-        # 但最终没能拿到任何有用的知识库内容时，明确要求 LLM 用固定模板告知
-        # 用户——不能像之前那样，不管有没有查到、查没查过，都照样生成一段看起来
-        # 像是"查出来的"通用建议（真实踩过的坑：VPN/钓鱼邮件那两次复现，见调试
-        # 记录）。这里没查到有用内容分两种情况，都要覆盖：
-        # 1. 真的查了但没查到相关的（attempted_collections 非空、collections
-        #    空，两个字段的区别见 subgraph.py tool_node 旁的说明）——能报出
-        #    具体查了哪几个知识库。
-        # 2. 工具子图的 think 节点自己判断"这个问题不像是知识库能答的"，压根
-        #    没调用 query_knowledge_hub（tool_execution_trace 里连一条
-        #    query_knowledge_hub 记录都没有）——报不出具体查了哪个库，只能
-        #    笼统说"公司知识库"。
-        # 只处理 query_knowledge_hub 这一个工具，_retrieve_node（用户自己上传
-        # 文件的 rag 分支）不在这个模板范围内，两者语义不同，不能共用一套措辞。
-        empty_kb_notice = ""
-        if state.get("target_tool") == "query_knowledge_hub":
-            kb_trace_entries = [
-                t for t in state.get("tool_execution_trace", [])
-                if t.get("tool_name") == "query_knowledge_hub"
-            ]
-            attempted = sorted({c for t in kb_trace_entries for c in (t.get("attempted_collections") or [])})
-            hit = sorted({c for t in kb_trace_entries for c in (t.get("collections") or [])})
-            if not hit:
-                if attempted:
-                    from src.mcp_server.tools.query_knowledge_hub import DEPARTMENT_KB_COLLECTIONS
-
-                    def _kb_label(c: str) -> str:
-                        if c in DEPARTMENT_KB_COLLECTIONS:
-                            return DEPARTMENT_KB_COLLECTIONS[c]
-                        # 委托模式（tenant_{org_id}_kb[:子库标签]）——原始 slug 带着
-                        # 企业的 org_id（一串 UUID），直接展示会很生硬，退回跟前端
-                        # kbMeta() 一致的"本企业知识库"泛称（见 TopNav.jsx）。
-                        if c.startswith("tenant_") and "_kb" in c:
-                            sub_label = c.split(":", 1)[1] if ":" in c else ""
-                            return f"本企业知识库 · {sub_label}" if sub_label else "本企业知识库"
-                        return c
-
-                    labels = [_kb_label(c) for c in attempted]
-                    labels_text = "、".join(f"【{label}】" for label in labels)
-                else:
-                    # 工具压根没被调用，报不出具体库名，用泛称
-                    labels_text = "【公司知识库】"
-                original_query = state.get("query", "")
-                empty_kb_notice = f"""
-【重要】公司知识库（{labels_text}）里没有查到跟用户问题直接相关的内容。你的回答必须
-严格按下面的格式组织，不能把接下来给的通用建议包装成"知识库里查到的"内容：
-1. 第一句明确说："抱歉，在公司内部{labels_text}中未找到关于"{original_query}"的直接相关内容。"
-2. 空一行，另起一段以"🔍 基于行业通用经验，您可以尝试以下方向："开头，给 2-3 条通用性建议
-   （只给业界通用的常识性做法，不要编造具体的公司制度、流程、联系方式或网址）。
-3. 这两部分之间不要出现"根据检索结果""知识库显示""公司规定"之类暗示这是公司内部
-   资料的措辞——用户必须能一眼看出第二部分是你自己的通用知识，不是公司知识库内容。
-"""
-
         prompt = ChatPromptTemplate.from_template("""你是企业级知识库助手，基于检索结果、工具执行结果、对话历史和用户长期记忆回答用户问题。
 
 【用户长期记忆】
@@ -1129,7 +1189,6 @@ class RAGWorkflow:
 【最近对话】
 {recent_history}
 {tool_section}
-{empty_kb_notice}
 【检索上下文】
 {context}
 
@@ -1147,7 +1206,6 @@ class RAGWorkflow:
             summary=state.get("summary", ""),
             recent_history=recent_history,
             tool_section=tool_section,
-            empty_kb_notice=empty_kb_notice,
             context=state.get("retrieval_context", ""),
             query=state.get("query", ""),
         )
@@ -1247,14 +1305,32 @@ class RAGWorkflow:
         messages = state.get("messages", [])
         current_turn_msgs = []
         
+        # 这一轮的真实端到端响应耗时——_session_node 记的图执行起点到现在
+        # （archive 是每轮总会跑到的最后一个节点），只写在 assistant 消息上，
+        # user 消息没有对应的"响应耗时"概念。state.get 兜底 time.time() 只是
+        # 防御性写法（正常路径 _turn_start_ts 每轮都会在 _session_node 设好），
+        # 真触发到兜底值的话 latency 会算成 0，不会报错但也不会污染统计
+        # （0 混在均值里影响可以忽略，不单独过滤）。
+        turn_latency_ms = round((time.time() - state.get("_turn_start_ts", time.time())) * 1000, 1)
+
+        # 本轮 generate 节点算出的 token 用量，只贴在 assistant 消息上——见
+        # schemas.py RAGState.last_turn_tokens 旁的说明。
+        turn_tokens = state.get("last_turn_tokens") or {}
+
         # 本轮最后两条应该是 user query 和 assistant answer
         if len(messages) >= 2:
             for m in messages[-2:]:
+                is_assistant = not isinstance(m, HumanMessage)
                 current_turn_msgs.append({
-                    "role": "user" if isinstance(m, HumanMessage) else "assistant",
+                    "role": "user" if not is_assistant else "assistant",
                     "content": m.content,
                     "message_id": m.id,
-                    "ts": time.time()
+                    "ts": time.time(),
+                    "latency_ms": turn_latency_ms if is_assistant else None,
+                    "prompt_tokens": turn_tokens.get("prompt_tokens") if is_assistant else None,
+                    "completion_tokens": turn_tokens.get("completion_tokens") if is_assistant else None,
+                    "total_tokens": turn_tokens.get("total_tokens") if is_assistant else None,
+                    "token_estimated": turn_tokens.get("estimated") if is_assistant else None,
                 })
         
         # 3. 合并：压缩的消息 + 本轮消息

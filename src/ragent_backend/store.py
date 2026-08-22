@@ -46,15 +46,25 @@ class ConversationArchiveStore:
     - 模型状态管理（由 LangGraph checkpointer 处理）
     """
 
+    # 类级别共享，不是实例级别：调用方（如 auth.py 的鉴权依赖）经常每次请求都
+    # `XStore()` 一个新实例，如果连接池挂在实例属性上，每个新实例都会各自懒建
+    # 一个池、旧实例的池没人持有引用也不会关闭，很快把 Postgres 连接数打满
+    # （见 2026-08-20 「权限系统」页面报错排查）。挂在类属性上，同一个类不管
+    # 被 new 多少次都共享同一个池。
+    _pool: Optional[asyncpg.Pool] = None
+    _pool_lock = asyncio.Lock()
+
     def __init__(self) -> None:
-        self._pool: Optional[asyncpg.Pool] = None
         self._dsn = os.getenv("RAGENT_POSTGRES_URL", "postgresql://postgres:postgres@localhost:5432/ragent")
 
     async def _get_pool(self) -> asyncpg.Pool:
         if self._pool is not None:
             return self._pool
-        self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
-        await self._ensure_schema()
+        async with self._pool_lock:
+            if self._pool is not None:
+                return self._pool
+            type(self)._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
+            await self._ensure_schema()
         return self._pool
 
     async def append_to_history(
@@ -78,13 +88,19 @@ class ConversationArchiveStore:
                         msg.get("message_id", ""),
                         msg.get("ts", time.time()),
                         turn_id,
+                        msg.get("latency_ms"),
+                        msg.get("prompt_tokens"),
+                        msg.get("completion_tokens"),
+                        msg.get("total_tokens"),
+                        msg.get("token_estimated"),
                     )
                     for msg in messages
                 ]
                 await conn.executemany(
                     """INSERT INTO conversation_archive
-                       (conversation_id, role, content, message_id, created_at, turn_id)
-                       VALUES ($1, $2, $3, $4, $5, $6)""",
+                       (conversation_id, role, content, message_id, created_at, turn_id, latency_ms,
+                        prompt_tokens, completion_tokens, total_tokens, token_estimated)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)""",
                     values
                 )
         except Exception as e:
@@ -157,7 +173,7 @@ class ConversationArchiveStore:
         """关闭连接池"""
         if self._pool is not None:
             await self._pool.close()
-            self._pool = None
+            type(self)._pool = None
 
     async def _ensure_schema(self) -> None:
         """确保表结构存在"""
@@ -174,6 +190,34 @@ class ConversationArchiveStore:
                     turn_id VARCHAR(64)
                 )
                 """
+            )
+            # 只在 assistant 消息上填——从"这一轮从哪个节点开始算"到"assistant
+            # 消息归档时"的真实耗时（见 workflow.py _session_node/_archive_node
+            # 里 _turn_start_ts 的说明）。不能从 created_at 反推：user/assistant
+            # 两条消息是同一个 _archive_node 循环里前后脚写的 time.time()
+            # （都是"归档时刻"，不是"用户发问时刻"/"回答生成完成时刻"），两者
+            # 的 created_at 差值趋近于 0，量级完全不对——运营仪表盘
+            # (dashboard_stats.py) 曾经直接拿 created_at 差值近似延迟，实测
+            # 数量级只有几毫秒的几百分之一，明显不对，才发现这个问题，改成
+            # 单独存一列真实耗时。
+            await conn.execute(
+                "ALTER TABLE conversation_archive ADD COLUMN IF NOT EXISTS latency_ms DOUBLE PRECISION"
+            )
+            # 成本可观测性用（dashboard_stats.py）——只在 assistant 消息上填，
+            # 见 workflow.py _generate_node/_archive_node 旁的说明。
+            # token_estimated=True 表示 LLM 没有回传真实 usage_metadata（比如
+            # 本地 Ollama 模型），是按字符数估算的，仪表盘据此标注"预估"。
+            await conn.execute(
+                "ALTER TABLE conversation_archive ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER"
+            )
+            await conn.execute(
+                "ALTER TABLE conversation_archive ADD COLUMN IF NOT EXISTS completion_tokens INTEGER"
+            )
+            await conn.execute(
+                "ALTER TABLE conversation_archive ADD COLUMN IF NOT EXISTS total_tokens INTEGER"
+            )
+            await conn.execute(
+                "ALTER TABLE conversation_archive ADD COLUMN IF NOT EXISTS token_estimated BOOLEAN"
             )
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_archive_conversation_time ON conversation_archive(conversation_id, created_at)"

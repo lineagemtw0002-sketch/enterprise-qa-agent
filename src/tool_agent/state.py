@@ -28,7 +28,10 @@ class ToolSubgraphState(TypedDict, total=False):
     user_id: str                         # 调用者身份，仅用于 tool_node 内部的 ACL 校验，
                                           # 不会出现在 available_tools 的 schema 里，
                                           # LLM 看不到也改不了这个值（见 tool_node）
-    
+
+    # === 多智能体协作编排（supervisor_node 写入，见 subgraph.py） ===
+    active_agent: Optional[str]          # "retrieval_agent" / "action_agent" / "general_agent"
+
     # === 内部状态（子图内部循环，不返回主图）===
     internal_messages: Annotated[List[AnyMessage], add_messages]
     tool_calls: List[Dict[str, Any]]     # LLM 决定的 tool calls [{name, arguments}]

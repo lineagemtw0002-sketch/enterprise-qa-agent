@@ -30,6 +30,8 @@ def mock_settings_openai() -> Any:
     settings.embedding.model = "text-embedding-3-small"
     settings.embedding.dimensions = 1536
     settings.embedding.base_url = None  # No base_url in settings by default
+    settings.embedding.api_key = None  # Unset by default; tests override via param/env var
+    settings.embedding.azure_endpoint = None  # Not in Azure-compatible mode by default
     return settings
 
 
@@ -44,6 +46,7 @@ def mock_settings_azure() -> Any:
     settings.embedding.azure_endpoint = "https://my-resource.openai.azure.com/"
     settings.embedding.api_version = "2024-02-01"
     settings.embedding.dimensions = None
+    settings.embedding.api_key = None  # Unset by default; tests override via param/env var
     return settings
 
 
@@ -233,12 +236,19 @@ class TestAzureEmbedding:
     def test_initialization_with_env_vars(
         self, mock_settings_azure: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Test initialization with Azure environment variables."""
+        """Test initialization with Azure environment variables.
+
+        Precedence is explicit param > settings.yaml > env var (see
+        AzureEmbedding.__init__ docstring), so settings must be unset here for
+        the env vars to actually take effect instead of being shadowed.
+        """
+        mock_settings_azure.embedding.api_key = None
+        mock_settings_azure.embedding.azure_endpoint = None
         monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-env-key")
         monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://env.openai.azure.com/")
-        
+
         embedding = AzureEmbedding(mock_settings_azure)
-        
+
         assert embedding.api_key == "azure-env-key"
         assert embedding.azure_endpoint == "https://env.openai.azure.com/"
     

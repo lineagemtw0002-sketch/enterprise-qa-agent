@@ -234,6 +234,74 @@ Body:
 | `5xx` / 连接失败 | 同上，统一降级提示，不让异常冒泡成用户看到的堆栈 |
 | 连接器未配置（`connector is None`） | 落到 `internal_chroma` 默认分支（3 节），不是报错——保证没配置真实连接器的组织仍然能用内置 demo 知识库 |
 
+### 4.4 委托写入契约（方案 2："平台代算，企业只存储"）
+
+员工上传文档时，切片 + embedding 的逻辑对所有企业都是一样的（同一套 `DocumentChunker`/
+`DenseEncoder`/`SparseEncoder`），没有理由让每家委托企业各自重新实现一遍——所以写入方向选的
+不是"企业自己接一个能理解原始文档格式、自己会切片/embedding 的接口"，而是**平台用自己已有的
+组件把文档算成 chunk + 向量 + 稀疏统计，企业那边只需要实现一个"存进去"的接口**，不需要跑任何
+AI 模型。跟 4.1-4.3 的查询契约是同一个连接器（`capability=knowledge_base`），只是反方向。
+
+#### 请求
+
+```
+POST {endpoint}/v1/vectors
+Headers:
+  Authorization: Bearer {token}
+  X-Organization-Id: {org_id}
+  Content-Type: application/json
+
+Body:
+{
+  "doc_id": "doc_a1b2c3",
+  "category": "hr_admin",                    // 可选：这份文档归属企业内部哪个子库/分类，员工上传时选的
+                                              // （见 4.2 节 metadata.kb_name——读写两侧用的是同一份分类
+                                              // 约定，参考实现 CATEGORY_LABELS/query_knowledge_hub.py
+                                              // DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES 目前用的 6 个固定
+                                              // 类目：hr_admin/finance/it_support/sales_marketing/
+                                              // rd_product/customer_success，是我们自己给 demo 企业定的
+                                              // 默认分类法，不是协议强制要求；不传时企业服务可以有自己的
+                                              // 默认归类逻辑，或者干脆不分类）
+  "chunks": [
+    {
+      "chunk_id": "doc_a1b2c3_0000_9f8e7d",   // 平台生成，仅供参考；企业存储时可以用自己的 ID 规则
+      "text": "报销标准：差旅费按实报销……",
+      "vector": [0.0123, -0.0456, ...],        // 维度跟随平台当前配置的 embedding 模型（settings.yaml embedding.dimensions）
+      "sparse_stats": {                          // SparseEncoder 的输出，企业若不打算支持关键词检索可以忽略这个字段
+        "term_frequencies": {"报销": 2, "差旅": 1},
+        "doc_length": 12,
+        "unique_terms": 9
+      },
+      "metadata": {"source_path": "员工手册2026.pdf", "title": "报销制度", "chunk_index": 0}
+    }
+  ]
+}
+```
+
+#### 响应
+
+```json
+{ "chunk_count": 1 }
+```
+
+#### 错误处理
+
+跟 4.3 同一套降级策略（401/403 鉴权失败、超时、5xx 统一处理）；写入比查询耗时更长，平台侧用一个
+更宽松的超时阈值（参考实现：60s，而不是查询用的 8s）。
+
+#### 参考实现
+
+`services/tenant_kb_demo/app.py` 的 `POST /v1/vectors`：不做任何 embedding 计算，直接把收到的
+`{text, vector, metadata}` 交给自己的 `VectorUpserter`，`sparse_stats` 交给自己的 `BM25Indexer`——
+这一步复用的正是平台自己的存储组件（跟 4.1 查询契约"复用 ChromaStore + HybridSearch"是同一个
+决策），企业接入时不要求照抄这两个类，只要接口形状对上、能把 `{text, vector}` 存进自己选择的
+任意向量库即可。
+
+平台侧的计算在 `src/ingestion/delegated_compute.py`：复用 `IngestionPipeline`（本地检索模式的
+完整摄入流水线）里真正无状态、可独立调用的那几个组件（`UniversalLoader`/`DocumentChunker`/
+`BatchProcessor`），只算不存——不识别图片、不做 chunk 精炼/元数据增强/文档级摘要，这几个本地
+模式独有的增强步骤不在这条委托写入通道的范围内。
+
 ---
 
 ## 5. 核心逻辑

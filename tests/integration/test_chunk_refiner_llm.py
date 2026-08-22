@@ -131,9 +131,15 @@ def create_settings_for_provider(provider: str) -> Settings:
         settings.llm.max_tokens = 1000
         
     elif provider == 'ollama':
-        settings.llm.model = "llama2"
+        # Model must actually be pulled locally (`ollama list`) for this test to
+        # run; max_tokens must be set explicitly — OllamaLLM reads
+        # settings.llm.max_tokens unconditionally (see ollama_llm.py), and on a
+        # bare Mock an unset attribute auto-vivifies as a Mock instead of None,
+        # which then fails JSON-serializing the request body.
+        settings.llm.model = os.getenv('OLLAMA_MODEL', 'qwen2.5:7b')
         settings.llm.base_url = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
         settings.llm.temperature = 0.3
+        settings.llm.max_tokens = 1000
         
     return settings
 
@@ -218,10 +224,12 @@ def test_multiple_providers_if_available(provider, env_var, sample_noisy_chunk):
             f"Expected keyword '{keyword}' not found in refined text"
     
     # Trace should record LLM usage
+    # get_stage_data already unwraps to the stage's `data` dict (see
+    # TraceContext.get_stage_data), so no extra ['data'] indexing here.
     stage_data = trace.get_stage_data('chunk_refiner')
     assert stage_data is not None
-    assert stage_data['data']['llm_enhanced_count'] == 1
-    assert stage_data['data']['fallback_count'] == 0
+    assert stage_data['llm_enhanced_count'] == 1
+    assert stage_data['fallback_count'] == 0
     
     # Print for manual review
     print(f"\n{'='*60}")

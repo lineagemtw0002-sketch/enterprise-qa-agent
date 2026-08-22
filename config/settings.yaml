@@ -98,6 +98,13 @@ ingestion:
     use_llm: false  # Set to true to enable LLM-based enrichment (requires LLM config)
     # When use_llm is false or LLM call fails, falls back to rule-based enrichment
 
+  # Document Summary Configuration — 层次化检索索引的文档摘要层
+  # (src/ingestion/hierarchy/doc_summary.py)
+  doc_summary:
+    use_llm: false  # Set to true to enable LLM-based summarization (requires LLM config)
+    # When use_llm is false or LLM call fails, falls back to rule-based summary
+    top_docs: 5  # 摘要层召回的候选文档数上限，见 query_knowledge_hub.py _narrow_by_document_summary
+
 # =============================================================================
 # MCP Client Configuration (External Tool Servers)
 # =============================================================================

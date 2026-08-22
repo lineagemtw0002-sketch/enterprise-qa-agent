@@ -232,44 +232,61 @@ def test_encode_rejects_chunk_with_whitespace_only_text():
 # ============================================================================
 
 def test_encode_handles_embedding_provider_failure():
-    """Test that embedding provider failures are properly surfaced."""
+    """Test that embedding provider failures are properly surfaced.
+
+    DenseEncoder.encode falls back to per-chunk retries when a batch call
+    fails (see dense_encoder.py's single-chunk fallback loop), so a provider
+    that fails on every call surfaces as a "Failed to encode chunk N after 3
+    attempts" error once those retries are exhausted, not an immediate
+    batch-level failure.
+    """
     embedding = FakeEmbedding(fail_on_call=True)
     encoder = DenseEncoder(embedding, batch_size=10)
-    
+
     chunks = [Chunk(id="1", text="Test", metadata={"source_path": "test.pdf"})]
-    
-    with pytest.raises(RuntimeError, match="Failed to encode batch.*Simulated embedding failure"):
+
+    with pytest.raises(RuntimeError, match="Failed to encode chunk 0 after 3 attempts.*Simulated embedding failure"):
         encoder.encode(chunks)
 
 
 def test_encode_failure_includes_batch_range():
-    """Test that error messages include batch range for debugging."""
+    """Test that error messages include the failing chunk index for debugging.
+
+    See test_encode_handles_embedding_provider_failure: a persistently
+    failing provider exhausts the single-chunk fallback retries and raises
+    with the chunk index, not the original batch range.
+    """
     embedding = FakeEmbedding(fail_on_call=True)
     encoder = DenseEncoder(embedding, batch_size=2)
-    
+
     chunks = [
         Chunk(id="1", text="Chunk 1", metadata={"source_path": "test.pdf"}),
         Chunk(id="2", text="Chunk 2", metadata={"source_path": "test.pdf"}),
         Chunk(id="3", text="Chunk 3", metadata={"source_path": "test.pdf"}),
     ]
-    
-    with pytest.raises(RuntimeError, match=r"Failed to encode batch 0-2"):
+
+    with pytest.raises(RuntimeError, match=r"Failed to encode chunk 0 after 3 attempts"):
         encoder.encode(chunks)
 
 
 def test_encode_validates_vector_count():
-    """Test that mismatched vector count is detected."""
+    """Test that a persistently mismatched vector count is surfaced.
+
+    A one-off count mismatch on the batch call alone falls back to
+    single-chunk retries (see dense_encoder.py) and can self-heal there, so
+    the provider here returns one fewer vector than requested on every call
+    — including single-chunk ones — to keep the mismatch genuine.
+    """
     embedding = Mock(spec=BaseEmbedding)
-    # Return wrong number of vectors
-    embedding.embed.return_value = [[0.1, 0.2]]  # Only 1 vector
-    
+    embedding.embed.side_effect = lambda texts, trace=None: [[0.1, 0.2]] * max(len(texts) - 1, 0)
+
     encoder = DenseEncoder(embedding, batch_size=10)
     chunks = [
         Chunk(id="1", text="Chunk 1", metadata={"source_path": "test.pdf"}),
         Chunk(id="2", text="Chunk 2", metadata={"source_path": "test.pdf"}),
     ]
-    
-    with pytest.raises(RuntimeError, match="returned 1 vectors for 2 texts"):
+
+    with pytest.raises(RuntimeError, match="Failed to encode chunk 0 after 3 attempts"):
         encoder.encode(chunks)
 
 

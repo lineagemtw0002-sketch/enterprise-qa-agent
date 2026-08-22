@@ -11,11 +11,14 @@ RAG Backend API - 会话级知识库版本
 from __future__ import annotations
 
 import asyncio
+import asyncpg
 import httpx
 import json
 import os
 import sys
-from typing import AsyncGenerator, FrozenSet, List, Optional
+import time
+import uuid
+from typing import Any, AsyncGenerator, Dict, FrozenSet, List, Optional
 from pathlib import Path
 
 # Windows: psycopg async 需要 SelectorEventLoop，而不是 ProactorEventLoop
@@ -31,7 +34,7 @@ except ImportError:
     pass  # python-dotenv 未安装
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -48,9 +51,15 @@ from src.ragent_backend.schemas import (
     RoleResponse, CreateRoleRequest, UpdateRoleRequest,
     SetRoleCollectionsRequest, SetUserRolesRequest,
     CollectionResponse, CreateCollectionRequest,
+    CollectionCatalogEntry, UploadStartedResponse, UploadProgressResponse,
+    TenantKbUploadResponse,
+    DashboardOverviewResponse, DashboardTrendResponse, DashboardTrendPointResponse,
+    AuditLogResponse, AuditLogListResponse, CostOverviewResponse,
     WorkflowTemplateResponse, CreateWorkflowTemplateRequest, UpdateWorkflowTemplateRequest,
     WorkflowInstanceResponse, WorkflowActionRequest, WorkflowReturnRequest, WorkflowRejectRequest,
     NotificationResponse,
+    AdminTestKBQueryRequest, AdminTestKBQueryResponse,  # 【测试专用，正式上线前删除】
+    AdminKbCollectionStat, AdminKbChunkPreview,  # 同上
 )
 from src.ragent_backend.store import build_archive_store, ConversationArchiveStore
 from src.ragent_backend.workflow import RAGWorkflow
@@ -64,16 +73,20 @@ from src.ragent_backend.attendance_store import AttendanceStore
 from src.ragent_backend.org_store import OrgStore
 from src.ragent_backend.tenant_connector_store import TenantConnectorStore, CAPABILITY_KNOWLEDGE_BASE, CONNECTOR_TYPE_HTTP_API
 from src.ragent_backend.collection_store import OrgCollectionStore
+from src.ragent_backend.dashboard_stats import DashboardStatsService
 from src.ragent_backend.tenant_identity_store import TenantIdentityStore
+from src.ragent_backend.audit_store import AuditStore
 from src.ragent_backend.auth import (
     AuthenticatedUser, create_access_token, get_current_user, require_role,
     require_same_org_or_platform, require_platform_admin,
 )
 from src.ingestion.pipeline import IngestionPipeline
-from src.core.settings import load_settings
+from src.ingestion.delegated_compute import compute_chunks_for_delegation
+from src.core.settings import load_settings, resolve_path
 from src.tool_agent.tool_registry import ToolRegistry
 from src.tool_agent.builtin_tools import register_builtin_tools
 from src.tool_agent.mcp_client import MCPClient
+from src.mcp_server.tools.query_knowledge_hub import QueryKnowledgeHubTool  # 【测试专用，正式上线前删除】
 
 
 def create_checkpointer():
@@ -283,9 +296,48 @@ def create_app() -> FastAPI:
     # org_collection_store：企业自建知识库的归属登记（只针对本地检索的企业，
     # 见 collection_store.py 顶部说明）
     org_collection_store: OrgCollectionStore = OrgCollectionStore()
+    # dashboard_stats_service：运营仪表盘只读聚合查询（见 dashboard_stats.py）
+    dashboard_stats_service: DashboardStatsService = DashboardStatsService()
     # tenant_identity_store：我方 user_id <-> 企业考勤系统工号的映射，只有委托考勤
     # 查询用得到（attendance-tenant-federation.md 第 3 节）
     tenant_identity_store: TenantIdentityStore = TenantIdentityStore()
+    # audit_store：治理与合规——管理后台变更操作 + 工具调用的审计记录（见
+    # audit_store.py）
+    audit_store: AuditStore = AuditStore()
+    # 【测试专用，正式上线前删除】管理员知识库超权测试查询工具，见下面
+    # admin_test_query_knowledge_base 端点旁的说明。复用已经建好的
+    # org_store/tenant_connector_store，不重开一份数据库连接池。
+    _admin_test_kb_tool: QueryKnowledgeHubTool = QueryKnowledgeHubTool(
+        org_store=org_store, tenant_connector_store=tenant_connector_store,
+    )
+
+    async def _audit_log(
+        user_id: Optional[str],
+        action: str,
+        resource_type: str,
+        resource_id: Optional[str],
+        detail: dict,
+        success: bool = True,
+    ) -> None:
+        """审计日志回调：补上 org_id/username 再落库。传给 RAGWorkflow（工具
+        调用审计）和各管理端点（管理操作审计）共用同一个函数，保证两类事件
+        落进同一张表、同一套字段。org_store/user_store 这里都能查——跟工具
+        调用发生在同一个进程内，不需要额外的服务间调用。"""
+        try:
+            org = await org_store.get_org_for_user(user_id) if user_id else None
+            user = await user_store.get_user_by_id(user_id) if user_id else None
+            await audit_store.record(
+                org_id=org.org_id if org else None,
+                user_id=user_id,
+                username=user.username if user else None,
+                action=action,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                detail=detail,
+                success=success,
+            )
+        except Exception as e:
+            print(f"[Audit] Failed to record: {e}")
 
     # 初始化 ToolRegistry（内置工具 + MCP 外部工具）
     tool_registry = ToolRegistry()
@@ -369,6 +421,7 @@ def create_app() -> FastAPI:
         tool_registry=tool_registry,
         ltm_store=ltm_store,
         workflow_store=workflow_store,
+        audit_log=_audit_log,
     )
 
     # lifespan：异步连接 MCP Servers（必须在 FastAPI 构造函数之前定义）
@@ -507,6 +560,10 @@ def create_app() -> FastAPI:
     # 「用户与角色分配」平台视角不展示"可访问知识库"列是同一个边界，见对应组件
     # 顶部注释）。
     _require_org_admin = require_role(ROLE_ORG_ADMIN)
+    # 运营仪表盘专用——跟 _require_super_admin 不一样，super_admin 和 admin
+    # 两个平台层级都能看（用户明确要求"超级管理员和管理员角色都能看到"），
+    # 但不含 org_admin（企业管理员看不到跨企业的平台整体运营数据）。
+    _require_platform_tier = require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN)
 
     async def _validate_role_assignment(
         actor: AuthenticatedUser, target_org_id: Optional[str], role_ids: List[str],
@@ -625,6 +682,10 @@ def create_app() -> FastAPI:
         if target_org_id:
             await org_store.set_user_organization(user.user_id, target_org_id)
 
+        await _audit_log(
+            current_user.user_id, "create_user", "user", user.user_id,
+            {"username": user.username, "role_ids": request.role_ids, "org_id": target_org_id},
+        )
         return await _build_admin_user_response(user)
 
     @app.delete("/api/v1/admin/users/{user_id}")
@@ -638,6 +699,7 @@ def create_app() -> FastAPI:
         found = await user_store.delete_user(user_id)
         if not found:
             raise HTTPException(status_code=404, detail="用户不存在")
+        await _audit_log(current_user.user_id, "delete_user", "user", user_id, {})
         return {"success": True}
 
     @app.put("/api/v1/admin/users/{user_id}/roles", response_model=AdminUserResponse)
@@ -684,7 +746,56 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=400, detail="不能取消自己的超级管理员角色")
 
         await role_store.assign_user_roles(user_id, request.role_ids)
+        await _audit_log(
+            current_user.user_id, "set_user_roles", "user", user_id,
+            {"role_ids": request.role_ids},
+        )
         return await _build_admin_user_response(user)
+
+    # ==================== 审计日志 API（治理与合规） ====================
+    # 记录谁在何时对哪个资源做了什么——管理后台变更操作（见上面各端点里的
+    # `_audit_log(...)` 调用）+ 工具调用（知识库检索/考勤查询/工作流操作，
+    # 见 RAGWorkflow 构造时传入的 audit_log 回调 -> subgraph.py tool_node）。
+    # 权限跟"用户管理"同一档（_require_user_admin_tier）：平台管理员能看
+    # 全平台记录（可选 org_id 过滤某一家企业），企业管理员只能看自己企业的
+    # ——不管请求里传了什么 org_id，一律强制用自己的，跟 admin_create_user
+    # 里"企业管理员不管请求体传了什么 org_id，一律用自己的"同一个模式。
+
+    @app.get("/api/v1/admin/audit-logs", response_model=AuditLogListResponse)
+    async def admin_list_audit_logs(
+        org_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        action: Optional[str] = None,
+        start: Optional[float] = None,
+        end: Optional[float] = None,
+        limit: int = 50,
+        offset: int = 0,
+        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
+    ) -> AuditLogListResponse:
+        if limit < 1 or limit > 200:
+            raise HTTPException(status_code=400, detail="limit 必须在 1-200 之间")
+
+        is_platform = await org_store.is_platform_admin(current_user.user_id)
+        effective_org_id = org_id
+        if not is_platform:
+            actor_org = await org_store.get_org_for_user(current_user.user_id)
+            effective_org_id = actor_org.org_id if actor_org else None
+
+        entries, total = await audit_store.list_logs(
+            org_id=effective_org_id, user_id=user_id, action=action,
+            start=start, end=end, limit=limit, offset=offset,
+        )
+        org_names = {o.org_id: o.name for o in await org_store.list_organizations()} if is_platform else {}
+        items = [
+            AuditLogResponse(
+                audit_id=e.audit_id, org_id=e.org_id, org_name=org_names.get(e.org_id),
+                user_id=e.user_id, username=e.username, action=e.action,
+                resource_type=e.resource_type, resource_id=e.resource_id,
+                detail=e.detail, success=e.success, created_at=e.created_at,
+            )
+            for e in entries
+        ]
+        return AuditLogListResponse(items=items, total=total)
 
     # 注意：没有"改派用户所属企业"的端点——员工的企业归属只在创建时确定一次
     # （见 admin_create_user），创建之后任何管理员（包括平台管理员）都不能再
@@ -719,10 +830,11 @@ def create_app() -> FastAPI:
     @app.post("/api/v1/admin/organizations", response_model=AdminOrganizationResponse)
     async def admin_create_organization(
         request: AdminCreateOrganizationRequest,
-        _: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_super_admin),
         __: AuthenticatedUser = Depends(require_platform_admin),
     ) -> AdminOrganizationResponse:
         org = await org_store.create_organization(request.name)
+        await _audit_log(current_user.user_id, "create_organization", "organization", org.org_id, {"name": org.name})
         return _org_response(org)
 
     # ==================== 租户连接器 API（仅平台管理员） ====================
@@ -776,7 +888,7 @@ def create_app() -> FastAPI:
         org_id: str,
         capability: str,
         request: UpsertTenantConnectorRequest,
-        _: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_super_admin),
         __: AuthenticatedUser = Depends(require_platform_admin),
     ) -> TenantConnectorResponse:
         org = await org_store.get_organization(org_id)
@@ -821,6 +933,10 @@ def create_app() -> FastAPI:
             field_mapping=request.field_mapping,
             is_active=request.is_active,
         )
+        await _audit_log(
+            current_user.user_id, "upsert_connector", "connector", connector.connector_id,
+            {"org_id": org_id, "capability": capability, "connector_type": request.connector_type, "is_active": request.is_active},
+        )
         return await _connector_response(connector)
 
     # ==================== 网关监控 API（仅平台管理员） ====================
@@ -851,6 +967,261 @@ def create_app() -> FastAPI:
                 last_called_at=c.last_called_at, last_latency_ms=c.last_latency_ms, last_error=c.last_error,
             ))
         return results
+
+    # ==================== 【测试专用，正式上线前删除】知识库超权测试查询 ====================
+    # 管理员调试用：选一家企业 + 输入查询词，直接看这家企业的知识库能查到什么、
+    # 命中的是哪几个 collection——绕过任何用户级 ACL（不模拟任何真实用户的可见
+    # 范围），只用来验证"这家企业的知识库摄入得对不对、检索质量怎么样"。这组
+    # 端点底下还挂着"清空/查看某企业知识库"（见下面 admin_test_kb_collections
+    # 等），都是同一类"内部 QA 专用、直接绕过正常权限边界"的工具。
+    #
+    # 光靠 super_admin + platform_admin 这两层角色校验不够——2026-08-22 加了
+    # 第三层 `_require_debug_mode`：这组端点只在 RAGENT_DEBUG=true 时可用（见
+    # .env / .env.example，生产环境默认 false）。这是吸取的一个真实教训：这几个
+    # 端点最早上线时只标了"测试专用，正式上线前删除"这行注释，没有任何运行时
+    # 硬限制——注释总有被漏掉、没人记得删的风险，尤其是这类"能绕过 ACL 直接看到
+    # 任何企业知识库内容"的工具，一旦真的漏删并且被误当成正式功能，就是一个
+    # 平台层面的权限漏洞。运行时开关不能替代"上线前整体删除"这个最终目标，但
+    # 能保证即使有人忘记删，只要生产环境的 RAGENT_DEBUG 没有被显式打开，这组
+    # 端点就是一律 403，不会被真正调用到。
+    #
+    # 上线前需要整体删除的部分：这几个端点、schemas.py 的
+    # AdminTestKBQueryRequest/Response 等、create_app() 里的 _admin_test_kb_tool、
+    # query_knowledge_hub.py 的 execute_admin_bypass/_build_empty_response_for_org、
+    # 前端 KnowledgeBaseTestQuery.jsx 及其在 OperationsDashboard.jsx 里的入口、
+    # admin.js 的 adminTestQueryKnowledgeBase 等。
+    async def _require_debug_mode(
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> AuthenticatedUser:
+        if os.getenv("RAGENT_DEBUG", "false").strip().lower() != "true":
+            raise HTTPException(
+                status_code=403,
+                detail="这组知识库测试工具只在 RAGENT_DEBUG=true 时可用（生产环境默认关闭）",
+            )
+        return current_user
+
+    @app.post("/api/v1/admin/test/knowledge-query", response_model=AdminTestKBQueryResponse)
+    async def admin_test_query_knowledge_base(
+        request: AdminTestKBQueryRequest,
+        _: AuthenticatedUser = Depends(_require_super_admin),
+        __: AuthenticatedUser = Depends(require_platform_admin),
+        ___: AuthenticatedUser = Depends(_require_debug_mode),
+    ) -> AdminTestKBQueryResponse:
+        try:
+            response = await _admin_test_kb_tool.execute_admin_bypass(
+                query=request.query, org_id=request.org_id, top_k=request.top_k,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        return AdminTestKBQueryResponse(
+            content=response.content,
+            collections=sorted(response.metadata.get("collections") or (
+                [response.metadata["collection"]] if response.metadata.get("collection") else []
+            )),
+            is_empty=response.is_empty,
+        )
+
+    @app.get("/api/v1/admin/test/knowledge-query/collections", response_model=List[AdminKbCollectionStat])
+    async def admin_test_list_kb_collections(
+        org_id: str,
+        _: AuthenticatedUser = Depends(_require_super_admin),
+        __: AuthenticatedUser = Depends(require_platform_admin),
+        ___: AuthenticatedUser = Depends(_require_debug_mode),
+    ) -> List[AdminKbCollectionStat]:
+        """列出这家企业名下的知识库 collection + 每个的 chunk 数——先看有没有
+        摄入、摄入了多少，再决定要不要点进去看 chunk 列表或者清空重试。"""
+        try:
+            return await _admin_test_kb_tool.list_org_collection_stats(org_id)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.get("/api/v1/admin/test/knowledge-query/chunks", response_model=List[AdminKbChunkPreview])
+    async def admin_test_list_kb_chunks(
+        org_id: str,
+        collection: str,
+        limit: int = 50,
+        _: AuthenticatedUser = Depends(_require_super_admin),
+        __: AuthenticatedUser = Depends(require_platform_admin),
+        ___: AuthenticatedUser = Depends(_require_debug_mode),
+    ) -> List[AdminKbChunkPreview]:
+        try:
+            return await _admin_test_kb_tool.list_org_collection_chunks(org_id, collection, limit=limit)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.delete("/api/v1/admin/test/knowledge-query/collection")
+    async def admin_test_clear_kb_collection(
+        org_id: str,
+        collection: str,
+        current_user: AuthenticatedUser = Depends(_require_super_admin),
+        __: AuthenticatedUser = Depends(require_platform_admin),
+        ___: AuthenticatedUser = Depends(_require_debug_mode),
+    ) -> dict:
+        """清空一个 collection 里的全部内容（向量库 + BM25 索引 + 摄入/去重历史
+        记录），不删除 collection 本身的登记信息——方便反复测试"导入知识库 ->
+        查询知识库"这条链路，不用每次都手动清数据库。"""
+        try:
+            cleared = await _admin_test_kb_tool.clear_org_collection(org_id, collection)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        await _audit_log(
+            current_user.user_id, "admin_test_clear_kb", "collection", collection,
+            {"org_id": org_id, "cleared_chunks": cleared},
+        )
+        return {"cleared_chunks": cleared}
+
+    # ==================== 运营仪表盘 API（仅平台管理员，见 dashboard_stats.py） ====================
+    # 权限比网关监控（admin_gateway_connectors，只认 super_admin）宽一档——
+    # _require_platform_tier 让 super_admin 和 admin 两个平台层级都能看，用户
+    # 明确要求过这一点；require_platform_admin 是第二层校验（组织归属，双重
+    # 校验同一套模式），确保只有 org.is_platform=True 的账号能进来。这是平台
+    # 整体的运营指标（会话数/消息数/活跃用户/响应延迟），不是任何企业的知识库
+    # 内容，跟"平台运营方不该看到企业内部知识库数据"这条边界不冲突，但仍然
+    # 只暴露给平台两层管理员，企业管理员（org_admin）看不到跨企业的平台整体
+    # 数据。前端对应的可见性判断见 App.jsx 的 PLATFORM_ADMIN_ROLE_NAMES。
+
+    def _pct_change(current: Optional[float], previous: Optional[float]) -> Optional[float]:
+        if current is None or not previous:
+            return None
+        return round((current - previous) / previous * 100, 1)
+
+    @app.get("/api/v1/admin/dashboard/overview", response_model=DashboardOverviewResponse)
+    async def admin_dashboard_overview(
+        window: str = "7d",
+        _: AuthenticatedUser = Depends(_require_platform_tier),
+        __: AuthenticatedUser = Depends(require_platform_admin),
+    ) -> DashboardOverviewResponse:
+        if window not in ("24h", "7d", "30d"):
+            raise HTTPException(status_code=400, detail="window 必须是 24h/7d/30d 之一")
+        try:
+            overview = await dashboard_stats_service.get_overview(window)
+        except asyncpg.exceptions.UndefinedTableError:
+            # 全新部署、一次对话都没发生过——conversations/conversation_archive
+            # 表还没被 ConversationStore/ConversationArchiveStore 建出来，不是
+            # 错误，是"暂无数据"，返回全零。
+            return DashboardOverviewResponse(
+                window=window, session_count=0, message_count=0, active_users=0,
+            )
+        return DashboardOverviewResponse(
+            window=window,
+            session_count=overview.session_count,
+            session_count_change=_pct_change(overview.session_count, overview.session_count_prev),
+            message_count=overview.message_count,
+            message_count_change=_pct_change(overview.message_count, overview.message_count_prev),
+            active_users=overview.active_users,
+            active_users_change=_pct_change(overview.active_users, overview.active_users_prev),
+            avg_latency_ms=overview.avg_latency_ms,
+            avg_latency_ms_change=_pct_change(overview.avg_latency_ms, overview.avg_latency_ms_prev),
+        )
+
+    @app.get("/api/v1/admin/dashboard/trend", response_model=DashboardTrendResponse)
+    async def admin_dashboard_trend(
+        metric: str,
+        window: str = "7d",
+        _: AuthenticatedUser = Depends(_require_platform_tier),
+        __: AuthenticatedUser = Depends(require_platform_admin),
+    ) -> DashboardTrendResponse:
+        if window not in ("24h", "7d", "30d"):
+            raise HTTPException(status_code=400, detail="window 必须是 24h/7d/30d 之一")
+        if metric not in ("sessions", "messages", "active_users", "latency"):
+            raise HTTPException(status_code=400, detail="metric 必须是 sessions/messages/active_users/latency 之一")
+        try:
+            points = await dashboard_stats_service.get_trend(metric, window)
+        except asyncpg.exceptions.UndefinedTableError:
+            points = []
+        return DashboardTrendResponse(
+            metric=metric, window=window,
+            points=[DashboardTrendPointResponse(bucket=p.bucket, value=p.value) for p in points],
+        )
+
+    # ==================== 成本与质量可观测性 API（仅平台管理员） ====================
+    # token 用量来自 conversation_archive（_generate_node 每轮写入，见
+    # workflow.py _extract_token_usage 旁的说明），工具调用成功率来自
+    # audit_logs（治理与合规那组端点/回调顺手落的审计记录，见上面
+    # `_audit_log`）——两类数据本来就是为各自的需求（成本追踪/审计）落库的，
+    # 这里只是复用，没有为了这块仪表盘新增埋点。权限跟运营仪表盘概览同一档
+    # （_require_platform_tier + require_platform_admin），企业管理员看不到
+    # 跨企业的平台整体数据。
+
+    # 单价参考自各家官网公开报价（USD / 1M tokens，(输入单价, 输出单价)），
+    # 不是实时价格、也不代表任何合同折扣——只用于给运营方一个数量级参考。
+    # key 用小写子串匹配 settings.llm.model，匹配不到就不显示成本（不编一个
+    # 不知道对不对的数字），比如本地跑的 qwen2.5:7b 不在表里，只展示 token
+    # 用量，不展示"预估成本"。
+    _MODEL_PRICE_PER_1M_USD: Dict[str, tuple] = {
+        "gpt-4o-mini": (0.15, 0.6),
+        "gpt-4o": (2.5, 10.0),
+        "gpt-4-turbo": (10.0, 30.0),
+        "gpt-3.5-turbo": (0.5, 1.5),
+        "deepseek-chat": (0.27, 1.1),
+        "deepseek-reasoner": (0.55, 2.19),
+    }
+
+    def _estimate_cost_usd(prompt_tokens: int, completion_tokens: int) -> Optional[float]:
+        # 本地 Ollama 模型没有按 token 计费的推理成本，直接是 0，不是"未知"。
+        if settings.llm.provider == "ollama":
+            return 0.0
+        model_name = (settings.llm.model or "").lower()
+        for key, (price_in, price_out) in _MODEL_PRICE_PER_1M_USD.items():
+            if key in model_name:
+                return round(prompt_tokens / 1_000_000 * price_in + completion_tokens / 1_000_000 * price_out, 4)
+        return None
+
+    @app.get("/api/v1/admin/dashboard/cost-overview", response_model=CostOverviewResponse)
+    async def admin_dashboard_cost_overview(
+        window: str = "7d",
+        _: AuthenticatedUser = Depends(_require_platform_tier),
+        __: AuthenticatedUser = Depends(require_platform_admin),
+    ) -> CostOverviewResponse:
+        if window not in ("24h", "7d", "30d"):
+            raise HTTPException(status_code=400, detail="window 必须是 24h/7d/30d 之一")
+        try:
+            overview = await dashboard_stats_service.get_cost_overview(window)
+        except asyncpg.exceptions.UndefinedTableError:
+            # 全新部署，conversation_archive/audit_logs 都还没建出来——"暂无数据"，
+            # 跟 admin_dashboard_overview 同一个兜底方式。
+            return CostOverviewResponse(
+                window=window, total_tokens=0, estimated_cost_usd=None,
+                tool_call_count=0, tool_success_rate=None, tool_failure_count=0,
+            )
+        success_rate = (
+            round(overview.tool_success_count / overview.tool_call_count * 100, 1)
+            if overview.tool_call_count else None
+        )
+        success_rate_prev = (
+            round(overview.tool_success_count_prev / overview.tool_call_count_prev * 100, 1)
+            if overview.tool_call_count_prev else None
+        )
+        return CostOverviewResponse(
+            window=window,
+            total_tokens=overview.total_tokens,
+            total_tokens_change=_pct_change(overview.total_tokens, overview.total_tokens_prev),
+            estimated_cost_usd=_estimate_cost_usd(overview.prompt_tokens, overview.completion_tokens),
+            tool_call_count=overview.tool_call_count,
+            tool_success_rate=success_rate,
+            tool_success_rate_change=_pct_change(success_rate, success_rate_prev),
+            tool_failure_count=overview.tool_call_count - overview.tool_success_count,
+        )
+
+    @app.get("/api/v1/admin/dashboard/cost-trend", response_model=DashboardTrendResponse)
+    async def admin_dashboard_cost_trend(
+        metric: str,
+        window: str = "7d",
+        _: AuthenticatedUser = Depends(_require_platform_tier),
+        __: AuthenticatedUser = Depends(require_platform_admin),
+    ) -> DashboardTrendResponse:
+        if window not in ("24h", "7d", "30d"):
+            raise HTTPException(status_code=400, detail="window 必须是 24h/7d/30d 之一")
+        if metric not in ("tokens", "tool_success_rate"):
+            raise HTTPException(status_code=400, detail="metric 必须是 tokens/tool_success_rate 之一")
+        try:
+            points = await dashboard_stats_service.get_cost_trend(metric, window)
+        except asyncpg.exceptions.UndefinedTableError:
+            points = []
+        return DashboardTrendResponse(
+            metric=metric, window=window,
+            points=[DashboardTrendPointResponse(bucket=p.bucket, value=p.value) for p in points],
+        )
 
     # ==================== 角色管理 API ====================
     # 角色的新建/重命名/删除仍然只对 super_admin 开放（角色是全平台共享的词表，
@@ -898,23 +1269,25 @@ def create_app() -> FastAPI:
     @app.post("/api/v1/admin/roles", response_model=RoleResponse)
     async def admin_create_role(
         request: CreateRoleRequest,
-        _: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_super_admin),
     ) -> RoleResponse:
         try:
             role = await role_store.create_role(request.name, request.display_name)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        await _audit_log(current_user.user_id, "create_role", "role", role.role_id, {"name": role.name})
         return _role_response(role)
 
     @app.patch("/api/v1/admin/roles/{role_id}", response_model=RoleResponse)
     async def admin_update_role(
         role_id: str,
         request: UpdateRoleRequest,
-        _: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_super_admin),
     ) -> RoleResponse:
         role = await role_store.update_role(role_id, request.display_name)
         if role is None:
             raise HTTPException(status_code=404, detail="角色不存在")
+        await _audit_log(current_user.user_id, "update_role", "role", role_id, {"display_name": request.display_name})
         # update_role 返回的是不带 collection_names 的 Role；重新从 list_roles()
         # 取一次带关联知识库的完整视图，避免响应把已有的知识库关联显示成空。
         roles = await role_store.list_roles()
@@ -923,7 +1296,7 @@ def create_app() -> FastAPI:
     @app.delete("/api/v1/admin/roles/{role_id}")
     async def admin_delete_role(
         role_id: str,
-        _: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_super_admin),
     ) -> dict:
         try:
             found = await role_store.delete_role(role_id)
@@ -931,6 +1304,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=403, detail=str(e))
         if not found:
             raise HTTPException(status_code=404, detail="角色不存在")
+        await _audit_log(current_user.user_id, "delete_role", "role", role_id, {})
         return {"success": True}
 
     @app.put("/api/v1/admin/roles/{role_id}/collections", response_model=RoleResponse)
@@ -1009,15 +1383,22 @@ def create_app() -> FastAPI:
         collection_store.py 顶部说明，文档摄入仍走现有的摄入脚本/流程）。"""
         org = await _require_local_retrieval_org(current_user)
 
-        # 内部标识不能撞平台自己的保留名——DEPARTMENT_KB_COLLECTIONS 那 6 个
-        # 固定部门库、`tenant_*_kb`（委托模式企业专属命名约定）、`default`
-        # （历史遗留、不该有人再摄入内容的库，见 query_knowledge_hub.py 顶部
-        # 说明）、`conv_*`（每个对话私有）。这里不查 org_collections 表里存不存在
+        # 内部标识不能撞平台保留名——`tenant_*_kb`（委托模式企业专属命名约定）、
+        # `default`（历史遗留、不该有人再摄入内容的库，见 query_knowledge_hub.py
+        # 顶部说明）、`conv_*`（每个对话私有），以及那 6 个部门角色名字
+        # （hr_admin_kb 等，现在专门用于委托模式企业的类目过滤，见
+        # query_knowledge_hub.py DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES）——虽然
+        # 平台自己已经没有同名的本地 collection 了，但企业自建库用同一个名字
+        # 容易让人以为这个库参与了委托模式的类目过滤，实际上两者毫不相关，
+        # 干脆继续保留这几个名字不让用。这里不查 org_collections 表里存不存在
         # ——存在的话下面 create() 的唯一约束自然会报错，不用在这里重复判断。
-        from src.mcp_server.tools.query_knowledge_hub import DEPARTMENT_KB_COLLECTIONS
+        _RESERVED_KB_ROLE_NAMES = {
+            "hr_admin_kb", "finance_kb", "it_support_kb",
+            "sales_marketing_kb", "rd_product_kb", "customer_success_kb",
+        }
         name = request.collection_name.strip()
         reserved = (
-            name in DEPARTMENT_KB_COLLECTIONS
+            name in _RESERVED_KB_ROLE_NAMES
             or name == "default"
             or name.startswith("conv_")
             or (name.startswith("tenant_") and name.endswith("_kb"))
@@ -1034,9 +1415,307 @@ def create_app() -> FastAPI:
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        await _audit_log(
+            current_user.user_id, "create_collection", "collection", created.collection_name,
+            {"display_name": created.display_name, "org_id": org.org_id},
+        )
         return CollectionResponse(
             collection_name=created.collection_name, display_name=created.display_name, created_at=created.created_at,
         )
+
+    # 知识库文档上传的进度状态——按 upload_id 存，供前端轮询进度条用。放内存
+    # 里就够了（不需要跨进程/重启存活）：单进程 dev/demo 部署，且这本来就是
+    # "这次上传现在到哪一步了"这种转瞬即逝的状态，不是需要审计追溯的持久数据
+    # （持久的那份是 audit_log 里落库的最终结果）。
+    _upload_progress: Dict[str, Dict[str, Any]] = {}
+
+    # ==================== 知识库目录 + 文档上传 API（任意登录员工） ====================
+    # 跟上面「企业自建知识库 API」的区别：那组是 org_admin 专属的管理入口；这组是
+    # 给普通员工上传资料用的自助入口——列出自己企业的全部知识库（不管有没有
+    # 权限都列出来，用 accessible 字段配合前端把没权限的选项置灰，而不是直接
+    # 从列表里拿掉；这样员工至少知道"这个库存在，只是我看不了，得找管理员要
+    # 权限"，而不是一头雾水地以为公司压根没建过这个库）。委托模式企业
+    # （Acme/Globex）复用 `_require_local_retrieval_org` 直接拒绝——道理跟企业
+    # 自建知识库那组端点一样：本地上传对它们的实际问答没有意义。
+
+    async def _local_org_owned_collections(org) -> Dict[str, str]:
+        """跟 query_knowledge_hub.py `_org_owned_collections` 保持同一个基准——
+        平台自己（org_platform）没有任何本地业务知识库，其余企业是
+        `org_collections` 表里登记的自建库，不处理委托模式（调用方在此之前
+        已经用 `_require_local_retrieval_org` 拒绝了委托模式企业），返回
+        {collection_name: display_name}。"""
+        if org.is_platform:
+            return {}
+        owned = await org_collection_store.list_for_org(org.org_id)
+        return {c.collection_name: c.display_name for c in owned}
+
+    @app.get("/api/v1/collections/catalog", response_model=List[CollectionCatalogEntry])
+    async def collections_catalog(
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> List[CollectionCatalogEntry]:
+        org = await _require_local_retrieval_org(current_user)
+        owned = await _local_org_owned_collections(org)
+        allowed = await user_store.get_allowed_collections(current_user.user_id)
+        accessible_all = "*" in allowed
+        return [
+            CollectionCatalogEntry(
+                collection_name=name, display_name=display_name,
+                accessible=accessible_all or name in allowed,
+            )
+            for name, display_name in sorted(owned.items())
+        ]
+
+    async def _run_collection_ingest_task(
+        upload_id: str, collection_name: str, dest_path: Path,
+        user_id: str, org_id: str, original_name: str,
+    ) -> None:
+        """后台任务：真正跑摄入流水线，边跑边把进度写进 `_upload_progress`。
+
+        `on_progress` 是 pipeline.run() 内部同步调的回调（跑在 asyncio.to_thread
+        开的工作线程里），这里只是往一个 dict 里写几个字段，CPython 下这种粒度
+        的写入不需要额外加锁——真出现读到"半更新"状态的极小概率窗口，最多是
+        进度条数字抖一下，不影响正确性（不会读到跨请求串号的数据，dict 本身
+        按 upload_id 隔离）。
+        """
+        def on_progress(stage: str, current: int, total: int) -> None:
+            _upload_progress[upload_id].update(stage=stage, current=current, total=total)
+
+        try:
+            async with INGEST_SEMAPHORE:
+                pipeline = IngestionPipeline(settings, collection=collection_name)
+                result = await asyncio.to_thread(pipeline.run, file_path=str(dest_path), on_progress=on_progress)
+
+            _upload_progress[upload_id].update(
+                done=True, success=result.success, chunk_count=result.chunk_count,
+                duplicate_chunk_count=result.duplicate_chunk_count,
+                error=result.error if not result.success else None,
+                stage="upsert", current=_upload_progress[upload_id]["total"],
+            )
+            await _audit_log(
+                user_id, "upload_document", "collection", collection_name,
+                {
+                    "filename": original_name, "org_id": org_id,
+                    "success": result.success, "chunk_count": result.chunk_count,
+                    "duplicate_chunk_count": result.duplicate_chunk_count,
+                },
+                success=result.success,
+            )
+        except Exception as e:
+            print(f"[KB Upload] ingest task failed: upload_id={upload_id}, error={e}")
+            _upload_progress[upload_id].update(done=True, success=False, error=str(e))
+            await _audit_log(
+                user_id, "upload_document", "collection", collection_name,
+                {"filename": original_name, "org_id": org_id, "error": str(e)}, success=False,
+            )
+
+    @app.post("/api/v1/collections/{collection_name}/documents", response_model=UploadStartedResponse)
+    async def upload_collection_document(
+        collection_name: str,
+        file: UploadFile = File(...),
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> UploadStartedResponse:
+        """把一份文档摄入到企业知识库共享 collection——跟 `/conversations/{id}/files`
+        （摄入到私有的 conv_{id} collection）是两条独立的路径，不复用同一个端点：
+        那边靠 `_require_conversation_owner` 判断"这是不是我自己的对话"，这里靠
+        "这个 collection 是不是我自己企业名下的、我是不是真的有权限"两层判断，
+        校验逻辑完全不是一回事。
+
+        前端会把没权限的知识库选项置灰，但那只是 UX 提示——不能只靠前端不让
+        选就默认后端安全，这里必须重新校验一遍，否则拼一个请求直接改
+        collection_name 就能绕过置灰，往任意知识库塞内容。
+
+        权限校验/存盘都是同步做完才返回 upload_id——真正耗时的摄入流水线
+        （embedding/LLM 精炼这些）扔进后台任务，前端拿 upload_id 轮询
+        `GET .../uploads/{upload_id}` 显示进度条，不用为了看进度把 HTTP
+        连接一直挂着等。
+        """
+        org = await _require_local_retrieval_org(current_user)
+        owned = await _local_org_owned_collections(org)
+        if collection_name not in owned:
+            raise HTTPException(status_code=404, detail="知识库不存在，或不属于你所在的企业")
+
+        allowed = await user_store.get_allowed_collections(current_user.user_id)
+        if "*" not in allowed and collection_name not in allowed:
+            await _audit_log(
+                current_user.user_id, "upload_document", "collection", collection_name,
+                {"filename": file.filename, "org_id": org.org_id}, success=False,
+            )
+            raise HTTPException(status_code=403, detail="你没有权限上传到这个知识库")
+
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        original_name = file.filename or ""
+        file_ext = Path(original_name).suffix.lower()
+        if file_ext == '.doc':
+            raise HTTPException(status_code=400, detail="旧版 .doc 格式暂不支持，请先转换为 .docx 后上传")
+        if file_ext not in ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"不支持的文件格式: {file_ext}。支持: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+            )
+
+        # 落盘位置只按 collection 分目录，不像对话文件那样需要 ConversationFileStore
+        # 追踪归属——这条路径没有"文件列表/删除单个文件"的管理需求（跟
+        # collection_store.py 顶部说明一致：这层只关心"库存不存在、归哪家企业"，
+        # 库里具体有哪些原始文件不是这组 API 的职责）。
+        upload_dir = resolve_path(f"data/kb_uploads/{collection_name}")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = f"{uuid.uuid4().hex}_{original_name}"
+        dest_path = upload_dir / safe_name
+        dest_path.write_bytes(content)
+
+        upload_id = uuid.uuid4().hex
+        # total 先给个 1，真实值等 pipeline 第一次回调 on_progress 才知道
+        # （阶段总数由 pipeline.py 决定，这里不该硬编码一份可能会漂移的副本）——
+        # 前端看到 total=1 且 done=false 就是"刚提交，还没收到第一个进度事件"。
+        _upload_progress[upload_id] = {
+            "collection_name": collection_name, "filename": original_name,
+            "stage": "queued", "current": 0, "total": 1,
+            "done": False, "success": None, "chunk_count": 0,
+            "duplicate_chunk_count": 0, "error": None,
+        }
+        asyncio.create_task(_run_collection_ingest_task(
+            upload_id, collection_name, dest_path, current_user.user_id, org.org_id, original_name,
+        ))
+
+        return UploadStartedResponse(upload_id=upload_id)
+
+    @app.get("/api/v1/collections/uploads/{upload_id}", response_model=UploadProgressResponse)
+    async def get_upload_progress(
+        upload_id: str,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> UploadProgressResponse:
+        state = _upload_progress.get(upload_id)
+        if state is None:
+            raise HTTPException(status_code=404, detail="上传任务不存在或已过期")
+        return UploadProgressResponse(upload_id=upload_id, **state)
+
+    # ==================== 委托模式企业知识库上传（方案 2："平台代算，企业只存储"，
+    # 见 knowledge-base-tenant-federation.md 第 4.4 节） ====================
+    # 跟上面 upload_collection_document（本地模式，按 org_collections 登记的
+    # collection_name 路由）是两条独立入口，不共用同一个端点：委托模式的
+    # "知识库"是整个企业一份，没有 collection 可选；本地模式的员工也不会走到
+    # 这里——两条路径靠企业的连接器类型（internal_chroma vs http_api）互斥。
+    #
+    # 权限：委托模式下没有 role_collections 那套细粒度 ACL（5.2 节"权限职责
+    # 转移"——本来就没有比"是不是这家企业的人"更细的粒度可以在平台侧判断），
+    # 所以只要求"属于这家企业"，不额外校验角色。
+
+    REMOTE_INGEST_TIMEOUT_SECONDS = 60.0  # 写入比查询耗时更长，比 8s 的查询超时更宽松
+
+    async def _require_delegated_retrieval_org(current_user: AuthenticatedUser):
+        """委托模式上传的前置校验，跟 `_require_local_retrieval_org` 互斥对称：
+        必须是配置了 http_api 连接器的企业才能走这条入口。返回 (org, connector)。"""
+        org = await org_store.get_org_for_user(current_user.user_id)
+        if org is None:
+            raise HTTPException(status_code=403, detail="账号未关联任何企业")
+        connector = await tenant_connector_store.get(org.org_id, CAPABILITY_KNOWLEDGE_BASE)
+        if connector is None or connector.connector_type != CONNECTOR_TYPE_HTTP_API:
+            raise HTTPException(
+                status_code=400,
+                detail="该企业的知识库检索没有委托给外部系统，请使用「新增知识库」里的本地上传入口",
+            )
+        return org, connector
+
+    @app.post("/api/v1/tenant-kb/documents", response_model=TenantKbUploadResponse)
+    async def upload_tenant_kb_document(
+        file: UploadFile = File(...),
+        category: Optional[str] = Form(default=None),
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> TenantKbUploadResponse:
+        """委托模式企业的员工上传文档：平台切块 + embedding（复用
+        `IngestionPipeline` 里无状态的那几个组件，见
+        src/ingestion/delegated_compute.py），推给企业自己的知识库微服务
+        存储——平台这边不落任何本地向量/索引。同步等待整个链路完成才返回，
+        大文件会比本地模式的异步轮询上传慢，这是当前版本的已知取舍，不是
+        本地模式那套 upload_id 轮询进度条。
+
+        `category`：这份文档归属企业内部哪个子库/分类，可选，原样透传给
+        委托契约 `/v1/vectors`（4.4 节）——平台不校验取值范围，是不是合法
+        类目、企业服务要不要认这个字段完全由对方决定，跟查询侧
+        `DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES` 用的是同一份约定，但那是
+        权限过滤用的映射，不是这里的校验依据。"""
+        org, connector = await _require_delegated_retrieval_org(current_user)
+
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        original_name = file.filename or ""
+        file_ext = Path(original_name).suffix.lower()
+        if file_ext == '.doc':
+            raise HTTPException(status_code=400, detail="旧版 .doc 格式暂不支持，请先转换为 .docx 后上传")
+        if file_ext not in ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"不支持的文件格式: {file_ext}。支持: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+            )
+
+        upload_dir = resolve_path(f"data/kb_uploads/tenant_{org.org_id}")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = upload_dir / f"{uuid.uuid4().hex}_{original_name}"
+        dest_path.write_bytes(content)
+
+        try:
+            # 切块 + embedding 是阻塞/CPU 密集操作，扔进线程池，不卡住事件循环
+            # （跟 query_knowledge_hub.py `_ensure_initialized` 的做法一致）。
+            computed = await asyncio.to_thread(compute_chunks_for_delegation, load_settings(), str(dest_path))
+        except Exception as e:
+            await _audit_log(
+                current_user.user_id, "upload_tenant_kb_document", "tenant_kb", org.org_id,
+                {"filename": original_name, "org_id": org.org_id, "error": str(e)}, success=False,
+            )
+            raise HTTPException(status_code=500, detail=f"文档解析/编码失败: {e}")
+
+        if not computed["chunks"]:
+            return TenantKbUploadResponse(
+                chunk_count=0, message="文档没有可摄入的内容（可能是空文件，或格式虽支持但提取不出正文）",
+            )
+
+        token = connector.auth_config.get("token", "")
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=REMOTE_INGEST_TIMEOUT_SECONDS) as client:
+                resp = await client.post(
+                    f"{connector.endpoint.rstrip('/')}/v1/vectors",
+                    json={"doc_id": computed["doc_id"], "chunks": computed["chunks"], "category": category},
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "X-Organization-Id": org.org_id,
+                        "Content-Type": "application/json",
+                    },
+                )
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            resp.raise_for_status()
+            result = resp.json()
+        except httpx.HTTPStatusError as e:
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            await tenant_connector_store.record_call(connector.connector_id, False, elapsed_ms, str(e))
+            await _audit_log(
+                current_user.user_id, "upload_tenant_kb_document", "tenant_kb", org.org_id,
+                {"filename": original_name, "org_id": org.org_id, "error": str(e)}, success=False,
+            )
+            raise HTTPException(status_code=502, detail="企业知识库暂时无法写入，请稍后再试")
+        except (httpx.TimeoutException, httpx.ConnectError):
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            await tenant_connector_store.record_call(connector.connector_id, False, elapsed_ms, "timeout_or_unreachable")
+            await _audit_log(
+                current_user.user_id, "upload_tenant_kb_document", "tenant_kb", org.org_id,
+                {"filename": original_name, "org_id": org.org_id, "error": "timeout_or_unreachable"}, success=False,
+            )
+            raise HTTPException(status_code=502, detail="企业知识库暂时无法访问，请稍后再试")
+
+        await tenant_connector_store.record_call(connector.connector_id, True, elapsed_ms, None)
+        await _audit_log(
+            current_user.user_id, "upload_tenant_kb_document", "tenant_kb", org.org_id,
+            {
+                "filename": original_name, "org_id": org.org_id,
+                "chunk_count": result.get("chunk_count", 0), "category": category,
+            },
+        )
+        return TenantKbUploadResponse(chunk_count=result.get("chunk_count", 0))
 
     # ==================== 工作流模板管理 API（仅超级管理员） ====================
     # work-flow.md 第 7 节：模板定义"某类流程需要哪些结构化字段"，附件材料只有

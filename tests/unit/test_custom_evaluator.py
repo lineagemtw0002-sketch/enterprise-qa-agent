@@ -42,8 +42,11 @@ class TestCustomEvaluator:
         with pytest.raises(ValueError, match="Query cannot be empty"):
             evaluator.evaluate("  ", [{"id": "x"}], ground_truth=["x"])
 
-        with pytest.raises(ValueError, match="retrieved_chunks cannot be empty"):
-            evaluator.evaluate("query", [], ground_truth=["x"])
+        # CustomEvaluator.validate_retrieved_chunks deliberately overrides the
+        # base class to allow an empty list — it's a valid "no results found"
+        # case, not an error, and hit_rate/mrr naturally resolve to 0.0 for it.
+        metrics = evaluator.evaluate("query", [], ground_truth=["x"])
+        assert metrics["hit_rate"] == 0.0
 
     def test_unsupported_metric_raises(self) -> None:
         with pytest.raises(ValueError, match="Unsupported custom metrics"):

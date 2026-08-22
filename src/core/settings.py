@@ -124,6 +124,7 @@ class IngestionSettings(_Section):
     batch_size: int
     chunk_refiner: Optional[Dict[str, Any]] = None  # 动态配置，直接透传
     metadata_enricher: Optional[Dict[str, Any]] = None  # 动态配置，直接透传
+    doc_summary: Optional[Dict[str, Any]] = None  # 动态配置，直接透传
 
 
 class MCPServerConfig(_Section):

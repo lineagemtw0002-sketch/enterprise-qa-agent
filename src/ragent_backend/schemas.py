@@ -142,6 +142,35 @@ class GatewayConnectorResponse(BaseModel):
     last_error: Optional[str]
 
 
+# ============== 【测试专用，正式上线前删除】知识库超权测试查询 ==============
+# 见 app.py `admin_test_query_knowledge_base` 端点旁的说明。
+
+class AdminTestKBQueryRequest(BaseModel):
+    org_id: str = Field(..., min_length=1)
+    query: str = Field(..., min_length=1, max_length=2000)
+    top_k: int = Field(default=5, ge=1, le=20)
+
+
+class AdminTestKBQueryResponse(BaseModel):
+    content: str
+    collections: List[str] = Field(default_factory=list)
+    is_empty: bool
+
+
+class AdminKbCollectionStat(BaseModel):
+    collection_name: str
+    display_name: str
+    source: Literal["local", "delegated"]
+    chunk_count: int
+
+
+class AdminKbChunkPreview(BaseModel):
+    chunk_id: str
+    text: str
+    source_path: str = ""
+    kb_name: Optional[str] = None
+
+
 # ============== 角色管理 API（仅 super_admin） ==============
 
 class RoleResponse(BaseModel):
@@ -177,6 +206,103 @@ class CollectionResponse(BaseModel):
 class CreateCollectionRequest(BaseModel):
     collection_name: str = Field(..., min_length=1, max_length=64)
     display_name: str = Field(..., min_length=1, max_length=128)
+
+
+# ============== 知识库目录 + 上传 API（任意登录用户，见 app.py collections_catalog） ==============
+# 跟上面"企业自建知识库 API"的区别：上面那组是 org_admin 专属的管理入口（新建/
+# 列出本企业注册过的库）；这组是给普通员工上传文档用的——列出自己企业名下
+# 全部知识库（不管有没有权限都列出来，配合 `accessible` 字段在前端置灰，而不是
+# 直接从列表里拿掉，员工至少知道"这个库存在，只是我看不了"）。
+
+class CollectionCatalogEntry(BaseModel):
+    collection_name: str
+    display_name: str
+    accessible: bool
+
+
+class UploadStartedResponse(BaseModel):
+    upload_id: str
+
+
+class UploadProgressResponse(BaseModel):
+    upload_id: str
+    collection_name: str
+    filename: str
+    stage: str  # integrity / load / split / transform / dedup / embed / upsert，见 pipeline.py on_progress
+    current: int
+    total: int
+    done: bool
+    success: Optional[bool] = None  # done=False 时未知，保持 None
+    chunk_count: int = 0
+    duplicate_chunk_count: int = 0
+    error: Optional[str] = None
+
+
+# ============== 委托模式企业知识库上传（方案 2，见 knowledge-base-tenant-
+# federation.md 第 4.4 节）==============
+
+class TenantKbUploadResponse(BaseModel):
+    chunk_count: int
+    message: Optional[str] = None
+
+
+# ============== 运营仪表盘 API（仅平台管理员，见 dashboard_stats.py） ==============
+
+class DashboardOverviewResponse(BaseModel):
+    window: str
+    session_count: int
+    session_count_change: Optional[float] = None  # 环比百分比；上一窗口是 0 时给 None，不算除零的"无穷大涨幅"
+    message_count: int
+    message_count_change: Optional[float] = None
+    active_users: int
+    active_users_change: Optional[float] = None
+    avg_latency_ms: Optional[float] = None
+    avg_latency_ms_change: Optional[float] = None
+
+
+class DashboardTrendPointResponse(BaseModel):
+    bucket: str
+    value: float
+
+
+class DashboardTrendResponse(BaseModel):
+    metric: str
+    window: str
+    points: List[DashboardTrendPointResponse]
+
+
+class AuditLogResponse(BaseModel):
+    """审计日志一行——管理后台变更操作或工具调用，见 audit_store.py。"""
+    audit_id: str
+    org_id: Optional[str] = None
+    org_name: Optional[str] = None
+    user_id: Optional[str] = None
+    username: Optional[str] = None
+    action: str
+    resource_type: str
+    resource_id: Optional[str] = None
+    detail: Dict[str, Any] = Field(default_factory=dict)
+    success: bool
+    created_at: float
+
+
+class AuditLogListResponse(BaseModel):
+    items: List[AuditLogResponse]
+    total: int
+
+
+class CostOverviewResponse(BaseModel):
+    """成本与质量仪表盘概览——token 用量/预估成本来自 conversation_archive，
+    工具调用成功率来自 audit_logs（见 dashboard_stats.py）。"""
+    window: str
+    total_tokens: int
+    total_tokens_change: Optional[float] = None
+    estimated_cost_usd: Optional[float] = None  # None 表示当前模型没有可靠的单价估算（如本地 Ollama）
+    estimated_cost_usd_change: Optional[float] = None
+    tool_call_count: int
+    tool_success_rate: Optional[float] = None  # 0-100，没有任何工具调用时为 None
+    tool_success_rate_change: Optional[float] = None
+    tool_failure_count: int
 
 
 class SetUserRolesRequest(BaseModel):
@@ -377,6 +503,12 @@ class RAGState(TypedDict, total=False):
     final_answer: str
     used_model: str
     kb_sources: List[str]  # 本轮回答实际用到的知识库 collection 名（去重），UI 来源角标用
+    # 本轮 generate 节点的 token 用量（成本可观测性用，见 workflow.py
+    # _generate_node/_archive_node、dashboard_stats.py）。字段：
+    # prompt_tokens/completion_tokens/total_tokens/estimated（bool，True 表示
+    # LLM 没有回传真实 usage_metadata，是按字符数估算的）。short-circuit
+    # 分支（如 ACL 拒绝、clarify/workflow）没有调用 LLM，此字段为 None。
+    last_turn_tokens: Optional[Dict[str, Any]]
     
     # === 长期记忆（跨会话认知连续）===
     memories: List[str]
@@ -396,6 +528,7 @@ class RAGState(TypedDict, total=False):
     
     # === 内部临时状态（不会存入 checkpoint）===
     _to_archive: List[Dict[str, Any]]  # 本轮要归档的消息
+    _turn_start_ts: float  # 本轮图执行起点（_session_node 设置），供 _archive_node 算端到端响应耗时
 
 
 class ArchivedMessage(BaseModel):

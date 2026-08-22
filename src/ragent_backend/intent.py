@@ -454,6 +454,19 @@ def _reconcile_intent_result(
     if workflow_type and workflow_type not in available_workflow_types:
         workflow_type = None
 
+    # 复现过的真实误判："远程办公的申请流程是什么？"被小模型判成
+    # workflow_type=business_trip——四个流程模板的 display_name 里全都带
+    # "申请"这个字，用户查询只要沾上这个字就容易被带偏，跟具体是哪个模板
+    # 无关。Step 1.5 的规则短路（_match_workflow_action_intent）已经用"动作型
+    # 前缀 + 无疑问句提示词"这个组合精确区分过"我想请假"和"请假标准是什么"，
+    # 这里复用同一组信号对 LLM 的结构化输出做事后校验：没有动作型前缀、却
+    # 带明显疑问句式时，不采信这次 workflow_type，避免把明摆着在问政策的
+    # 疑问句发起成一个用户根本没打算触发的业务流程。
+    if workflow_type and not any(p in rewritten_query for p in _WORKFLOW_ACTION_PREFIXES) and any(
+        w in rewritten_query for w in _WORKFLOW_QUESTION_CUE_WORDS
+    ):
+        workflow_type = None
+
     intent_type = result.intent_type
     # 小模型（如 qwen2.5:7b）的结构化输出偶尔会自相矛盾：workflow_type 已经准确
     # 判断出来了（reasoning 里也明确点出是请假/报修等申请），但 intent_type 却
@@ -472,13 +485,21 @@ def _reconcile_intent_result(
     if target_tool and intent_type not in ("tool", "workflow"):
         intent_type = "tool"
 
-    # workflow 意图但没能对应到一个合法类型，退回 rag，避免进入一个没有类型的死路
+    # workflow 意图但没能对应到一个合法类型（包括被上面的疑问句守卫剔除），
+    # 退回 "tool" 而不是 "rag"——_route_after_intent 里 "rag" 只会走
+    # "retrieve" 节点，那条路径只搜这次对话自己上传的附件，多数场景压根没
+    # 传过文件，查到 0 条后 generate 会凭训练知识编一段看似合理的回答，用户
+    # 完全看不出这不是知识库查出来的（workflow.py `_route_after_intent`
+    # 里 "clarify" 自相矛盾分支已经踩过同一个坑、改成交给 tool_subgraph，
+    # 这里是同一类"分类器判不准"情形，沿用同一个更安全的默认：交给工具
+    # 子图，让它按可用工具列表自己再判断一次要不要查企业知识库）。
     if intent_type == "workflow" and not workflow_type:
         return IntentResult(
-            intent_type="rag",
+            intent_type="tool",
             rewritten_query=rewritten_query,
             confidence=0.6,
-            reasoning="LLM 判断为 workflow 意图，但未能匹配到合法的流程类型，回退到 rag",
+            target_tool=target_tool,
+            reasoning="LLM 判断为 workflow 意图，但未能匹配到合法的流程类型（或被疑问句守卫剔除），回退到 tool 交给工具子图判断",
         )
 
     # 置信度阈值

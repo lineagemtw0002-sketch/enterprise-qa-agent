@@ -165,32 +165,45 @@ def test_tokenize_handles_punctuation():
 
 
 def test_tokenize_handles_hyphens_and_underscores():
-    """Test that hyphens and underscores are preserved."""
+    """Test that hyphenated/underscored compounds are split into their parts.
+
+    SparseEncoder tokenizes via plain jieba.lcut (see _tokenize's docstring),
+    deliberately kept identical to QueryProcessor's query-side tokenizer so
+    index and query terms line up for BM25 matching. jieba treats '-' and
+    '_' as punctuation boundaries, so compounds split into their constituent
+    words rather than surviving as one token — that's fine for matching
+    since both sides split the same way.
+    """
     encoder = SparseEncoder()
     chunks = [
         Chunk(id="1", text="machine-learning deep_learning", metadata={"source_path": "test.txt"})
     ]
-    
+
     results = encoder.encode(chunks)
-    
-    assert "machine-learning" in results[0]["term_frequencies"]
-    assert "deep_learning" in results[0]["term_frequencies"]
+
+    assert "machine" in results[0]["term_frequencies"]
+    assert "learning" in results[0]["term_frequencies"]
+    assert "deep" in results[0]["term_frequencies"]
 
 
 def test_tokenize_handles_numbers():
-    """Test that numbers are tokenized."""
+    """Test that numbers are tokenized.
+
+    See test_tokenize_handles_hyphens_and_underscores: 'gpt-4' splits into
+    'gpt' and '4' via jieba, and the standalone '4' then gets dropped by the
+    min_term_length=2 filter (a single digit isn't a useful BM25 term).
+    """
     encoder = SparseEncoder()
     chunks = [
         Chunk(id="1", text="Python 3.11 and GPT-4", metadata={"source_path": "test.txt"})
     ]
-    
+
     results = encoder.encode(chunks)
-    
+
     # Numbers should be preserved as alphanumeric tokens
     assert "python" in results[0]["term_frequencies"]
-    # "3.11" may be split into "3" and "11" depending on tokenizer
-    # "gpt-4" should be preserved as hyphenated term
-    assert "gpt-4" in results[0]["term_frequencies"]
+    assert "3.11" in results[0]["term_frequencies"]
+    assert "gpt" in results[0]["term_frequencies"]
 
 
 # ============================================================================

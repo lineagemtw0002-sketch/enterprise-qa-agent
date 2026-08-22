@@ -54,13 +54,23 @@ class VectorUpserter:
         >>> # Chunks written with stable IDs like: "a1b2c3d4_0000_e5f6g7h8"
     """
     
-    def __init__(self, settings: Settings, collection_name: Optional[str] = None):
+    def __init__(
+        self,
+        settings: Settings,
+        collection_name: Optional[str] = None,
+        persist_directory: Optional[str] = None,
+    ):
         """Initialize VectorUpserter with configured vector store.
-        
+
         Args:
             settings: Application settings containing vector_store configuration.
             collection_name: Optional collection name to override settings default.
-        
+            persist_directory: Optional persist directory to override settings
+                default — needed when the caller manages its own physically
+                isolated store (e.g. a delegated tenant's own ChromaDB
+                directory, see services/tenant_kb_demo/app.py), not the
+                platform's shared one.
+
         Raises:
             ValueError: If settings are invalid or vector store cannot be created.
         """
@@ -68,6 +78,8 @@ class VectorUpserter:
         kwargs = {}
         if collection_name:
             kwargs['collection_name'] = collection_name
+        if persist_directory:
+            kwargs['persist_directory'] = persist_directory
         self.vector_store = VectorStoreFactory.create(settings, **kwargs)
     
     def upsert(

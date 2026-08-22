@@ -420,17 +420,25 @@ class ChromaStore(BaseVectorStore):
             For simplicity, we currently support only exact equality matches.
             Future enhancement: support complex filters.
         """
-        # Simple implementation: exact equality matches only
-        # For complex filters (e.g., {'score': {'$gt': 0.5}}), extend this method
+        # Simple implementation: exact equality matches, plus list -> $in.
+        # For other complex filters (e.g., {'score': {'$gt': 0.5}}), extend this method.
         where = {}
         for key, value in filters.items():
             if isinstance(value, dict):
                 # Already in ChromaDB operator format (e.g., {'$eq': 'value'})
                 where[key] = value
+            elif isinstance(value, list):
+                # ChromaDB rejects a bare list as a where-value (raises
+                # "Expected where value to be a str, int, float, or operator
+                # expression") — membership needs the explicit $in operator.
+                # Real case this fixes: query_knowledge_hub.py's hierarchical
+                # retrieval narrowing passes {"source_ref": [doc_id, ...]} to
+                # scope a search to a handful of documents.
+                where[key] = {"$in": value}
             else:
                 # Simple equality
                 where[key] = value
-        
+
         return where
     
     def get_collection_stats(self) -> Dict[str, Any]:
