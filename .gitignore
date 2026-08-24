@@ -131,3 +131,6 @@ nonexistent_traces.jsonl/
 reports/
 benchmark_report_*.json
 src/参考.html
+
+# macOS
+.DS_Store
