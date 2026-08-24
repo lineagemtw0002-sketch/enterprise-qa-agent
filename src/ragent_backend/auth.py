@@ -26,10 +26,81 @@ from typing import Optional
 import jwt
 from fastapi import Depends, Header, HTTPException
 
-# 生产环境必须通过环境变量覆盖；这里的默认值只是让本地开发不需要额外配置就能跑起来。
-_JWT_SECRET = os.getenv("RAGENT_JWT_SECRET", "dev-only-insecure-secret-change-me")
+# 这个字符串公开在源码里，任何拿到仓库的人都能用它签发任意 user_id 的 token。
+# 它只是让本地开发不用额外配置就能跑起来，绝不能出现在真实部署里。
+_DEV_FALLBACK_SECRET = "dev-only-insecure-secret-change-me"
+
+
+def resolve_jwt_secret(
+    secret: Optional[str] = None,
+    debug_mode: Optional[bool] = None,
+) -> str:
+    """决定实际使用的 JWT 签名密钥，配置不安全时直接拒绝启动。
+
+    2026-08-24 代码审计发现的 P0：原本这里是
+    `os.getenv("RAGENT_JWT_SECRET", "dev-only-insecure-secret-change-me")`，
+    而全仓（`.env`、`.env.example`、所有文档）都没有出现过 RAGENT_JWT_SECRET
+    这个变量名——也就是说真实部署里它几乎必然就是上面那个公开的默认值。
+    `get_current_user` 是整个系统身份的唯一来源，`require_role`、多租户
+    collection ACL 全部建立在它解出的 user_id 之上，所以密钥一旦可预测，
+    上层所有权限设计（角色校验、tenant_ 前缀拦截、归属二次校验）一起失效。
+
+    这里选择 fail-fast 而不是继续"打个日志然后照常启动"：不安全的密钥不会
+    产生任何可观察的异常，服务照常工作、登录照常成功，问题只在被利用时才
+    暴露——这种缺陷必须在启动阶段挡住，不能指望运维记得看警告。
+
+    放行条件只有一个：显式开着 RAGENT_DEBUG=true（本地开发）。这里复用
+    `_require_debug_mode` 那组端点已经在用的同一个开关，不再引入新的环境概念。
+
+    参数可注入是为了让这段策略能被直接单测，不必操作进程环境变量。
+    """
+    if secret is None:
+        secret = os.getenv("RAGENT_JWT_SECRET", "")
+    secret = secret.strip()
+
+    if secret and secret != _DEV_FALLBACK_SECRET:
+        return secret
+
+    if debug_mode is None:
+        debug_mode = os.getenv("RAGENT_DEBUG", "false").strip().lower() == "true"
+
+    if debug_mode:
+        print(
+            "[Auth] 警告：正在使用源码内置的开发用 JWT 密钥，任何人都可以伪造身份。"
+            "仅限本地开发；部署前必须设置 RAGENT_JWT_SECRET。"
+        )
+        return _DEV_FALLBACK_SECRET
+
+    raise RuntimeError(
+        "RAGENT_JWT_SECRET 未设置（或仍是源码里的开发默认值），拒绝启动。\n"
+        "该密钥是整个系统身份校验的唯一凭据，使用默认值等于任何人都能伪造任意用户"
+        "（包括 super_admin）的登录凭证，多租户权限隔离将完全失效。\n"
+        "请设置一个随机密钥，例如：\n"
+        "    python -c \"import secrets; print(secrets.token_urlsafe(48))\"\n"
+        "然后写入部署环境的 RAGENT_JWT_SECRET。\n"
+        "（仅本地开发可通过 RAGENT_DEBUG=true 使用内置开发密钥。）"
+    )
+
+
 _JWT_ALGORITHM = "HS256"
 _TOKEN_TTL_SECONDS = 24 * 60 * 60  # 24 小时
+
+# 惰性解析：import 这个模块本身不应该有"可能让进程崩掉"的副作用，否则任何想
+# 引用 AuthenticatedUser 的测试/脚本都得先准备好完整环境。真正的 fail-fast 由
+# `create_app()` 启动时显式调用 `get_jwt_secret()` 完成（那时崩掉才是想要的）。
+_jwt_secret_cache: Optional[str] = None
+
+
+def get_jwt_secret() -> str:
+    """取实际使用的签名密钥；配置不安全时抛 RuntimeError。
+
+    结果缓存，保证同一进程内签发和校验用的一定是同一个密钥（否则轮换配置时
+    会出现"签出来的 token 自己验不过"这种极难排查的状态）。
+    """
+    global _jwt_secret_cache
+    if _jwt_secret_cache is None:
+        _jwt_secret_cache = resolve_jwt_secret()
+    return _jwt_secret_cache
 
 
 @dataclass(frozen=True)
@@ -46,12 +117,12 @@ def create_access_token(user_id: str, username: str) -> str:
         "iat": now,
         "exp": now + _TOKEN_TTL_SECONDS,
     }
-    return jwt.encode(payload, _JWT_SECRET, algorithm=_JWT_ALGORITHM)
+    return jwt.encode(payload, get_jwt_secret(), algorithm=_JWT_ALGORITHM)
 
 
 def _decode_token(token: str) -> AuthenticatedUser:
     try:
-        payload = jwt.decode(token, _JWT_SECRET, algorithms=[_JWT_ALGORITHM])
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[_JWT_ALGORITHM])
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
     except jwt.InvalidTokenError:
