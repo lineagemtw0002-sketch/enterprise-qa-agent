@@ -34,8 +34,9 @@ class LoginResponse(BaseModel):
 
 
 class RoleSummary(BaseModel):
-    """用户当前拥有的角色摘要，用于 /auth/me 展示——不含关联的知识库列表，
-    那是角色管理界面才需要的东西。"""
+    """用户当前拥有的角色摘要，用于 /auth/me 展示——角色直接携带知识库权限
+    （见 role_store.py 顶部说明），这里不重复带 collection_names，知识库信息
+    统一走 allowed_collections（后端已经算好并集）。"""
     role_id: str
     name: str
     display_name: str
@@ -50,8 +51,8 @@ class OrganizationSummary(BaseModel):
 class MeResponse(BaseModel):
     user_id: str
     username: str
-    roles: List[RoleSummary]          # 原来是 role: str；一个用户可以有多个角色
-    allowed_collections: List[str]    # 保留：后端算好的角色并集，前端不用二次拼接
+    roles: List[RoleSummary]          # 一人一角色（当前业务规则），列表长度 0 或 1
+    allowed_collections: List[str]    # 保留：后端按角色关联算好的知识库并集，前端不用二次拼接
     organization: Optional[OrganizationSummary] = None
     created_at: float
 
@@ -75,7 +76,7 @@ class AdminUserResponse(BaseModel):
 class AdminCreateUserRequest(BaseModel):
     username: str = Field(..., min_length=1)
     password: str = Field(..., min_length=6)
-    role_ids: List[str] = Field(default_factory=list, description="初始分配的角色 id 列表")
+    role_ids: List[str] = Field(default_factory=list, description="初始分配的角色 id 列表，最多 1 个（一人一角色）")
     org_id: Optional[str] = Field(
         default=None,
         description="所属企业；非平台管理员建号时后端会忽略这个字段，强制用调用者自己的 org_id",
@@ -171,14 +172,21 @@ class AdminKbChunkPreview(BaseModel):
     kb_name: Optional[str] = None
 
 
-# ============== 角色管理 API（仅 super_admin） ==============
+# ============== 角色管理 API ==============
+# 角色直接携带知识库权限（role_store.py 顶部说明）。分两类，用 org_id 是否
+# 为空区分：全局角色（org_id=None，系统权限档位 + 跨企业共用的部门身份，只有
+# 平台管理员能建/改名/删）；企业角色（org_id 非空，某家企业管理员自己建的
+# 角色，只在自己企业内可见/可分配，能配置知识库关联）。平台管理员管全局角色
+# （/admin/roles，不涉及知识库——运营商的角色没有知识库权限，见 role_store.py），
+# 企业管理员管自己企业的角色（同一组端点，权限档位不同则看到的范围不同）。
 
 class RoleResponse(BaseModel):
     role_id: str
     name: str
     display_name: str
     is_system: bool
-    collection_names: List[str]
+    org_id: Optional[str] = None
+    collection_names: List[str] = Field(default_factory=list)
     created_at: float
 
 
@@ -200,6 +208,7 @@ class SetRoleCollectionsRequest(BaseModel):
 class CollectionResponse(BaseModel):
     collection_name: str
     display_name: str
+    chunk_count: int = 0
     created_at: float
 
 
@@ -358,15 +367,14 @@ class WorkflowFieldSpec(BaseModel):
 
 class WorkflowTemplateResponse(BaseModel):
     """公开的轻量视图（`GET /api/v1/workflow-templates`）和管理视图
-    （`GET /api/v1/admin/workflow-templates`）复用同一个响应模型——管理视图只是
-    多暴露 `approver_role_id`，不需要为此拆两个模型。"""
+    （`GET /api/v1/admin/workflow-templates`）复用同一个响应模型——纯表单结构，
+    不含审批人信息，那是按企业配置的，见 WorkflowApproverAssignmentResponse。"""
     template_id: str
     workflow_type: str
     display_name: str
     description: str
     required_fields: List[WorkflowFieldSpec]
     attachments_note: str
-    approver_role_id: Optional[str] = None
     is_system: bool
     created_at: float
 
@@ -384,6 +392,20 @@ class UpdateWorkflowTemplateRequest(BaseModel):
     description: Optional[str] = None
     required_fields: Optional[List[WorkflowFieldSpec]] = None
     attachments_note: Optional[str] = None
+
+
+# ============== 工作流审批人分配 API（仅 org_admin，按企业隔离） ==============
+# "这类流程谁来批"是企业内部的事，见 workflow_store.py 顶部说明——同一个
+# workflow_type 在不同企业可以配不同的审批角色。
+
+class WorkflowApproverAssignmentResponse(BaseModel):
+    workflow_type: str
+    display_name: str
+    approver_role_id: Optional[str] = None
+    approver_role_display_name: Optional[str] = None
+
+
+class SetWorkflowApproverRequest(BaseModel):
     approver_role_id: Optional[str] = None
 
 

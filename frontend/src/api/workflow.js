@@ -31,6 +31,20 @@ export function adminDeleteWorkflowTemplate(templateId) {
   return axios.delete(`${BASE}/admin/workflow-templates/${templateId}`).then((res) => res.data)
 }
 
+// ==================== 工作流审批人分配（仅企业管理员，按企业隔离） ====================
+// "这类流程谁来批"是企业内部的事，跟上面平台管理的模板表单结构是两回事——
+// 见 app.py 工作流审批人分配 API 旁的说明。
+
+export function adminListWorkflowApprovers() {
+  return axios.get(`${BASE}/admin/workflow-approvers`).then((res) => res.data)
+}
+
+export function adminSetWorkflowApprover(workflowType, approverRoleId) {
+  return axios
+    .put(`${BASE}/admin/workflow-approvers/${workflowType}`, { approver_role_id: approverRoleId })
+    .then((res) => res.data)
+}
+
 // ==================== 工作流实例 ====================
 
 export function listMyWorkflows(status) {

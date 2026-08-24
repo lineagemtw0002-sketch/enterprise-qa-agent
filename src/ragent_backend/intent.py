@@ -286,6 +286,32 @@ _WORKFLOW_QUESTION_CUE_WORDS = [
     "吗", "呢", "？", "?", "怎么", "如何", "什么", "多少", "标准", "规定", "政策", "流程是",
 ]
 
+# _needs_clarify_rule 用：真正需要澄清的模糊代词。
+_VAGUE_PRONOUNS = ["它", "这个", "那个", "that", "it", "this", "上述", "上面"]
+# "这个"/"那个" 紧跟着这些时间量词时是"这个月""那个星期"这类具体时间指代，
+# 不是指代不明的代词——之前直接用子串匹配（"这个" in "这个月迟到了几次"）
+# 会把这类句子也误判成需要澄清，实测"我这个月迟到了几次"这种完整、明确的
+# 问题被 100% 命中误判（跟 LLM 模型大小无关，规则层面这一步就短路掉了，
+# 根本没轮到 LLM 判断）。
+_TEMPORAL_SUFFIXES_AFTER_ZHE_NA = ["月", "年", "星期", "周", "季度", "礼拜", "阵子", "次"]
+
+
+def _has_vague_pronoun(text: str) -> bool:
+    """检测文本里是否包含真正指代不明的模糊代词，排除"这个月""那个星期"
+    这类"这个/那个 + 时间量词"的具体时间指代——两者字面上都含"这个"/"那个"
+    这个子串，但语义上前者需要追问"你说的是哪个"，后者本身已经是完整信息。"""
+    for token in _VAGUE_PRONOUNS:
+        if token not in text:
+            continue
+        if token in ("这个", "那个"):
+            idx = text.index(token)
+            suffix_start = idx + len(token)
+            following = text[suffix_start:suffix_start + 2]
+            if any(following.startswith(suf) for suf in _TEMPORAL_SUFFIXES_AFTER_ZHE_NA):
+                continue
+        return True
+    return False
+
 
 def _match_workflow_action_intent(
     rewritten_query: str, available_workflows: List[Dict[str, Any]],
@@ -344,18 +370,9 @@ async def detect_intent(
         IntentResult
     """
     # === Step 1: 澄清检查（硬规则，不经过 LLM）===
-    vague_pronouns = ["它", "这个", "那个", "that", "it", "this", "上述", "上面"]
-    has_vague = any(token in rewritten_query for token in vague_pronouns)
-
-    if len(rewritten_query.strip()) < 4 or (has_vague and len(rewritten_query) < 10):
-        return IntentResult(
-            intent_type="clarify",
-            rewritten_query=rewritten_query,
-            confidence=0.35,
-            need_clarify=True,
-            clarify_prompt="请补充更具体的信息，例如具体的产品名、文档名或业务指标。",
-            reasoning="查询过短或包含模糊代词，需要澄清",
-        )
+    clarify_override = _needs_clarify_rule(rewritten_query)
+    if clarify_override is not None:
+        return clarify_override
 
     # === Step 1.5：动作型表达规则短路（不经过 LLM）===
     # "我想报销"这类短句交给 LLM 判断时，本项目用的本地小模型（qwen2.5:7b）
@@ -556,8 +573,7 @@ def _needs_clarify_rule(rewritten_query: str) -> Optional[IntentResult]:
     `detect_intent`（旧路径，检查的是待分类的 rewritten_query）和
     `analyze_and_route`（合并路径，检查 LLM 自己重写出来的 rewritten_query，
     当"后置安全网"用，防止合并调用里模型自己也没把指代消解干净）两处复用。"""
-    vague_pronouns = ["它", "这个", "那个", "that", "it", "this", "上述", "上面"]
-    has_vague = any(token in rewritten_query for token in vague_pronouns)
+    has_vague = _has_vague_pronoun(rewritten_query)
     if len(rewritten_query.strip()) < 4 or (has_vague and len(rewritten_query) < 10):
         return IntentResult(
             intent_type="clarify",

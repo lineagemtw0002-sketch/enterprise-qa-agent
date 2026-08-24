@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -44,9 +45,9 @@ REMOTE_SEARCH_TIMEOUT_SECONDS = 8.0
 # 运营方只负责用户/角色/审计/运营仪表盘这类系统管理，不代表任何一家具体企业，
 # 挂着"财务政策""销售话术"这类业务知识库本身就名不正言不顺。原来这里有一份
 # `DEPARTMENT_KB_COLLECTIONS`（6 个固定部门库，物理上是平台自己本地共享的
-# Chroma collection），已经连同 role_collections 关联、BM25 索引一并下线——
-# 那 6 个部门角色名字（hr_admin_kb/finance_kb/...）还在，但现在只用于委托模式
-# 企业的类目过滤（见下面 DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES），跟"平台自己
+# Chroma collection），已经连同角色关联、BM25 索引一并下线——那 6 个知识库
+# 分组名字（hr_admin_kb/finance_kb/...）还在，但现在只用于委托模式企业的
+# 类目过滤（见下面 DEPARTMENT_KB_GROUP_TO_REMOTE_CATEGORIES），跟"平台自己
 # 有没有本地库"是两件不相关的事。之前误摄入 README 的 "default" collection、
 # 以及迁移前的 4 个老单文档部门库（it_kb/attendance_kb/logistics_kb/legal_kb）
 # 也是同一天一起下线的。`it_dept`/`attendance_dept`/`logistics_dept`/`legal_dept`
@@ -75,27 +76,30 @@ MIN_RELEVANCE_SCORE: float = 0.1
 # 客户接入时不一定会）在我们这一侧做二次过滤——不是本地检索那套 collection
 # 级 ACL（那套只认本地 collection 名，管不到委托企业自己的分类体系）。
 #
-# 这份角色 -> 可见类目中文标签的映射是我们自己按"角色名字面意思 + Acme/Globex
-# 演示语料的类目名"推断出来的默认策略，不是企业自己配的（后台还没有让企业管理员
-# 自定义这份映射的入口，后续要加真实客户接入时再补）。org_admin 不查这份映射，
-# 视为企业内部无限制（跟本地检索路径 `get_allowed_collections_for_user` 对
-# org_admin 的特判是同一个语义："企业管理员=企业内全部知识库"）。
+# 这份知识库分组 -> 可见类目中文标签的映射是我们自己按"分组名字面意思 +
+# Acme/Globex 演示语料的类目名"推断出来的默认策略，不是企业自己配的（后台还
+# 没有让企业管理员自定义这份映射的入口，后续要加真实客户接入时再补）。
+# org_admin 不查这份映射，视为企业内部无限制（跟本地检索路径
+# `get_allowed_collections_for_user` 对 org_admin 的特判是同一个语义："企业
+# 管理员=企业内全部知识库"）。
 #
-# 没有上报 kb_name 的结果、或者角色不在这份映射里（包括压根没有部门角色的账号）
-# 一律拦下（fail-closed）而不是放行——委托企业如果压根不上报分类，非管理员员工
-# 在这条路径上会看到"无权访问"而不是内容，这是刻意的：宁可员工发现自己好像
-# 用不了、去找管理员，也不要在权限判断不出来的时候默认放行。
+# 没有上报 kb_name 的结果、或者用户不属于这份映射里的任何分组（包括压根没有
+# 知识库分组的账号）一律拦下（fail-closed）而不是放行——委托企业如果压根不
+# 上报分类，非管理员员工在这条路径上会看到"无权访问"而不是内容，这是刻意的：
+# 宁可员工发现自己好像用不了、去找管理员，也不要在权限判断不出来的时候默认放行。
 #
-# 2026-08-22 第二次改版：委托企业(Acme/Globex)的语料改成跟平台之前那 6 个
-# 本地部门知识库同一套分类（人力资源与行政/财务与报销制度/IT支持与技术运维/
-# 销售话术与市场/研发与产品代码/客户成功与售后服务，见 services/tenant_kb_demo/app.py
-# 的 CATEGORY_LABELS、scripts/generate_tenant_kb_corpus.py），跟角色名是严格
-# 一对一——不再需要老版本那种"一个角色对应好几个类目、类目名跟角色名对不上"
-# 的模糊映射。旧的 Acme/Globex 专属分类（故障排查/供应链/报关…）已经随语料
-# 一起重新生成，不再存在。legal_dept/attendance_dept/logistics_dept/it_dept
-# 这几个平台本地遗留角色不在新分类体系里，持有它们、且没有额外角色的委托企业
-# 员工在这条路径上会查不到任何内容（fail-closed 的自然结果，不是 bug）。
-DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES: Dict[str, List[str]] = {
+# 这 6 个分组名字就是角色名（role_store.py）——2026-08-23 起角色和知识库分组
+# 合并回一套（角色直接携带知识库权限，见 role_store.py 文件顶部说明），这里
+# 改成直接读 `RoleStore.get_user_roles` 的角色名集合做匹配，不再单独查一次
+# 知识库分组。跟平台之前那 6 个本地部门知识库同一套分类（人力资源与行政/
+# 财务与报销制度/IT支持与技术运维/销售话术与市场/研发与产品代码/客户成功
+# 与售后服务，见 services/tenant_kb_demo/app.py 的 CATEGORY_LABELS、
+# scripts/generate_tenant_kb_corpus.py），跟角色名是严格一对一。
+# legal_dept/attendance_dept/logistics_dept/it_dept 这几个纯工作流审批路由
+# 用的部门角色（在这家委托企业没有另外配置知识库关联）不在这份映射里，持有
+# 它们的委托企业员工在这条路径上会查不到任何内容（fail-closed 的自然结果，
+# 不是 bug）。
+DEPARTMENT_KB_GROUP_TO_REMOTE_CATEGORIES: Dict[str, List[str]] = {
     "hr_admin_kb": ["人力资源与行政"],
     "finance_kb": ["财务与报销制度"],
     "it_support_kb": ["IT支持与技术运维"],
@@ -289,7 +293,48 @@ class QueryKnowledgeHubTool:
         if self._settings is None:
             self._settings = load_settings()
         return self._settings
-    
+
+    def _ensure_shared_clients(self) -> None:
+        """把 embedding_client/reranker 这两个跨 collection 共享、只需要建一次
+        的对象准备好——`_build_hybrid_search_for` 和 `_narrow_by_document_summary`
+        原来各自写了一遍一模一样的 `if self._x is None: ...` 判断，这里抽成
+        一个方法，两处都改成调它，同时也是 `preload_models()`（见下面）在
+        应用启动阶段"预热"时调的同一个入口——保证"预热时走的代码路径"和
+        "真实请求第一次用到时走的代码路径"完全是同一段逻辑，不会出现预热
+        逻辑跟正式逻辑各写一份、以后改了一处忘了改另一处的问题。"""
+        from src.libs.embedding.embedding_factory import EmbeddingFactory
+        from src.core.query_engine.reranker import create_core_reranker
+
+        if self._embedding_client is None:
+            self._embedding_client = EmbeddingFactory.create(self.settings)
+        if self._reranker is None:
+            self._reranker = create_core_reranker(settings=self.settings)
+
+    async def preload_models(self) -> None:
+        """应用启动阶段主动预热——见 docs/optimization_tracking.md 耗时优化
+        任务"知识库检索为什么要 7 秒"那次排查：真正的大头不是检索/重排本身
+        （几十到几百毫秒），是 `self._reranker`（本地 cross-encoder
+        `BAAI/bge-reranker-base`）第一次被用到时才现场加载模型，撞上这次
+        加载的是"运气不好、第一个问知识库问题的真实用户"，代价被摊派给了
+        它，而不是摊派给"服务启动"这个所有用户都不会感知到的阶段。
+
+        `_ensure_shared_clients()` 建好 embedding_client/reranker 两个对象后，
+        这里再额外发一次真实的 embedding 调用（Ollama 的 nomic-embed-text）——
+        只建 client 对象不够，Ollama 那边的模型本身也有独立的冷启动（同一次
+        排查里 embed_query 这一步从 587ms 降到 27ms，降的就是这个），只有
+        真的调用一次才能把它也预热到位。查询文本随便传一个占位符即可，这次
+        调用的结果不使用，只为了触发模型加载。
+
+        调用方（app.py lifespan）需要对每一个真实持有的 `QueryKnowledgeHubTool`
+        实例都单独调一次——`self._reranker`/`self._embedding_client` 是实例
+        级别的缓存，不跨实例共享（当前项目里这个工具类被实例化了不止一处，
+        各自预热互不影响，也互不能替对方省下这次加载）。"""
+        self._ensure_shared_clients()
+        try:
+            await asyncio.to_thread(self._embedding_client.embed, ["预热"])
+        except Exception as e:
+            logger.warning(f"[Preload] embedding warm-up call failed (non-fatal): {e}")
+
     def _build_hybrid_search_for(self, collection: str) -> "HybridSearch":
         """为单个 collection 现建一个独立的 HybridSearch 实例，不读也不写
         self._hybrid_search/self._current_collection——"全库混合召回"
@@ -307,17 +352,11 @@ class QueryKnowledgeHubTool:
         from src.core.query_engine.hybrid_search import create_hybrid_search
         from src.core.query_engine.dense_retriever import create_dense_retriever
         from src.core.query_engine.sparse_retriever import create_sparse_retriever
-        from src.core.query_engine.reranker import create_core_reranker
         from src.ingestion.storage.bm25_indexer import BM25Indexer
-        from src.libs.embedding.embedding_factory import EmbeddingFactory
         from src.libs.vector_store.vector_store_factory import VectorStoreFactory
 
         # === 真正无状态、可跨 collection 共享的部分：挂在 self 上复用 ===
-        if self._embedding_client is None:
-            self._embedding_client = EmbeddingFactory.create(self.settings)
-
-        if self._reranker is None:
-            self._reranker = create_core_reranker(settings=self.settings)
+        self._ensure_shared_clients()
 
         # === 跟 collection 绑定的部分：每次现建，不缓存在 self 上 ===
         # ChromaDB PersistentClient 底层是 SQLite，并发读是安全的（多个
@@ -418,12 +457,12 @@ class QueryKnowledgeHubTool:
 
         is_remote = connector is not None and connector.connector_type == CONNECTOR_TYPE_HTTP_API
 
-        # 委托模式下按部门角色过滤的可见类目集合——只在这里（remote 分支）用，
+        # 委托模式下按知识库分组过滤的可见类目集合——只在这里（remote 分支）用，
         # 跟上面 `allowed_collections`（本地 collection ACL）是两个不同的概念，
         # 不复用同一个变量：None 表示"不过滤"（org_admin，或没有 user_id 的老
-        # 调用方，保留原有行为），空集合表示"这个人没有任何部门角色能匹配上
-        # 已知类目，过滤到一条不剩"，不是"跳过过滤"。见 DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES
-        # 旁边的完整说明。
+        # 调用方，保留原有行为），空集合表示"这个人没有任何知识库分组能匹配上
+        # 已知类目，过滤到一条不剩"，不是"跳过过滤"。见
+        # DEPARTMENT_KB_GROUP_TO_REMOTE_CATEGORIES 旁边的完整说明。
         remote_allowed_categories: Optional[set] = None
         if is_remote and user_id is not None:
             from src.ragent_backend.role_store import RoleStore, ROLE_ORG_ADMIN
@@ -432,7 +471,7 @@ class QueryKnowledgeHubTool:
             if ROLE_ORG_ADMIN not in role_names:
                 remote_allowed_categories = set()
                 for role_name in role_names:
-                    remote_allowed_categories.update(DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES.get(role_name, []))
+                    remote_allowed_categories.update(DEPARTMENT_KB_GROUP_TO_REMOTE_CATEGORIES.get(role_name, []))
 
         # 委托模式（企业自己的知识库微服务）：这几个固定部门知识库是本地
         # internal_chroma 专属的概念，委托出去的查询不受影响，沿用老逻辑——
@@ -690,13 +729,20 @@ class QueryKnowledgeHubTool:
         返回 None 表示不按分类过滤/清空，行为等同于改这次之前。"""
         return collection.split(":", 1)[1] if ":" in collection else None
 
-    async def list_org_collection_chunks(self, org_id: str, collection: str, limit: int = 50) -> List[Dict[str, Any]]:
+    async def list_org_collection_chunks(
+        self, org_id: str, collection: str, limit: int = 50, offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        # offset 只对本地检索生效——委托模式的参考实现语料量很小，压根没有
+        # 分页概念（见 services/tenant_kb_demo/app.py list_chunks 旁的说明），
+        # 传了也会被忽略，这里干脆不传，避免造成"这个参数在委托模式下也生效"
+        # 的错觉。企业管理员的「知识库权限」自助分页查数据功能本来就只对本地
+        # 检索企业开放（跟"新增知识库"同一条边界，见 _require_local_retrieval_org）。
         org, connector = await self._resolve_org_and_connector(org_id)
         if connector is not None:
             category = self._split_remote_category(collection)
             return await self._remote_collection_chunks(connector, limit, category=category)
         await self._assert_local_collection_owned(org, collection)
-        return await self._local_collection_chunks(collection, limit)
+        return await self._local_collection_chunks(collection, limit, offset=offset)
 
     async def clear_org_collection(self, org_id: str, collection: str) -> int:
         org, connector = await self._resolve_org_and_connector(org_id)
@@ -725,12 +771,12 @@ class QueryKnowledgeHubTool:
         return await asyncio.to_thread(_sync)
 
     @staticmethod
-    async def _local_collection_chunks(collection_name: str, limit: int) -> List[Dict[str, Any]]:
+    async def _local_collection_chunks(collection_name: str, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
         from src.libs.vector_store.vector_store_factory import VectorStoreFactory
 
         def _sync() -> List[Dict[str, Any]]:
             store = VectorStoreFactory.create(load_settings(), collection_name=collection_name)
-            raw = store.collection.get(limit=limit, include=["metadatas", "documents"])
+            raw = store.collection.get(limit=limit, offset=offset, include=["metadatas", "documents"])
             items = []
             for i, chunk_id in enumerate(raw.get("ids", [])):
                 metadata = (raw.get("metadatas") or [{}])[i] or {}
@@ -1015,7 +1061,7 @@ class QueryKnowledgeHubTool:
         return [r for r in results if r.score >= MIN_RELEVANCE_SCORE]
 
     async def _narrow_by_document_summary(
-        self, query: str, candidate_collections: List[str],
+        self, query: str, candidate_collections: List[str], trace: Optional["TraceContext"] = None,
     ) -> Dict[str, List[str]]:
         """层次化检索的"粗筛"阶段——见 ingestion/hierarchy/doc_summary.py 顶部
         说明。在每个候选 collection 的 `{collection}__summary` 摘要层各查一次
@@ -1027,13 +1073,17 @@ class QueryKnowledgeHubTool:
         没有任何文档摘要——比如这个功能上线前就已经摄入的老数据），调用方
         （_execute_local_multi）据此决定要不要整体退回原来的平铺检索，不是
         把空结果当成"真的查无相关文档"处理。
+
+        `trace` 是本次诊断"知识库检索为什么要 7 秒"时临时加的分段计时——把
+        "建 6 个摘要 store（当前是串行）""embed 一次查询向量""并行查各 store"
+        这三步拆开各自计时，写进 `trace.record_stage("narrow_detail", ...)`，
+        跟正式的 rerank 计时用同一套机制，方便直接从 logs/traces.jsonl 里
+        对比哪一步才是真正的大头。不影响任何检索结果，只是多记了几条日志。
         """
         from src.ingestion.hierarchy.doc_summary import summary_collection_name
-        from src.libs.embedding.embedding_factory import EmbeddingFactory
         from src.libs.vector_store.vector_store_factory import VectorStoreFactory
 
-        if self._embedding_client is None:
-            self._embedding_client = EmbeddingFactory.create(self.settings)
+        self._ensure_shared_clients()
 
         top_docs = getattr(getattr(self.settings, "ingestion", None), "doc_summary", None) or {}
         top_docs = top_docs.get("top_docs", 5)
@@ -1050,11 +1100,21 @@ class QueryKnowledgeHubTool:
                     logger.warning(f"Failed to open summary store for '{c}': {e}")
             return stores
 
+        _t0 = time.monotonic()
         summary_stores = await asyncio.to_thread(_build_stores_sync)
+        _t_build = (time.monotonic() - _t0) * 1000.0
+        if trace is not None:
+            trace.record_stage("narrow_detail", {
+                "step": "build_summary_stores", "collection_count": len(candidate_collections),
+            }, elapsed_ms=_t_build)
         if not summary_stores:
             return {}
 
+        _t0 = time.monotonic()
         query_vector = (await asyncio.to_thread(self._embedding_client.embed, [query]))[0]
+        _t_embed = (time.monotonic() - _t0) * 1000.0
+        if trace is not None:
+            trace.record_stage("narrow_detail", {"step": "embed_query"}, elapsed_ms=_t_embed)
 
         def _query_one_sync(collection: str) -> List[Dict[str, Any]]:
             try:
@@ -1066,9 +1126,15 @@ class QueryKnowledgeHubTool:
                 h["_collection"] = collection
             return hits
 
+        _t0 = time.monotonic()
         per_collection_hits = await asyncio.gather(
             *[asyncio.to_thread(_query_one_sync, c) for c in summary_stores],
         )
+        _t_query = (time.monotonic() - _t0) * 1000.0
+        if trace is not None:
+            trace.record_stage("narrow_detail", {
+                "step": "query_summary_stores", "store_count": len(summary_stores),
+            }, elapsed_ms=_t_query)
         all_hits = [h for sub in per_collection_hits for h in sub]
         if not all_hits:
             return {}
@@ -1103,7 +1169,9 @@ class QueryKnowledgeHubTool:
         结果；摘要层没信号（老数据没有摘要）就整体退回原来的行为，不做任何
         收窄，保证这个功能是纯增量的，不会让还没补摘要的旧数据查不到东西。
         """
-        narrowed = await self._narrow_by_document_summary(query, candidate_collections)
+        _t0 = time.monotonic()
+        narrowed = await self._narrow_by_document_summary(query, candidate_collections, trace=trace)
+        _t_narrow_total = (time.monotonic() - _t0) * 1000.0
         # 先把每个 collection 的 HybridSearch（内部会各自新建一个指向同一个
         # persist_directory 的 chromadb.PersistentClient）串行建好，再并行跑
         # 查询——实测踩过坑：6 个 collection 各自在不同线程里并发 new 一个
@@ -1119,17 +1187,24 @@ class QueryKnowledgeHubTool:
         # 过滤，收窄到具体那几份文档）；没信号（narrowed 为空）就是老行为——
         # 全部候选 collection、不加文档级过滤。
         search_collections = list(narrowed.keys()) if narrowed else candidate_collections
-        if narrowed:
-            trace.record_stage("hierarchy_narrow", {
-                "narrowed_collections": {c: docs for c, docs in narrowed.items()},
-            })
+        # elapsed_ms 用整个 _narrow_by_document_summary() 的墙钟时间（含它
+        # 内部三个子步骤），narrow_detail 那几条已经拆得更细，这里是总览。
+        trace.record_stage("hierarchy_narrow", {
+            "narrowed_collections": {c: docs for c, docs in narrowed.items()},
+        }, elapsed_ms=_t_narrow_total)
 
         def _build_all_sync() -> Dict[str, "HybridSearch"]:
             return {c: self._build_hybrid_search_for(c) for c in search_collections}
 
+        _t0 = time.monotonic()
         hybrid_searches = await asyncio.to_thread(_build_all_sync)
+        _t_build_hybrid = (time.monotonic() - _t0) * 1000.0
+        trace.record_stage("build_hybrid_searches", {
+            "collection_count": len(search_collections),
+        }, elapsed_ms=_t_build_hybrid)
 
         def _search_one_sync(collection: str) -> List[RetrievalResult]:
+            _t0_one = time.monotonic()
             hybrid_search = hybrid_searches[collection]
             initial_top_k = top_k * 2 if self.config.enable_rerank else top_k
             doc_filter = {"source_ref": narrowed[collection]} if collection in narrowed else None
@@ -1140,12 +1215,22 @@ class QueryKnowledgeHubTool:
             for r in results:
                 r.metadata = dict(r.metadata or {})
                 r.metadata["collection"] = collection
+            # 诊断用：每个 collection 自己的 HybridSearch.search() 内部会不会
+            # 重新 embed 一次 query（跟 narrow 阶段那次 embedding 是否重复），
+            # 这里先只测"这个 collection 整体花了多久"，跟 narrow_detail 的
+            # embed_query 那条对比数量级——如果好几个 collection 各自都接近
+            # 那个数字，基本能坐实"重复 embedding"这个猜测。
+            trace.record_stage("search_one_collection", {
+                "collection": collection, "result_count": len(results),
+            }, elapsed_ms=(time.monotonic() - _t0_one) * 1000.0)
             return results
 
+        _t0 = time.monotonic()
         per_collection_results = await asyncio.gather(
             *[asyncio.to_thread(_search_one_sync, c) for c in search_collections],
             return_exceptions=True,
         )
+        _t_gather = (time.monotonic() - _t0) * 1000.0
 
         merged: List[RetrievalResult] = []
         for collection, sub_results in zip(search_collections, per_collection_results):
@@ -1157,7 +1242,7 @@ class QueryKnowledgeHubTool:
         trace.record_stage("parallel_recall", {
             "candidate_collections": candidate_collections,
             "merged_candidate_count": len(merged),
-        })
+        }, elapsed_ms=_t_gather)
 
         if self.config.enable_rerank and merged:
             merged, scored = await asyncio.to_thread(self._apply_rerank, query, merged, top_k, trace)
@@ -1265,7 +1350,7 @@ class QueryKnowledgeHubTool:
                 kb_name = r.metadata.get("remote_kb_name")
                 r.metadata["collection"] = f"{collection}:{kb_name}" if kb_name else collection
 
-            # 部门级过滤——见 DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES 旁边的说明。
+            # 部门级过滤——见 DEPARTMENT_KB_GROUP_TO_REMOTE_CATEGORIES 旁边的说明。
             # None 表示不过滤（org_admin 或没有 user_id 的老调用方）；否则只保留
             # kb_name 命中允许类目集合的结果，企业没上报 kb_name 的结果一律拦下
             # （fail-closed，不是"看不出类目就放行"）。这一步只发生在委托模式，

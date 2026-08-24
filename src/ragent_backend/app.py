@@ -39,6 +39,8 @@ from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
+from langchain_core.messages import HumanMessage
+
 # LangGraph checkpointer
 from langgraph.checkpoint.postgres import PostgresSaver
 
@@ -48,14 +50,15 @@ from src.ragent_backend.schemas import (
     OrganizationSummary, AdminUserResponse, AdminCreateUserRequest,
     AdminOrganizationResponse, AdminCreateOrganizationRequest,
     TenantConnectorResponse, UpsertTenantConnectorRequest, GatewayConnectorResponse,
-    RoleResponse, CreateRoleRequest, UpdateRoleRequest,
-    SetRoleCollectionsRequest, SetUserRolesRequest,
+    RoleResponse, CreateRoleRequest, UpdateRoleRequest, SetUserRolesRequest,
+    SetRoleCollectionsRequest,
     CollectionResponse, CreateCollectionRequest,
     CollectionCatalogEntry, UploadStartedResponse, UploadProgressResponse,
     TenantKbUploadResponse,
     DashboardOverviewResponse, DashboardTrendResponse, DashboardTrendPointResponse,
     AuditLogResponse, AuditLogListResponse, CostOverviewResponse,
     WorkflowTemplateResponse, CreateWorkflowTemplateRequest, UpdateWorkflowTemplateRequest,
+    WorkflowApproverAssignmentResponse, SetWorkflowApproverRequest,
     WorkflowInstanceResponse, WorkflowActionRequest, WorkflowReturnRequest, WorkflowRejectRequest,
     NotificationResponse,
     AdminTestKBQueryRequest, AdminTestKBQueryResponse,  # 【测试专用，正式上线前删除】
@@ -67,7 +70,7 @@ from src.ragent_backend.ltm_store import LTMStore
 from src.ragent_backend.file_store import build_file_store, ConversationFileStore
 from src.ragent_backend.conversation_store import build_conversation_store, ConversationStore, Conversation
 from src.ragent_backend.user_store import UserStore, User
-from src.ragent_backend.role_store import RoleStore, ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_ORG_ADMIN, ROLE_USER
+from src.ragent_backend.role_store import Role, RoleStore, ROLE_SUPER_ADMIN, ROLE_ORG_ADMIN
 from src.ragent_backend.workflow_store import WorkflowStore, WorkflowTemplate, WorkflowInstance
 from src.ragent_backend.attendance_store import AttendanceStore
 from src.ragent_backend.org_store import OrgStore
@@ -78,7 +81,7 @@ from src.ragent_backend.tenant_identity_store import TenantIdentityStore
 from src.ragent_backend.audit_store import AuditStore
 from src.ragent_backend.auth import (
     AuthenticatedUser, create_access_token, get_current_user, require_role,
-    require_same_org_or_platform, require_platform_admin,
+    require_same_org_or_platform, require_platform_admin, get_jwt_secret,
 )
 from src.ingestion.pipeline import IngestionPipeline
 from src.ingestion.delegated_compute import compute_chunks_for_delegation
@@ -276,13 +279,21 @@ def _build_active_workflow_summary(active_workflow: Optional[dict]) -> Optional[
 
 
 def create_app() -> FastAPI:
+    # 最先校验 JWT 密钥：配置不安全时在这里就崩掉，不要等到有人登录才发现。
+    # 密钥用了源码内置默认值意味着任何人都能伪造任意用户身份，下面这一整套
+    # 权限设计（require_role / 多租户 collection ACL / tenant_ 前缀拦截）
+    # 全部形同虚设，所以这属于"必须挡在启动阶段"的配置错误。
+    # 见 auth.py `resolve_jwt_secret` 与 2026-08-24 代码审计 P0-2。
+    get_jwt_secret()
+
     # 加载配置
     settings = load_settings()
 
     # user_store 先建好，因为 ToolRegistry 里的工具要用它做 ACL 校验
     user_store: UserStore = UserStore()
-    # role_store：角色 CRUD + 角色<->知识库/用户<->角色 关联；
-    # user_store.get_allowed_collections 内部会委托它算权限并集
+    # role_store：角色 CRUD + 用户<->角色关联 + 角色<->知识库关联（角色直接携带
+    # 知识库权限，见 role_store.py 顶部说明）；user_store.get_allowed_collections
+    # 内部会委托它算权限并集
     role_store: RoleStore = RoleStore()
     # workflow_store：流程模板 + 工作流实例 + 站内信（work-flow.md / work-flow-web.md）
     workflow_store: WorkflowStore = WorkflowStore()
@@ -304,10 +315,21 @@ def create_app() -> FastAPI:
     # audit_store：治理与合规——管理后台变更操作 + 工具调用的审计记录（见
     # audit_store.py）
     audit_store: AuditStore = AuditStore()
-    # 【测试专用，正式上线前删除】管理员知识库超权测试查询工具，见下面
-    # admin_test_query_knowledge_base 端点旁的说明。复用已经建好的
-    # org_store/tenant_connector_store，不重开一份数据库连接池。
-    _admin_test_kb_tool: QueryKnowledgeHubTool = QueryKnowledgeHubTool(
+    # 知识库管理工具：统计/查看/清空一家企业名下知识库的数据，供两类调用方
+    # 共用同一个实例（复用已经建好的 org_store/tenant_connector_store，不重开
+    # 一份数据库连接池）——
+    # 1. 企业管理员在「知识库权限」页面自助删除知识库/分页查看数据（正式功能，
+    #    见下面 admin_delete_collection / admin_list_collection_chunks，只传
+    #    调用方自己的 org_id，不会越权碰到别的企业）。
+    # 2.【测试专用，正式上线前删除】admin_test_query_knowledge_base 等几个
+    #    debug 端点，它们额外调用这个实例上会绕过 ACL 的 execute_admin_bypass。
+    #    实例本身不是"绕过权限的东西"——list_org_collection_stats/chunks/
+    #    clear_org_collection 这几个方法内部仍然做 org 归属校验，只是调用方
+    #    传的 org_id 由谁负责收窄（自己的 org 还是任意 org）决定安全边界，正式
+    #    端点固定传调用方自己的 org_id，debug 端点才是"允许调用方指定任意
+    #    org_id"的那个例外，需要额外的 super_admin + platform_admin + debug
+    #    模式三层守门。
+    _kb_management_tool: QueryKnowledgeHubTool = QueryKnowledgeHubTool(
         org_store=org_store, tenant_connector_store=tenant_connector_store,
     )
 
@@ -341,7 +363,11 @@ def create_app() -> FastAPI:
 
     # 初始化 ToolRegistry（内置工具 + MCP 外部工具）
     tool_registry = ToolRegistry()
-    register_builtin_tools(
+    # 返回值是真正会被 ReAct 工具子图调用的 QueryKnowledgeHubTool 实例——
+    # 跟下面的 _kb_management_tool、RAGWorkflow 内部的 _retrieval_tool 是三个
+    # 各自独立的实例，启动阶段预热（见 lifespan 里的 _preload_retrieval_models）
+    # 需要拿到这个引用，见 register_builtin_tools 的 Returns 说明。
+    chat_kb_tool = register_builtin_tools(
         tool_registry,
         user_store=user_store,
         workflow_store=workflow_store,
@@ -370,21 +396,27 @@ def create_app() -> FastAPI:
         return conv
 
     async def _is_workflow_approver_for_conversation(conversation_id: str, user_id: str) -> bool:
-        """这个对话上有没有一条工作流实例，且当前用户持有它对应模板的审批角色。"""
+        """这个对话上有没有一条工作流实例，且当前用户持有"申请人所在企业"给
+        这类流程配的审批角色——审批角色按企业配置（见 workflow_store.py 顶部
+        说明），要按申请人（不是当前查看者）所属企业去查，两者本来就该是
+        同一家企业，不然 mode="approver" 的权限检查通不过。"""
         instance = await workflow_store.get_latest_instance_by_conversation(conversation_id)
         if instance is None:
             return False
-        template = await workflow_store.get_template_by_type(instance.workflow_type)
-        if template is None or not template.approver_role_id:
+        requester_org = await org_store.get_org_for_user(instance.requester_user_id)
+        if requester_org is None:
+            return False
+        approver_role_id = await workflow_store.get_org_approver_role_id(requester_org.org_id, instance.workflow_type)
+        if not approver_role_id:
             return False
         user_role_ids = {r.role_id for r in await role_store.get_user_roles(user_id)}
-        return template.approver_role_id in user_role_ids
+        return approver_role_id in user_role_ids
 
     # 初始化 LLM（配置完全来自 settings.yaml + 环境变量覆盖）
-    try:
+    def _build_llm(model: str):
         from langchain_openai import ChatOpenAI
         llm_kwargs = {
-            "model": settings.llm.model,
+            "model": model,
             "temperature": settings.llm.temperature,
             "max_tokens": settings.llm.max_tokens,
         }
@@ -400,10 +432,31 @@ def create_app() -> FastAPI:
                 llm_kwargs["base_url"] = base_url
             if api_key:
                 llm_kwargs["api_key"] = api_key
-        llm = ChatOpenAI(**llm_kwargs)
+        return ChatOpenAI(**llm_kwargs)
+
+    try:
+        llm = _build_llm(settings.llm.model)
     except Exception as e:
         print(f"[Init] Failed to init LLM: {e}")
         llm = None
+
+    # 意图分类专用模型（docs/optimization_tracking.md 耗时优化任务）：LoRA 微调
+    # qwen2.5:1.5b（训练数据覆盖"指代消解 + 子查询拆分 + 四分类"合并任务
+    # analyze_and_route()，见 workflow.py RAGWorkflow._intent_llm 旁的说明）+
+    # 反量化转 GGUF 导入 Ollama 得到，准确率不输 7b 跑同一个合并任务（部分
+    # 边界案例反而更准），单次调用耗时约 3.2s，比 7b 的约 8.7s 快 2.7 倍左右。
+    # RAGENT_INTENT_MODEL 留空或者这个模型在当前环境没有被 `ollama create`
+    # 出来，直接退回主模型，不让意图节点因为模型不存在报错——这是"用哪个
+    # 模型做分类"的开关，不是"要不要做意图分类"的开关。
+    intent_model_name = os.getenv("RAGENT_INTENT_MODEL", "qwen2.5-1.5b-router")
+    if intent_model_name:
+        try:
+            intent_llm = _build_llm(intent_model_name)
+        except Exception as e:
+            print(f"[Init] Failed to init intent-classification LLM ({intent_model_name}), falling back to main LLM: {e}")
+            intent_llm = llm
+    else:
+        intent_llm = llm
 
     # 创建工作流（传入 tool_registry）
     # LTMStore was never constructed here, so RAGWorkflow always received
@@ -415,6 +468,7 @@ def create_app() -> FastAPI:
     workflow = RAGWorkflow(
         store=archive_store,
         llm=llm,
+        intent_llm=intent_llm,
         checkpointer=checkpointer,
         max_messages=int(os.getenv("RAGENT_MAX_MESSAGES", "20")),
         keep_recent=int(os.getenv("RAGENT_KEEP_RECENT", "4")),
@@ -424,9 +478,66 @@ def create_app() -> FastAPI:
         audit_log=_audit_log,
     )
 
+    async def _keep_models_warm():
+        """后台模型保活探测（docs/optimization_tracking.md 耗时优化任务）——
+        Ollama 默认 keep_alive 是 5 分钟，空闲超时模型会被换出显存，下一次
+        真实用户请求撞上就要额外付出几秒到十几秒的冷启动加载耗时
+        （query_knowledge_hub.py 里已经有专门的 cold_start 检测逻辑，说明
+        这个问题真实发生过）。现在同时有生成用的 llm 和意图分类专用的
+        intent_llm 两个模型要保活，任何一个被换出都会让下一次请求平白多等。
+
+        每隔 4 分钟（小于 5 分钟的默认超时窗口）分别给两个模型发一个只要求
+        输出 1 个 token 的极短请求——Ollama 那边只要收到请求就会重置"最近
+        使用时间"、顺延保活窗口，不需要改 Ollama 服务本身的 keep_alive 配置
+        （那需要重启 Ollama daemon）。ping 失败只打日志，不影响正常请求
+        （下一次真实请求该走的重试/降级逻辑不受这里影响）。"""
+        ping_llms = [m for m in {id(llm): llm, id(intent_llm): intent_llm}.values() if m is not None]
+        if not ping_llms:
+            return
+        while True:
+            try:
+                await asyncio.sleep(240)
+                for ping_llm in ping_llms:
+                    try:
+                        await ping_llm.bind(max_tokens=1).ainvoke([HumanMessage(content="ping")])
+                    except Exception as e:
+                        print(f"[KeepAlive] ping failed for {getattr(ping_llm, 'model_name', '?')}: {e}")
+            except asyncio.CancelledError:
+                break
+
+    async def _preload_retrieval_models() -> None:
+        """启动阶段预热知识库检索用到的 reranker/embedding client（
+        docs/optimization_tracking.md 耗时优化任务，"知识库检索为什么要
+        7 秒"那次排查的结论）——`QueryKnowledgeHubTool._build_hybrid_search_for`
+        原来是"谁第一个真的查知识库，谁就现场付一次模型加载的钱"（本地
+        cross-encoder `BAAI/bge-reranker-base` 首次加载实测 6.4 秒），现在
+        挪到这里，在 `lifespan` 里 `yield`（开始真正接受请求）之前跑完，
+        对用户完全不可见。
+
+        `QueryKnowledgeHubTool` 在这个进程里被实例化了三处（这里、
+        `_kb_management_tool`、`RAGWorkflow._retrieval_tool`），各自的
+        `_embedding_client`/`_reranker` 是实例级缓存，互不共享——预热一个
+        不能省下另外两个的加载，所以三个都要单独调一次 `preload_models()`。
+        单个失败只打日志、不阻断启动：预热本身是优化手段，不是正确性前提，
+        真出问题时该走的懒加载兜底路径仍然生效，只是退化成没预热的效果。"""
+        targets = {
+            "chat_kb_tool": chat_kb_tool,
+            "kb_management_tool": _kb_management_tool,
+            "workflow_retrieval_tool": workflow._retrieval_tool,
+        }
+        for name, tool in targets.items():
+            try:
+                await tool.preload_models()
+                print(f"[Preload] {name}: reranker/embedding client warmed up")
+            except Exception as e:
+                print(f"[Preload] {name} failed (non-fatal, falls back to lazy load): {e}")
+
     # lifespan：异步连接 MCP Servers（必须在 FastAPI 构造函数之前定义）
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        await _preload_retrieval_models()
+        keep_warm_task = asyncio.create_task(_keep_models_warm())
+
         # 启动时连接配置的 MCP Servers
         if settings.mcp_servers:
             for name, cfg in settings.mcp_servers.items():
@@ -453,10 +564,16 @@ def create_app() -> FastAPI:
                     print(f"[MCP] Failed to connect server '{name}': {e}")
         
         yield
-        
+
         # 关闭时断开所有 MCP 连接
         await tool_registry.disconnect_all_mcp()
         print("[MCP] All MCP connections closed")
+
+        keep_warm_task.cancel()
+        try:
+            await keep_warm_task
+        except asyncio.CancelledError:
+            pass
 
     # 创建 FastAPI app
     app = FastAPI(
@@ -536,16 +653,16 @@ def create_app() -> FastAPI:
         return {"success": True}
 
     # ==================== 管理后台 API ====================
-    # 三层角色模型：
-    #   super_admin / admin —— 平台运营方，管平台本身（建企业、配连接器、定义
-    #     角色……），但不了解客户企业内部的部门架构，所以对某个客户企业能做的
-    #     唯一一件事是"任命谁是这家企业的 org_admin"，不直接管理该企业内部的
-    #     员工角色/知识库权限。admin 由 super_admin 任命，权限跟 super_admin
-    #     在人员管理这块基本对等，唯一区别是不能再往外发 admin/super_admin。
+    # 两层角色模型（2026-08-24 起废弃平台侧的 admin/user 两个系统角色，运营方
+    # 只保留 super_admin 一个身份档位，见 role_store.py 顶部说明）：
+    #   super_admin —— 平台运营方，管平台本身（建企业、配连接器、定义角色……），
+    #     但不了解客户企业内部的部门架构，所以对某个客户企业能做的唯一一件事
+    #     是"任命谁是这家企业的 org_admin"，不直接管理该企业内部的员工角色/
+    #     知识库权限。
     #   org_admin（企业管理员）—— 客户企业侧，被平台层任命后，管理自己企业
     #     内部的员工（增/删/查/分配角色，含知识库权限角色），管不到别的企业，
     #     也不能任命新的 org_admin（那还是平台层的事）。
-    # 人员管理（增/查/删/分配角色）三层角色都能碰，具体边界由
+    # 人员管理（增/查/删/分配角色）两层角色都能碰，具体边界由
     # `_validate_role_assignment` 按"谁在给哪家企业的人分配什么角色"判断，不是
     # 简单的"有没有权限调这个接口"能表达清楚的，所以拆成单独的校验函数。
     # 组织管理、连接器配置、角色定义、工作流模板这类跨企业/平台级操作仍然只对
@@ -553,17 +670,17 @@ def create_app() -> FastAPI:
     # 角色判断是每次请求都现查数据库（见 auth.require_role），不是信 token。
 
     _require_super_admin = require_role(ROLE_SUPER_ADMIN)
-    _require_user_admin_tier = require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_ORG_ADMIN)
-    # 企业自建知识库（新增/列出）只对 org_admin 开放，platform 管理员（super_admin/
-    # admin）不在允许名单里——不是"看不全"，是这两个端点对他们直接 403，企业
-    # 内部的知识库归属信息平台运营方压根碰不到（跟"角色管理"页面不展示知识库、
+    _require_user_admin_tier = require_role(ROLE_SUPER_ADMIN, ROLE_ORG_ADMIN)
+    # 企业自建知识库（新增/列出）只对 org_admin 开放，平台管理员（super_admin）
+    # 不在允许名单里——不是"看不全"，是这两个端点对他们直接 403，企业内部的
+    # 知识库归属信息平台运营方压根碰不到（跟"角色管理"页面不展示知识库、
     # 「用户与角色分配」平台视角不展示"可访问知识库"列是同一个边界，见对应组件
     # 顶部注释）。
     _require_org_admin = require_role(ROLE_ORG_ADMIN)
-    # 运营仪表盘专用——跟 _require_super_admin 不一样，super_admin 和 admin
-    # 两个平台层级都能看（用户明确要求"超级管理员和管理员角色都能看到"），
-    # 但不含 org_admin（企业管理员看不到跨企业的平台整体运营数据）。
-    _require_platform_tier = require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN)
+    # 运营仪表盘专用——平台侧只剩 super_admin 一个身份档位后，跟
+    # _require_super_admin 已无实质区别，单独保留是为了让这批"运营仪表盘"
+    # 端点的 Depends 读起来语义独立（不是随手复用了用户管理那档权限）。
+    _require_platform_tier = require_role(ROLE_SUPER_ADMIN)
 
     async def _validate_role_assignment(
         actor: AuthenticatedUser, target_org_id: Optional[str], role_ids: List[str],
@@ -572,49 +689,56 @@ def create_app() -> FastAPI:
         """校验 `actor` 能不能把 `role_ids` 这组角色发给 `target_org_id` 这家企业的
         某个用户，三条边界见本节顶部的角色模型说明：
 
-        1. admin/super_admin 这两个平台角色只有 super_admin 自己能授予——防止
-           admin 自我提权或互相提权。
-        2. org_admin（企业管理员）角色只有平台层（admin/super_admin）能授予——
-           这是"任命企业管理员"这个动作本身，企业管理员不能任命同事、不能给
-           自己续任。
-        3. 平台层账号（super_admin/admin）如果是在给客户企业（非平台组织）的
-           用户分配角色，只能分配 user/org_admin 这两种——不能替客户企业分配
-           具体的知识库/部门角色，因为他们不了解客户企业内部架构，那是该企业
+        1. super_admin 这个平台角色只有 super_admin 自己能授予——防止越权
+           互相提权。
+        2. org_admin（企业管理员）角色只有平台层（super_admin）能授予——这是
+           "任命企业管理员"这个动作本身，企业管理员不能任命同事、不能给自己
+           续任。
+        3. 平台层账号（super_admin）如果是在给客户企业（非平台组织）的用户
+           分配角色，只能分配 org_admin 这一种——不能替客户企业分配具体的
+           部门/知识库角色，因为他们不了解客户企业内部架构，那是该企业
            org_admin 被任命后自己的事。
+        4. 企业角色（`role.org_id` 非空，某家企业管理员自己建的、直接携带知识库
+           权限的角色）只能分配给同一家企业的员工——不能把 Acme 建的角色发给
+           测试新公司的员工，跨了会直接导致这个员工能看到 Acme 的知识库内容。
 
-        以上三条只审查"新授予"的角色（`role_ids` 里目标用户原本没有的部分，
+        以上四条只审查"新授予"的角色（`role_ids` 里目标用户原本没有的部分，
         由调用方通过 `existing_role_names` 传入目标用户当前已有的角色名）。
-        企业管理员/管理员在企业内本就是最高权限，编辑自己或同事时，Select
-        提交的是完整角色集合，必然带着自己已有的 org_admin/admin——如果连
-        "保留自己已有的角色"都按"新任命"的标准审查，企业管理员/管理员会
-        连自己的其他权限（比如加一个部门角色）都改不了，等于企业内最高权限
-        者反而管不了自己。只有目标用户原本没有、这次新加进来的角色，才真的
-        构成"任命"，才需要走上面三条边界。新建用户时 `existing_role_names`
-        传空集，等价于所有角色都是"新授予"，跟原来的校验强度一致。
+        企业管理员在企业内本就是最高权限，编辑自己或同事时，Select 提交的是
+        完整角色集合，必然带着自己已有的 org_admin——如果连"保留自己已有的
+        角色"都按"新任命"的标准审查，企业管理员会连自己的其他权限（比如换
+        一个部门角色）都改不了，等于企业内最高权限者反而管不了自己。只有目标
+        用户原本没有、这次新加进来的角色，才真的构成"任命"，才需要走上面
+        四条边界。新建用户时 `existing_role_names` 传空集，等价于所有角色都
+        是"新授予"，跟原来的校验强度一致。
         """
         actor_role_names = {r.name for r in await role_store.get_user_roles(actor.user_id)}
-        is_platform_tier = bool({ROLE_SUPER_ADMIN, ROLE_ADMIN} & actor_role_names)
+        is_platform_tier = ROLE_SUPER_ADMIN in actor_role_names
 
-        all_roles = {r.role_id: r for r in await role_store.list_roles()}
-        requested_names = {all_roles[rid].name for rid in role_ids if rid in all_roles}
-        newly_granted_names = requested_names - existing_role_names
+        requested_roles = [r for r in [await role_store.get_role_by_id(rid) for rid in role_ids] if r is not None]
+        newly_granted = [r for r in requested_roles if r.name not in existing_role_names]
+        newly_granted_names = {r.name for r in newly_granted}
 
-        if newly_granted_names & {ROLE_ADMIN, ROLE_SUPER_ADMIN} and ROLE_SUPER_ADMIN not in actor_role_names:
-            raise HTTPException(status_code=403, detail="只有超级管理员能授予管理员/超级管理员角色")
+        if ROLE_SUPER_ADMIN in newly_granted_names and ROLE_SUPER_ADMIN not in actor_role_names:
+            raise HTTPException(status_code=403, detail="只有超级管理员能授予超级管理员角色")
 
         if ROLE_ORG_ADMIN in newly_granted_names and not is_platform_tier:
-            raise HTTPException(status_code=403, detail="只有平台管理员（超级管理员/管理员）能任命企业管理员")
+            raise HTTPException(status_code=403, detail="只有平台管理员（超级管理员）能任命企业管理员")
 
         if is_platform_tier and target_org_id is not None:
             target_org = await org_store.get_organization(target_org_id)
             if target_org is not None and not target_org.is_platform:
-                disallowed = newly_granted_names - {ROLE_USER, ROLE_ORG_ADMIN}
+                disallowed = newly_granted_names - {ROLE_ORG_ADMIN}
                 if disallowed:
                     raise HTTPException(
                         status_code=403,
                         detail="平台管理员不了解客户企业内部架构，只能任命该企业的企业管理员，"
                                "具体的员工角色/知识库权限请由该企业的企业管理员分配",
                     )
+
+        cross_org = [r for r in newly_granted if r.org_id is not None and r.org_id != target_org_id]
+        if cross_org:
+            raise HTTPException(status_code=403, detail="不能分配其他企业创建的角色")
 
     async def _build_admin_user_response(user: User) -> AdminUserResponse:
         roles = await role_store.get_user_roles(user.user_id)
@@ -667,8 +791,7 @@ def create_app() -> FastAPI:
 
         if request.role_ids:
             await _validate_role_assignment(current_user, target_org_id, request.role_ids)
-            all_role_ids = {r.role_id for r in await role_store.list_roles()}
-            unknown = set(request.role_ids) - all_role_ids
+            unknown = [rid for rid in request.role_ids if await role_store.get_role_by_id(rid) is None]
             if unknown:
                 raise HTTPException(status_code=400, detail=f"角色不存在: {sorted(unknown)}")
 
@@ -719,8 +842,7 @@ def create_app() -> FastAPI:
         if user is None:
             raise HTTPException(status_code=404, detail="用户不存在")
 
-        all_roles = {r.role_id: r for r in await role_store.list_roles()}
-        unknown = set(request.role_ids) - set(all_roles)
+        unknown = [rid for rid in request.role_ids if await role_store.get_role_by_id(rid) is None]
         if unknown:
             raise HTTPException(status_code=400, detail=f"角色不存在: {sorted(unknown)}")
 
@@ -735,13 +857,11 @@ def create_app() -> FastAPI:
 
         if user_id == current_user.user_id:
             # 防止超级管理员误操作把自己的 super_admin 角色摘掉，导致管理后台再也进不去
-            super_admin_role_id = next(
-                (rid for rid, r in all_roles.items() if r.name == ROLE_SUPER_ADMIN), None
-            )
+            super_admin_role = await role_store.get_role_by_name(ROLE_SUPER_ADMIN)
             if (
-                super_admin_role_id
-                and super_admin_role_id in current_role_ids
-                and super_admin_role_id not in request.role_ids
+                super_admin_role
+                and super_admin_role.role_id in current_role_ids
+                and super_admin_role.role_id not in request.role_ids
             ):
                 raise HTTPException(status_code=400, detail="不能取消自己的超级管理员角色")
 
@@ -985,11 +1105,15 @@ def create_app() -> FastAPI:
     # 能保证即使有人忘记删，只要生产环境的 RAGENT_DEBUG 没有被显式打开，这组
     # 端点就是一律 403，不会被真正调用到。
     #
-    # 上线前需要整体删除的部分：这几个端点、schemas.py 的
-    # AdminTestKBQueryRequest/Response 等、create_app() 里的 _admin_test_kb_tool、
-    # query_knowledge_hub.py 的 execute_admin_bypass/_build_empty_response_for_org、
-    # 前端 KnowledgeBaseTestQuery.jsx 及其在 OperationsDashboard.jsx 里的入口、
-    # admin.js 的 adminTestQueryKnowledgeBase 等。
+    # 上线前需要整体删除的部分：这几个端点本身、schemas.py 的
+    # AdminTestKBQueryRequest/Response 等、query_knowledge_hub.py 的
+    # execute_admin_bypass/_build_empty_response_for_org、前端
+    # KnowledgeBaseTestQuery.jsx 及其在 OperationsDashboard.jsx 里的入口、
+    # admin.js 的 adminTestQueryKnowledgeBase 等。`_kb_management_tool` 这个
+    # 实例本身不在删除范围内——它同时也是下面 admin_delete_collection /
+    # admin_list_collection_chunks（企业管理员知识库自助管理的正式功能）在用
+    # 的共享实例，删的话会连带砸掉正式功能，只删这组 debug 端点对它的调用
+    # 就够了。
     async def _require_debug_mode(
         current_user: AuthenticatedUser = Depends(get_current_user),
     ) -> AuthenticatedUser:
@@ -1008,7 +1132,7 @@ def create_app() -> FastAPI:
         ___: AuthenticatedUser = Depends(_require_debug_mode),
     ) -> AdminTestKBQueryResponse:
         try:
-            response = await _admin_test_kb_tool.execute_admin_bypass(
+            response = await _kb_management_tool.execute_admin_bypass(
                 query=request.query, org_id=request.org_id, top_k=request.top_k,
             )
         except ValueError as e:
@@ -1031,7 +1155,7 @@ def create_app() -> FastAPI:
         """列出这家企业名下的知识库 collection + 每个的 chunk 数——先看有没有
         摄入、摄入了多少，再决定要不要点进去看 chunk 列表或者清空重试。"""
         try:
-            return await _admin_test_kb_tool.list_org_collection_stats(org_id)
+            return await _kb_management_tool.list_org_collection_stats(org_id)
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
@@ -1045,7 +1169,7 @@ def create_app() -> FastAPI:
         ___: AuthenticatedUser = Depends(_require_debug_mode),
     ) -> List[AdminKbChunkPreview]:
         try:
-            return await _admin_test_kb_tool.list_org_collection_chunks(org_id, collection, limit=limit)
+            return await _kb_management_tool.list_org_collection_chunks(org_id, collection, limit=limit)
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
@@ -1061,7 +1185,7 @@ def create_app() -> FastAPI:
         记录），不删除 collection 本身的登记信息——方便反复测试"导入知识库 ->
         查询知识库"这条链路，不用每次都手动清数据库。"""
         try:
-            cleared = await _admin_test_kb_tool.clear_org_collection(org_id, collection)
+            cleared = await _kb_management_tool.clear_org_collection(org_id, collection)
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
         await _audit_log(
@@ -1071,14 +1195,14 @@ def create_app() -> FastAPI:
         return {"cleared_chunks": cleared}
 
     # ==================== 运营仪表盘 API（仅平台管理员，见 dashboard_stats.py） ====================
-    # 权限比网关监控（admin_gateway_connectors，只认 super_admin）宽一档——
-    # _require_platform_tier 让 super_admin 和 admin 两个平台层级都能看，用户
-    # 明确要求过这一点；require_platform_admin 是第二层校验（组织归属，双重
-    # 校验同一套模式），确保只有 org.is_platform=True 的账号能进来。这是平台
-    # 整体的运营指标（会话数/消息数/活跃用户/响应延迟），不是任何企业的知识库
-    # 内容，跟"平台运营方不该看到企业内部知识库数据"这条边界不冲突，但仍然
-    # 只暴露给平台两层管理员，企业管理员（org_admin）看不到跨企业的平台整体
-    # 数据。前端对应的可见性判断见 App.jsx 的 PLATFORM_ADMIN_ROLE_NAMES。
+    # _require_platform_tier 目前只剩 super_admin 一档（2026-08-24 起平台侧
+    # 废弃 admin 角色，见文件顶部说明），单独保留这个 Depends 只是为了语义
+    # 独立；require_platform_admin 是第二层校验（组织归属，双重校验同一套
+    # 模式），确保只有 org.is_platform=True 的账号能进来。这是平台整体的运营
+    # 指标（会话数/消息数/活跃用户/响应延迟），不是任何企业的知识库内容，跟
+    # "平台运营方不该看到企业内部知识库数据"这条边界不冲突，但仍然只暴露给
+    # 平台管理员，企业管理员（org_admin）看不到跨企业的平台整体数据。前端
+    # 对应的可见性判断见 App.jsx 的 PLATFORM_ADMIN_ROLE_NAMES。
 
     def _pct_change(current: Optional[float], previous: Optional[float]) -> Optional[float]:
         if current is None or not previous:
@@ -1224,80 +1348,110 @@ def create_app() -> FastAPI:
         )
 
     # ==================== 角色管理 API ====================
-    # 角色的新建/重命名/删除仍然只对 super_admin 开放（角色是全平台共享的词表，
-    # 没有按企业隔离，交给企业管理员建/删会有跨企业改到别人角色、name 唯一约束
-    # 互相冲突等问题，这次不做，见需求确认时选定的"轻量版"）。企业管理员能碰的
-    # 只有"给本企业员工已经持有的角色配置关联知识库"这一件事——见下面
-    # admin_list_company_roles / admin_set_role_collections 里的权限边界。
+    # 角色直接携带知识库权限（role_store.py 顶部说明），分两类，用 org_id 是否
+    # 为空区分：
+    #   全局角色（org_id=None）：系统权限档位，固定只有 super_admin/org_admin
+    #     两个内置角色，super_admin 只能改展示名，不能新建/删除——运营商的
+    #     角色（super_admin）本身就没有配置知识库的入口，"无知识库权限"是
+    #     天然结果，不是额外拦出来的。全局角色曾经还支持"新建一个跨企业共用
+    #     的部门身份"（设想给工作流审批用），但 2026-08-23 工作流审批人分配
+    #     改成按企业独立配置（见 workflow_store.py 顶部说明），全局角色不再
+    #     服务这个用途，也没有别的消费方，新建入口已经去掉（`admin_create_role`
+    #     现在只接受企业角色）。
+    #   企业角色（org_id 非空）：某家企业管理员自己建的、可以配置知识库关联的
+    #     角色，只能操作自己企业的，只有该企业的 org_admin 能建/改名/删/配置
+    #     知识库——是原来「知识库分组 API」的直接延续。
+    # 列表读取对两层都开放（谁能不能真的把某个角色分配出去，由
+    # admin_set_user_roles / admin_create_user 里的 _validate_role_assignment
+    # 负责拦，这里只是读，读了不代表能用）。
 
-    def _role_response(role_obj) -> RoleResponse:
+    async def _actor_role_names(current_user: AuthenticatedUser) -> set:
+        return {r.name for r in await role_store.get_user_roles(current_user.user_id)}
+
+    def _role_response(role_obj: Role) -> RoleResponse:
         return RoleResponse(
             role_id=role_obj.role_id,
             name=role_obj.name,
             display_name=role_obj.display_name,
             is_system=role_obj.is_system,
-            collection_names=getattr(role_obj, "collection_names", []),
+            org_id=role_obj.org_id,
+            collection_names=list(getattr(role_obj, "collection_names", [])),
             created_at=role_obj.created_at,
         )
 
     @app.get("/api/v1/admin/roles", response_model=List[RoleResponse])
     async def admin_list_roles(
-        # 企业管理员给自己企业员工分配角色时，前端要拿完整角色列表填多选框的选项
-        # （谁能不能真的把某个角色发出去，由 admin_set_user_roles /
-        # admin_create_user 里的 _validate_role_assignment 负责拦，这里只是读
-        # 列表，读了不代表能用）。角色的增/删/改（下面几个端点）仍然只对
-        # super_admin 开放。
-        _: AuthenticatedUser = Depends(_require_user_admin_tier),
-    ) -> List[RoleResponse]:
-        roles = await role_store.list_roles()
-        return [_role_response(r) for r in roles]
-
-    @app.get("/api/v1/admin/roles/company", response_model=List[RoleResponse])
-    async def admin_list_company_roles(
         current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
     ) -> List[RoleResponse]:
-        """企业管理员「知识库权限」页面专用：只列出本企业员工实际持有的部门角色。
-        跟上面 `GET /admin/roles` 的区别——那个端点是给"用户与角色分配"页面的
-        角色多选框用的，要看到全平台角色目录（哪怕本企业员工还没人持有过），
-        职责不同，不能合并成一个端点两种截断逻辑。"""
+        if await org_store.is_platform_admin(current_user.user_id):
+            roles = await role_store.list_roles()
+            return [_role_response(r) for r in roles]
         org = await org_store.get_org_for_user(current_user.user_id)
         if org is None:
             return []
-        roles = await role_store.list_roles_used_by_org(org.org_id)
+        roles = await role_store.list_roles_for_org(org.org_id)
         return [_role_response(r) for r in roles]
+
+    async def _authorize_role_mutation(current_user: AuthenticatedUser, role: Role) -> None:
+        """全局角色只有 super_admin 能改/删；企业角色只有该企业的 org_admin 能改/删。"""
+        if role.org_id is None:
+            if ROLE_SUPER_ADMIN not in await _actor_role_names(current_user):
+                raise HTTPException(status_code=403, detail="只有超级管理员能修改平台角色")
+            return
+        actor_org = await org_store.get_org_for_user(current_user.user_id)
+        if actor_org is None or actor_org.org_id != role.org_id:
+            raise HTTPException(status_code=403, detail="只能操作本企业的角色")
+        if ROLE_ORG_ADMIN not in await _actor_role_names(current_user):
+            raise HTTPException(status_code=403, detail="只有企业管理员能修改本企业角色")
 
     @app.post("/api/v1/admin/roles", response_model=RoleResponse)
     async def admin_create_role(
         request: CreateRoleRequest,
-        current_user: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
     ) -> RoleResponse:
+        """只建企业角色——建全局角色的入口已经去掉（见本节顶部说明），
+        `_require_org_admin` 已经挡掉了平台管理员，这里不用再判断"是不是
+        平台管理员"这个分支。"""
+        actor_org = await org_store.get_org_for_user(current_user.user_id)
+        if actor_org is None:
+            raise HTTPException(status_code=403, detail="只有企业管理员能新建本企业角色")
+        org_id = actor_org.org_id
         try:
-            role = await role_store.create_role(request.name, request.display_name)
+            role = await role_store.create_role(org_id, request.name, request.display_name)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
-        await _audit_log(current_user.user_id, "create_role", "role", role.role_id, {"name": role.name})
+        await _audit_log(current_user.user_id, "create_role", "role", role.role_id, {"name": role.name, "org_id": org_id})
         return _role_response(role)
 
     @app.patch("/api/v1/admin/roles/{role_id}", response_model=RoleResponse)
     async def admin_update_role(
         role_id: str,
         request: UpdateRoleRequest,
-        current_user: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
     ) -> RoleResponse:
-        role = await role_store.update_role(role_id, request.display_name)
-        if role is None:
+        existing = await role_store.get_role_by_id(role_id)
+        if existing is None:
             raise HTTPException(status_code=404, detail="角色不存在")
+        await _authorize_role_mutation(current_user, existing)
+        role = await role_store.update_role(role_id, request.display_name)
         await _audit_log(current_user.user_id, "update_role", "role", role_id, {"display_name": request.display_name})
-        # update_role 返回的是不带 collection_names 的 Role；重新从 list_roles()
-        # 取一次带关联知识库的完整视图，避免响应把已有的知识库关联显示成空。
-        roles = await role_store.list_roles()
-        return _role_response(next(r for r in roles if r.role_id == role_id))
+        # role_store.update_role 返回的是不带 collection_names 的裸 Role（改名
+        # 不影响知识库关联，没必要每次都重新算），这里按角色自己的 org_id
+        # 补一次查询，响应体里不要让"重命名"看起来把知识库关联清空了。
+        if role.org_id is not None:
+            roles = await role_store.list_roles_for_org(role.org_id)
+            role = next((r for r in roles if r.role_id == role_id), role)
+        return _role_response(role)
 
     @app.delete("/api/v1/admin/roles/{role_id}")
     async def admin_delete_role(
         role_id: str,
-        current_user: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
     ) -> dict:
+        existing = await role_store.get_role_by_id(role_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="角色不存在")
+        await _authorize_role_mutation(current_user, existing)
         try:
             found = await role_store.delete_role(role_id)
         except ValueError as e:
@@ -1311,30 +1465,32 @@ def create_app() -> FastAPI:
     async def admin_set_role_collections(
         role_id: str,
         request: SetRoleCollectionsRequest,
-        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
     ) -> RoleResponse:
+        """给角色配置知识库关联——只有 org_admin 能碰（运营商的角色没有这个
+        入口，见文件顶部说明），且只按调用方自己的企业写 role_collections：
+        企业角色只能配自己的；全局共用的部门角色（如 IT部）也能配，但只影响
+        "调用方企业名下持有这个角色的人"，不会波及其他企业（role_collections
+        按 (role_id, org_id) 隔离，见 role_store.py）。两个内置系统角色
+        （super_admin/org_admin）不允许配置——"运营商的角色没有知识库权限"
+        是业务规则本身，不是遗漏；org_admin 虽然不是运营商，但已经隐式拥有
+        企业内全部知识库，配置了也不会生效，一并挡掉避免误导。"""
         role = await role_store.get_role_by_id(role_id)
         if role is None:
             raise HTTPException(status_code=404, detail="角色不存在")
-
-        # 不管调用方是哪一层管理员，一律只能配置"自己所属企业的员工实际持有"的
-        # 角色（role_store.py list_roles_used_by_org 的判定标准，跟
-        # admin_list_company_roles 用的是同一个方法，读/写口径必须一致）——
-        # 之前平台管理员（super_admin/admin）有特殊豁免，能不受这层限制改任意
-        # 企业的角色知识库关联，这跟"平台运营方不该碰任何企业内部知识库配置"
-        # 的边界矛盾，这次去掉这个豁免。平台管理员自己所属 org_platform 也会走
-        # 这同一套逻辑——list_roles_used_by_org(org_platform) 天然包含平台自己
-        # 那几个部门角色，所以平台管理员管理自己组织的知识库关联不受影响，只是
-        # 不能再碰别的企业的。
-        org = await org_store.get_org_for_user(current_user.user_id)
-        allowed_role_ids = (
-            {r.role_id for r in await role_store.list_roles_used_by_org(org.org_id)} if org else set()
+        if role.is_system:
+            raise HTTPException(status_code=403, detail="系统内置角色不支持配置知识库")
+        actor_org = await org_store.get_org_for_user(current_user.user_id)
+        if actor_org is None:
+            raise HTTPException(status_code=403, detail="账号未关联任何企业")
+        if role.org_id is not None and role.org_id != actor_org.org_id:
+            raise HTTPException(status_code=403, detail="只能给本企业的角色配置知识库")
+        await role_store.set_role_collections(role_id, actor_org.org_id, request.collection_names)
+        await _audit_log(
+            current_user.user_id, "set_role_collections", "role", role_id,
+            {"collection_names": request.collection_names},
         )
-        if role_id not in allowed_role_ids:
-            raise HTTPException(status_code=403, detail="只能配置本企业员工持有的角色的知识库关联")
-
-        await role_store.set_role_collections(role_id, request.collection_names)
-        roles = await role_store.list_roles()
+        roles = await role_store.list_roles_for_org(actor_org.org_id)
         return _role_response(next(r for r in roles if r.role_id == role_id))
 
     async def _require_local_retrieval_org(current_user: AuthenticatedUser):
@@ -1369,8 +1525,16 @@ def create_app() -> FastAPI:
         被 `_require_local_retrieval_org` 拒绝，报出清楚原因。"""
         org = await _require_local_retrieval_org(current_user)
         owned = await org_collection_store.list_for_org(org.org_id)
+        # chunk_count 现查 Chroma——量级（企业自建库通常几个到几十个）不需要
+        # 缓存，配合下面的分页查数据/删除功能，管理员一进页面就知道每个库有没有
+        # 摄入内容、大概多大，不用点进去才发现是空的。
+        stats = await _kb_management_tool.list_org_collection_stats(org.org_id)
+        counts = {s["collection_name"]: s["chunk_count"] for s in stats}
         return [
-            CollectionResponse(collection_name=c.collection_name, display_name=c.display_name, created_at=c.created_at)
+            CollectionResponse(
+                collection_name=c.collection_name, display_name=c.display_name,
+                chunk_count=counts.get(c.collection_name, 0), created_at=c.created_at,
+            )
             for c in owned
         ]
 
@@ -1385,20 +1549,20 @@ def create_app() -> FastAPI:
 
         # 内部标识不能撞平台保留名——`tenant_*_kb`（委托模式企业专属命名约定）、
         # `default`（历史遗留、不该有人再摄入内容的库，见 query_knowledge_hub.py
-        # 顶部说明）、`conv_*`（每个对话私有），以及那 6 个部门角色名字
+        # 顶部说明）、`conv_*`（每个对话私有），以及那 6 个知识库分组名字
         # （hr_admin_kb 等，现在专门用于委托模式企业的类目过滤，见
-        # query_knowledge_hub.py DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES）——虽然
+        # query_knowledge_hub.py DEPARTMENT_KB_GROUP_TO_REMOTE_CATEGORIES）——虽然
         # 平台自己已经没有同名的本地 collection 了，但企业自建库用同一个名字
         # 容易让人以为这个库参与了委托模式的类目过滤，实际上两者毫不相关，
         # 干脆继续保留这几个名字不让用。这里不查 org_collections 表里存不存在
         # ——存在的话下面 create() 的唯一约束自然会报错，不用在这里重复判断。
-        _RESERVED_KB_ROLE_NAMES = {
+        _RESERVED_KB_GROUP_NAMES = {
             "hr_admin_kb", "finance_kb", "it_support_kb",
             "sales_marketing_kb", "rd_product_kb", "customer_success_kb",
         }
         name = request.collection_name.strip()
         reserved = (
-            name in _RESERVED_KB_ROLE_NAMES
+            name in _RESERVED_KB_GROUP_NAMES
             or name == "default"
             or name.startswith("conv_")
             or (name.startswith("tenant_") and name.endswith("_kb"))
@@ -1422,6 +1586,50 @@ def create_app() -> FastAPI:
         return CollectionResponse(
             collection_name=created.collection_name, display_name=created.display_name, created_at=created.created_at,
         )
+
+    @app.get("/api/v1/admin/collections/{collection_name}/chunks", response_model=List[AdminKbChunkPreview])
+    async def admin_list_collection_chunks(
+        collection_name: str,
+        offset: int = 0,
+        limit: int = 20,
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> List[AdminKbChunkPreview]:
+        """分页查看一个知识库的原始 chunk 内容——「知识库权限」页面"查看数据"
+        用，只对本企业自建库开放（`list_org_collection_chunks` 内部会校验
+        collection 归属这家企业，跟 admin_list_collections 同一条边界）。"""
+        org = await _require_local_retrieval_org(current_user)
+        try:
+            chunks = await _kb_management_tool.list_org_collection_chunks(
+                org.org_id, collection_name, limit=limit, offset=offset,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        return [AdminKbChunkPreview(**c) for c in chunks]
+
+    @app.delete("/api/v1/admin/collections/{collection_name}")
+    async def admin_delete_collection(
+        collection_name: str,
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> dict:
+        """企业管理员删除一个自建知识库——三步都要做，缺一步都会留下不一致的
+        僵尸状态：1）物理数据（Chroma collection + BM25 索引 + 摄入去重历史，
+        复用 clear_org_collection，它内部已经校验 collection 归属这家企业）；
+        2）org_collections 里的归属登记；3）从所有角色的知识库关联里摘掉这个
+        名字（role_store.remove_collection_everywhere，见该方法旁的说明——
+        角色关联存的是裸字符串，不摘的话万一这个名字以后被重新注册，老角色会
+        意外拿到新知识库的访问权限）。"""
+        org = await _require_local_retrieval_org(current_user)
+        try:
+            cleared = await _kb_management_tool.clear_org_collection(org.org_id, collection_name)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        await org_collection_store.delete(collection_name)
+        await role_store.remove_collection_everywhere(collection_name)
+        await _audit_log(
+            current_user.user_id, "delete_collection", "collection", collection_name,
+            {"org_id": org.org_id, "cleared_chunks": cleared},
+        )
+        return {"success": True}
 
     # 知识库文档上传的进度状态——按 upload_id 存，供前端轮询进度条用。放内存
     # 里就够了（不需要跨进程/重启存活）：单进程 dev/demo 部署，且这本来就是
@@ -1599,7 +1807,7 @@ def create_app() -> FastAPI:
     # "知识库"是整个企业一份，没有 collection 可选；本地模式的员工也不会走到
     # 这里——两条路径靠企业的连接器类型（internal_chroma vs http_api）互斥。
     #
-    # 权限：委托模式下没有 role_collections 那套细粒度 ACL（5.2 节"权限职责
+    # 权限：委托模式下没有知识库分组那套细粒度 ACL（5.2 节"权限职责
     # 转移"——本来就没有比"是不是这家企业的人"更细的粒度可以在平台侧判断），
     # 所以只要求"属于这家企业"，不额外校验角色。
 
@@ -1635,7 +1843,7 @@ def create_app() -> FastAPI:
         `category`：这份文档归属企业内部哪个子库/分类，可选，原样透传给
         委托契约 `/v1/vectors`（4.4 节）——平台不校验取值范围，是不是合法
         类目、企业服务要不要认这个字段完全由对方决定，跟查询侧
-        `DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES` 用的是同一份约定，但那是
+        `DEPARTMENT_KB_GROUP_TO_REMOTE_CATEGORIES` 用的是同一份约定，但那是
         权限过滤用的映射，不是这里的校验依据。"""
         org, connector = await _require_delegated_retrieval_org(current_user)
 
@@ -1719,7 +1927,10 @@ def create_app() -> FastAPI:
 
     # ==================== 工作流模板管理 API（仅超级管理员） ====================
     # work-flow.md 第 7 节：模板定义"某类流程需要哪些结构化字段"，附件材料只有
-    # 一句提醒文案（attachments_note），不逐条建模校验。
+    # 一句提醒文案（attachments_note），不逐条建模校验——这是跨企业共用的表单
+    # 结构，不含审批人信息。"这类流程谁来批"2026-08-23 起改成企业内部的事，
+    # 由各企业管理员在自己的「审批设置」页面配置（见下面「工作流审批人分配
+    # API」），平台这里不再管。
 
     def _workflow_template_response(template: WorkflowTemplate) -> WorkflowTemplateResponse:
         return WorkflowTemplateResponse(
@@ -1729,7 +1940,6 @@ def create_app() -> FastAPI:
             description=template.description,
             required_fields=template.required_fields,
             attachments_note=template.attachments_note,
-            approver_role_id=template.approver_role_id,
             is_system=template.is_system,
             created_at=template.created_at,
         )
@@ -1764,8 +1974,6 @@ def create_app() -> FastAPI:
         request: UpdateWorkflowTemplateRequest,
         _: AuthenticatedUser = Depends(_require_super_admin),
     ) -> WorkflowTemplateResponse:
-        # exclude_unset：区分"这次 PATCH 没传这个字段"和"显式传了 null"，
-        # approver_role_id 本身允许为 null（表示暂无审批人），两种情况不能混淆。
         updates = request.model_dump(exclude_unset=True)
         kwargs: dict = {}
         if "display_name" in updates:
@@ -1776,12 +1984,6 @@ def create_app() -> FastAPI:
             kwargs["required_fields"] = updates["required_fields"]
         if "attachments_note" in updates:
             kwargs["attachments_note"] = updates["attachments_note"]
-        if "approver_role_id" in updates:
-            if updates["approver_role_id"] is not None:
-                role = await role_store.get_role_by_id(updates["approver_role_id"])
-                if role is None:
-                    raise HTTPException(status_code=400, detail="审批角色不存在")
-            kwargs["approver_role_id"] = updates["approver_role_id"]
 
         template = await workflow_store.update_template(template_id, **kwargs)
         if template is None:
@@ -1801,6 +2003,77 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="流程模板不存在")
         return {"success": True}
 
+    # ==================== 工作流审批人分配 API（仅 org_admin，按企业隔离） ====================
+    # "这类流程谁来批"是企业内部的事——同一个 workflow_type（比如"请假申请"）
+    # 在不同企业应该能配不同的审批角色，只能由该企业自己的管理员配置，见
+    # workflow_store.py 顶部说明。平台管理员不管这个（工作流模板本身的表单
+    # 结构才归平台管，见上面「工作流模板管理 API」）。
+
+    @app.get("/api/v1/admin/workflow-approvers", response_model=List[WorkflowApproverAssignmentResponse])
+    async def admin_list_workflow_approvers(
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> List[WorkflowApproverAssignmentResponse]:
+        """列出全部流程类型 + 本企业当前给每个类型配的审批角色（没配就是
+        null）——前端拿这份列表渲染"每类流程选一个审批角色"的表单。"""
+        org = await org_store.get_org_for_user(current_user.user_id)
+        if org is None:
+            raise HTTPException(status_code=403, detail="账号未关联任何企业")
+        templates = await workflow_store.list_templates()
+        assignments = await workflow_store.list_org_approver_roles(org.org_id)
+        role_ids = {rid for rid in assignments.values() if rid}
+        roles_by_id = {}
+        for rid in role_ids:
+            role = await role_store.get_role_by_id(rid)
+            if role is not None:
+                roles_by_id[rid] = role
+        result = []
+        for t in templates:
+            approver_role_id = assignments.get(t.workflow_type)
+            approver_role = roles_by_id.get(approver_role_id) if approver_role_id else None
+            result.append(WorkflowApproverAssignmentResponse(
+                workflow_type=t.workflow_type,
+                display_name=t.display_name,
+                approver_role_id=approver_role_id,
+                approver_role_display_name=approver_role.display_name if approver_role else None,
+            ))
+        return result
+
+    @app.put("/api/v1/admin/workflow-approvers/{workflow_type}", response_model=WorkflowApproverAssignmentResponse)
+    async def admin_set_workflow_approver(
+        workflow_type: str,
+        request: SetWorkflowApproverRequest,
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> WorkflowApproverAssignmentResponse:
+        org = await org_store.get_org_for_user(current_user.user_id)
+        if org is None:
+            raise HTTPException(status_code=403, detail="账号未关联任何企业")
+        template = await workflow_store.get_template_by_type(workflow_type)
+        if template is None:
+            raise HTTPException(status_code=404, detail="流程模板不存在")
+
+        approver_role = None
+        if request.approver_role_id is not None:
+            approver_role = await role_store.get_role_by_id(request.approver_role_id)
+            if approver_role is None:
+                raise HTTPException(status_code=400, detail="审批角色不存在")
+            # 只能指定本企业自己的角色——全局角色（部门身份、系统角色）不再
+            # 作为审批人来源，工作流跟角色/知识库一样是"企业内部的事"，见
+            # workflow_store.py 顶部说明。
+            if approver_role.org_id != org.org_id:
+                raise HTTPException(status_code=403, detail="只能指定本企业自己的角色作为审批人")
+
+        await workflow_store.set_org_approver_role(org.org_id, workflow_type, request.approver_role_id)
+        await _audit_log(
+            current_user.user_id, "set_workflow_approver", "workflow_template", workflow_type,
+            {"approver_role_id": request.approver_role_id},
+        )
+        return WorkflowApproverAssignmentResponse(
+            workflow_type=workflow_type,
+            display_name=template.display_name,
+            approver_role_id=request.approver_role_id,
+            approver_role_display_name=approver_role.display_name if approver_role else None,
+        )
+
     # ==================== 工作流 API ====================
     # work-flow.md 第 7 节 + work-flow-web.md 第 3/6.2 节
 
@@ -1819,8 +2092,11 @@ def create_app() -> FastAPI:
     ) -> List[WorkflowTemplateResponse]:
         """登录用户可调，只返回当前用户角色能审批的流程类型，用于"待我审批"
         Tab 的可见性判断，不要求 super_admin。"""
+        org = await org_store.get_org_for_user(current_user.user_id)
+        if org is None:
+            return []
         role_ids = [r.role_id for r in await role_store.get_user_roles(current_user.user_id)]
-        templates = await workflow_store.approvable_templates_for_role_ids(role_ids)
+        templates = await workflow_store.approvable_templates_for_org_and_role_ids(org.org_id, role_ids)
         return [_workflow_template_response(t) for t in templates]
 
     async def _build_workflow_instance_response(instance: WorkflowInstance) -> WorkflowInstanceResponse:
@@ -1851,10 +2127,10 @@ def create_app() -> FastAPI:
     async def _require_workflow_access(
         instance_id: str, current_user: AuthenticatedUser, mode: str,
     ) -> WorkflowInstance:
-        """`mode`: "owner" 必须是发起人；"approver" 必须持有该实例所属模板的审批
-        角色；"owner_or_approver" 满足其一即可。审批角色是 per-模板动态的，不能
-        用静态的 `require_role(*names)` 工厂，运行期查模板后再判断（work-flow.md
-        第 7 节）。"""
+        """`mode`: "owner" 必须是发起人；"approver" 必须持有"申请人所在企业"给
+        该实例对应流程类型配的审批角色；"owner_or_approver" 满足其一即可。
+        审批角色现在按企业配置（见 workflow_store.py 顶部说明），不能用静态的
+        `require_role(*names)` 工厂，运行期按申请人所属企业现查后再判断。"""
         instance = await workflow_store.get_instance(instance_id)
         if instance is None:
             raise HTTPException(status_code=404, detail="工作流不存在")
@@ -1865,11 +2141,15 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=403, detail="无权访问该工作流")
             return instance
 
-        template = await workflow_store.get_template_by_type(instance.workflow_type)
+        requester_org = await org_store.get_org_for_user(instance.requester_user_id)
         is_approver = False
-        if template is not None and template.approver_role_id:
-            role_ids = {r.role_id for r in await role_store.get_user_roles(current_user.user_id)}
-            is_approver = template.approver_role_id in role_ids
+        if requester_org is not None:
+            approver_role_id = await workflow_store.get_org_approver_role_id(
+                requester_org.org_id, instance.workflow_type,
+            )
+            if approver_role_id:
+                role_ids = {r.role_id for r in await role_store.get_user_roles(current_user.user_id)}
+                is_approver = approver_role_id in role_ids
 
         if mode == "approver":
             if not is_approver:
@@ -1906,9 +2186,13 @@ def create_app() -> FastAPI:
     async def list_pending_approval_workflows(
         current_user: AuthenticatedUser = Depends(get_current_user),
     ) -> List[WorkflowInstanceResponse]:
-        """我（按角色）能审批的待处理列表。"""
+        """我（按角色）能审批的待处理列表——按我自己所在的企业过滤，见
+        workflow_store.list_pending_for_org_and_role_ids 旁的说明。"""
+        org = await org_store.get_org_for_user(current_user.user_id)
+        if org is None:
+            return []
         role_ids = [r.role_id for r in await role_store.get_user_roles(current_user.user_id)]
-        instances = await workflow_store.list_pending_for_role_ids(role_ids)
+        instances = await workflow_store.list_pending_for_org_and_role_ids(org.org_id, role_ids)
         return [await _build_workflow_instance_response(i) for i in instances]
 
     @app.get("/api/v1/workflows/{instance_id}", response_model=WorkflowInstanceResponse)

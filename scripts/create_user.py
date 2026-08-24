@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.ragent_backend.user_store import UserStore, VALID_ROLES, ROLE_USER
-from src.ragent_backend.role_store import RoleStore, ROLE_SUPER_ADMIN, ROLE_ADMIN
+from src.ragent_backend.role_store import RoleStore
 from src.ragent_backend.org_store import OrgStore, ORG_PLATFORM_ID
 
 

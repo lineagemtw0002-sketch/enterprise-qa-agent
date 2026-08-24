@@ -25,6 +25,7 @@ from src.core.settings import Settings, load_settings, resolve_path
 from src.core.types import Document, Chunk
 from src.core.trace.trace_context import TraceContext
 from src.observability.logger import get_logger
+from src.security.prompt_guard import detect_document_injection
 
 # Libs layer imports
 from src.libs.loader.file_integrity import SQLiteIntegrityChecker
@@ -328,7 +329,24 @@ class IngestionPipeline:
                     "image_count": image_count,
                     "text_preview": document.text,
                 }, elapsed_ms=_elapsed)
-            
+
+            # 提示词注入防护（docs/prompt_injection_remediation_plan.md 问题2，
+            # P0）：任何持有 collection 上传权限的员工上传的文档，摄入后都会
+            # 原样作为检索上下文喂给模型——投毒文档在这一步之前拒绝掉，比事后
+            # 在生成阶段做输出过滤更彻底（压根不进入可检索状态，也就不会被
+            # 混合检索跨话题带出去，见测试报告案例2"完全不相关问题也会触发
+            # 注入"的现象）。只挡"[SYSTEM INSTRUCTION]"这类伪装成系统级声明的
+            # 显眼手法，更隐蔽的自然语言包装挡不住，需要跟 Prompt 模板侧的
+            # 防注入包装（_build_prompt 的 <retrieved_context> 声明）配合。
+            injection_hit = detect_document_injection(document.text)
+            if injection_hit:
+                raise ValueError(
+                    f"检测到疑似提示词注入内容，已拒绝摄入：文档中包含类似"
+                    f"「{injection_hit}」的可疑文本，这类内容常被用来伪装成"
+                    f"系统指令诱导 AI 泄露信息或执行非预期操作。如果这是正常"
+                    f"业务内容的误判，请联系管理员人工复核。"
+                )
+
             # ─────────────────────────────────────────────────────────────
             # 阶段 3：文本切块
             # ─────────────────────────────────────────────────────────────

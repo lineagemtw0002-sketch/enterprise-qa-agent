@@ -1,0 +1,262 @@
+{
+  "description": "企业知识库问答 + 权限边界的黄金测试集——覆盖「测试新公司」(本地检索模式) 的年假/远程办公两份政策文档，配套测试知识库权限（有权限/无权限/企业管理员通配/跨企业隔离/平台管理员不可访问）以及知识库来源角标（kb_sources）的展示逻辑。用 scripts/run_tenant_kb_golden_tests.py 跑，起点原因见 case leave-carryover-month：管理员实测「年假可以顺延到次年几月？」无答案，排查后发现是「测试新公司」的共享知识库里当时确实没有年假相关文档（唯一命中是私有对话文件，不算数），不是 bug；已把年假政策文档摄入 product_req_kb，本测试集固化下来防止回归。",
+  "version": "1.0",
+  "org": "测试新公司",
+  "collection": "product_req_kb",
+  "seed_documents": [
+    "远程办公申请政策.pdf（已存在的旧数据）",
+    "年假管理制度.txt（本次为验证问题新摄入，见 tests/fixtures/ 同目录没有原始文件——文本见 scripts/run_tenant_kb_golden_tests.py 顶部注释或直接问库）"
+  ],
+  "accounts": {
+    "qa_run_company_user": {
+      "password": "QaRun@2026",
+      "org": "测试新公司",
+      "role": "IT部",
+      "kb_group": "产品需求库权限（QA测试）→ product_req_kb",
+      "note": "正常有权限的普通员工"
+    },
+    "qa_run_noperm_user": {
+      "password": "QaRun@2026",
+      "org": "测试新公司",
+      "role": null,
+      "kb_group": null,
+      "note": "同企业但没有任何角色/知识库分组，用来测无权限拒绝"
+    },
+    "qa_run_orgadmin_check": {
+      "password": "QaRun@2026",
+      "org": "测试新公司",
+      "role": "org_admin",
+      "kb_group": null,
+      "note": "企业管理员，不需要显式分组也能访问本企业全部知识库（隐式通配）"
+    },
+    "qa_run_crossorg_user": {
+      "password": "QaRun@2026",
+      "org": "测试审计企业",
+      "role": "org_admin",
+      "kb_group": null,
+      "note": "另一家企业的管理员，即使自己企业内是通配权限，也不能看到「测试新公司」的知识库——测跨企业隔离"
+    },
+    "qa_run_platform_admin": {
+      "password": "QaRun@2026",
+      "org": "平台运营方",
+      "role": "super_admin",
+      "kb_group": null,
+      "note": "平台管理员不管理任何客户企业的知识库内容，问企业知识库问题应该被拒绝"
+    }
+  },
+  "test_cases": [
+    {
+      "id": "leave-carryover-month",
+      "category": "factual",
+      "tags": [
+        "exact-answer",
+        "regression-anchor"
+      ],
+      "account": "qa_run_company_user",
+      "query": "年假可以顺延到次年几月？",
+      "expect_access": "allowed",
+      "expect_answer_contains_any": [
+        "3月31日",
+        "第一季度"
+      ],
+      "expect_kb_sources": [
+        "product_req_kb"
+      ],
+      "note": "本测试集的起因——2026-08-23 管理员实测这个问题无答案，排查确认是共享知识库当时缺这份文档，已补录。这条用例是回归锚点，以后再出现「无答案」要先怀疑是不是有人把年假文档删了/改了，而不是又去怀疑代码。"
+    },
+    {
+      "id": "leave-carryover-rephrase",
+      "category": "factual-paraphrase",
+      "tags": [
+        "exact-answer",
+        "paraphrase-robustness"
+      ],
+      "account": "qa_run_company_user",
+      "query": "没休完的年假什么时候会作废？",
+      "expect_access": "allowed",
+      "expect_answer_contains_any": [
+        "3月31日",
+        "逾期作废",
+        "第一季度"
+      ],
+      "expect_kb_sources": [
+        "product_req_kb"
+      ],
+      "note": "同一份文档、换一种问法，确认检索不是靠死记硬背原问题的字面匹配。"
+    },
+    {
+      "id": "leave-tenure-cap",
+      "category": "boundary",
+      "tags": [
+        "numeric-boundary"
+      ],
+      "account": "qa_run_company_user",
+      "query": "工龄满多少年，年假天数就不再增加了？",
+      "expect_access": "allowed",
+      "expect_answer_contains_any": [
+        "15"
+      ],
+      "expect_kb_sources": [
+        "product_req_kb"
+      ],
+      "note": "边界条件：封顶年限（15年）+ 封顶天数（15天）容易被模型搞混，检查答案里出现的是年限还是天数。"
+    },
+    {
+      "id": "leave-first-year-eligibility",
+      "category": "boundary",
+      "tags": [
+        "numeric-boundary"
+      ],
+      "account": "qa_run_company_user",
+      "query": "入职多久才开始有年假？",
+      "expect_access": "allowed",
+      "expect_answer_contains_any": [
+        "一年",
+        "1年",
+        "满一年",
+        "满 1 年"
+      ],
+      "expect_kb_sources": [
+        "product_req_kb"
+      ],
+      "note": "边界条件：试用期员工不享受年假，确认模型没有把「入职即有年假」当成默认答案。"
+    },
+    {
+      "id": "leave-same-day-conflict",
+      "category": "nuance",
+      "tags": [
+        "policy-nuance"
+      ],
+      "account": "qa_run_company_user",
+      "query": "年假和病假能不能同一天一起申请？",
+      "expect_access": "allowed",
+      "expect_answer_contains_any": [
+        "不可以",
+        "不能"
+      ],
+      "expect_kb_sources": [
+        "product_req_kb"
+      ],
+      "note": "细节条款，容易被检索漏掉（属于 FAQ 里靠后的一条）。",
+      "known_nuance": "实测发现这条偶尔会答不稳定：文档虽然只有 1 个 chunk（FAQ 那一条肯定在检索到的上下文里），但模型有时会说「没有直接的相关记录」而不是给出「不可以」——这是 LLM 生成层面的抽取不稳定，不是检索/权限的问题，多跑几次这条用例能复现出来，留着当 LLM 层质量的观测点，不建议为了让测试通过就放宽断言。"
+    },
+    {
+      "id": "remote-work-days-regression",
+      "category": "regression",
+      "tags": [
+        "cross-document-isolation"
+      ],
+      "account": "qa_run_company_user",
+      "query": "每个月最多可以申请多少天远程办公？",
+      "expect_access": "allowed",
+      "expect_answer_contains_any": [
+        "8天",
+        "8 天"
+      ],
+      "expect_kb_sources": [
+        "product_req_kb"
+      ],
+      "note": "回归用例：确认新摄入年假文档之后，老的远程办公政策文档依旧能被正确检索到，两份文档没有互相污染答案。"
+    },
+    {
+      "id": "maternity-leave-no-data",
+      "category": "negative",
+      "tags": [
+        "no-data",
+        "hallucination-risk"
+      ],
+      "account": "qa_run_company_user",
+      "query": "产假可以请多少天？",
+      "expect_access": "allowed",
+      "expect_answer_contains_any": [
+        "没有直接提及",
+        "没有找到",
+        "未提及",
+        "没有相关",
+        "没有提及",
+        "无法从现有资料",
+        "无法从现有资料中得出"
+      ],
+      "expect_answer_not_contains": [],
+      "known_nuance": "实测答案会先如实说「没有直接提及」，但接着会补一段模型自己知道的通用常识（如「中国大陆产假一般为98天」），容易让用户误以为是公司政策。kb_sources 这条也不是空的（检索到了不相关的年假/远程办公文档但被判定为「有结果」）。这两点是 prompt/检索阈值层面的已知细节，不是本次改动引入的 bug，先记录下来，要不要收紧交给产品判断。",
+      "note": "真正意义上「公司知识库里没有这个信息」的场景，用来验证系统不会编造一个看起来像是来自公司制度的假答案。"
+    },
+    {
+      "id": "permission-denied-no-kb-group",
+      "category": "permission",
+      "tags": [
+        "acl",
+        "negative-access"
+      ],
+      "account": "qa_run_noperm_user",
+      "query": "年假可以顺延到次年几月？",
+      "expect_access": "denied",
+      "expect_answer_contains_any": [
+        "无权访问",
+        "没有权限"
+      ],
+      "expect_kb_sources": [],
+      "note": "同企业但没有分配任何知识库分组的普通员工，必须被明确拒绝，不能因为「反正是同企业的文档」就放行。"
+    },
+    {
+      "id": "cross-org-isolation",
+      "category": "permission",
+      "tags": [
+        "acl",
+        "cross-tenant-isolation"
+      ],
+      "account": "qa_run_crossorg_user",
+      "query": "年假可以顺延到次年几月？",
+      "expect_access": "allowed-but-isolated",
+      "expect_kb_sources_not_contains": [
+        "product_req_kb"
+      ],
+      "note": "另一家企业（测试审计企业）的企业管理员，自己企业内是隐式通配权限，但问「测试新公司」专属的年假政策时，检索结果必须完全落在自己企业名下（test_audit_scope_kb 或空），绝不能命中 product_req_kb——这是防跨企业越权的核心用例，比单纯测「没有分组的普通用户」更严格。"
+    },
+    {
+      "id": "org-admin-implicit-wildcard",
+      "category": "permission",
+      "tags": [
+        "acl",
+        "org-admin-wildcard"
+      ],
+      "account": "qa_run_orgadmin_check",
+      "query": "年假可以顺延到次年几月？",
+      "expect_access": "allowed",
+      "expect_answer_contains_any": [
+        "3月31日",
+        "第一季度"
+      ],
+      "expect_kb_sources": [
+        "product_req_kb"
+      ],
+      "note": "企业管理员没有被显式分配任何知识库分组，但作为 org_admin 应该隐式拥有本企业全部知识库的访问权（角色和知识库分组是两回事，见 kb_group_store.py 说明）。"
+    },
+    {
+      "id": "platform-admin-denied",
+      "category": "permission",
+      "tags": [
+        "acl",
+        "platform-boundary"
+      ],
+      "account": "qa_run_platform_admin",
+      "query": "年假可以顺延到次年几月？",
+      "expect_access": "denied",
+      "expect_kb_sources": [],
+      "note": "平台管理员不管理任何客户企业的知识库内容，问企业内部制度类问题应该被拒绝，不能因为「反正权限最大」就能看到所有客户企业的数据。"
+    },
+    {
+      "id": "chit-chat-no-kb-badge",
+      "category": "ui-regression",
+      "tags": [
+        "kb-source-icon",
+        "no-icon-baseline"
+      ],
+      "account": "qa_run_company_user",
+      "query": "你好，你是谁？",
+      "expect_access": "allowed",
+      "expect_kb_sources": [],
+      "note": "纯闲聊、不涉及知识库检索的问题，kb_sources 必须是空数组——对应前端「没有则不提示」知识库来源图标的基线用例（App.jsx message-kb-badge）。"
+    }
+  ]
+}

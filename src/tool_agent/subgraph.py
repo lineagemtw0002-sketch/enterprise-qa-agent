@@ -2,18 +2,24 @@
 Tool Subgraph — 工具子智能体的 LangGraph 实现。
 
 拓扑：
-    START → think_node → router_node
-                             │
-                ┌────────────┼────────────┐
-                ▼            ▼            ▼
-           tool_node    summarize_node   END (max_iter)
-                │            │
-                └────→ think_node (循环，最多 N 轮)
+    START → supervisor_node ──(高置信度单一检索工具，见 supervisor_node 说明)──→ tool_node
+                    │
+                    └──(其余场景，原有路径)──→ think_node → router_node
+                                                    │
+                                       ┌────────────┼────────────┐
+                                       ▼            ▼            ▼
+                                  tool_node    summarize_node   END (max_iter)
+                                       │            │
+                                       └────→ think_node (循环，最多 N 轮)
 
 关键设计：
 - 独立 State Schema，internal_messages 不返回主图
 - 只输出 tool_summary + tool_execution_trace
 - 主图通过 tool_subgraph 节点调用，像普通节点一样使用
+- supervisor_node 在"主图已经高置信度指定唯一检索工具"时可以直接构造
+  tool_calls 跳过第一次 think（见该函数旁的说明）；跳过之后如果工具调用
+  失败，`_route_after_tool` 仍会按原有逻辑把决策权交还给 think_node，不会
+  绕开容错。
 """
 
 from __future__ import annotations
@@ -43,6 +49,32 @@ from src.tool_agent.unified_tool import ToolDecision, ToolResult
 # 能看到，行为跟改造前完全一致，不会因为分类遗漏导致访问不到。
 RETRIEVAL_TOOLS = {"query_knowledge_hub", "list_collections", "get_document_summary", "query_attendance"}
 ACTION_TOOLS = {"check_workflow_status", "resubmit_workflow"}
+
+# =============================================================================
+# 直接路由：意图分类已经高置信度确定唯一目标工具时，跳过第一次 think
+# =============================================================================
+# 见 docs/optimization_tracking.md 耗时优化任务、supervisor_node 旁的说明。
+# 只覆盖 query_knowledge_hub——这个工具的参数就是一段查询文本，直接复用主图
+# `analyze_query` 产出的 rewritten_query 即可，不需要 think_node 的 LLM 调用
+# 重新决策"要不要调工具、调哪个、参数怎么填"。
+#
+# 没有覆盖 query_attendance：think_node 的系统提示词里有一条专门的指引——
+# "如果查询里出现'明天''上周'这类相对日期，调用工具时传的日期参数要先换算
+# 成 YYYY-MM-DD 格式"，这是真实的推理工作，不是顺手为之；主图目前没有算好
+# 的 start_date/end_date 可以直接透传，跳过 think 会导致这类相对日期被
+# builtin_tools.py 的兜底逻辑悄悄按"默认查最近 30 天"处理，结果是错的，不是
+# 单纯变慢。等以后有专门的日期解析步骤/字段能提供给这条路径，再考虑把
+# query_attendance 也纳入。
+#
+# 没有覆盖 ACTION_TOOLS：工作流类操作需要更复杂的参数推理（比如判断具体是
+# 哪个 workflow_instance_id），不是"重复决策"，不适合跳过。
+_DIRECT_ROUTE_TOOLS = {"query_knowledge_hub"}
+# 跟 intent.py::_reconcile_intent_result 里"分类器自己都没底"时的置信度下限
+# （0.5~0.6 区间会被降级处理）对齐——目标不是发明一个新的置信度标准，而是
+# 只在意图分类明确达到"可信"这个既有门槛以上时才短路，没达到的场景（也是
+# target_tool 经常被主动置空、需要 think_node 兜底判断的场景，见 intent.py
+# 里三处"子图自己选工具"的说明）继续走完整的 think_node。
+_DIRECT_ROUTE_CONFIDENCE_THRESHOLD = 0.6
 
 AGENT_PERSONAS = {
     "retrieval_agent": "你是「检索专家 Agent」，专注于从知识库、文档摘要、考勤记录等数据源中查找信息，只处理只读查询，不执行任何工作流操作。",
@@ -103,17 +135,35 @@ def build_tool_subgraph(
         """决定这一轮交给哪个专家 Agent 处理：优先看主图（意图分类）是否已经
         指定了唯一目标工具，没有的话退而看这次请求实际可用的工具集合里有没有
         动作类工具——两类都有或者都没有（比如只有外部 MCP 工具）就交给通用的
-        「协调 Agent」，覆盖全部工具，行为退化成改造前的样子。"""
+        「协调 Agent」，覆盖全部工具，行为退化成改造前的样子。
+
+        顺带判断"要不要直接路由，跳过第一次 think"：意图分类不只是决定了走
+        哪个专家 Agent，如果它给出的 target_tool 属于 `_DIRECT_ROUTE_TOOLS`
+        （目前只有 query_knowledge_hub）且置信度达到 `_DIRECT_ROUTE_CONFIDENCE_
+        THRESHOLD`，说明这本来就是"查一个东西"的单步、无歧义意图——
+        think_node 再问模型一次"要不要调工具、调哪个"，问的是同一个问题
+        （对照 intent.py 里"target_tool 从受限枚举选出、比 intent_type 更
+        可信"的判断），没有实际增益，只是多付一次 LLM 往返的延迟（实测约
+        6-7 秒，见 docs/optimization_tracking.md）。命中就直接构造
+        tool_calls，`next_node` 设成 "tool"，跳过 think；没命中（置信度不够、
+        target_tool 为空、或者是 ACTION_TOOLS/其他工具）就不设这两个字段，
+        走原来的 supervisor → think 路径，不受影响。
+
+        跳过之后的容错完全复用已有机制：工具调用失败时，`_route_after_tool`
+        照常把决策权交还给 think_node（iteration_count 这时还是 0，
+        think_node 按"第一轮"正常构建 system_prompt，行为跟从来没跳过一样，
+        不需要专门处理"跳过之后又失败了怎么办"）。"""
         target_tool = state.get("target_tool")
         available_tools = state.get("available_tools", [])
         available_names = {
             _bare_tool_name((t.get("function") or {}).get("name", ""))
             for t in available_tools
         }
+        bare_target = _bare_tool_name(target_tool) if target_tool else None
 
-        if target_tool and _bare_tool_name(target_tool) in ACTION_TOOLS:
+        if bare_target in ACTION_TOOLS:
             agent = "action_agent"
-        elif target_tool and _bare_tool_name(target_tool) in RETRIEVAL_TOOLS:
+        elif bare_target in RETRIEVAL_TOOLS:
             agent = "retrieval_agent"
         else:
             has_action = bool(available_names & ACTION_TOOLS)
@@ -125,8 +175,21 @@ def build_tool_subgraph(
             else:
                 agent = "general_agent"
 
-        _trace("tool_subgraph", "supervisor", "success", {"agent": agent, "target_tool": target_tool})
-        return {"active_agent": agent}
+        update: Dict[str, Any] = {"active_agent": agent}
+
+        direct_route = (
+            bare_target in _DIRECT_ROUTE_TOOLS
+            and (state.get("intent_confidence") or 0) >= _DIRECT_ROUTE_CONFIDENCE_THRESHOLD
+        )
+        if direct_route:
+            query_text = state.get("rewritten_query") or state.get("query", "")
+            update["tool_calls"] = [{"name": target_tool, "arguments": {"query": query_text}}]
+            update["next_node"] = "tool"
+
+        _trace("tool_subgraph", "supervisor", "success", {
+            "agent": agent, "target_tool": target_tool, "direct_route": direct_route,
+        })
+        return update
 
     # ------------------------------------------------------------------
     # think_node: LLM 决策下一步动作
@@ -383,10 +446,16 @@ def build_tool_subgraph(
     graph.add_node("tool", tool_node)
     graph.add_node("summarize", summarize_node)
 
-    # 边：supervisor 先分派专家 Agent，再进 think；think 直接路由到 tool 或
-    # summarize（根据 think_node 写入的 next_node）
+    # 边：supervisor 先分派专家 Agent；如果它顺带判定可以直接路由（见
+    # supervisor_node 旁的说明，写好了 tool_calls 且 next_node="tool"），跳过
+    # think 直接进 tool，否则走原来的路径先进 think。think 自己再路由到 tool
+    # 或 summarize（根据 think_node 写入的 next_node）。
     graph.add_edge(START, "supervisor")
-    graph.add_edge("supervisor", "think")
+    graph.add_conditional_edges(
+        "supervisor",
+        lambda state: "tool" if state.get("next_node") == "tool" and state.get("tool_calls") else "think",
+        {"tool": "tool", "think": "think"},
+    )
     graph.add_conditional_edges(
         "think",
         lambda state: "summarize" if state.get("iteration_count", 0) >= state.get("max_iterations", max_iterations) else state.get("next_node", "summarize"),

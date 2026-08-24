@@ -2,8 +2,8 @@
 企业自建知识库存储 (Org Collection Store) — PostgreSQL 版
 
 职责：
-1. 记录"哪个 collection 归属哪家企业"——`role_collections`（role_store.py）只存
-   role_id <-> collection_name 的关联，从不知道一个 collection 本身归属哪家企业；
+1. 记录"哪个 collection 归属哪家企业"——`role_collections`（role_store.py）
+   只存 role_id/org_id <-> collection_name 的关联，从不知道一个 collection 本身归属哪家企业；
    在这张表之前，`GET /admin/collections` 只能不加区分地列出 ChromaDB 里现存的
    全部 collection（见 app.py `admin_list_collections` 改造前的实现），任何一家
    企业的管理员都能看到、并把其他企业甚至平台自己的部门知识库配置给自己企业的
@@ -154,6 +154,16 @@ class OrgCollectionStore:
             collection_name=collection_name, org_id=org_id, display_name=display_name,
             created_at=now, created_by=created_by,
         )
+
+    async def delete(self, collection_name: str) -> bool:
+        """只删登记信息本身；物理数据（向量库/BM25/摄入历史）由调用方（app.py
+        `admin_delete_collection`）通过 query_knowledge_hub.py 的
+        `clear_org_collection` 先清掉，这里只负责"这个 collection 还归不归
+        某家企业"这条记录——职责跟 create() 对称。"""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute("DELETE FROM org_collections WHERE collection_name = $1", collection_name)
+        return result.split()[-1] != "0"
 
     async def close(self) -> None:
         if self._pool is not None:

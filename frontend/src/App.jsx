@@ -9,7 +9,7 @@ import {
   Activity, Settings, User, Send, XCircle, Info, Lock, UserRound, Eye, EyeOff,
 } from 'lucide-react'
 import AppShell from './components/shell/AppShell.jsx'
-import { KbTag } from './components/shell/TopNav.jsx'
+import { KbTag, KbSourceIcon } from './components/shell/TopNav.jsx'
 import TracePanel from './components/TracePanel.jsx'
 import AdminPanel from './components/admin/AdminPanel.jsx'
 import OperationsDashboard from './components/admin/OperationsDashboard.jsx'
@@ -19,13 +19,13 @@ import OpsPlaceholder from './components/ops/OpsPlaceholder.jsx'
 import UploadToKbModal from './components/kb/UploadToKbModal.jsx'
 import './App.css'
 
-const ADMIN_ROLE_NAMES = new Set(['admin', 'super_admin', 'org_admin'])
+const ADMIN_ROLE_NAMES = new Set(['super_admin', 'org_admin'])
 // 「运营仪表盘」顶层模块专用——比 ADMIN_ROLE_NAMES 更严格，不包含 org_admin。
 // 平台整体运营指标（会话数/消息数/活跃用户/响应耗时）只对平台运营方开放，
 // 跟后端 admin_dashboard_overview/admin_dashboard_trend 的权限边界
-// （_require_super_admin 或 _require_admin_role + require_platform_admin，
-// 见 app.py）保持一致。
-const PLATFORM_ADMIN_ROLE_NAMES = new Set(['admin', 'super_admin'])
+// （_require_platform_tier + require_platform_admin，见 app.py）保持一致。
+// 2026-08-24 起平台侧废弃 admin 角色，运营方只剩 super_admin 一个身份档位。
+const PLATFORM_ADMIN_ROLE_NAMES = new Set(['super_admin'])
 
 // 客服形象头像：用来替换 assistant 消息原来的 <Bot> 图标（线框机器人不太像
 // "在跟人对话"）。纯 SVG 画一个极简的女性客服半身像（发型+耳麦+肩膀），
@@ -1066,10 +1066,11 @@ export default function App() {
                         </div>
                       </div>
                       <div className="message-content-wrapper">
-                        {/* 知识库来源角标临时隐藏——短回复时角标会跟正文遮挡，等想好新的展示方式再打开（保留 kbSources 数据和下面的渲染逻辑不动，去掉 `&& false` 即可恢复）。*/}
-                        {false && msg.role === 'assistant' && msg.kbSources && msg.kbSources.length > 0 && (
+                        {/* 知识库来源角标：回答实际用到了哪些知识库，就在气泡上方用图标提示；
+                            没有用到任何知识库（闲聊/未检索）就不展示。 */}
+                        {msg.role === 'assistant' && msg.kbSources && msg.kbSources.length > 0 && (
                           <div className="message-kb-badge">
-                            {msg.kbSources.map((slug) => <KbTag key={slug} slug={slug} />)}
+                            {msg.kbSources.map((slug) => <KbSourceIcon key={slug} slug={slug} />)}
                           </div>
                         )}
                         {msg.role === 'assistant' && msg.content === '' && isTyping ? (

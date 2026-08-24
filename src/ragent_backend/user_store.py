@@ -227,9 +227,9 @@ class UserStore:
         return True
 
     async def get_allowed_collections(self, user_id: str) -> List[str]:
-        """给 ACL 检查用：签名不变，内部委托 RoleStore 按角色并集计算——
-        调用方（3 个 MCP 工具）不用动。users.allowed_collections 列本身已不再是
-        权限真相源，只在角色迁移脚本里作为回填数据源使用。"""
+        """给 ACL 检查用：签名不变，内部委托 RoleStore 按角色关联的知识库并集
+        计算——调用方（3 个 MCP 工具）不用动。users.allowed_collections 列本身
+        已不再是权限真相源，只在角色迁移脚本里作为回填数据源使用。"""
         from src.ragent_backend.role_store import RoleStore
 
         return await RoleStore().get_allowed_collections_for_user(user_id)

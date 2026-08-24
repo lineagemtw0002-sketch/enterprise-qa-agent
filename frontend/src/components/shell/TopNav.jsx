@@ -1,4 +1,4 @@
-import { Popover } from 'antd'
+import { Popover, Tooltip } from 'antd'
 import {
   Sparkles, ChevronDown, MessageSquare, ListChecks, ShieldCheck, Activity,
   Sparkle, Files as FilesIcon, Building2, LayoutDashboard,
@@ -50,6 +50,24 @@ export function KbTag({ slug }) {
       <Icon size={12} strokeWidth={2.25} />
       {meta.label}
     </span>
+  )
+}
+
+// 聊天回复来源知识库角标用的紧凑版本——只露一个小圆点图标，鼠标悬停才展开
+// 知识库名字。之前 App.jsx 里那版 KbTag（图标+完整文字）用 position:absolute
+// 贴在回复气泡右上角，短回复气泡本身很窄，文字标签会伸到气泡外面跟正文视觉
+// 冲突，所以一直被 `&& false` 关闭；换成纯图标 + Tooltip 之后天然不会有这个
+// 宽度问题，改用正常文档流（不再绝对定位）放在气泡上方即可，见 App.css
+// .message-kb-badge。
+export function KbSourceIcon({ slug }) {
+  const meta = slug === '*' ? KB_META_UNLIMITED : kbMeta(slug)
+  const Icon = meta.icon
+  return (
+    <Tooltip title={`来源知识库：${meta.label}`}>
+      <span className="kb-source-icon" style={{ '--kb-color': meta.color }}>
+        <Icon size={12} strokeWidth={2.25} />
+      </span>
+    </Tooltip>
   )
 }
 
@@ -120,16 +138,7 @@ export default function TopNav({
         <div className="profile-section-label">角色</div>
         <div className="profile-collections">
           {(() => {
-            // "普通用户"（内部标识 user）是角色系统改造前给所有账号打的基础
-            // 角色，改造后新账号也就一个角色（UserRoleAssignment.jsx"一人一
-            // 角色"），但老账号（比如 admin）还留着当年的 user + super_admin
-            // 两个角色——同时挂着"超级管理员"和"普通用户"两个标签会让人以为
-            // 权限判断有问题，其实只是历史数据没清理。user 本身不携带任何
-            // 额外信息（不比"没有更具体的角色"多说明什么），只要还有别的角色
-            // 在，就不展示它；真的只剩 user 一个角色时才照常显示"普通用户"。
-            const displayRoles = meProfile?.roles?.length > 1
-              ? meProfile.roles.filter((r) => r.name !== 'user')
-              : meProfile?.roles ?? []
+            const displayRoles = meProfile?.roles ?? []
             return displayRoles.length ? (
               displayRoles.map((r) => (
                 <span key={r.role_id} className="tag tag--primary">{r.display_name}</span>
@@ -146,12 +155,12 @@ export default function TopNav({
         <div className="profile-collections">
           {(() => {
             // 跟 UserRoleAssignment.jsx 的知识库列用同一套口径：org_admin 对
-            // 自己企业的知识库是隐式全权限（不是靠 role_collections 表里挂了
-            // 通配符），allowed_collections 字段对它来说本来就是空数组——
+            // 自己企业的知识库是隐式全权限（不是靠某个角色挂了通配符），
+            // allowed_collections 字段对它来说本来就是空数组——
             // 这里不特判就会跟"仅自己的对话"（无知识库权限）撞成一个显示，
             // 企业管理员会误以为自己看不了知识库。
             const roleNames = meProfile?.roles?.map((r) => r.name) ?? []
-            if (roleNames.includes('super_admin') || roleNames.includes('admin')) {
+            if (roleNames.includes('super_admin')) {
               return <span className="profile-empty-hint">无（平台管理员不管理知识库）</span>
             }
             if (roleNames.includes('org_admin')) {

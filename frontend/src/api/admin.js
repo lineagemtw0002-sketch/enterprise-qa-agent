@@ -11,8 +11,8 @@ export function listUsers() {
   return axios.get(`${BASE}/users`).then((res) => res.data)
 }
 
-export function createUser({ username, password, role_ids }) {
-  return axios.post(`${BASE}/users`, { username, password, role_ids }).then((res) => res.data)
+export function createUser({ username, password, role_ids, org_id }) {
+  return axios.post(`${BASE}/users`, { username, password, role_ids, org_id }).then((res) => res.data)
 }
 
 export function deleteUser(userId) {
@@ -50,14 +50,13 @@ export function listGatewayConnectors() {
 }
 
 // ==================== 角色管理 ====================
+// 角色直接携带知识库权限（一人一角色）：平台管理员管全局角色（系统权限档位+
+// 跨企业共用的部门身份，没有知识库配置入口）；企业管理员管自己企业的角色，
+// 能建/改名/删/配置知识库关联，同一组接口，权限档位不同看到的范围不同——
+// 见 role_store.py / app.py 角色管理 API 旁的说明。
 
 export function listRoles() {
   return axios.get(`${BASE}/roles`).then((res) => res.data)
-}
-
-// 企业管理员「知识库权限」页面专用：只返回本企业员工实际持有的部门角色。
-export function listCompanyRoles() {
-  return axios.get(`${BASE}/roles/company`).then((res) => res.data)
 }
 
 export function createRole({ name, display_name }) {
@@ -84,6 +83,14 @@ export function listCollections() {
 
 export function createCollection({ collection_name, display_name }) {
   return axios.post(`${BASE}/collections`, { collection_name, display_name }).then((res) => res.data)
+}
+
+export function deleteCollection(collectionName) {
+  return axios.delete(`${BASE}/collections/${collectionName}`).then((res) => res.data)
+}
+
+export function listCollectionChunks(collectionName, { offset = 0, limit = 20 } = {}) {
+  return axios.get(`${BASE}/collections/${collectionName}/chunks`, { params: { offset, limit } }).then((res) => res.data)
 }
 
 // ==================== 运营仪表盘（仅平台管理员） ====================

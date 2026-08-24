@@ -68,7 +68,7 @@ def register_builtin_tools(
     org_store: Optional["OrgStore"] = None,
     tenant_connector_store: Optional["TenantConnectorStore"] = None,
     tenant_identity_store: Optional["TenantIdentityStore"] = None,
-) -> None:
+) -> "QueryKnowledgeHubTool":
     """注册所有内置工具到 ToolRegistry。
 
     Args:
@@ -91,8 +91,14 @@ def register_builtin_tools(
             我方 user_id 映射成企业考勤系统认得的工号（仅委托考勤查询时用到，见
             attendance-tenant-federation.md 第 3 节）；不传时委托考勤查询会直接
             提示"未关联工号"（因为没有身份映射数据源可查）。
+
+    Returns:
+        注册进去的 `QueryKnowledgeHubTool` 实例——这是 ReAct 工具子图真正会
+        调用的那一个（跟 app.py 里 `_kb_management_tool`、workflow.py 里
+        `RAGWorkflow._retrieval_tool` 是各自独立的实例，互不共享缓存），
+        调用方需要这个引用来在应用启动阶段调它的 `preload_models()`。
     """
-    _register_query_knowledge_hub(registry, user_store, org_store, tenant_connector_store)
+    query_knowledge_hub_tool = _register_query_knowledge_hub(registry, user_store, org_store, tenant_connector_store)
     _register_list_collections(registry, user_store)
     _register_get_document_summary(registry, user_store)
     if workflow_store is not None:
@@ -100,6 +106,7 @@ def register_builtin_tools(
         _register_resubmit_workflow(registry, workflow_store)
     if attendance_store is not None:
         _register_query_attendance(registry, attendance_store, org_store, tenant_connector_store, tenant_identity_store)
+    return query_knowledge_hub_tool
 
 
 def _register_query_knowledge_hub(
@@ -107,8 +114,12 @@ def _register_query_knowledge_hub(
     user_store: Optional["UserStore"] = None,
     org_store: Optional["OrgStore"] = None,
     tenant_connector_store: Optional["TenantConnectorStore"] = None,
-) -> None:
-    """注册 query_knowledge_hub 工具。"""
+) -> "QueryKnowledgeHubTool":
+    """注册 query_knowledge_hub 工具，返回创建的工具实例——它是这个函数体
+    里唯一一个原来完全"关在闭包里、外部拿不到"的对象，app.py 需要这个引用
+    才能在启动阶段调用它的 `preload_models()`（见该方法旁的说明：reranker/
+    embedding client 首次使用时的模型加载耗时，不预热的话会摊派给第一个
+    真实提问的用户）。"""
     tool = QueryKnowledgeHubTool(user_store=user_store, org_store=org_store, tenant_connector_store=tenant_connector_store)
 
     async def handler(query: str, top_k: int = 5, collection: str = None, user_id: str = None) -> Any:
@@ -122,6 +133,7 @@ def _register_query_knowledge_hub(
         result_formatter=lambda r: r.content if hasattr(r, "content") else str(r),
     )
     registry.register(unified_tool)
+    return tool
 
 
 def _register_list_collections(registry: ToolRegistry, user_store: Optional["UserStore"] = None) -> None:

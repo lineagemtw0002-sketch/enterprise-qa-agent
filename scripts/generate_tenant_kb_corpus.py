@@ -1,12 +1,12 @@
 """生成 Acme / Globex 两家模拟企业的知识库语料——2026-08-22 第二版：改成跟
 平台之前那 6 个本地部门知识库同一套分类（人力资源与行政 / 财务与报销制度 /
 IT 支持与技术运维 / 销售话术与市场 / 研发与产品代码 / 客户成功与售后服务，
-见 query_knowledge_hub.py DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES），不再各自
+见 query_knowledge_hub.py DEPARTMENT_KB_GROUP_TO_REMOTE_CATEGORIES），不再各自
 用一套自定义分类（老版本 Acme 是 troubleshoot/security/product/...，Globex
 是 fleet/warehouse/customs/... 共 11 个，互不相同）。统一成这 6 个之后，
-委托企业的部门角色过滤（hr_admin_kb 角色只看得到"人力资源与行政"类目，
-finance_kb 角色只看得到"财务与报销制度"类目……）才能对两家企业用同一套
-角色名生效，不需要为每家企业单独维护一份类目映射。
+委托企业的知识库分组过滤（hr_admin_kb 分组只看得到"人力资源与行政"类目，
+finance_kb 分组只看得到"财务与报销制度"类目……）才能对两家企业用同一套
+分组名生效，不需要为每家企业单独维护一份类目映射。
 
 Acme 依然是云软件/SaaS 公司人设，Globex 依然是跨境物流集团人设——两家在
 "财务/销售"这类通用部门上内容自然会有些相似（毕竟都是公司），但"研发与

@@ -11,7 +11,7 @@ import * as collectionsApi from '../../api/collections.js'
 // 会重新做一遍（见该端点旁的说明）——这里没权限选不中，不代表拼接口就能绕过。
 
 // 委托模式企业上传时可选的子库/分类——跟 query_knowledge_hub.py
-// DEPARTMENT_ROLE_TO_REMOTE_CATEGORIES / tenant_kb_demo/app.py CATEGORY_LABELS
+// DEPARTMENT_KB_GROUP_TO_REMOTE_CATEGORIES / tenant_kb_demo/app.py CATEGORY_LABELS
 // 用的是同一份 6 类目约定，这是平台给 demo 企业定的默认分类法，不是协议
 // 强制要求，企业服务可以不认这个字段（见 collections.js uploadTenantKbDocument
 // 旁的说明）。
