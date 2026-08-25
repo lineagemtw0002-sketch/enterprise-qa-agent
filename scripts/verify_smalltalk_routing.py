@@ -60,6 +60,8 @@ scenario_id=smalltalk）里，bob_acme 问「你好，你是谁」，系统回�
     target_tool=query_knowledge_hub）算通过——对照组本来就该查知识库，真实
     知识库里有对应内容时它命中的是正常回答，不是拒绝话术。
   考勤对照组（expect="tool"）：intent=tool 即算通过，不限定具体工具。
+  流程对照组（expect="workflow"）：intent=workflow 即算通过，不限定具体模板
+    （模板选得对不对是另一个问题，这里只关心"没被别的分支截胡"）。
 
 怎么跑
 ------
@@ -108,9 +110,10 @@ KB_TOOL = "query_knowledge_hub"
 
 
 # ============== 用例集（分层） ==============
-# expect: "chat" = 应该直接对话回答（不该查知识库、不该澄清、不该发起流程）
-#         "kb"   = 应该查企业知识库（intent=tool + target_tool=query_knowledge_hub）
-#         "tool" = 应该调某个工具，不限定是哪个（考勤类）
+# expect: "chat"     = 应该直接对话回答（不该查知识库、不该澄清、不该发起流程）
+#         "kb"       = 应该查企业知识库（intent=tool + target_tool=query_knowledge_hub）
+#         "tool"     = 应该调某个工具，不限定是哪个（考勤类）
+#         "workflow" = 应该发起业务流程，不限定具体模板
 @dataclass(frozen=True)
 class Case:
     category: str
@@ -145,11 +148,34 @@ CASES: List[Case] = [
     Case("5_mixed", "你好，我想问个问题", "chat"),
     Case("5_mixed", "你能帮我查东西吗", "chat"),
     Case("5_mixed", "在吗，有点事想请教你", "chat"),
-    # 6. 对照组：本来就该查知识库 / 该调工具
+    # 6. 对照组：本来就该查知识库 / 该调工具 / 该发起流程
+    #    2026-08-25 扩充：原来只有 4 条（3 kb + 1 考勤），报告 §6.5 明确说
+    #    "不足以证明修复不会伤业务问答"。给闲聊路由做任何规则短路都必须先
+    #    证明这一点，所以这里补到 18 条，并新增两类：
+    #      - "闲聊夹真业务"（"你好，年假多少天"）：专门用来抓"闲聊白名单
+    #        把带寒暄前缀的正经业务问题也吞掉"这种误伤，是白名单类修法最
+    #        危险的失败模式；
+    #      - workflow 对照（"我想请假"）：确认新增的短路没有插到工作流
+    #        动作短路前面、把发起流程的句子截胡。
     Case("6_control_kb", "年假多少天", "kb"),
     Case("6_control_kb", "远程办公政策是什么", "kb"),
     Case("6_control_kb", "报销流程是怎样的", "kb"),
+    Case("6_control_kb", "员工手册里关于加班是怎么规定的", "kb"),
+    Case("6_control_kb", "试用期多久可以转正", "kb"),
+    Case("6_control_kb", "差旅住宿标准是多少", "kb"),
+    Case("6_control_kb", "公司的绩效考核制度是什么", "kb"),
+    Case("6_control_kb", "入职需要准备哪些材料", "kb"),
+    Case("6_control_kb", "公积金缴纳比例是多少", "kb"),
+    # 带寒暄前缀 / 寒暄措辞的**真**业务问题——闲聊白名单绝不能吞掉这些
+    Case("6_control_kb_mixed", "你好，年假多少天", "kb"),
+    Case("6_control_kb_mixed", "你能帮我查一下报销流程吗", "kb"),
+    Case("6_control_kb_mixed", "谢谢，那远程办公政策呢", "kb"),
     Case("6_control_tool", "我这个月迟到几次", "tool"),
+    Case("6_control_tool", "上个月我的考勤记录", "tool"),
+    Case("6_control_tool", "我这周的打卡情况怎么样", "tool"),
+    Case("6_control_workflow", "我想请假", "workflow"),
+    Case("6_control_workflow", "我要报销", "workflow"),
+    Case("6_control_workflow", "帮我报修电脑", "workflow"),
 ]
 
 
@@ -206,6 +232,8 @@ def is_ok(r: RunResult) -> bool:
         return r.intent_type == "tool" and r.target_tool == KB_TOOL
     if r.expect == "tool":
         return r.intent_type == "tool"
+    if r.expect == "workflow":
+        return r.intent_type == "workflow"
     return False
 
 
@@ -295,6 +323,11 @@ async def run_one(
     cleaned = " ".join(case.query.split())
     if intent_mod._match_workflow_action_intent(cleaned, workflows) is not None:
         r.rule_hit = "workflow_action_rule"
+    elif intent_mod._match_chitchat_intent(cleaned) is not None:
+        # 闲聊白名单短路（2026-08-25 修复）也是在 LLM 之前返回、不经过
+        # _reconcile_intent_result，不先标出来的话下面那段兜底会把它错记成
+        # clarify_rule，明细表会显示成"被澄清规则拦下"，正好是相反的意思。
+        r.rule_hit = "chitchat_rule"
 
     # 抓取 _reconcile_intent_result 之前的原始 LLM 输出，用来区分
     # 「模型判错」和「后处理改写」——这是任务 A 的关键证据

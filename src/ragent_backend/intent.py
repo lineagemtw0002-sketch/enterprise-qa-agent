@@ -313,6 +313,154 @@ def _has_vague_pronoun(text: str) -> bool:
     return False
 
 
+# ============== 闲聊短路（_match_chitchat_intent 用） ==============
+#
+# 背景与实测依据：docs/review_2026-08-25/smalltalk_routing_regression.md。
+# 21 条闲聊 × 2 次实测，误判率 81%——57% 被 `_needs_clarify_rule` 的
+# `len < 4` 拦成固定澄清话术、24% 被 1.5b router 判成 tool+query_knowledge_hub
+# 后撞上 `workflow.py` 的知识库空命中短路（"您的知识库里没有『你是谁』"）。
+#
+# 修法为什么是"白名单短路"而不是"放宽长度阈值"：做过 A/B 对照实验
+# （把长度阈值从 <4 关到 <0，其余不动，同一批用例同一模型跑两遍）：
+#   总误判率 81.0% -> 66.7%，但 kb_refusal 从 23.8% **涨到 28.6%**
+#   （"你是谁" 从"澄清话术"变成"知识库里没有你是谁"，正是用户报告的那种
+#    更有害的错法）；且放宽后 "早上好" 被判成 target_tool=query_attendance
+#   （真的会去查考勤），只是脚本的静态判据把它算成了 answered。
+# 结论：**单独放宽阈值只是把失败从一个桶挪进更坏的桶**，不采纳。改成在 LLM
+# 之前用高精度白名单把闲聊摘出来，长度阈值**原样不动**——"他呢""多少"这类
+# 真正模糊的短查询仍然被拦成 clarify，那个能力一点没丢。
+#
+# 为什么终判是 "rag" 而不是新增一类 "chitchat"：四分类里确实没有"直接对话
+# 回答"这一桶（根因三），补第五类要同时改 `IntentDetectionResult` 的 Literal、
+# `workflow.py` 的 `_route_after_intent` 并新增一个生成节点，属于结构性改动、
+# 本次不做。"rag" 是现有四个桶里唯一能走到"正常调 LLM 生成回答"的：
+# `_route_after_intent` 把 rag 送进 `_retrieve_node`（只搜本次对话上传的附件，
+# 闲聊时零命中），再进 `_generate_node` 正常生成——**不会**碰到只认
+# `target_tool == "query_knowledge_hub"` 的知识库空命中闸门。
+
+# 归一化后**整句精确相等**才命中（不是子串匹配）——子串匹配会把
+# "报销流程你好像提过" 这类正常业务问句也吞掉。
+_CHITCHAT_EXACT: set = {
+    # 打招呼
+    "你好", "您好", "你好呀", "你好啊", "您好呀", "哈喽", "哈啰", "嗨", "嘿",
+    "hi", "hello", "hey", "halo", "helo",
+    "早", "早啊", "早上好", "早安", "中午好", "下午好", "晚上好", "晚安",
+    "好久不见", "在吗", "在不在", "在么", "在嘛", "在忙吗", "在忙么", "忙吗",
+    # 礼貌用语 / 收到确认
+    "谢谢", "谢谢你", "谢谢您", "多谢", "感谢", "感谢你", "感谢您", "太感谢了",
+    "非常感谢", "非常感谢你的帮助", "谢谢你的帮助", "3q", "thx", "thanks",
+    "thankyou", "thank you", "辛苦了", "辛苦", "辛苦你了", "麻烦你了",
+    "厉害", "不错", "你真棒", "你太棒了", "好的", "好", "好滴", "行", "行的",
+    "ok", "okay", "收到", "知道了", "明白了", "懂了", "没问题", "嗯", "嗯嗯",
+    "哦", "好吧", "没事了", "没事",
+    # 告别
+    "再见", "拜拜", "拜", "bye", "byebye", "goodbye", "下次聊", "先这样",
+    # 开场白（后面还没说正事，本身没有可检索的主题）
+    "我想问个问题", "我想问个事", "有个问题想问你", "有个问题想请教你",
+    "想请教你个问题", "有点事想请教你", "有点事想问你", "请教一下",
+    "请教你一下", "打扰一下", "问你个问题", "问个问题",
+}
+
+# 问助手自身身份/能力/工作方式的元问题——这类穷举不完，用少量高精度正则，
+# 全部锚定 `^...$`（整段匹配）且主语必须是"你/您"，不做子串匹配。
+_CHITCHAT_PATTERNS: List[str] = [
+    r"^(请问)?(你|您|你们)(是谁|叫什么名字|叫什么|是什么|是什么身份|什么来头)$",
+    r"^(请问)?(你|您)是(ai|人工智能|机器人|真人|什么模型)(吗|么)?$",
+    r"^(请问)?(你|您)(能|会|可以)(做|干)(什么|啥|嘛)$",
+    r"^(请问)?(你|您)(会|能)(什么|啥)$",
+    r"^(请问)?(你|您)(有|能提供)(什么|哪些)(功能|能力|服务|帮助)$",
+    r"^(介绍|说明|讲讲|说说)一?下?(你自己|你|自己)$",
+    r"^(请问)?(你|您)(用的|使用的|背后用的)?(是)?(什么|哪个)(模型|大模型|ai|技术|引擎)$",
+    r"^(请问)?(你|您)是(怎么|如何)(工作|运作|运行|实现|训练)的$",
+    r"^(请问)?(你|您)(的)?(回答|答案|结果)(准确|靠谱|可靠|正确)(吗|么|不)$",
+    r"^(请问)?(你|您)(能|可以|会)(帮我)?(查|找|搜)(东西|点东西|资料|什么)?(吗|么)?$",
+]
+
+_CHITCHAT_COMPILED = [re.compile(p, re.IGNORECASE) for p in _CHITCHAT_PATTERNS]
+
+# 保险栓：只要句子里出现任何一个业务主题词，无论其它部分多像寒暄，都**不**当
+# 闲聊短路，一律交回给原来的判断路径。这是"闲聊白名单不能伤业务问答"这条底线
+# 的兜底——比如"你好，年假多少天""你能帮我查一下报销流程吗"必须照常走检索。
+_CHITCHAT_BUSINESS_VETO: List[str] = [
+    "年假", "假期", "请假", "事假", "病假", "调休", "加班", "考勤", "打卡",
+    "迟到", "早退", "报销", "发票", "出差", "差旅", "报修", "故障", "维修",
+    "政策", "制度", "规定", "流程", "规章", "手册", "指南", "条例", "标准",
+    "文档", "文件", "资料", "知识库", "合同", "协议", "工资", "薪资", "薪酬",
+    "绩效", "社保", "公积金", "入职", "离职", "转正", "培训", "审批", "申请",
+    "权限", "账号", "密码", "系统", "远程办公", "考核", "预算", "客户", "项目",
+    "订单", "库存", "发货", "部门", "员工", "福利", "补贴", "签到", "排班",
+]
+
+# 归一化时剥掉的标点/语气符号（只做整句归一化，不改变句子内部的语义单元）
+_CHITCHAT_STRIP_CHARS = " \t\r\n，,。.！!？?～~、；;：:…—-_\"'“”‘’（）()【】[]"
+
+# 句尾纯语气词，剥掉不改变语义（"在不在呀" -> "在不在"）。**刻意不含**
+# "吗/么/呢"——它们参与疑问句式判断，白名单正则里就写着 `(吗|么)`，
+# 在这里剥掉会让"你的回答准确吗"反而匹配不上。
+_CHITCHAT_TAIL_PARTICLES = ("呀", "啊", "哈", "嘞", "咯", "啦", "喔", "噢", "嘛", "唷", "耶")
+
+
+def _normalize_chitchat_token(text: str) -> str:
+    """归一化一个语义片段：去空白、去首尾标点、剥句尾语气词、转小写。"""
+    token = text.strip(_CHITCHAT_STRIP_CHARS).strip().lower()
+    while len(token) > 1 and token.endswith(_CHITCHAT_TAIL_PARTICLES):
+        token = token[:-1].strip(_CHITCHAT_STRIP_CHARS)
+    return token
+
+
+def _is_chitchat_segment(segment: str) -> bool:
+    """判断**单个**语义片段是不是闲聊。业务主题词一票否决。"""
+    token = _normalize_chitchat_token(segment)
+    if not token:
+        return True  # 空片段（连续标点切出来的）不影响整句判定
+    if any(w in token for w in _CHITCHAT_BUSINESS_VETO):
+        return False
+    if token in _CHITCHAT_EXACT:
+        return True
+    return any(p.match(token) for p in _CHITCHAT_COMPILED)
+
+
+def _match_chitchat_intent(query: str) -> Optional[IntentResult]:
+    """闲聊白名单短路：整句（按标点切成的**每一个**片段）都是寒暄/致谢/告别/
+    问助手自身身份能力时，直接判成 rag —— 不调 LLM、不进知识库检索工具，
+    让主图走 `_retrieve_node` -> `_generate_node` 正常生成一句对话回答。
+
+    与 `_needs_clarify_rule` 的分工（这是本函数存在的关键）：本函数只认**白名单
+    里那些确定无疑的寒暄**，`_needs_clarify_rule` 继续负责拦真正模糊的短查询。
+    两者都作用于短句，靠"是否在白名单里"区分，不靠字数：
+      "你好"(2 字) -> 闲聊短路 -> 正常回答
+      "他呢"(2 字) -> 不在白名单 -> 照旧被长度/模糊代词规则拦成 clarify
+    所以调用顺序必须是**闲聊检查在澄清检查之前**，且长度阈值保持不变。
+
+    复合句按标点拆开逐段判定，要求**每一段都是闲聊**才短路：
+      "你好，你是谁"      -> ["你好", "你是谁"]     两段都是 -> 短路
+      "你好，年假多少天"   -> ["你好", "年假多少天"] 第二段带业务词 -> 不短路
+    """
+    cleaned = " ".join((query or "").split())
+    if not cleaned:
+        return None
+    # 太长的句子即使每段都像寒暄，也更可能是夹带了正事，交给 LLM 更稳妥
+    if len(cleaned) > 30:
+        return None
+
+    segments = [s for s in re.split(r"[，,。.！!？?；;～~\n]+", cleaned) if s.strip()]
+    if not segments:
+        return None
+    if not all(_is_chitchat_segment(seg) for seg in segments):
+        return None
+
+    return IntentResult(
+        intent_type="rag",
+        rewritten_query=cleaned,
+        confidence=0.9,
+        need_clarify=False,
+        reasoning=(
+            "规则短路：整句命中闲聊白名单（寒暄/致谢/告别/问助手自身身份能力），"
+            "不查企业知识库、不走澄清话术，直接交给生成节点正常对话回答"
+        ),
+    )
+
+
 def _match_workflow_action_intent(
     rewritten_query: str, available_workflows: List[Dict[str, Any]],
 ) -> Optional[IntentResult]:
@@ -369,6 +517,15 @@ async def detect_intent(
     Returns:
         IntentResult
     """
+    # === Step 0: 闲聊白名单短路（硬规则，不经过 LLM）===
+    # 必须排在 Step 1 澄清检查**之前**："你好""谢谢"这类 2~3 字的寒暄会被
+    # `_needs_clarify_rule` 的长度阈值 100% 拦成澄清话术（实测占全部闲聊误判
+    # 约四成），而那道阈值本身要留着拦"他呢""多少"这种真正模糊的短查询，
+    # 不能放宽。两者的分工见 `_match_chitchat_intent` 的 docstring。
+    chitchat_intent = _match_chitchat_intent(rewritten_query)
+    if chitchat_intent is not None:
+        return chitchat_intent
+
     # === Step 1: 澄清检查（硬规则，不经过 LLM）===
     clarify_override = _needs_clarify_rule(rewritten_query)
     if clarify_override is not None:
@@ -572,7 +729,12 @@ def _needs_clarify_rule(rewritten_query: str) -> Optional[IntentResult]:
     """Step 1 的模糊代词澄清检查（硬规则，不经过 LLM）——独立成函数，供
     `detect_intent`（旧路径，检查的是待分类的 rewritten_query）和
     `analyze_and_route`（合并路径，检查 LLM 自己重写出来的 rewritten_query，
-    当"后置安全网"用，防止合并调用里模型自己也没把指代消解干净）两处复用。"""
+    当"后置安全网"用，防止合并调用里模型自己也没把指代消解干净）两处复用。
+
+    这里的 `len < 4` 阈值是**刻意保留**的（做过 A/B 实测，放宽它会让更有害的
+    kb_refusal 从 23.8% 涨到 28.6%，详见 `_match_chitchat_intent` 上方的说明）：
+    它的职责是拦"他呢""多少"这类真正模糊的短查询。寒暄类短句由排在本函数
+    **之前**的 `_match_chitchat_intent` 先摘走，不会再走到这里。"""
     has_vague = _has_vague_pronoun(rewritten_query)
     if len(rewritten_query.strip()) < 4 or (has_vague and len(rewritten_query) < 10):
         return IntentResult(
@@ -607,6 +769,10 @@ async def analyze_and_route(
     2. Step 1（模糊代词澄清检查）必须在拿到（LLM 自己产出的）rewritten_query
        之后才能做，所以挪到合并调用返回之后，当一层后置安全网，跟旧路径的
        检查时机（也是拿到 rewritten_query 之后）等价。
+    3. Step 0（闲聊白名单短路）在 LLM 之前和之后各做一次：之前那次针对原始
+       query（命中就零 LLM 调用），之后那次针对 LLM 自己重写出来的
+       rewritten_query（重写可能把"嗨~"整理成"你好"这类白名单形式），
+       两次都排在澄清检查前面，理由见 `_match_chitchat_intent` 的 docstring。
 
     合并调用本身失败（网络错误/JSON 解析失败/schema 不匹配）时，整个函数
     降级回旧的两次调用路径（`analyze_query` + `detect_intent`），不会比合并
@@ -620,6 +786,13 @@ async def analyze_and_route(
     action_intent = _match_workflow_action_intent(cleaned, available_workflows)
     if action_intent is not None:
         return cleaned, [cleaned], action_intent
+
+    # Step 0：闲聊白名单短路，同样零 LLM 调用（见上面 docstring 第 3 点）。
+    # 放在工作流动作短路之后：真要发起流程的句子（"我想请假"）优先走流程，
+    # 白名单本身也不会命中它们（带业务词一票否决）。
+    chitchat_intent = _match_chitchat_intent(cleaned)
+    if chitchat_intent is not None:
+        return cleaned, [cleaned], chitchat_intent
 
     if llm is None:
         rewritten = cleaned
@@ -676,6 +849,11 @@ async def analyze_and_route(
         sub_queries = [
             sq.strip(" ,，。？！?！") for sq in sub_queries if sq.strip(" ,，。？！?！")
         ] or [rewritten_query]
+
+        # Step 0 后置安全网：必须在下面的澄清检查之前（见 docstring 第 3 点）
+        chitchat_override = _match_chitchat_intent(rewritten_query)
+        if chitchat_override is not None:
+            return rewritten_query, [rewritten_query], chitchat_override
 
         # Step 1 后置安全网（见上面 docstring 第 2 点）
         clarify_override = _needs_clarify_rule(rewritten_query)
