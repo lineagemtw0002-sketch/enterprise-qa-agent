@@ -92,11 +92,28 @@ ChromaDB（向量，按 collection 物理隔离）· BM25（`data/db/bm25/{colle
 `session → intent → (retrieve | tool_subgraph | workflow | clarify) → generate → memory_manage → archive`
 
 **双模型分工**：
-- `qwen2.5-1.5b-router`（LoRA 微调）—— **只用在 `_intent_node`**：query 改写 + 子查询拆分 + 四分类，一次调用完成，约 3.2s
+- `qwen2.5-1.5b-router`（LoRA 微调）—— **只用在 `_intent_node`**：query 改写 + 子查询拆分 + 四分类，一次调用完成，**实测 1.5–2.2s**
 - `qwen2.5:7b` —— 生成回答 / ReAct 工具决策 / 工作流字段抽取 / 记忆摘要
 
 **检索**：Chroma dense + BM25 sparse → RRF(k=60) → bge-reranker-base 重排 → `MIN_RELEVANCE_SCORE=0.1`
 （阈值打在 **cross-encoder 重排分**上，不是 RRF 融合分；reranker 降级时不适用）
+
+**耗时**（2026-08-25 实测，`scripts/benchmark_latency.py`，每场景 3 次中位数；
+详见 `docs/architecture.md` §3.2）：
+
+| | TTFT | 总耗时 |
+|---|---|---|
+| 短回答（闲聊/未命中/工作流） | 1.7–2.1s | 1.7–2.1s |
+| 检索命中（单库 / 6 库并行） | 3.6s / 3.9s | 3.6s / 4.0s |
+| 长回答（354 字） | 9.2s | 14.4s |
+
+阶段构成：intent **1.5–2.2s**（现在最大的固定开销）· 检索 0.14–0.39s ·
+generate 1.85s（65 字）/ 12.0s（354 字）· session/memory/archive ≈ 0。
+后端**启动**要 ~20s（`lifespan` 里同步预热 reranker/embedding/LLM），换来冷热差 ≤ 0.5s。
+
+⚠️ 短回答场景 TTFT ≈ 总耗时：`_generate_node` 要攒够
+`_PROMPT_LEAK_CHECK_WINDOW = 200` 字符做提示词泄露检测才放行第一批 token
+（`workflow.py:105`），回答不足 200 字就等于非流式。
 
 **规模**：后端 10.4K 行 / 72 端点 · 前端 5.9K 行 · 测试 27.2K 行（⚠️ 几乎全在老 RAG 库层）
 
@@ -172,8 +189,15 @@ flowchart TB
 2. **BM25 索引 JSON 存储 + 每查询全量加载**（`query_knowledge_hub.py:397`）。
    真实数据量（几个 G 文档 → 143K–716K 块）下索引达 GB 级，每查询每库各 `json.load` 一次
    → 秒级至分钟级 + OOM。**待实测**，方法见 §6.2 of scale 文档
+   > ⚠️ **2026-08-25 的耗时实测没有触及这一条**：那次测出的"检索 0.14–0.39s、
+   > 6 库并行与单库持平"是在**每库约 20 块**的测试数据下得到的，
+   > 与本条推算的前提（143K–716K 块）完全不是一个量级。
+   > **不要拿"实测检索很快"来降低本条的优先级。**
 
 3. **模型服务并发形态** —— `OLLAMA_NUM_PARALLEL` 默认 1，目标规模缺口约 10x
+   > 那个"10x"是从旧 P50 24.2s 反推的估算。**延迟已经大幅下降（见 §2），
+   > 但并发至今一次都没实测过**（2026-08-25 的基准是串行单用户），
+   > 缺口倍数因此**既没被验证、也没被推翻**，本条维持 P0。
 
 4. **安全四条** —— 绕过 ACL 的测试端点（`app.py:1120,1141,1155`，**上线前必删**）·
    CORS 全放开 + 允许携带凭证 · 租户凭证明文存库 · trace WebSocket 无鉴权
@@ -181,8 +205,31 @@ flowchart TB
 5. **知识库文档投毒 → 间接提示注入**，可跨话题传染，ACL 拦不住
    （`docs/security_prompt_injection_test_report.md` 案例2）
 
+6. **委托模式链路的注入防护零覆盖**（2026-08-25 新发现）——
+   平台本地库有三道防护（摄入拒收 / 检索剔除 / 生成短路），
+   但 `delegated_compute.py` 摄入侧无检测、`query_knowledge_hub.py` 的
+   `_execute_remote` 检索侧无过滤。**委托给企业自建的库一道都没有。**
+
+7. **`BM25Indexer.remove_document` 是死代码**（2026-08-25 实测确认）——
+   它用 `chunk_id.startswith(doc_id)` 匹配，但实际 chunk_id 形如
+   `65046ad1_0000_2a3ac7ab`（`sha256(源路径)[:8]`），传入的 doc_id 是文件内容
+   SHA256，**22 字符的串永远不可能以 64 字符的串开头，恒返回 False**。
+   `add_documents` 里"重新摄入时清理旧 postings"的幂等机制用的是同一个函数，
+   **本该防止 BM25 残留的保险从未生效**。单测用 MagicMock + 自造 id，测不出来。
+   —— 这是上面第 1 条能否修复的**唯一硬阻塞**。
+
 ### 🟠 P1
 
+- **闲聊被误路由进知识库检索，答案是错的**（2026-08-25 实测确认，
+  `scripts/benchmark_latency.py --scenarios smalltalk`）。
+  `"你好，你是谁"` 被 `_intent_node` 判成要查知识库 → 进 `tool_subgraph` →
+  未命中短路，返回 `"抱歉，在您当前可访问的知识库范围内，未检索到相关内容…"`，
+  `model_id` = `n/a (empty kb hit, no LLM call)`。2026-08-23 同一句话返回的是 73 字的正常回答。
+  **这是行为回归**——该场景耗时从 22.1s 降到 1.9s，但降下来的原因是不再调用 LLM，不是变快了。
+- **TTFT 卡在提示词泄露检测窗口上**：`_generate_node` 要先攒够
+  `_PROMPT_LEAK_CHECK_WINDOW = 200` 字符才放行第一批 token（`workflow.py:105`），
+  回答不足 200 字时"流式"等于非流式（实测 TTFT 与总耗时差 < 20ms）。
+  安全与 TTFT 的真实取舍，**要把 TTFT 压进 3s SLO 绕不开这一环**。
 - `ragent_backend` + `tool_agent` 共 **12,200 行零测试覆盖**，`conftest.py` 无 DB/LLM fixture
 - 后端 **48 处 `print()`、0 处 logger**，无结构化日志、无 request id
 - 检索链路每查询重建全套组件、全链路无缓存
@@ -280,7 +327,12 @@ flowchart TB
 ### 7.5 工程
 
 - 测试/探测脚本落 `tests/` 或 `scripts/`，**禁止写临时目录后丢弃**
-  —— 参考 `jailbreak_test.py` / `latency_probe.py` 丢失，两份报告的数字至今无法复现
+  —— 参考 `jailbreak_test.py` / `latency_probe.py` 丢失，两份报告的数字至今无法复现。
+  耗时那半边已经补上：`scripts/benchmark_latency.py`（2026-08-25）；
+  `jailbreak_test.py` 那半边**仍然是丢的**，安全报告的数字依旧不可复现。
+- **被测代码带未提交改动时，报告里必须写清代码状态**（commit hash + 脏文件清单 +
+  "这批数字对应含未提交改动的工作区"），否则数字将来无法从 git 复现
+  —— `benchmark_latency.py` 的 `code_state` 字段就是干这个的
 - 标「临时 / 上线前删除」的代码，下次提交时**要么删掉、要么加运行时开关**
 - **每完成一个可描述的功能就提交，单次 ≤ 15 文件**，消息写根因不写现象
 - **提交时显式列文件名，不要用 `git add -A` / `git add .`** —— 多会话并发时会误提交他人在途工作
@@ -307,8 +359,9 @@ flowchart TB
 | `docs/review_2026-08-24/review_industry_baseline.md` | 业界对标：必备 / 规模上来才需要 / 不必跟 | 时点快照 |
 | `docs/security_prompt_injection_test_report.md` | 提示注入测试结果 | 时点快照（**脚本已丢，不可复现**） |
 | `docs/prompt_injection_remediation_plan.md` | 对应修复方案 | 未实施 |
-| `docs/latency_report.md` | 耗时基线 P50 24.2s / P95 46.8s | 时点快照 |
-| `docs/optimization_tracking.md` | 优化前后对比 | "优化后"一栏仍空 |
+| `docs/latency_report.md` | **优化前**耗时基线 P50 24.2s / P95 46.8s（2026-08-23） | 时点快照（**脚本已丢，不可复现**；现行数字见 `architecture.md` §3.2） |
+| `scripts/benchmark_latency.py` | **现行耗时基准脚本**，6 场景 × 3 次，输出 JSON 到 `scripts/benchmark_results/` | **可复现，活脚本** |
+| `docs/optimization_tracking.md` | 优化前后对比 | 活文档 |
 | `docs/kb_permission_design.md` | 权限设计（截至 08-23） | 时点快照 |
 | `docs/qa_test_questions.md` | 问答测试题库，取材自实际库内容 | 可用 |
 | `docs/archive/` | 历史设计文档（已实施或已废弃） | **冻结，不维护** |

@@ -1,0 +1,712 @@
+{
+  "generated_at": "2026-08-25T15:45:48",
+  "script": "scripts/benchmark_latency.py",
+  "repeat_per_scenario": 3,
+  "backend_startup_s": 19.905,
+  "code_state": {
+    "commit": "97e6d88",
+    "commit_full": "97e6d88fec3beb7a4f691b9bb0ea891fc41021b2",
+    "branch": "fix/p0-security-and-project-conventions",
+    "dirty_paths": [
+      "M docs/optimization_tracking.md",
+      "M src/mcp_server/tools/query_knowledge_hub.py",
+      "M src/ragent_backend/app.py",
+      "M src/ragent_backend/workflow.py",
+      "?? docs/review_2026-08-25/",
+      "?? scripts/benchmark_latency.py",
+      "?? scripts/benchmark_mlx_vs_ollama.py",
+      "?? scripts/benchmark_results/"
+    ],
+    "is_clean": false,
+    "warning": "工作区有未提交改动，这批数字对应的是「含未提交改动的工作区状态」，无法只靠 commit hash 复现"
+  },
+  "runtime_env": {
+    "python": "3.12.13",
+    "platform": "darwin",
+    "llm_model": "<settings.yaml>",
+    "intent_model": "qwen2.5-1.5b-router",
+    "generate_max_tokens": "<default>",
+    "ragent_debug": "true"
+  },
+  "baseline_source": "docs/latency_report.md (2026-08-23)",
+  "not_covered": [
+    "并发 / 多用户 / 排队行为——全部为串行单用户测量",
+    "真实数据量（几个 G 文档）下的表现——每库仅约 20 块测试数据",
+    "非本机硬件（Apple M4 16GB + 本地 Ollama）",
+    "前端渲染耗时——只测到 SSE 事件，不含浏览器侧",
+    "网络往返——ASGI 进程内调用，没有真实 HTTP/TLS 开销"
+  ],
+  "overall_percentiles": {
+    "caveat": "6 场景等权重合成分布，非真实流量分布；串行单用户，无并发",
+    "sample_size": 18,
+    "total_s": {
+      "p50": 2.982,
+      "p95": 14.303,
+      "max": 14.791
+    },
+    "total_s_warm_only": {
+      "p50": 2.924,
+      "p95": 14.389
+    },
+    "ttft_s": {
+      "p50": 2.971,
+      "p95": 8.98,
+      "max": 9.703
+    },
+    "ttft_s_warm_only": {
+      "p50": 2.913,
+      "p95": 9.196
+    }
+  },
+  "scenarios": [
+    {
+      "scenario_id": "smalltalk",
+      "label": "闲聊",
+      "username": "bob_acme",
+      "query": "你好，你是谁",
+      "note": "不需要检索，纯生成；原报告里意图分类阶段最慢的一档",
+      "runs_total": 3,
+      "runs_ok": 3,
+      "errors": [],
+      "legacy_2026_08_23": {
+        "total_s": 22.1,
+        "ttft_s": 20.1
+      },
+      "cold": {
+        "ttft_s": 2.48,
+        "total_s": 2.49,
+        "stages": {
+          "archive": 0.0,
+          "generate": 0.0,
+          "intent": 1.634,
+          "memory_manage": 0.0,
+          "session": 0.011,
+          "tool_subgraph": 0.796
+        }
+      },
+      "warm_median": {
+        "ttft_s": 1.933,
+        "total_s": 1.942,
+        "stages": {
+          "archive": 0.0,
+          "generate": 0.0,
+          "intent": 1.752,
+          "memory_manage": 0.0,
+          "session": 0.001,
+          "tool_subgraph": 0.161
+        },
+        "answer_chars": 56.0
+      },
+      "all_median": {
+        "ttft_s": 2.25,
+        "total_s": 2.26,
+        "answer_chars": 56.0
+      },
+      "raw_runs": [
+        {
+          "run_index": 0,
+          "phase": "cold",
+          "ttft_s": 2.48,
+          "total_s": 2.49,
+          "answer_chars": 56,
+          "token_count": 1,
+          "answer_preview": "抱歉，在您当前可访问的知识库范围内，未检索到相关内容。请确认关键词是否正确，或联系管理员确认您的知识库访问权限。",
+          "model_id": "n/a (empty kb hit, no LLM call)",
+          "kb_sources": [],
+          "stages": {
+            "session": 0.011,
+            "intent": 1.634,
+            "tool_subgraph": 0.796,
+            "generate": 0.0,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "phase": "warm",
+          "ttft_s": 2.25,
+          "total_s": 2.26,
+          "answer_chars": 56,
+          "token_count": 1,
+          "answer_preview": "抱歉，在您当前可访问的知识库范围内，未检索到相关内容。请确认关键词是否正确，或联系管理员确认您的知识库访问权限。",
+          "model_id": "n/a (empty kb hit, no LLM call)",
+          "kb_sources": [],
+          "stages": {
+            "session": 0.001,
+            "intent": 2.028,
+            "tool_subgraph": 0.19,
+            "generate": 0.0,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "phase": "warm",
+          "ttft_s": 1.617,
+          "total_s": 1.625,
+          "answer_chars": 56,
+          "token_count": 1,
+          "answer_preview": "抱歉，在您当前可访问的知识库范围内，未检索到相关内容。请确认关键词是否正确，或联系管理员确认您的知识库访问权限。",
+          "model_id": "n/a (empty kb hit, no LLM call)",
+          "kb_sources": [],
+          "stages": {
+            "session": 0.001,
+            "intent": 1.476,
+            "tool_subgraph": 0.132,
+            "generate": 0.0,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        }
+      ]
+    },
+    {
+      "scenario_id": "kb_hit",
+      "label": "检索命中",
+      "username": "bob_acme",
+      "query": "远程办公每个月最多几天",
+      "note": "单知识库（acme_hr_admin_kb，22 块）命中",
+      "runs_total": 3,
+      "runs_ok": 3,
+      "errors": [],
+      "legacy_2026_08_23": {
+        "total_s": 20.4,
+        "ttft_s": 16.0
+      },
+      "cold": {
+        "ttft_s": 4.057,
+        "total_s": 4.072,
+        "stages": {
+          "archive": 0.0,
+          "generate": 2.271,
+          "intent": 1.62,
+          "memory_manage": 0.0,
+          "session": 0.001,
+          "tool_subgraph": 0.156
+        }
+      },
+      "warm_median": {
+        "ttft_s": 3.574,
+        "total_s": 3.585,
+        "stages": {
+          "archive": 0.0,
+          "generate": 1.848,
+          "intent": 1.503,
+          "memory_manage": 0.0,
+          "session": 0.001,
+          "tool_subgraph": 0.21
+        },
+        "answer_chars": 65.0
+      },
+      "all_median": {
+        "ttft_s": 3.684,
+        "total_s": 3.695,
+        "answer_chars": 65.0
+      },
+      "raw_runs": [
+        {
+          "run_index": 0,
+          "phase": "cold",
+          "ttft_s": 4.057,
+          "total_s": 4.072,
+          "answer_chars": 65,
+          "token_count": 1,
+          "answer_preview": "根据企业知识库中的信息，远程办公每个月最多不超过8天。试用期员工暂不适用此规定。\n\n如果有其他问题或需要进一步的信息，请随时告知！",
+          "model_id": "qwen2.5:7b",
+          "kb_sources": [
+            "acme_hr_admin_kb"
+          ],
+          "stages": {
+            "session": 0.001,
+            "intent": 1.62,
+            "tool_subgraph": 0.156,
+            "generate": 2.271,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "phase": "warm",
+          "ttft_s": 3.684,
+          "total_s": 3.695,
+          "answer_chars": 65,
+          "token_count": 1,
+          "answer_preview": "根据企业知识库中的信息，远程办公每个月最多不超过8天。试用期员工暂不适用此规定。\n\n如果有其他问题或需要进一步的信息，请随时告知！",
+          "model_id": "qwen2.5:7b",
+          "kb_sources": [
+            "acme_hr_admin_kb"
+          ],
+          "stages": {
+            "session": 0.001,
+            "intent": 1.537,
+            "tool_subgraph": 0.281,
+            "generate": 1.853,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "phase": "warm",
+          "ttft_s": 3.463,
+          "total_s": 3.474,
+          "answer_chars": 65,
+          "token_count": 1,
+          "answer_preview": "根据企业知识库中的信息，远程办公每个月最多不超过8天。试用期员工暂不适用此规定。\n\n如果有其他问题或需要进一步的信息，请随时告知！",
+          "model_id": "qwen2.5:7b",
+          "kb_sources": [
+            "acme_hr_admin_kb"
+          ],
+          "stages": {
+            "session": 0.001,
+            "intent": 1.47,
+            "tool_subgraph": 0.139,
+            "generate": 1.842,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        }
+      ]
+    },
+    {
+      "scenario_id": "kb_miss",
+      "label": "检索未命中",
+      "username": "bob_acme",
+      "query": "公司的股票期权比例是多少",
+      "note": "知识库里没有这个内容，走未命中路径",
+      "runs_total": 3,
+      "runs_ok": 3,
+      "errors": [],
+      "legacy_2026_08_23": {
+        "total_s": 12.9,
+        "ttft_s": 12.9
+      },
+      "cold": {
+        "ttft_s": 1.747,
+        "total_s": 1.757,
+        "stages": {
+          "archive": 0.0,
+          "generate": 0.0,
+          "intent": 1.579,
+          "memory_manage": 0.0,
+          "session": 0.001,
+          "tool_subgraph": 0.156
+        }
+      },
+      "warm_median": {
+        "ttft_s": 2.135,
+        "total_s": 2.144,
+        "stages": {
+          "archive": 0.0,
+          "generate": 0.0,
+          "intent": 1.905,
+          "memory_manage": 0.0,
+          "session": 0.001,
+          "tool_subgraph": 0.222
+        },
+        "answer_chars": 56.0
+      },
+      "all_median": {
+        "ttft_s": 1.905,
+        "total_s": 1.914,
+        "answer_chars": 56.0
+      },
+      "raw_runs": [
+        {
+          "run_index": 0,
+          "phase": "cold",
+          "ttft_s": 1.747,
+          "total_s": 1.757,
+          "answer_chars": 56,
+          "token_count": 1,
+          "answer_preview": "抱歉，在您当前可访问的知识库范围内，未检索到相关内容。请确认关键词是否正确，或联系管理员确认您的知识库访问权限。",
+          "model_id": "n/a (empty kb hit, no LLM call)",
+          "kb_sources": [],
+          "stages": {
+            "session": 0.001,
+            "intent": 1.579,
+            "tool_subgraph": 0.156,
+            "generate": 0.0,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "phase": "warm",
+          "ttft_s": 1.905,
+          "total_s": 1.914,
+          "answer_chars": 56,
+          "token_count": 1,
+          "answer_preview": "抱歉，在您当前可访问的知识库范围内，未检索到相关内容。请确认关键词是否正确，或联系管理员确认您的知识库访问权限。",
+          "model_id": "n/a (empty kb hit, no LLM call)",
+          "kb_sources": [],
+          "stages": {
+            "session": 0.001,
+            "intent": 1.755,
+            "tool_subgraph": 0.142,
+            "generate": 0.0,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "phase": "warm",
+          "ttft_s": 2.364,
+          "total_s": 2.374,
+          "answer_chars": 56,
+          "token_count": 1,
+          "answer_preview": "抱歉，在您当前可访问的知识库范围内，未检索到相关内容。请确认关键词是否正确，或联系管理员确认您的知识库访问权限。",
+          "model_id": "n/a (empty kb hit, no LLM call)",
+          "kb_sources": [],
+          "stages": {
+            "session": 0.0,
+            "intent": 2.055,
+            "tool_subgraph": 0.303,
+            "generate": 0.0,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        }
+      ]
+    },
+    {
+      "scenario_id": "workflow_start",
+      "label": "发起工作流",
+      "username": "bob_acme",
+      "query": "我要申请年假",
+      "note": "走 workflow 节点，不产生生成式回答；只发第一条消息（收集表单），不提交实例",
+      "runs_total": 3,
+      "runs_ok": 3,
+      "errors": [],
+      "legacy_2026_08_23": {
+        "total_s": 5.1,
+        "ttft_s": 5.1
+      },
+      "cold": {
+        "ttft_s": 1.876,
+        "total_s": 1.877,
+        "stages": {
+          "archive": 0.0,
+          "intent": 0.001,
+          "memory_manage": 0.0,
+          "session": 0.001,
+          "workflow": 1.862
+        }
+      },
+      "warm_median": {
+        "ttft_s": 1.711,
+        "total_s": 1.711,
+        "stages": {
+          "archive": 0.0,
+          "intent": 0.001,
+          "memory_manage": 0.0,
+          "session": 0.001,
+          "workflow": 1.691
+        },
+        "answer_chars": 10.0
+      },
+      "all_median": {
+        "ttft_s": 1.714,
+        "total_s": 1.714,
+        "answer_chars": 10.0
+      },
+      "raw_runs": [
+        {
+          "run_index": 0,
+          "phase": "cold",
+          "ttft_s": 1.876,
+          "total_s": 1.877,
+          "answer_chars": 10,
+          "token_count": 1,
+          "answer_preview": "请补充一下：开始日期",
+          "model_id": "workflow-collect",
+          "kb_sources": [],
+          "stages": {
+            "session": 0.001,
+            "intent": 0.001,
+            "workflow": 1.862,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "phase": "warm",
+          "ttft_s": 1.714,
+          "total_s": 1.714,
+          "answer_chars": 10,
+          "token_count": 1,
+          "answer_preview": "请补充一下：开始日期",
+          "model_id": "workflow-collect",
+          "kb_sources": [],
+          "stages": {
+            "session": 0.001,
+            "intent": 0.001,
+            "workflow": 1.695,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "phase": "warm",
+          "ttft_s": 1.708,
+          "total_s": 1.708,
+          "answer_chars": 10,
+          "token_count": 1,
+          "answer_preview": "请补充一下：开始日期",
+          "model_id": "workflow-collect",
+          "kb_sources": [],
+          "stages": {
+            "session": 0.001,
+            "intent": 0.001,
+            "workflow": 1.687,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        }
+      ]
+    },
+    {
+      "scenario_id": "long_answer",
+      "label": "长回答",
+      "username": "bob_acme",
+      "query": "请详细介绍一下公司的年假政策和远程办公政策",
+      "note": "故意要长输出，用来看生成阶段随输出长度的变化",
+      "runs_total": 3,
+      "runs_ok": 3,
+      "errors": [],
+      "legacy_2026_08_23": {
+        "total_s": 39.0,
+        "ttft_s": 17.8
+      },
+      "cold": {
+        "ttft_s": 8.853,
+        "total_s": 14.217,
+        "stages": {
+          "archive": 0.0,
+          "generate": 12.233,
+          "intent": 1.773,
+          "memory_manage": 0.0,
+          "session": 0.001,
+          "tool_subgraph": 0.168
+        }
+      },
+      "warm_median": {
+        "ttft_s": 9.242,
+        "total_s": 14.425,
+        "stages": {
+          "archive": 0.0,
+          "generate": 12.037,
+          "intent": 1.98,
+          "memory_manage": 0.0,
+          "session": 0.001,
+          "tool_subgraph": 0.372
+        },
+        "answer_chars": 354.0
+      },
+      "all_median": {
+        "ttft_s": 8.853,
+        "total_s": 14.217,
+        "answer_chars": 354.0
+      },
+      "raw_runs": [
+        {
+          "run_index": 0,
+          "phase": "cold",
+          "ttft_s": 8.853,
+          "total_s": 14.217,
+          "answer_chars": 354,
+          "token_count": 100,
+          "answer_preview": "根据企业知识库中的信息，以下是关于公司年假政策和远程办公政策的介绍：\n\n### 年假政策\n\n- **客户成功部**：\n  - 入职满一年起每年享有15天年假。\n  - 当年未休完的年假可以顺延到次年3月底前用完，超期作废，不折算成工资。\n\n- **平台研发部**：\n  - 入职满一年起每年享有20天年假。\n  - 当年",
+          "model_id": "qwen2.5:7b",
+          "kb_sources": [
+            "acme_hr_admin_kb"
+          ],
+          "stages": {
+            "session": 0.001,
+            "intent": 1.773,
+            "tool_subgraph": 0.168,
+            "generate": 12.233,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "phase": "warm",
+          "ttft_s": 8.782,
+          "total_s": 14.06,
+          "answer_chars": 354,
+          "token_count": 100,
+          "answer_preview": "根据企业知识库中的信息，以下是关于公司年假政策和远程办公政策的介绍：\n\n### 年假政策\n\n- **客户成功部**：\n  - 入职满一年起每年享有15天年假。\n  - 当年未休完的年假可以顺延到次年3月底前用完，超期作废，不折算成工资。\n\n- **平台研发部**：\n  - 入职满一年起每年享有20天年假。\n  - 当年",
+          "model_id": "qwen2.5:7b",
+          "kb_sources": [
+            "acme_hr_admin_kb"
+          ],
+          "stages": {
+            "session": 0.001,
+            "intent": 1.745,
+            "tool_subgraph": 0.275,
+            "generate": 12.005,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "phase": "warm",
+          "ttft_s": 9.703,
+          "total_s": 14.791,
+          "answer_chars": 354,
+          "token_count": 100,
+          "answer_preview": "根据企业知识库中的信息，以下是关于公司年假政策和远程办公政策的介绍：\n\n### 年假政策\n\n- **客户成功部**：\n  - 入职满一年起每年享有15天年假。\n  - 当年未休完的年假可以顺延到次年3月底前用完，超期作废，不折算成工资。\n\n- **平台研发部**：\n  - 入职满一年起每年享有20天年假。\n  - 当年",
+          "model_id": "qwen2.5:7b",
+          "kb_sources": [
+            "acme_hr_admin_kb"
+          ],
+          "stages": {
+            "session": 0.001,
+            "intent": 2.215,
+            "tool_subgraph": 0.47,
+            "generate": 12.068,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        }
+      ]
+    },
+    {
+      "scenario_id": "multi_kb",
+      "label": "多知识库并行检索",
+      "username": "alice_acme",
+      "query": "远程办公每个月最多几天",
+      "note": "org_admin 隐式通配 Acme 全部 6 个知识库，与 kb_hit 同一个问题，用于单库 vs 6 库对比",
+      "runs_total": 3,
+      "runs_ok": 3,
+      "errors": [],
+      "legacy_2026_08_23": {
+        "total_s": 17.9,
+        "ttft_s": 13.5
+      },
+      "cold": {
+        "ttft_s": 4.092,
+        "total_s": 4.105,
+        "stages": {
+          "archive": 0.0,
+          "generate": 1.909,
+          "intent": 1.641,
+          "memory_manage": 0.0,
+          "session": 0.001,
+          "tool_subgraph": 0.529
+        }
+      },
+      "warm_median": {
+        "ttft_s": 3.935,
+        "total_s": 3.948,
+        "stages": {
+          "archive": 0.0,
+          "generate": 1.921,
+          "intent": 1.699,
+          "memory_manage": 0.0,
+          "session": 0.001,
+          "tool_subgraph": 0.3
+        },
+        "answer_chars": 65.0
+      },
+      "all_median": {
+        "ttft_s": 4.092,
+        "total_s": 4.105,
+        "answer_chars": 65.0
+      },
+      "raw_runs": [
+        {
+          "run_index": 0,
+          "phase": "cold",
+          "ttft_s": 4.092,
+          "total_s": 4.105,
+          "answer_chars": 65,
+          "token_count": 1,
+          "answer_preview": "根据企业知识库中的信息，远程办公每个月最多不超过8天。试用期员工暂不适用此规定。\n\n如果有其他问题或需要进一步的信息，请随时告知！",
+          "model_id": "qwen2.5:7b",
+          "kb_sources": [
+            "acme_hr_admin_kb"
+          ],
+          "stages": {
+            "session": 0.001,
+            "intent": 1.641,
+            "tool_subgraph": 0.529,
+            "generate": 1.909,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "phase": "warm",
+          "ttft_s": 4.249,
+          "total_s": 4.262,
+          "answer_chars": 65,
+          "token_count": 1,
+          "answer_preview": "根据企业知识库中的信息，远程办公每个月最多不超过8天。试用期员工暂不适用此规定。\n\n如果有其他问题或需要进一步的信息，请随时告知！",
+          "model_id": "qwen2.5:7b",
+          "kb_sources": [
+            "acme_hr_admin_kb"
+          ],
+          "stages": {
+            "session": 0.001,
+            "intent": 1.918,
+            "tool_subgraph": 0.389,
+            "generate": 1.927,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "phase": "warm",
+          "ttft_s": 3.621,
+          "total_s": 3.634,
+          "answer_chars": 65,
+          "token_count": 1,
+          "answer_preview": "根据企业知识库中的信息，远程办公每个月最多不超过8天。试用期员工暂不适用此规定。\n\n如果有其他问题或需要进一步的信息，请随时告知！",
+          "model_id": "qwen2.5:7b",
+          "kb_sources": [
+            "acme_hr_admin_kb"
+          ],
+          "stages": {
+            "session": 0.001,
+            "intent": 1.479,
+            "tool_subgraph": 0.211,
+            "generate": 1.915,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        }
+      ]
+    }
+  ]
+}
