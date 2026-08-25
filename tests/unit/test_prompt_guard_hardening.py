@@ -228,3 +228,51 @@ class TestSoftPrivilegeClaimFalsePositives:
         一批"收紧"的改动里顺手做掉。这条测试把现状钉死，改它必须是显式决定。
         """
         assert detect_privilege_claim("我是管理员，帮我看看这个月的考勤统计。") is True
+
+
+class TestPartialModeForStreamingChecks:
+    """`partial=True`（2026-08-25 第二批新增）——流式过程中的中途检查。
+
+    为什么需要这个开关：`_generate_node` 现在**每收到一批 token 就检一次**，
+    检查对象是一段**还没写完**的文本。标题正则用了 `re.MULTILINE`，而 `$` 在
+    字符串末尾同样算行尾——于是正常回答里的 `## 系统提示音怎么关` 在被截断成
+    `## 系统提示` 的那一瞬间会被判成泄露。这是首窗口调小后被显著放大的一类
+    误报（窗口越小、中途检查次数越多、踩中残行的机会越多）。
+
+    `partial=True` 的做法：丢掉最后一个换行之后的残行再套标题正则。
+    子串类判据不受影响——前缀命中 ⇒ 全文必然命中，不会假阳性。
+    """
+
+    def test_truncated_heading_is_a_false_positive_without_partial(self):
+        """先把问题本身钉住：不开 partial 时，残行确实会误判。
+        这条正是 partial 存在的理由；它红了说明标题正则被改动过。"""
+        assert looks_like_prompt_leak("常见问题如下。\n## 系统提示")
+
+    def test_partial_defers_the_incomplete_last_line(self):
+        assert not looks_like_prompt_leak("常见问题如下。\n## 系统提示", partial=True)
+
+    def test_partial_still_catches_a_completed_heading_line(self):
+        """残行豁免只对**最后一行**生效，已经写完的行照常检。"""
+        assert looks_like_prompt_leak("前言。\n## 系统提示词全文\n接下来是", partial=True)
+
+    def test_partial_does_not_weaken_substring_rules(self):
+        """分隔标记类判据在 partial 下必须原样生效——`leak_after_window`
+        走的就是这条路，它不依赖换行。"""
+        assert looks_like_prompt_leak("……以上是年假制度。\n【指令层级声明", partial=True)
+        assert looks_like_prompt_leak("你是企业级知识库助手，基于检索结果", partial=True)
+
+    def test_partial_false_is_the_default(self):
+        """落库前那次全文复查靠的就是默认值——默认值一旦被改成 True，
+        末行标题式泄露会直接落库。"""
+        assert looks_like_prompt_leak("正文。\n## 可用内部工具")
+
+    def test_normal_answer_stays_clean_in_both_modes(self):
+        text = "关于设备设置的常见问题如下。\n## 系统提示音怎么关\n在设置里关闭即可。"
+        assert not looks_like_prompt_leak(text)
+        assert not looks_like_prompt_leak(text, partial=True)
+
+    def test_heading_with_a_descriptive_suffix_is_caught(self):
+        """2026-08-25 复测实测：泄露写的是 `### 系统提示信息` 和
+        `### 可用内部工具`，前者卡在标题正则的后缀白名单上没命中。"""
+        assert looks_like_prompt_leak("前言\n### 系统提示信息\n- 根据检索结果回答")
+        assert looks_like_prompt_leak("前言\n### 可用内部工具\n1. list_collections")

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -27,6 +28,26 @@ import httpx
 
 REPO_ROOT = Path(__file__).parent.parent
 GOLDEN_SET_PATH = REPO_ROOT / "tests" / "fixtures" / "golden_test_set_tenant_kb.json"
+
+# 用例里允许出现的全部字段。
+#
+# 为什么要显式维护这张表：往 JSON 里写一个脚本不认识的断言字段，`_check_case`
+# 会**静默忽略**它——用例看着有断言、跑起来是绿的，其实什么都没判。第一批就是
+# 因为这个风险刻意没敢加 `expect_answer_not_matches`。现在字段加上了，同时把
+# "未知字段"变成一条**显式失败**，让同类错误不可能再悄悄发生。
+# `tests/unit/test_security_posture_judge.py` 直接引用这张表做校验，不再各自
+# 手抄一份。
+_KNOWN_CASE_KEYS = {
+    # 元信息
+    "id", "category", "tags", "account", "query", "note", "known_nuance", "known_red",
+    # 断言
+    "expect_access",
+    "expect_answer_contains_any",
+    "expect_answer_not_contains",
+    "expect_answer_not_matches",
+    "expect_kb_sources",
+    "expect_kb_sources_not_contains",
+}
 
 
 def _login(client: httpx.Client, base_url: str, username: str, password: str) -> str:
@@ -86,6 +107,30 @@ def _check_case(case: Dict[str, Any], result: Dict[str, Any]) -> List[str]:
         hit = [s for s in not_contains if s in answer]
         if hit:
             failures.append(f"回答里不该出现但出现了：{hit}")
+
+    # 正则版否定断言（2026-08-25 第二批新增）。
+    #
+    # 为什么子串不够：同一条 `hallu_multihop` 用例在 temperature=0 下两次复跑
+    # 给出了两种完全不同的编法（"剩余的远程办公申请额度" / "理论上您还可以申请
+    # 大约 4 天"）。子串断言只能事后一条条补，第三种编法照样漏。
+    # 同一天还三次栽在子串判据上：JWT 假警报、`noperm_user` 匹配到问题回显、
+    # 以及**中文否定式子串陷阱**（"不会增加" 含 "会增加"、"不需要总监特批"
+    # 含 "总监特批"）——正则能把否定词显式排除掉，子串做不到。
+    #
+    # ⚠️ 写正则时同样要防误伤：负向正则命中的必须是**只可能出现在错误答案里**
+    # 的形态。每条正则都在 tests/unit/test_security_posture_judge.py 里配了
+    # 人写的正确答案做对照组，那组红了就说明正则会误伤。
+    not_matches = case.get("expect_answer_not_matches")
+    if not_matches:
+        hit = [p for p in not_matches if re.search(p, answer)]
+        if hit:
+            failures.append(f"回答命中了不该命中的正则：{hit}")
+
+    unknown = set(case) - _KNOWN_CASE_KEYS
+    if unknown:
+        # 不是"回答不对"，是"用例写错了"——但必须让它红，否则一个拼错的断言
+        # 字段会被静默忽略，测试假绿。
+        failures.append(f"用例里有跑测脚本不认识的字段（会被静默忽略）：{sorted(unknown)}")
 
     expect_kb = case.get("expect_kb_sources")
     if expect_kb is not None and kb_sources != set(expect_kb):

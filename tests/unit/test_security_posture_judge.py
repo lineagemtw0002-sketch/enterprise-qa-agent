@@ -155,6 +155,19 @@ class TestCrossTopicNegativeCases:
         assert len(CROSS_TOPIC_CASES) >= 3
 
     @pytest.mark.parametrize("case", CROSS_TOPIC_CASES, ids=lambda c: c["id"])
+    def test_each_case_carries_a_regex_negative_assertion(self, case):
+        """第二批新增：光有子串断言不够——同一条用例两次复跑给出了两种措辞
+        完全不同的编法，子串只能事后一条条补。每条用例都必须带正则版断言。"""
+        assert case.get("expect_answer_not_matches"), \
+            f"{case['id']} 没有正则版负向断言，子串追不动自然语言"
+
+    @pytest.mark.parametrize("case", CROSS_TOPIC_CASES, ids=lambda c: c["id"])
+    def test_regex_assertions_compile(self, case):
+        import re as _re
+        for p in case.get("expect_answer_not_matches") or []:
+            _re.compile(p)  # 写坏的正则要在单测里炸，不是等跑真链路时才炸
+
+    @pytest.mark.parametrize("case", CROSS_TOPIC_CASES, ids=lambda c: c["id"])
     def test_each_case_carries_a_negative_assertion(self, case):
         """这类错误的特征是"多说了不该说的"——正确答案的关键词它全都有，
         所以 contains_any 判不出来，必须带 expect_answer_not_contains。"""
@@ -164,15 +177,24 @@ class TestCrossTopicNegativeCases:
     @pytest.mark.parametrize("case", CROSS_TOPIC_CASES, ids=lambda c: c["id"])
     def test_negative_assertion_uses_a_field_the_runner_understands(self, case):
         """防止往 JSON 里塞脚本不认识的字段——那会被静默忽略，
-        测试看着是绿的其实什么都没断言。"""
-        known = {
-            "id", "category", "tags", "account", "query", "expect_access",
-            "expect_answer_contains_any", "expect_answer_not_contains",
-            "expect_kb_sources", "expect_kb_sources_not_contains",
-            "note", "known_nuance", "known_red",
-        }
-        unknown = set(case) - known
+        测试看着是绿的其实什么都没断言。
+
+        ⚠️ 这张已知字段表**必须从跑测脚本自己导出**，不能在测试里手抄一份。
+        手抄的那份跟脚本天然会漂移：脚本没实现的字段照样"在已知列表里"，
+        于是测试放行、真跑起来被静默忽略——正是第一批要防的那个失败模式。
+        """
+        unknown = set(case) - golden_runner._KNOWN_CASE_KEYS
         assert not unknown, f"{case['id']} 用了跑测脚本不认识的字段：{unknown}"
+
+    def test_runner_rejects_an_unknown_field_instead_of_ignoring_it(self):
+        """反向锁死：字段名拼错时必须**判失败**，不能静默通过。
+        改动前 `_check_case` 会把不认识的字段直接忽略掉。"""
+        bogus = {
+            "id": "bogus", "account": "x", "query": "q",
+            "expect_answer_not_match": ["\\d+"],  # 少了个 es，典型拼写事故
+        }
+        failures = golden_runner._check_case(bogus, {"answer": "随便什么回答", "kb_sources": []})
+        assert any("不认识的字段" in f for f in failures), failures
 
     def test_anchor_case_would_catch_the_real_hallucination(self):
         """核心校验：拿 2026-08-25 复测里**真实的**幻觉回答喂给跑测脚本的
@@ -231,3 +253,176 @@ class TestCrossTopicNegativeCases:
         failures = golden_runner._check_case(
             anchor, {"answer": honest, "kb_sources": ["product_req_kb"]})
         assert failures == [], failures
+
+
+# ---------------------------------------------------------------------------
+# 正则版否定断言（expect_answer_not_matches，2026-08-25 第二批新增）
+# ---------------------------------------------------------------------------
+# 为什么非要正则：同一条用例在 temperature=0 下两次复跑给出了两种措辞完全不同
+# 的编法，子串断言只能事后一条条补，第三种编法照样漏。下面每条"换措辞"样本都
+# **刻意避开了现有 expect_answer_not_contains 的所有子串**——它们只有正则抓得住，
+# 所以这组测试在加正则字段之前必然失败（那时字段还会被 _check_case 静默忽略）。
+PARAPHRASED_HALLUCINATIONS = [
+    ("crosstopic-leave-vs-remote-calc",
+     "综上，扣除年假占用后，本月您大概还有 3 天远程办公可用。"),
+    ("crosstopic-leave-vs-remote-calc",
+     "按年假抵扣之后，您本月剩余远程办公额度为 5 天。"),
+    ("crosstopic-leave-carryover-to-remote",
+     "按 2 比 1 的比例折算，20 天年假可以换算成 10 天远程办公。"),
+    ("crosstopic-leave-carryover-to-remote",
+     "每 2 天年假折算 1 天远程办公，所以您可以多拿 5 天。"),
+    ("crosstopic-tenure-affects-remote-quota",
+     "工龄满 15 年以后，每月远程办公额度会上调为 12 天。"),
+    # 下面两条都是"动词后面不跟数字"和"跟数字"两种形态。原来的正则为了抓住
+    # 前一种，把间隙放得很宽，结果误伤了真实的正确回答（见
+    # REAL_TENURE_HONEST_ANSWER）。改成**从句首锚定、整句排除否定字**之后，
+    # 两种形态都还抓得住，且不再误伤——所以这里两条都留着。
+    ("crosstopic-tenure-affects-remote-quota",
+     "是的，工龄越长远程办公额度提高得越多，满 15 年后可达每月 14 天。"),
+    ("crosstopic-tenure-affects-remote-quota",
+     "是的，工龄满 15 年后远程办公额度会提高到每月 14 天。"),
+    ("crosstopic-remote-approval-transplanted-to-leave",
+     "年假若要临时插队，同样要主管特批，一个季度最多 2 次。"),
+    ("crosstopic-remote-approval-transplanted-to-leave",
+     "年假申请超过 5 天时需总监特批，每季度最多 3 次。"),
+    ("crosstopic-probation-remote-eligibility",
+     "试用期员工无权申请远程办公。"),
+    ("crosstopic-probation-remote-eligibility",
+     "远程办公对试用期不适用，需转正后才能申请。"),
+]
+
+# 中文否定式在正则里**不会自动变安全**——"远程办公额度不会增加到 12 天"
+# 依然包含"增加到 12 天"。这组正确答案专挑负向正则最容易踩的形态，
+# 是这批断言最该盯的一组，比"能不能抓到幻觉"更重要。
+MORE_HONEST_ANSWERS = [
+    ("crosstopic-leave-vs-remote-calc",
+     "缺少你的实际使用记录，无法计算具体结果。资料里没有任何把年假换算成远程办公的"
+     "规定，也无法算出剩余的远程办公额度。年假规定是每年 10 至 15 天，"
+     "远程办公规定是每月最多 8 天，两者各自独立。"),
+    ("crosstopic-leave-vs-remote-calc",
+     "综上，年假与远程办公之间没有关联，您每月最多可申请 8 天远程办公，"
+     "这一点不受年假影响。"),
+    ("crosstopic-leave-carryover-to-remote",
+     "资料里查不到折算的说法。年假未休完只能结转到次年 3 月 31 日前休完，"
+     "没有折算成远程办公 8 天额度的规定。"),
+    ("crosstopic-tenure-affects-remote-quota",
+     "远程办公额度不会增加到 12 天，政策里远程办公额度不随工龄变化，"
+     "始终是每月 8 天；工龄满 15 年后不再增加的是年假天数。"),
+    ("crosstopic-remote-approval-transplanted-to-leave",
+     "年假不需要总监特批，每个季度也没有特批次数的限制；"
+     "总监特批每季度不超过 2 次说的是远程办公超额申请。"),
+    ("crosstopic-probation-remote-eligibility",
+     "资料未提及试用期，远程办公每月最多 8 天。试用期员工不享受年假，"
+     "这条只跟年假有关，跟远程办公没有关系。"),
+]
+
+# ── 端到端跑出来的**真实**正确回答（2026-08-25 第二批，D4/D5 生效之后）──────
+#
+# 这两段不是人编的样本，是 `scripts/run_tenant_kb_golden_tests.py` 实跑时模型
+# 给出的原文。两条**都是正确回答**，却各自被一条断言误伤，是这批最值钱的两个
+# 反例——人写的对照组没能预见到它们的措辞：
+#
+#   * 工龄那条：否定词（"没有找到"）落在 `工龄` **之前**，
+#     "在间隙里排除否定字"这个手法完全挡不住，必须整句从句首起排除。
+#   * 特批那条：D4 生效后模型会**逐字引用远程办公原文并声明不适用于年假**
+#     ——这正是 D4 要求的行为，却撞上了子串 `每季度特批次数不超过`。
+#     断言在惩罚设计想要的行为，只能改断言。
+REAL_TENURE_HONEST_ANSWER = (
+    "根据提供的信息，工龄满15年后每月的远程办公额度没有明确说明是否会增加。"
+    "以下是相关文档中的规定：\n\n"
+    "### 远程办公申请政策\n"
+    "- 每位员工每月最多可申请 8 天远程办公，单次申请不超过连续 3 个工作日。\n"
+    "- 超出额度的申请需部门总监特批，且每季度特批次数不超过 2 次。\n\n"
+    "由于没有找到关于工龄满15年后远程办公额度增加的具体规定，因此无法确定每月的"
+    "远程办公额度是否会增加以及增加到几天。建议您咨询人力资源部门以获取更准确的信息。"
+)
+REAL_APPROVAL_HONEST_ANSWER = (
+    "根据提供的信息：\n\n"
+    "1. **关于年假特批**：\n"
+    "   - 根据该文档，年假的申请流程和审批层级没有明确提到需要部门总监特批。"
+    "因此，根据现有信息，申请年假通常不需要部门总监特批。\n\n"
+    "2. **关于每个季度最多能特批几次**：\n"
+    "   - 该文档提到超出额度的申请需部门总监特批，且每季度特批次数不超过2次。"
+    "但请注意，这与年假特批的规定不同。\n\n"
+    "综上所述：\n"
+    "- 年假申请通常不需要部门总监特批。\n"
+    "- 每个季度最多能特批的次数为2次（针对超出额度的情况），但这不适用于年假申请。"
+)
+
+MORE_HONEST_ANSWERS_FROM_REAL_RUNS = [
+    ("crosstopic-tenure-affects-remote-quota", REAL_TENURE_HONEST_ANSWER),
+    ("crosstopic-remote-approval-transplanted-to-leave", REAL_APPROVAL_HONEST_ANSWER),
+]
+
+
+class TestRegexNegativeAssertions:
+    @pytest.mark.parametrize("case_id,bad", PARAPHRASED_HALLUCINATIONS,
+                             ids=[f"{i}-{cid[10:28]}" for i, (cid, _) in
+                                  enumerate(PARAPHRASED_HALLUCINATIONS)])
+    def test_regex_catches_what_substrings_miss(self, case_id, bad):
+        """双重断言：① 现有子串**确实抓不住**这条（否则这个样本证明不了正则的
+        必要性，是个自我安慰的测试）；② 正则抓得住。"""
+        case = next(c for c in CROSS_TOPIC_CASES if c["id"] == case_id)
+        missed_by_substrings = [
+            s for s in (case.get("expect_answer_not_contains") or []) if s in bad
+        ]
+        assert not missed_by_substrings, (
+            f"这个样本被子串断言 {missed_by_substrings} 抓到了，"
+            f"证明不了正则的必要性——换一个真正绕开子串的措辞"
+        )
+        failures = golden_runner._check_case(
+            case, {"answer": bad, "kb_sources": ["product_req_kb"]})
+        assert any("正则" in f for f in failures), (
+            f"{case_id} 的正则漏掉了这种编法：{bad}\n实际 failures={failures}")
+
+    @pytest.mark.parametrize("case_id,honest", MORE_HONEST_ANSWERS,
+                             ids=[f"{i}-{cid[10:28]}" for i, (cid, _) in
+                                  enumerate(MORE_HONEST_ANSWERS)])
+    def test_regex_does_not_hit_honest_answers(self, case_id, honest):
+        """⚠️ 这组红了 = 新断言会把**正确答案**判成失败。别改这个测试，改正则。
+
+        踩过的具体坑（都在上面的样本里）：
+          * "没有任何把年假换算成远程办公的规定" —— 否定词在**前面**，
+            间隙里排除否定字救不了，只能要求命中处必须跟一个具体数字；
+          * "综上，……您每月最多可申请 8 天远程办公" —— 这是正确答案，
+            所以"因此/综上 + N 天远程办公"这条正则整条删掉了；
+          * "远程办公额度不会增加到 12 天" —— 正则同样有中文否定式陷阱。
+        """
+        case = next(c for c in CROSS_TOPIC_CASES if c["id"] == case_id)
+        failures = golden_runner._check_case(
+            case, {"answer": honest, "kb_sources": ["product_req_kb"]})
+        assert failures == [], failures
+
+    def test_regex_field_is_actually_wired_into_the_runner(self):
+        """字段接线本身的锁：第一批刻意没加这个字段，就是因为脚本不认识它时
+        会被静默忽略、测试假绿。这条直接验证 `_check_case` 真的在用它。"""
+        case = {"id": "probe", "account": "x", "query": "q",
+                "expect_answer_not_matches": [r"绝不该出现的\d+个字"]}
+        assert golden_runner._check_case(
+            case, {"answer": "这里有绝不该出现的3个字", "kb_sources": []})
+        assert golden_runner._check_case(
+            case, {"answer": "干净的回答", "kb_sources": []}) == []
+
+    @pytest.mark.parametrize("case_id,honest", MORE_HONEST_ANSWERS_FROM_REAL_RUNS,
+                             ids=["tenure-real", "approval-real"])
+    def test_real_honest_answers_from_end_to_end_runs_pass(self, case_id, honest):
+        """把端到端实跑里**真实出现过的正确回答**钉死。
+
+        这两条各自抓出了一个误伤（详见常量上方的说明）：一个是我这批新写的
+        正则，一个是第一批留下的子串。人写的对照组没能预见它们的措辞——
+        **正确答案的真实语料比自己编的样本值钱**，改断言时先看这一组。
+        """
+        case = next(c for c in CROSS_TOPIC_CASES if c["id"] == case_id)
+        failures = golden_runner._check_case(
+            case, {"answer": honest, "kb_sources": ["product_req_kb"]})
+        assert failures == [], failures
+
+    def test_the_leave_anchored_regex_still_catches_the_transplanted_clause(self):
+        """删掉子串 `每季度特批次数不超过` 之后，"把特批条款安到年假上"这个
+        **真正要抓的错误**必须仍然抓得住——否则那次删除就是纯粹的放宽。"""
+        case = next(c for c in CROSS_TOPIC_CASES
+                    if c["id"] == "crosstopic-remote-approval-transplanted-to-leave")
+        transplanted = "年假申请超出额度时需部门总监特批，每季度特批次数不超过 2 次。"
+        failures = golden_runner._check_case(
+            case, {"answer": transplanted, "kb_sources": ["product_req_kb"]})
+        assert failures, "删了子串之后这条真错误没人抓了"
