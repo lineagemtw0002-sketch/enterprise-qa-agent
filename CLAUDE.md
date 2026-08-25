@@ -189,6 +189,7 @@ ChromaDB（向量）· 本地 Ollama 提供模型
 
 | 文档 | 内容 |
 |---|---|
+| `docs/scale_slo_and_priorities.md` | **万人规模下的最小 SLO 与优先级重估（提案，待确认）**：<br>容量测算、最小 SLO、27+1 条审计发现的重新分级。<br>**审计报告的 P0/P1/P2 请以本文的重估为准，不要直接沿用旧排序** |
 | `docs/orchestration_design.md` | **编排层设计（草案，未实施）**：并行编排与思维错乱防护 + 记忆/归档异步化。<br>合并自 `parallel_reasoning_design.md` 与 `memory_manage_async_decouple_design.md`，<br>那两份已标记为被取代，**不要按它们改代码** |
 | `docs/collaboration_retrospective.md` | 协作复盘：问题清单、改进指南、自查清单 |
 | `docs/review_2026-08-24/review_codebase_findings.md` | 代码审计：2 P0 / 16 P1 / 9 P2，带行号证据 |
