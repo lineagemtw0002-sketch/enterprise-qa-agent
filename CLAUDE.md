@@ -220,7 +220,7 @@ flowchart TB
 
 ### 🟠 P1
 
-- 🟡 **闲聊路由误判：81% → 0%（但只覆盖"可枚举的寒暄"，不是结构性解决）**
+- 🟡 **闲聊路由误判：81% → 0%（但只覆盖"可枚举的寒暄"，不是结构性解决）** ⏸ **结构性方案已设计但搁置**，见 `docs/chitchat_intent_design.md`，需用户明确启动，不要主动开工
   （2026-08-25 修复，`intent.py` 的 `_match_chitchat_intent`；
   复现/度量脚本 `scripts/verify_smalltalk_routing.py`，
   回归测试 `tests/unit/test_intent_chitchat_routing.py`；
