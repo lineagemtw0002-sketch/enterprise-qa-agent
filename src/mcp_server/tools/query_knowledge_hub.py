@@ -319,11 +319,23 @@ class QueryKnowledgeHubTool:
         它，而不是摊派给"服务启动"这个所有用户都不会感知到的阶段。
 
         `_ensure_shared_clients()` 建好 embedding_client/reranker 两个对象后，
-        这里再额外发一次真实的 embedding 调用（Ollama 的 nomic-embed-text）——
-        只建 client 对象不够，Ollama 那边的模型本身也有独立的冷启动（同一次
-        排查里 embed_query 这一步从 587ms 降到 27ms，降的就是这个），只有
-        真的调用一次才能把它也预热到位。查询文本随便传一个占位符即可，这次
-        调用的结果不使用，只为了触发模型加载。
+        这里再额外发一次真实调用（不只是建对象），两个都要跑，理由不完全
+        一样：
+        1. **embedding_client**：Ollama 那边的 embedding 模型本身也有独立的
+           冷启动（同一次排查里 embed_query 这一步从 587ms 降到 27ms，降的
+           就是这个），只建 client 对象不会触发它加载，必须真的调一次。
+        2. **reranker**：这是后来又发现的第二层、更小的冷启动——权重加载
+           好了不代表"针对某个具体输入形状的计算图"也编译好了，本地跑的是
+           PyTorch MPS（Metal GPU）后端，**第一次真正调用推理**时还要为这
+           个输入形状现场编译一次计算核心，实测同一批候选、同一个进程内，
+           第一次调用 573ms、第二次只要 32ms，差了将近 20 倍。只创建
+           reranker 对象（`_ensure_shared_clients`）不会触发这层编译，必须
+           真的跑一次 `rerank()`（而不是空转），且候选数量要 ≥ 2——
+           `CoreReranker.rerank()` 对 0/1 条候选有专门的短路分支，根本不会
+           进真正的 cross-encoder 推理，预热不到点上。
+
+        查询文本/候选内容随便传占位符即可，这次调用的结果不使用，只为了
+        触发这两层各自的模型加载/计算图编译。
 
         调用方（app.py lifespan）需要对每一个真实持有的 `QueryKnowledgeHubTool`
         实例都单独调一次——`self._reranker`/`self._embedding_client` 是实例
@@ -334,6 +346,16 @@ class QueryKnowledgeHubTool:
             await asyncio.to_thread(self._embedding_client.embed, ["预热"])
         except Exception as e:
             logger.warning(f"[Preload] embedding warm-up call failed (non-fatal): {e}")
+
+        if self._reranker is not None and self._reranker.is_enabled:
+            try:
+                dummy = [
+                    RetrievalResult(chunk_id="preload_1", score=0.0, text="预热占位文本一"),
+                    RetrievalResult(chunk_id="preload_2", score=0.0, text="预热占位文本二"),
+                ]
+                await asyncio.to_thread(self._reranker.rerank, "预热", dummy, 2)
+            except Exception as e:
+                logger.warning(f"[Preload] reranker warm-up call failed (non-fatal): {e}")
 
     def _build_hybrid_search_for(self, collection: str) -> "HybridSearch":
         """为单个 collection 现建一个独立的 HybridSearch 实例，不读也不写
