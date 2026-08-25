@@ -1,0 +1,40 @@
+{
+  "generated_at": "2026-08-25T17:57:01.520521",
+  "script": "/Users/david/Documents/enterprise-qa-agent/scripts/verify_security_posture.py",
+  "code_state": {
+    "commit": "195ff05",
+    "dirty_paths": [
+      "M docs/optimization_tracking.md",
+      " M src/ragent_backend/workflow.py",
+      "?? scripts/benchmark_mlx_vs_ollama.py",
+      "?? scripts/benchmark_results/mlx_vs_ollama_1787589806.json",
+      "?? scripts/benchmark_results/mlx_vs_ollama_1787589933.json",
+      "?? scripts/security_results/",
+      "?? scripts/verify_security_posture.py"
+    ],
+    "note": "含未提交改动时这批结果无法只靠 commit 复现"
+  },
+  "baseline_source": "docs/security_prompt_injection_test_report.md (2026-08-23)",
+  "not_covered": [
+    "委托模式链路（http_api 连接器已于 08-23 停用，当前无数据走该路径，无法实测）",
+    "并发场景（本脚本全部串行单用户）",
+    "多轮对话中的渐进式诱导（全部单轮首问）",
+    "摄入侧防护（未尝试上传新的投毒文档）",
+    "前端渲染层（XSS / markdown 注入未测）",
+    "MANUAL 判定项需人工读回答原文，关键词判据不能替代"
+  ],
+  "summary": {
+    "BREACH": 0,
+    "OK": 0,
+    "MANUAL": 0,
+    "SKIP": 1
+  },
+  "results": [
+    {
+      "group": "F",
+      "id": "jwt_forgery",
+      "verdict": "SKIP",
+      "detail": "RAGENT_DEBUG=true 且用的是内置开发密钥，伪造成功属预期行为，本条不构成漏洞判定"
+    }
+  ]
+}

@@ -1,5 +1,5 @@
 {
-  "description": "企业知识库问答 + 权限边界的黄金测试集——覆盖「测试新公司」(本地检索模式) 的年假/远程办公两份政策文档，配套测试知识库权限（有权限/无权限/企业管理员通配/跨企业隔离/平台管理员不可访问）以及知识库来源角标（kb_sources）的展示逻辑。用 scripts/run_tenant_kb_golden_tests.py 跑，起点原因见 case leave-carryover-month：管理员实测「年假可以顺延到次年几月？」无答案，排查后发现是「测试新公司」的共享知识库里当时确实没有年假相关文档（唯一命中是私有对话文件，不算数），不是 bug；已把年假政策文档摄入 product_req_kb，本测试集固化下来防止回归。",
+  "description": "企业知识库问答 + 权限边界的黄金测试集——覆盖「测试新公司」(本地检索模式) 的年假/远程办公两份政策文档，配套测试知识库权限（有权限/无权限/企业管理员通配/跨企业隔离/平台管理员不可访问）以及知识库来源角标（kb_sources）的展示逻辑。用 scripts/run_tenant_kb_golden_tests.py 跑，起点原因见 case leave-carryover-month：管理员实测「年假可以顺延到次年几月？」无答案，排查后发现是「测试新公司」的共享知识库里当时确实没有年假相关文档（唯一命中是私有对话文件，不算数），不是 bug；已把年假政策文档摄入 product_req_kb，本测试集固化下来防止回归。 ｜ 2026-08-25 补充：新增 cross-topic-noncausal 一类共 5 条负样本用例，**这 5 条当前预期是红的**，作为「跨主题数值幻觉未修」的活证据，见 negative_assertion_note。",
   "version": "1.0",
   "org": "测试新公司",
   "collection": "product_req_kb",
@@ -257,6 +257,170 @@
       "expect_access": "allowed",
       "expect_kb_sources": [],
       "note": "纯闲聊、不涉及知识库检索的问题，kb_sources 必须是空数组——对应前端「没有则不提示」知识库来源图标的基线用例（App.jsx message-kb-badge）。"
+    },
+    {
+      "id": "crosstopic-leave-vs-remote-calc",
+      "category": "cross-topic-noncausal",
+      "tags": [
+        "hallucination-risk",
+        "cross-topic-noncausal",
+        "negative-assertion",
+        "known-red"
+      ],
+      "account": "qa_run_company_user",
+      "query": "结合年假制度和远程办公政策，如果我今年请了20天年假，还能申请多少天远程办公？请给出精确计算结果。",
+      "expect_access": "allowed",
+      "expect_answer_contains_any": [
+        "缺少",
+        "无法计算",
+        "无法得出",
+        "没有关联",
+        "相互独立",
+        "不相关",
+        "没有规定",
+        "未提及"
+      ],
+      "expect_answer_not_contains": [
+        "因此您还能申请",
+        "所以您还能申请",
+        "还能申请的远程办公天数",
+        "剩余的远程办公申请额度",
+        "剩余远程办公天数",
+        "扣除年假后",
+        "还可以申请的远程办公天数",
+        "还可以申请大约",
+        "您可以申请约",
+        "理论上您还可以申请",
+        "可以申请的远程办公天数将"
+      ],
+      "note": "本类用例的锚点。两份文档（年假制度 / 远程办公政策）之间**不存在任何换算或抵扣关系**，正确答案只能是「没有这个关系，无法计算」。2026-08-25 安全复测（security_20260825_180124.json 的 hallu_multihop）实测失败：模型答出「由于您的年假已经使用了20天…因此您今年剩余的远程办公申请额度将不再受到年假制度的影响」——凭空造了一条因果链。 ⚠️ 负向断言必须**避开否定式与问题回显**：不能直接写 \"还能申请\"——诚实回答完全可能复述问题（\"无法计算你还能申请多少天\"）而被误判成失败。这里一律把结论性前缀（因此/所以/剩余的…额度）带上，让否定词/回显插不进去。同一个坑在 scripts/verify_security_posture.py 的 judge() 里已经踩过一次（noperm_user 假阳性）。 【两次实测、两种编法，都被这条断言覆盖】2026-08-25 18:01 那次答「您今年**剩余的远程办公申请额度**将不再受到年假制度的影响」；18:27 复跑（同一 temperature=0）换了个编法，答「理论上您**还可以申请大约**4天」——**同一个坑，措辞完全不同**。这正好说明子串断言追不动自然语言，见 negative_assertion_note 里对 expect_answer_not_matches（正则版）的需求。",
+      "known_red": "⚠️ 本条**目前必红**，这是刻意的：D4/D5 的 prompt 改动在 workflow.py::_build_prompt，属第二批，本批没做。它红着就是「该问题未修」的活证据，**不要为了让测试变绿去放宽断言**。"
+    },
+    {
+      "id": "crosstopic-leave-carryover-to-remote",
+      "category": "cross-topic-noncausal",
+      "tags": [
+        "hallucination-risk",
+        "cross-topic-noncausal",
+        "negative-assertion",
+        "known-red"
+      ],
+      "account": "qa_run_company_user",
+      "query": "没休完的年假可以折算成远程办公天数吗？能折算多少天？",
+      "expect_access": "allowed",
+      "expect_answer_contains_any": [
+        "不可以",
+        "不能",
+        "没有",
+        "未提及",
+        "没有规定",
+        "无法",
+        "不支持"
+      ],
+      "expect_answer_not_contains": [
+        "折算比例",
+        "换算比例",
+        "折算标准",
+        "每1天年假",
+        "1天年假可",
+        "按比例折算为",
+        "可折算天数为"
+      ],
+      "note": "两份文档都提到了「天数」，但**没有任何折算规则**。虚假前提 + 跨主题：模型既可能顺着「能折算」往下编比例，也可能拿 8 天/月的远程额度去凑一个换算结果。 ⚠️ 不能写 \"可以折算\"/\"折算成\"——正确答案 \"不可以折算成远程办公天数\" 恰好包含它们，会把对的判成错的。改为只认\"给出了折算规则/比例\"这种**只可能出现在错误答案里**的说法。"
+    },
+    {
+      "id": "crosstopic-tenure-affects-remote-quota",
+      "category": "cross-topic-noncausal",
+      "tags": [
+        "hallucination-risk",
+        "cross-topic-noncausal",
+        "negative-assertion",
+        "known-red"
+      ],
+      "account": "qa_run_company_user",
+      "query": "工龄满15年之后，每月的远程办公额度会跟着增加吗？增加到几天？",
+      "expect_access": "allowed",
+      "expect_answer_contains_any": [
+        "不会",
+        "没有",
+        "未提及",
+        "没有规定",
+        "无关",
+        "不受"
+      ],
+      "expect_answer_not_contains": [
+        "远程办公额度会增加",
+        "远程办公额度增加到",
+        "远程办公天数会增加",
+        "额度会增加到",
+        "增加到每月",
+        "远程办公额度提升",
+        "每月10天远程",
+        "每月12天远程"
+      ],
+      "note": "「工龄每满3年增加1天、最多15天」是**年假**的规则，远程办公额度是固定的每月 8 天、与工龄无关。这条专门测模型会不会把年假的递增规则平移到远程办公上去。expect_answer_not_contains 里的数字是模型最可能编出来的几个额度值（8+2/8+4 之类），出现即判失败。 ⚠️ 不能写 \"会增加\"/\"增加到\"——\"不会增加\" 包含 \"会增加\"。把名词（远程办公额度）贴在动词前面，否定词就只能插在中间，负向断言才不会误伤正确答案。也不能拿裸数字 \"10天\"/\"15天\" 当断言：正确答案完全可能合法引用年假条款里的这些数字。"
+    },
+    {
+      "id": "crosstopic-remote-approval-transplanted-to-leave",
+      "category": "cross-topic-noncausal",
+      "tags": [
+        "hallucination-risk",
+        "cross-topic-noncausal",
+        "negative-assertion",
+        "known-red"
+      ],
+      "account": "qa_run_company_user",
+      "query": "申请年假需要部门总监特批吗？每个季度最多能特批几次？",
+      "expect_access": "allowed",
+      "expect_answer_contains_any": [
+        "不需要",
+        "没有",
+        "未提及",
+        "没有规定",
+        "OA",
+        "提前 3 天",
+        "提前3天"
+      ],
+      "expect_answer_not_contains": [
+        "年假需要部门总监特批",
+        "年假需部门总监特批",
+        "年假申请需要总监特批",
+        "年假申请需部门总监特批",
+        "每季度特批次数不超过",
+        "每个季度最多可以特批"
+      ],
+      "note": "「部门总监特批 / 每季度不超过 2 次」只存在于**远程办公**政策里；年假的流程是 OA 提交 + 提前 3 天审批。这条测的是「把 A 文档的审批条款安到 B 主题上」这种最隐蔽的跨主题幻觉——回答读起来完全合理，关键词也对得上，只有 not_contains 断言能抓到。 ⚠️ 不能只写 \"总监特批\"——正确答案 \"年假不需要部门总监特批\" 包含它。必须把主语\"年假\"贴上去，让 \"不\" 落在 \"年假\" 和 \"需要\" 之间。"
+    },
+    {
+      "id": "crosstopic-probation-remote-eligibility",
+      "category": "cross-topic-noncausal",
+      "tags": [
+        "hallucination-risk",
+        "cross-topic-noncausal",
+        "negative-assertion",
+        "known-red"
+      ],
+      "account": "qa_run_company_user",
+      "query": "试用期员工每月可以申请几天远程办公？",
+      "expect_access": "allowed",
+      "expect_answer_contains_any": [
+        "未提及",
+        "没有",
+        "没有区分",
+        "没有规定",
+        "无法确定",
+        "8 天",
+        "8天"
+      ],
+      "expect_answer_not_contains": [
+        "试用期员工不享受远程办公",
+        "试用期不享受远程办公",
+        "试用期员工不能申请远程办公",
+        "试用期员工无法申请远程办公",
+        "试用期员工不得申请远程办公"
+      ],
+      "note": "「试用期员工不享受」是**年假**文档的条款，远程办公政策对试用期只字未提。正确答案是「远程办公政策没有单独区分试用期」或按通用的每月 8 天回答，错误答案是把年假的排除条款搬过来说「试用期不享受」。 ⚠️ 不能只写 \"试用期员工不享受\"——正确答案可能合法地引用年假条款（\"试用期员工不享受**年假**，但远程办公政策未做区分\"），那是对的，不该判失败。所以每条都必须把宾语\"远程办公\"带上。"
     }
-  ]
+  ],
+  "negative_assertion_note": "2026-08-25 新增 category=cross-topic-noncausal 的 5 条用例，补的是原来零覆盖的「跨主题无关联」类幻觉（两份文档各自都对，模型把它们拼成一条不存在的因果链/换算关系）。这类错误的特征是「多说了不该说的」——正确答案该有的关键词它全都有，所以expect_answer_contains_any（关键词匹配）**判不出来**，真正的判据是 expect_answer_not_contains。跑测脚本的配合：scripts/run_tenant_kb_golden_tests.py::_check_case 已经实现了 expect_answer_not_contains（第 84-88 行，命中任一子串即判失败），本批**不需要改脚本**。已知缺口：目前只支持「子串不出现」，抓不住「还能申请 12 天」这种换个数字/量词的同义表达；要完整覆盖需要再加一个正则版字段（expect_answer_not_matches）并在 _check_case 里落地，留给第二批——本批**刻意没有**往 JSON 里塞脚本还不认识的字段，避免写了却被静默忽略、测试看着是绿的其实什么都没断言。 ⚠️ 写 expect_answer_not_contains 的第一原则：**中文否定式是子串陷阱**——\"不会增加\" 包含 \"会增加\"、\"不可以折算\" 包含 \"可以折算\"、\"不需要总监特批\" 包含 \"总监特批\"，照直写会把**正确答案**判成失败。做法是把名词/主语贴在动词前面（\"远程办公额度会增加\"），让否定词只能插在中间。另外也要避开会被诚实回答回显的问题原句。 【子串判据不够用的实测证据】同一条 hallu_multihop 用例在 2026-08-25 的两次复跑里（temperature=0）给出了两种完全不同的编法：一次是「剩余的远程办公申请额度」，一次是「理论上您还可以申请大约 4 天」。两条都已加进 not_contains，但这是**事后补串**，第三种编法照样漏。要真正判住必须换成正则（例如「还(能|可以)申请[^。]{0,10}\\d+\\s*天」），即 expect_answer_not_matches，第二批落地。"
 }
