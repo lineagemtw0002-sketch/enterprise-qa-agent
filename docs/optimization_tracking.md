@@ -75,4 +75,59 @@
 
 ### 优化后
 
-> 待补充：用同一份 `latency_probe.py` 受控探测脚本（覆盖闲聊/检索命中/检索未命中/工作流/长回答/多知识库并行 6 种场景）和真实历史数据复测，对比优化前后的平均耗时、P50/P90/P95、TTFT、意图分类阶段耗时，计算具体提升百分比。
+原方案里的 P0/P1 几项（意图分类规则短路扩面、换更小模型专做意图分类、限制生成输出长度、`keep_alive` 保活）在
+更早的一轮改动里已经落地——`intent.py` 里已经能看到规则短路 fallback、`app.py` 里已经在用 LoRA 微调过的
+1.5B 意图分类专用模型（`RAGENT_INTENT_MODEL`，23 条基准用例 100% 准确率，比 7B 还高，见
+`docs/dual_model_architecture.pptx`）、`workflow.py` 里已经有 `GENERATE_MAX_TOKENS` 上限和 `_keep_models_warm`
+后台保活。本轮没有用统一的
+`latency_probe.py` 脚本重新跑一遍 6 种场景做整体对比（脚本本身未提交到仓库），而是针对**这轮新发现的两类冷启动
+问题**做了定点优化，用同一个真实请求（`alice_acme` 问"安全合规部的差旅报销需要在出差结束后几天内提交"）反复
+测了 5 轮，每轮改动后立刻用真实数据验证：
+
+| 阶段 | 改动前 | +think 节点跳过 | +启动预加载 reranker/embedding | +reranker 推理预热 | 完全 warm 稳态 |
+|---|---|---|---|---|---|
+| 总耗时 | 25.44s | 14.6s（同问题第2次问：6.4s） | 9.3s（首次即快） | 8.44s（首次） | **7.10-7.46s** |
+| 意图分类 | 2.64s | 2.64s | — | — | 1.65-1.97s |
+| **工具决策（think）** | **6.83s** | **~0.01s** | ~0.01s | ~0.01s | 0.01-0.05s |
+| **知识库检索** | **8.65s** | 7.36s（reranker 仍冷） | 1.3s（首次） | ~0.66-1.0s（首次） | **0.37-0.48s** |
+| 最终生成 | 7.30s | 9.32s | — | — | 4.56s |
+
+四轮改动，每一轮都用真实数据验证了确实解决了那一轮定位的具体瓶颈，不是拍脑袋的估算：
+
+1. **think 节点跳过**（`src/tool_agent/subgraph.py::supervisor_node`，新方案，不在原计划里）——意图分类已经高
+   置信度（≥0.6，跟 `intent.py` 里判定分类器"没底"时的降级阈值对齐）确定了唯一目标工具（目前只做
+   `query_knowledge_hub`，`query_attendance` 涉及相对日期解析暂不覆盖，见该函数旁的说明）时，跳过 ReAct 的
+   第一次 `think_node` LLM 决策调用，直接构造 tool_calls——`tool_execution_trace` 的 `iteration:0`（原来是
+   `iteration:1`）实测证实了这一点。单次请求省下约 6.8 秒。安全网复用已有的 `_route_after_tool`：工具调用
+   失败会照常回退到 think_node 让模型接管，不影响容错。
+2. **启动阶段预加载 reranker/embedding client**（`QueryKnowledgeHubTool.preload_models()` + `app.py` 的
+   `_preload_retrieval_models()`，新方案）——本地 cross-encoder（`BAAI/bge-reranker-base`）原来是第一次真的被
+   用到时才现场加载模型权重，实测 6.4 秒；这个耗时原来被摊派给"运气不好、第一个问知识库问题的真实用户"，
+   现在挪到后端启动阶段、`lifespan` 的 `yield` 之前 `await` 完成，对用户完全不可见。项目里这个工具类被
+   实例化了 3 处（`_kb_management_tool`/`chat_kb_tool`/`workflow._retrieval_tool`，各自独立缓存），三个都要
+   预热到——为了让 `builtin_tools.py` 里原来完全关在闭包里的工具实例能被 `app.py` 拿到引用，
+   `register_builtin_tools()`/`_register_query_knowledge_hub()` 顺带改成了有返回值。
+3. **reranker 推理冷启动**（同一个 `preload_models()`，本轮追加，比第2条晚发现）——权重加载好了不代表"针对
+   某个具体输入形状的计算图"也编译好了，本地跑 PyTorch MPS（Metal GPU）后端，第一次真正调用推理时还要为
+   这个输入形状现场编译一次计算核心：隔离测试同一批 5 条候选，第一次调用 603ms、第二次只要 32ms，差了近
+   20 倍。预热时额外真跑一次 `rerank()`（≥2 条占位候选，`CoreReranker.rerank()` 对 0/1 条候选有专门的短路
+   分支，预热不到点上）覆盖这一层。
+4. **检索时提示词注入过滤 + 越权话术短路**（本轮同时实现的两个安全修复，见任务一）——追加验证过不会拖慢
+   正常问答：`_filter_injected_chunks` 是纯正则匹配，跟已经测过的重排/embedding 网络调用不在一个数量级；
+   越权话术短路命中时反而是提速（跳过一次几秒钟的 LLM 生成）。改完之后同一个基准请求复测总耗时
+   7.46s，跟第 3 条改完后的稳态数字一致，确认两个安全修复没有引入新的性能回归。
+
+**结论**：四轮加起来，同一个真实请求从 25.44s 降到 7.1-7.5s，降了约 **71%**；其中 think 节点跳过和两层模型
+预热贡献了几乎全部的提升（分别对应"工具决策"从 6.83s 到 ~0.01s、"知识库检索"从 8.65s 到 0.37-0.48s），意图
+分类（1.65-1.97s）和最终生成（4.56s）是本轮没有再进一步优化的部分，仍然是真实的 LLM 推理耗时——受限于本机
+消费级硬件（Apple M4 基础版，16GB），继续往下压需要换推理框架或者换生产级 GPU，这两条都超出本轮"消灭冷启动"
+的范围，留作后续方向。
+
+**换推理框架（MLX）已实测，结论是收益不够、暂缓**：用同一份 `qwen2.5:7b` 权重（Ollama 的 GGUF 4bit vs.
+`mlx-community/Qwen2.5-7B-Instruct-4bit`）跑了 `scripts/benchmark_mlx_vs_ollama.py`，覆盖两个场景、每个 3 次
+重复（原始数据见 `scripts/benchmark_results/`）。解码速度 MLX 稳定快 15-19%（22.3→25.7 tok/s，20.8→24.7
+tok/s），但真实 RAG 场景（约665 token 上下文）里耗时大头是 prefill，两个引擎在这一步几乎打平（2.93s vs.
+2.73s），导致**总耗时只提升约5%**（6.63s→6.33s），不是此前"20-40%"的估算量级——那个数字来自网络资料的一般性
+说法，未经本机实测。用户决定：收益不足以覆盖迁移风险（tool-calling 兼容性未验证、`qwen2.5-1.5b-router`
+需要重新走一遍 LoRA+MLX 转换流程、embedding 需要脱离 Ollama 单独跑），**此计划暂缓，不投入**。
+本次未覆盖：intent 模型和 embedding 模型的速度对比、tool-calling 兼容性、并发场景下两个引擎的排队行为。
