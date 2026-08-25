@@ -1,0 +1,63 @@
+{
+  "generated_at": "2026-08-25T19:45:31.931135",
+  "script": "/Users/david/Documents/enterprise-qa-agent/scripts/measure_bm25_index_growth.py",
+  "code_state": "8f2aa5d",
+  "real_corpus_chunks": 936,
+  "growth_exponent_alpha": 0.9487,
+  "load_rate_mb_per_s": 186.9,
+  "measurements": [
+    {
+      "chunks": 500,
+      "real_chunk_count": 167,
+      "index_bytes": 2778776,
+      "index_mb": 2.65,
+      "vocab_terms": 3850,
+      "avg_doc_length": 47.838,
+      "total_terms": 3850,
+      "bytes_per_chunk": 5557.6,
+      "encode_s": 0.32,
+      "build_s": 0.13,
+      "json_load_s_median": 0.0144,
+      "json_load_s_first": 0.0144,
+      "_index_dir": "/Users/david/Documents/enterprise-qa-agent/data/db/bm25/_bm25growth_500"
+    },
+    {
+      "chunks": 2000,
+      "real_chunk_count": 667,
+      "index_bytes": 10351835,
+      "index_mb": 9.87,
+      "vocab_terms": 7433,
+      "avg_doc_length": 47.799,
+      "total_terms": 7433,
+      "bytes_per_chunk": 5175.9,
+      "encode_s": 0.32,
+      "build_s": 0.79,
+      "json_load_s_median": 0.0528,
+      "json_load_s_first": 0.0573,
+      "_index_dir": "/Users/david/Documents/enterprise-qa-agent/data/db/bm25/_bm25growth_2000"
+    }
+  ],
+  "projections": [
+    {
+      "chunks": 143000,
+      "est_mb": 567.0,
+      "est_load_s": 3.03
+    },
+    {
+      "chunks": 358000,
+      "est_mb": 1354.1,
+      "est_load_s": 7.24
+    },
+    {
+      "chunks": 716000,
+      "est_mb": 2613.6,
+      "est_load_s": 13.98
+    }
+  ],
+  "not_covered": [
+    "只测 BM25 索引，未测向量库体积与端到端检索延迟",
+    "语料约 1/3 为仓库真实中文文本、2/3 为模板扩充；真实企业文档的词表更丰富，实际索引可能更大",
+    "未测多库并行加载的叠加效应",
+    "未测索引写入/更新耗时随规模的变化"
+  ]
+}
