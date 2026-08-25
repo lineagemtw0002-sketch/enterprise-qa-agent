@@ -921,6 +921,8 @@ class QueryKnowledgeHubTool:
             results = await asyncio.to_thread(
                 self._perform_search, query, effective_top_k, trace,
             )
+            # 提示词注入防护，见 _filter_injected_chunks 旁的说明——重排之前拦。
+            results = self._filter_injected_chunks(results, trace)
 
             # Apply reranking if enabled (may call LLM API)
             if self.config.enable_rerank and results:
@@ -1015,6 +1017,46 @@ class QueryKnowledgeHubTool:
         except Exception as e:
             logger.warning(f"Hybrid search failed: {e}")
             return []
+
+    def _filter_injected_chunks(
+        self, results: List[RetrievalResult], trace: Optional[TraceContext] = None,
+    ) -> List[RetrievalResult]:
+        """检索时的提示词注入防护（docs/prompt_injection_remediation_plan.md
+        问题2 P0）——摄入时的 `detect_document_injection` 检测（见
+        pipeline.py）只挡新上传的文档，挡不住这个功能上线之前就已经在库里的
+        老数据；而且检索到的投毒 chunk 会跟着"全库混合召回"混进跟它毫不相关
+        的问题的上下文（安全复测发现：一句问数据库连接串的越狱话术，也能把
+        `product_req_kb` 里的投毒文档钓鱼话术带出来），说明不能只在摄入时
+        挡一次，检索到的内容每次也要重新过一遍——不管这条数据是什么时候
+        进的库。
+
+        在重排之前调用（`_execute_local_single`/`_execute_local_multi` 拿到
+        原始候选集之后），而不是等重排完、或者等模型生成完之后再检查：
+        1. 不依赖模型"听不听话"——这层是确定性代码，命中就直接从候选集里
+           拿掉，模型压根没有机会接触这段内容，不用赌它会不会把内容说出来。
+        2. 不给重排机会——投毒内容如果留到重排阶段，可能拿到一个不低的
+           cross-encoder 分数，占用最终 top_k 里的一个名额、挤掉真正相关
+           的结果；摄入时就问对了."""
+        from src.security.prompt_guard import detect_document_injection
+
+        filtered: List[RetrievalResult] = []
+        dropped = 0
+        for r in results:
+            hit = detect_document_injection(r.text or "")
+            if hit:
+                dropped += 1
+                logger.warning(
+                    f"[InjectionGuard] Dropped retrieved chunk suspected of prompt "
+                    f"injection: {hit!r} (chunk_id={getattr(r, 'chunk_id', '?')})"
+                )
+                continue
+            filtered.append(r)
+
+        if dropped and trace is not None:
+            trace.record_stage("injection_filter", {
+                "dropped_count": dropped, "remaining_count": len(filtered),
+            })
+        return filtered
 
     def _apply_rerank(
         self,
@@ -1265,6 +1307,10 @@ class QueryKnowledgeHubTool:
             "candidate_collections": candidate_collections,
             "merged_candidate_count": len(merged),
         }, elapsed_ms=_t_gather)
+
+        # 提示词注入防护，见 _filter_injected_chunks 旁的说明——重排之前拦，
+        # 不给投毒 chunk 机会拿到一个不低的重排分数、挤掉真正相关的结果。
+        merged = self._filter_injected_chunks(merged, trace)
 
         if self.config.enable_rerank and merged:
             merged, scored = await asyncio.to_thread(self._apply_rerank, query, merged, top_k, trace)
