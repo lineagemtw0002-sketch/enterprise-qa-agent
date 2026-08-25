@@ -107,6 +107,23 @@ class BM25Indexer:
             os.getenv("RAGENT_BM25_SQLITE_DUAL_WRITE", "true").strip().lower() != "false"
         )
 
+        # 方案 C 阶段 2：读后端。
+        #   auto（默认）—— 有可用的 SQLite 副本就走它，否则回退 JSON
+        #   json        —— 强制走 JSON（回滚开关，出问题时不用改代码）
+        #   sqlite      —— 强制走 SQLite，缺副本就报错（给迁移验收用，别在生产开）
+        self.read_backend = (
+            os.getenv("RAGENT_BM25_READ_BACKEND", "auto").strip().lower()
+        )
+        # `auto` 模式下，JSON 索引小于这个字节数就仍走 JSON —— 小索引上
+        # SQLite 的连接固定开销盖过收益。默认 256KB，实测交叉点约 290KB。
+        # 详见 `_use_sqlite_for_read` 里的实测表。
+        self._sqlite_min_json_bytes = int(
+            os.getenv("RAGENT_BM25_SQLITE_MIN_JSON_BYTES", str(256 * 1024))
+        )
+        # `load()` 判定走 SQLite 之后记在这里；`query()` 据此分流。
+        # 为空表示走 JSON 的老路径（`self._index`）。
+        self._sqlite_read_collection: Optional[str] = None
+
     def build(
         self,
         term_stats: List[Dict[str, Any]],
@@ -229,25 +246,60 @@ class BM25Indexer:
         
         Raises:
             ValueError: If index file is corrupted
+
+        方案 C 阶段 2：**这个方法是读路径的分流点。**
+
+        `SparseRetriever._ensure_index_loaded` 每次查询都调它一次，
+        它的注释写着"The load is fast (a single JSON file read)" ——
+        那正是要修的错误假设：50K 块时这一次 `json.load` 实测要 **1.2–1.3 秒**，
+        6 库企业每次提问就是 8 秒，而 TTFT SLO 是 3 秒。
+
+        有可用的 SQLite 副本时，这里**什么都不读**，只记下走 SQLite，
+        把实际取数推迟到 `query()` 里按词条做。`self._index` 保持为空 ——
+        这正是收益所在，不要"顺手"再把 JSON 载进来。
+        """
+        if self._use_sqlite_for_read(collection):
+            from src.ingestion.storage.bm25_sqlite_store import BM25SQLiteStore
+
+            self._sqlite_read_collection = collection
+            # `_index` 保持为空 —— 那是整个改动的收益所在，不要"顺手"把 JSON
+            # 载进来。但 `_metadata` 照常填：它只有 4 个标量，从 meta 表读几乎
+            # 免费，而填上之后 `load()` 的对外契约基本不变，既有调用方
+            # （以及测试）不必区分后端。
+            self._index = {}
+            with BM25SQLiteStore(self._sqlite_path(collection)) as store:
+                self._metadata = store.load_metadata()
+            return True
+
+        self._sqlite_read_collection = None
+        return self._load_json_index(collection)
+
+    def _load_json_index(self, collection: str) -> bool:
+        """把 JSON 索引读进 `self._index`。
+
+        **写路径（`add_documents` / `remove_document`）必须调这个而不是 `load()`**：
+        阶段 2 起 `load()` 在有 SQLite 副本时会走读路径分流、刻意不填充
+        `self._index`，而写路径的合并重建完全依赖它。用错会导致既有 postings
+        全部丢失、整个索引被这一份文档覆盖。
         """
         index_path = self._get_index_path(collection)
-        
+
         if not index_path.exists():
             return False
-        
+
         try:
             with open(index_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            
+
             # Validate structure
             if "metadata" not in data or "index" not in data:
                 raise ValueError(f"Invalid index file structure: missing metadata or index")
-            
+
             self._metadata = data["metadata"]
             self._index = data["index"]
-            
+
             return True
-            
+
         except json.JSONDecodeError as e:
             raise ValueError(f"Corrupted index file at {index_path}: {e}")
     
@@ -276,12 +328,24 @@ class BM25Indexer:
             >>> results = indexer.query(["machine", "learning"], top_k=5)
             >>> results[0]["score"] > 0  # True if matches found
         """
-        if not self._index:
-            raise ValueError("Index not loaded. Call load() or build() first.")
-        
         if not query_terms:
             raise ValueError("query_terms cannot be empty")
-        
+
+        # 阶段 2：`load()` 判定走 SQLite 时，`self._index` 是空的（那是设计，
+        # 不是漏加载），所以这个分流必须排在下面的 `not self._index` 检查之前。
+        if self._sqlite_read_collection is not None:
+            from src.ingestion.storage.bm25_sqlite_store import BM25SQLiteStore
+
+            with BM25SQLiteStore(
+                self._sqlite_path(self._sqlite_read_collection)
+            ) as store:
+                return store.query(
+                    query_terms, top_k=top_k, k1=self.k1, b=self.b
+                )
+
+        if not self._index:
+            raise ValueError("Index not loaded. Call load() or build() first.")
+
         # Lowercase query terms to match index (SparseEncoder lowercases during build)
         query_terms = [t.lower() for t in query_terms]
         
@@ -377,8 +441,12 @@ class BM25Indexer:
         self._validate_term_stats(term_stats)
 
         # Load existing index (ignore if missing – will start fresh)
+        # ⚠️ 必须走 `_load_json_index`，不能走 `load()` —— 阶段 2 起 `load()`
+        # 在有 SQLite 副本时会走读路径分流、**刻意不填充 `self._index`**，
+        # 而下面的合并重建完全依赖 `self._index`。用 `load()` 会导致
+        # "既有 postings 全部丢失、索引被这一份文档覆盖"。
         if not self._index:
-            self.load(collection)
+            self._load_json_index(collection)
 
         # Remove stale postings for this document (re-ingest case)
         if doc_id and self._index:
@@ -458,7 +526,8 @@ class BM25Indexer:
         sqlite_deleted = self._delete_from_sqlite(collection, doc_id)
 
         if not self._index:
-            if not self.load(collection):
+            # 同 `add_documents`：写路径只认 JSON 索引，见那里的说明。
+            if not self._load_json_index(collection):
                 return sqlite_deleted > 0
 
         removed_any = False
@@ -588,6 +657,73 @@ class BM25Indexer:
 
     def _sqlite_path(self, collection: str) -> Path:
         return self.index_dir / f"{collection}_bm25.sqlite"
+
+    def _use_sqlite_for_read(self, collection: str) -> bool:
+        """这个 collection 的读请求该不该走 SQLite。
+
+        默认 `auto`：**必须同时满足"副本存在"和"副本不比 JSON 旧"**，
+        否则回退 JSON。
+
+        新鲜度检查不是多余的谨慎 —— 影子写是 fail-soft 的（见
+        `_mirror_to_sqlite`），磁盘满、权限、进程被杀都会让某个 collection 的
+        SQLite 副本停在旧版本上，而 JSON 侧照常更新。没有这道检查，
+        一次无人注意的影子写失败会**静默地让该库的检索结果退回到过去某个时刻**，
+        比直接报错难查得多。用 mtime 比较是因为它零成本；代价是精度只到文件级，
+        所以它只是安全网，不能替代迁移脚本里那次逐条打分比对。
+        """
+        if self.read_backend == "json":
+            return False
+
+        sqlite_path = self._sqlite_path(collection)
+        if self.read_backend == "sqlite":
+            # 强制模式下缺副本要显式失败，不能悄悄回退 —— 它的用途就是验收迁移，
+            # 一旦回退，"读的到底是哪个后端"就说不清了。
+            if not sqlite_path.exists():
+                raise FileNotFoundError(
+                    f"RAGENT_BM25_READ_BACKEND=sqlite 但 {sqlite_path} 不存在。"
+                    f"先跑 scripts/migrate_bm25_json_to_sqlite.py 迁移该 collection，"
+                    f"或改回 auto。"
+                )
+            return True
+
+        if not sqlite_path.exists():
+            return False
+
+        json_path = self._get_index_path(collection)
+
+        # JSON 已经不在（阶段 4 清理过）→ 没得选。
+        if not json_path.exists():
+            return True
+
+        # ⚠️ **小索引上 SQLite 更慢，别无脑切。** 实测交叉点约 50 块 / 290KB：
+        #
+        #   块数   JSON大小   JSON读   SQLite读
+        #     20     119KB    0.38ms    0.82ms   ← JSON 快 2.2 倍
+        #     50     292KB    0.86ms    0.86ms   ← 持平
+        #    200    1148KB    3.31ms    1.14ms   ← SQLite 快 2.9 倍
+        #   3000   16812KB   51.65ms    7.68ms   ← SQLite 快 6.7 倍
+        #
+        # 原因是固定开销：开一个 sqlite3 连接约 0.5ms，而 60KB 的 json.load
+        # 只要 0.35ms。本项目现网 17 个业务库全是 20 篇文档级别，**无条件切读
+        # 会让它们每次查询都慢一倍** —— 收益要等单库上到几百块以后才出现。
+        # 连接复用救不了这一点：`query_knowledge_hub._build_hybrid_search_for`
+        # 每次查询都新建一个 BM25Indexer，实例级缓存跨不过查询边界。
+        if json_path.stat().st_size < self._sqlite_min_json_bytes:
+            return False
+
+        if json_path.stat().st_mtime > sqlite_path.stat().st_mtime:
+            logger.warning(
+                "BM25 SQLite 副本比 JSON 旧，本次查询回退 JSON。"
+                "该 collection 的影子写可能失败过，需重新迁移。collection=%s",
+                collection,
+                extra={
+                    "event": "bm25.sqlite.stale_fallback",
+                    "collection": collection,
+                },
+            )
+            return False
+
+        return True
 
     def _mirror_to_sqlite(
         self,

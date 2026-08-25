@@ -526,3 +526,141 @@ class TestDualWriteThroughPublicApi:
         assert indexer.query(["年假"], top_k=5), "JSON 侧读路径必须照常工作"
         errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert any("影子写失败" in r.getMessage() for r in errors), "失败被静默了"
+
+
+# ─────────── 阶段 2：读路径切换（含回退与阈值）───────────
+
+
+class TestReadBackendSwitch:
+    """`load()` 是读路径的分流点，`query()` 据此走 SQLite 或 JSON。
+
+    这组测试的重点不是"能切"，而是**每一条不该切的情况都真的没切** ——
+    切错的后果是检索静默返回旧数据或空结果，比报错难查得多。
+    """
+
+    def _big_corpus(self, n: int = 400) -> List[Dict[str, Any]]:
+        """造一个大到能越过 auto 阈值的语料（阈值默认 256KB）。"""
+        rng = random.Random(4242)
+        vocab = [f"w{i}" for i in range(500)]
+        return [
+            _stat(f"c_{i:05d}", {t: rng.randint(1, 5) for t in rng.sample(vocab, 40)})
+            for i in range(n)
+        ]
+
+    def test_big_index_reads_from_sqlite_and_leaves_index_empty(self, tmp_path):
+        """走 SQLite 时 `_index` 必须保持为空 —— 那正是这次改动的收益。"""
+        ix = BM25Indexer(index_dir=str(tmp_path / "b"))
+        ix.build(self._big_corpus(), collection="big")
+
+        fresh = BM25Indexer(index_dir=str(tmp_path / "b"))
+        assert fresh.load("big") is True
+        assert fresh._sqlite_read_collection == "big"
+        assert fresh._index == {}, "把 JSON 也载进来了，等于没省"
+        assert fresh._metadata["num_docs"] == 400, "metadata 应照常填充"
+        assert fresh.query(["w1"], top_k=5) is not None
+
+    def test_small_index_still_reads_json(self, tmp_path):
+        """小索引上 SQLite 更慢（实测交叉点约 290KB），auto 必须留在 JSON。"""
+        ix = BM25Indexer(index_dir=str(tmp_path / "s"))
+        ix.build([_stat("c_0", {"年假": 1})], collection="small")
+        assert ix._sqlite_path("small").exists(), "前提：影子副本确实写了"
+
+        fresh = BM25Indexer(index_dir=str(tmp_path / "s"))
+        assert fresh.load("small") is True
+        assert fresh._sqlite_read_collection is None
+        assert fresh._index, "小索引应走 JSON，_index 必须被填充"
+
+    def test_results_identical_across_backends(self, tmp_path):
+        """同一个库、两种后端，完整分数映射必须逐 bit 相同。"""
+        corpus = self._big_corpus()
+        ix = BM25Indexer(index_dir=str(tmp_path / "p"))
+        ix.build(corpus, collection="par")
+        q = ["w1", "w7", "w13", "w21"]
+
+        j = BM25Indexer(index_dir=str(tmp_path / "p")); j.read_backend = "json"
+        j.load("par")
+        s = BM25Indexer(index_dir=str(tmp_path / "p")); s.read_backend = "sqlite"
+        s.load("par")
+
+        assert {r["chunk_id"]: r["score"] for r in j.query(q, top_k=10**6)} == \
+               {r["chunk_id"]: r["score"] for r in s.query(q, top_k=10**6)}
+
+    def test_stale_sqlite_falls_back_to_json(self, tmp_path, caplog):
+        """影子写失败过 => SQLite 比 JSON 旧 => 必须回退，且要留告警。
+
+        没有这道检查，一次无人注意的影子写失败会**静默地把该库的检索结果
+        退回到过去某个时刻**。
+        """
+        import logging
+        import os
+
+        ix = BM25Indexer(index_dir=str(tmp_path / "st"))
+        ix.build(self._big_corpus(), collection="stale")
+
+        # 把 JSON 的 mtime 推到 SQLite 之后，模拟"JSON 更新了但影子写失败"
+        json_p = ix._get_index_path("stale")
+        sqlite_p = ix._sqlite_path("stale")
+        newer = sqlite_p.stat().st_mtime + 60
+        os.utime(json_p, (newer, newer))
+
+        fresh = BM25Indexer(index_dir=str(tmp_path / "st"))
+        with caplog.at_level(logging.WARNING):
+            assert fresh.load("stale") is True
+
+        assert fresh._sqlite_read_collection is None, "读到了过期副本"
+        assert fresh._index, "应已回退到 JSON"
+        assert any("比 JSON 旧" in r.getMessage() for r in caplog.records), "回退没留痕"
+
+    def test_backend_json_forces_json_even_when_sqlite_exists(self, tmp_path):
+        """回滚开关：出问题时不用改代码就能退回老路径。"""
+        ix = BM25Indexer(index_dir=str(tmp_path / "f"))
+        ix.build(self._big_corpus(), collection="forced")
+
+        fresh = BM25Indexer(index_dir=str(tmp_path / "f"))
+        fresh.read_backend = "json"
+        assert fresh.load("forced") is True
+        assert fresh._sqlite_read_collection is None
+        assert fresh._index
+
+    def test_backend_sqlite_raises_when_copy_missing(self, tmp_path):
+        """强制模式缺副本要显式失败，不能悄悄回退。
+
+        它的用途是验收迁移；一旦回退，"读的到底是哪个后端"就说不清了。
+        """
+        ix = BM25Indexer(index_dir=str(tmp_path / "m"))
+        ix.dual_write_sqlite = False           # 不写影子副本
+        ix.build([_stat("c_0", {"年假": 1})], collection="nocopy")
+
+        fresh = BM25Indexer(index_dir=str(tmp_path / "m"))
+        fresh.read_backend = "sqlite"
+        with pytest.raises(FileNotFoundError, match="不存在"):
+            fresh.load("nocopy")
+
+    def test_write_path_still_uses_json_after_switch(self, tmp_path):
+        """**最危险的回归**：写路径若误用 `load()`，既有 postings 会被整份覆盖。
+
+        `add_documents` 靠 `self._index` 做合并重建，而切读后 `load()` 刻意
+        不填充它。用错的话，新增一份文档会把整个索引换成只有这一份。
+        """
+        ix = BM25Indexer(index_dir=str(tmp_path / "w"))
+        ix.build(self._big_corpus(), collection="wr")
+        before_chunks = {
+            p["chunk_id"]
+            for td in ix._index.values() for p in td["postings"]
+        }
+        assert len(before_chunks) == 400
+
+        fresh = BM25Indexer(index_dir=str(tmp_path / "w"))
+        fresh.add_documents(
+            [_stat("newcomer", {"年假": 3})], collection="wr", doc_id="h" * 64
+        )
+
+        after_chunks = {
+            p["chunk_id"]
+            for td in fresh._index.values() for p in td["postings"]
+        }
+        assert "newcomer" in after_chunks
+        assert before_chunks <= after_chunks, (
+            f"既有 chunk 丢失了 {len(before_chunks - after_chunks)} 个 —— "
+            f"写路径误用了读路径的 load()"
+        )

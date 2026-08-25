@@ -249,25 +249,46 @@ flowchart TB
    **剩下的仍是方案 C 本身**（词条级存储），见上一条。这两步是它的前置，
    但**独立成立**：即使 C 推迟也已落袋。
 
-2c. 🟡 **方案 C 阶段 1 已落地：SQLite 后端 + 影子双写，读仍走 JSON**
-   （2026-08-25。`src/ingestion/storage/bm25_sqlite_store.py`；
-   回归保护 `tests/unit/test_bm25_sqlite_store.py` 22 条；详见
-   `docs/bm25_storage_design.md` §11）
+2c. 🟡 **方案 C 阶段 1–3 已落地**（后端+双写 → 存量迁移 → 切读）
+   （2026-08-25。`src/ingestion/storage/bm25_sqlite_store.py`、
+   `scripts/migrate_bm25_json_to_sqlite.py`；回归保护
+   `tests/unit/test_bm25_sqlite_store.py` 29 条；详见
+   `docs/bm25_storage_design.md` §11 §12）
 
-   ⚠️ **存量 99 个 collection 尚未迁移** —— 只有此后新写入的才有影子副本。
-   阶段 2（切读）/ 3（存量迁移）/ 4（停写 JSON）均未做。
+   🔴 **最需要先知道的一条：现网数据规模下，切读是性能倒退。**
+   17 个业务库全是 20 篇文档级别，实测 JSON 读 0.35ms vs SQLite 读 0.82ms
+   —— **JSON 快 2.3 倍**。原因是固定开销：开一个 sqlite3 连接约 0.5ms，
+   而 60KB 的 `json.load` 只要 0.35ms。
+   交叉点实测在 **~50 块 / ~290KB**。
+   因此 `auto` 模式带大小阈值（`RAGENT_BM25_SQLITE_MIN_JSON_BYTES`，默认 256KB），
+   **现网实际只有 3 个库切到 SQLite、23 个继续走 JSON**，没有引入倒退。
+   **收益要等单库上到几百块以后才出现**，不要拿"已经上了 SQLite"当性能已改善。
 
-   **性能：三组语料给出三个差 200 倍的答案，引用时必须说明是哪一组。**
+   ⚠️ 连接复用救不了小库：`query_knowledge_hub._build_hybrid_search_for`
+   **每次查询都新建一个 `BM25Indexer`**，实例级缓存跨不过查询边界。
 
-   | 语料 | 50K 块 JSON | 50K 块 SQLite | 提速 |
-   |---|---|---|---|
-   | 词条近似均匀 | 1230.8 ms | 0.60 ms | 2044x ⚠️ **不真实** |
-   | Zipf + 查最高频 5 词（最坏） | 1349.2 ms | 128.08 ms | **11x** |
-   | 原型语料 + 真实查询词 | — | 8.5 ms | 139–187x |
+   **读后端开关**：`RAGENT_BM25_READ_BACKEND` = `auto`（默认）/ `json`（**回滚开关**）
+   / `sqlite`（强制，缺副本报错，仅供验收）。
+   `auto` 走 SQLite 需同时满足：副本存在 **且** JSON ≥ 阈值 **且** 副本不比 JSON 旧。
+   最后一条是防影子写失败后**静默读到过期数据**。
 
-   差别全在"查询词命中多少 postings"。**确定的是下界**：最坏情况 50K 块
-   也只要 128 ms，而 JSON 侧 1349 ms × 6 库 = 8 秒，对 3s TTFT SLO 是硬伤。
-   SQLite 文件约为 JSON 的一半（151 MB vs 310 MB）。
+   **规模上来后的收益**（Zipf 语料 + 查最高频 5 词，最坏情况）：
+   50K 块 JSON 1349 ms vs SQLite 128 ms（11x）；文件大小约减半。
+   〔另有两组语料测出 2044x 和 139–187x，差别全在"查询词命中多少 postings"，
+   引用时必须说明是哪一组 —— 详见 `bm25_storage_design.md` §11。〕
+
+   **迁移已真跑**：17 个业务库全部成功，共比对 **3,470 条分数逐 bit 相同**，
+   磁盘 3.8MB → 2.5MB。跳过 17 个 `conv_*`/`test_*`/`e2e_*` 残留。
+   ⚠️ **`doc_hash` 迁不过来**（JSON 里就没存），这些库的按文档删除依然失效，
+   要等各自文档下次重新摄入才补上。
+
+   ⚠️ **一处契约变更**：`load()` 走 SQLite 时**刻意不填充 `self._index`**
+   （那正是收益所在），`_metadata` 照常填。
+   **写路径必须用 `_load_json_index()`** —— `add_documents` 靠 `_index` 做合并重建，
+   误用 `load()` 会让**既有 postings 全部丢失、整个索引被这一份文档覆盖**。
+   这是本次最危险的回归点，`test_write_path_still_uses_json_after_switch` 守着。
+
+   **阶段 4（停写 JSON）未做，且现在不该做** —— JSON 仍是多数库的主力读路径。
 
 2d. ✅ **顺带修掉一个此前完全静默的正确性 bug：重摄入导致同一 chunk 被记两次**
    （2026-08-25，由 SQLite 主键 `(term, chunk_id)` 顶出来）

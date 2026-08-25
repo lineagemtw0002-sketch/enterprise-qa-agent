@@ -268,7 +268,13 @@ class TestBuildIsSinglePass:
         assert indexer._metadata["collection"] == "meta"
 
     def test_round_trip_through_disk_preserves_index(self, indexer, tmp_path):
-        """单遍改写不能破坏落盘格式 —— 存回来的必须和内存里一样。"""
+        """单遍改写不能破坏落盘格式 —— 存回来的必须和内存里一样。
+
+        ⚠️ 这里用 `_load_json_index` 而不是 `load()`：本用例验的是 **JSON
+        落盘格式**，而阶段 2 起 `load()` 在有 SQLite 副本时会走读路径分流、
+        刻意不填充 `_index`。用 `load()` 会让这条测试悄悄变成"测 SQLite 分流"，
+        而真正要保的 JSON 序列化格式反倒没人看着了。
+        """
         term_stats = [
             _stat("c_0", {"年假": 3, "申请": 1}),
             _stat("c_1", {"报销": 2, "申请": 1}),
@@ -277,7 +283,7 @@ class TestBuildIsSinglePass:
         in_memory = indexer._index
 
         reloaded = BM25Indexer(index_dir=str(tmp_path / "bm25"))
-        assert reloaded.load(collection="disk") is True
+        assert reloaded._load_json_index(collection="disk") is True
         assert reloaded._index == in_memory
 
 
