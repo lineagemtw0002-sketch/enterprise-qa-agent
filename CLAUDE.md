@@ -128,6 +128,15 @@ ChromaDB（向量）· 本地 Ollama 提供模型
 
 ## 已知未闭环
 
+- 🔴 **文档更新后旧版本片段永久残留**（`pipeline.py`：`doc_id` 即文件 SHA256，
+  内容一变即视为新文档；片段去重是跳过语义；全仓无版本替换逻辑）。
+  **每天更新的场景下，同一段落的新旧版本会同时被检索到，模型拿到矛盾材料且
+  无法判断哪个是当前版本 → 产生错误答案。** 待实测确认，见
+  `docs/scale_slo_and_priorities.md` §1.5
+- 🔴 **BM25 索引以 JSON 存储且每查询全量加载**（`query_knowledge_hub.py:397`）。
+  真实数据量（几个 G 文档）下索引达 GB 级，每查询每库各 `json.load` 一次 →
+  秒级至分钟级 + OOM。待实测确认，见 §1.4
+- 🔴 **模型服务并发形态**：`OLLAMA_NUM_PARALLEL` 默认 1，目标规模下缺口约 10x。见 §1.3
 - 🟠 知识库文档投毒 → 间接提示注入，可跨话题传染，ACL 拦不住
   （见 `docs/security_prompt_injection_test_report.md` 案例2）
 - 🟠 `app.py:1120,1141,1155` 的 `/api/v1/admin/test/knowledge-query*` 是绕过 ACL 的测试接口，**上线前必删**
