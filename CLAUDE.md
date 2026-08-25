@@ -131,8 +131,9 @@ ChromaDB（向量）· 本地 Ollama 提供模型
 - 🔴 **文档更新后旧版本片段永久残留**（`pipeline.py`：`doc_id` 即文件 SHA256，
   内容一变即视为新文档；片段去重是跳过语义；全仓无版本替换逻辑）。
   **每天更新的场景下，同一段落的新旧版本会同时被检索到，模型拿到矛盾材料且
-  无法判断哪个是当前版本 → 产生错误答案。** 待实测确认，见
-  `docs/scale_slo_and_priorities.md` §1.5
+  无法判断哪个是当前版本 → 产生错误答案。**
+  **已实测确认**（2026-08-25，`scripts/verify_stale_chunk_retention.py`：
+  改一句话重传，库中两个版本各 1 条片段）。见 `docs/scale_slo_and_priorities.md` §1.5
 - 🔴 **BM25 索引以 JSON 存储且每查询全量加载**（`query_knowledge_hub.py:397`）。
   真实数据量（几个 G 文档）下索引达 GB 级，每查询每库各 `json.load` 一次 →
   秒级至分钟级 + OOM。待实测确认，见 §1.4
@@ -220,7 +221,7 @@ ChromaDB（向量）· 本地 Ollama 提供模型
 
 | 文档 | 内容 |
 |---|---|
-| `docs/scale_slo_and_priorities.md` | **万人规模下的最小 SLO 与优先级重估（提案，待确认）**：<br>容量测算、最小 SLO、27+1 条审计发现的重新分级。<br>**审计报告的 P0/P1/P2 请以本文的重估为准，不要直接沿用旧排序** |
+| `docs/scale_slo_and_priorities.md` | **万人规模下的最小 SLO 与优先级重估（提案，待确认）**：<br>容量测算、最小 SLO、27+3 条发现的重新分级（12 条 P0）。<br>**审计报告的 P0/P1/P2 请以本文的重估为准，不要直接沿用旧排序** |
 | `docs/orchestration_design.md` | **编排层设计（草案，未实施）**：并行编排与思维错乱防护 + 记忆/归档异步化。<br>合并自 `parallel_reasoning_design.md` 与 `memory_manage_async_decouple_design.md`，<br>那两份已标记为被取代，**不要按它们改代码** |
 | `docs/collaboration_retrospective.md` | 协作复盘与开发流程指南。<br>**每周自查只需读 §1（27 行）**；§2 是好流程的五根支柱；证据在附录 |
 | `docs/review_2026-08-24/review_codebase_findings.md` | 代码审计：2 P0 / 16 P1 / 9 P2，带行号证据 |
