@@ -70,10 +70,20 @@ class TestDebugModeEscapeHatch:
         secret = resolve_jwt_secret(secret="", debug_mode=True)
         assert secret == _DEV_FALLBACK_SECRET
 
-    def test_debug_mode_warns_loudly(self, capsys):
-        """放行可以，但必须留下痕迹，否则本地配置被带上生产时无人察觉。"""
-        resolve_jwt_secret(secret="", debug_mode=True)
-        assert "警告" in capsys.readouterr().out
+    def test_debug_mode_warns_loudly(self, caplog):
+        """放行可以，但必须留下痕迹，否则本地配置被带上生产时无人察觉。
+
+        2026-08-25：告警从 `print` 改为 `logger.warning`（可观测性阶段一），
+        断言随之从 stdout 改为日志通道。**级别必须仍是 WARNING** —— 这条
+        断言就是防"迁移日志时顺手把安全告警降成 debug/info"。
+        """
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            resolve_jwt_secret(secret="", debug_mode=True)
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("警告" in r.getMessage() for r in warnings)
 
 
 class TestSecretIsNotPredictable:

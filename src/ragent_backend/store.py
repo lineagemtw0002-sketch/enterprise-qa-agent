@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import asyncpg
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -104,7 +107,19 @@ class ConversationArchiveStore:
                     values
                 )
         except Exception as e:
-            print(f"[ArchiveStore] Failed to append history: {e}")
+            # error 而不是 warning：这条路径失败 = 对话历史**静默丢失**，
+            # 没有任何降级补偿，用户下一轮就看不到上一轮说了什么。
+            # 只记条数不记内容——消息正文的权威副本本来就该在这张表里。
+            logger.error(
+                "[ArchiveStore] Failed to append history",
+                extra={
+                    "event": "archive.append_history.failed",
+                    "error_type": type(e).__name__,
+                    "conversation_id": conversation_id,
+                    "message_count": len(messages),
+                },
+                exc_info=True,
+            )
 
     async def load_full_history(self, conversation_id: str) -> List[Dict[str, Any]]:
         """加载完整历史（给用户看）"""

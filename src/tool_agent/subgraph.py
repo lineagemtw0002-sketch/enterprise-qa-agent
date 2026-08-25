@@ -24,6 +24,7 @@ Tool Subgraph — 工具子智能体的 LangGraph 实现。
 
 from __future__ import annotations
 
+import logging
 import time
 from datetime import date
 from typing import Any, Callable, Dict, List, Literal, Optional
@@ -34,6 +35,8 @@ from langgraph.graph import StateGraph, START, END
 from src.tool_agent.state import ToolSubgraphState
 from src.tool_agent.tool_registry import ToolRegistry
 from src.tool_agent.unified_tool import ToolDecision, ToolResult
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -379,7 +382,22 @@ def build_tool_subgraph(
                         success=result.success,
                     )
                 except Exception as e:
-                    print(f"[ToolSubgraph] audit_log callback failed: {e}")
+                    # error：这条回调是 OWASP LLM08 要的「谁在何时查了哪个知识库」
+                    # 的唯一落点，失败等于**这次工具调用在合规记录里不存在**。
+                    # 只记工具名/collection（S1），不记 args——对
+                    # query_knowledge_hub 而言 args 里就是用户的问题（S2）。
+                    logger.error(
+                        "[ToolSubgraph] audit_log callback failed",
+                        extra={
+                            "event": "tool_subgraph.audit_log.failed",
+                            "error_type": type(e).__name__,
+                            "tool_name": name,
+                            "agent": agent_role,
+                            "collections": collections,
+                            "success": result.success,
+                        },
+                        exc_info=True,
+                    )
         
         return {
             "internal_messages": new_messages,

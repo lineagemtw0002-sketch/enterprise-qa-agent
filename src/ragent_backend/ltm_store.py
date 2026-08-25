@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -19,6 +20,10 @@ from typing import Any, List, Optional
 
 import asyncpg
 from langchain_core.messages import HumanMessage
+
+from src.observability.redact import sensitive_digest
+
+logger = logging.getLogger(__name__)
 
 
 class LTMStore:
@@ -225,7 +230,21 @@ class LTMStore:
             if isinstance(facts, list):
                 return [str(f).strip() for f in facts if str(f).strip()]
         except Exception as e:
-            print(f"[LTM] extract_facts failed: {e!r}; raw content={content!r}")
+            # ⚠️ 这里原本是 `print(f"... raw content={content!r}")`。
+            # `content` 是模型对用户对话抽取出的**长期记忆事实原文**——姓名、
+            # 职位、请假原因这类东西——直接进 stdout 就等于落盘一份用户画像。
+            # 现在只记长度 + sha256 前 12 位（S2）：足以判断"两次失败是不是同一个
+            # 坏输出"、也足以让用户把原文给你时你能 hash 一遍对上号，
+            # 但日志本身不再是内容泄露面。
+            logger.warning(
+                "[LTM] extract_facts failed, returning no facts",
+                extra={
+                    "event": "ltm.extract_facts.failed",
+                    "error_type": type(e).__name__,
+                    **sensitive_digest("raw_content", content),
+                },
+                exc_info=True,
+            )
         return []
 
     async def delete_facts_from_turn(

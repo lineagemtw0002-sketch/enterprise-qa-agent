@@ -20,6 +20,16 @@ from langchain_core.messages import HumanMessage
 from src.ragent_backend.schemas import IntentResult
 
 
+# 子查询并行扇出的硬上限（`docs/orchestration_design.md` §4.3 决策 D2、§8 Q1）。
+# 已拍板取 3：当前没有评估体系，无法验证放宽到 5 是变好还是变坏，属于盲改；
+# 等 D6a/D6b 评估建起来后再用数据决定是否放宽。
+#
+# 定义在这里、由 workflow.py 导入，是为了让"提示词里写的上限"和"代码里截断
+# 的上限"永远是同一个数字——两处各写一个常量迟早会漂。
+# **真正的截断只发生在 workflow.py::_retrieve_multi 一处**（那里才有 trace）。
+MAX_SUB_QUERY_FANOUT = 3
+
+
 # ============== 结构化 LLM 输出模型 ==============
 
 class QueryAnalysisResult(BaseModel):
@@ -142,21 +152,34 @@ async def analyze_query(query: str, messages: list, llm=None) -> QueryAnalysisRe
 
 处理要求：
 1. 消除所有代词和指代（如"它"、"这个"、"that"、"这个文档"、"上面说的"、"前者"等），替换为对话历史中提到的具体实体。
-2. 如果当前问题包含多个并列主题（如多个城市、多个产品、多个时间段的比较），即使没有连词也必须拆分成可独立执行的子查询列表。
+2. 如果当前问题包含多个**彼此独立**的并列主题（如多个城市、多个产品、多个时间段的比较），即使没有连词也必须拆分成可独立执行的子查询列表。
 3. 如果问题只涉及单一主题，sub_queries 列表中只放一个元素即可。
 4. 每个子查询必须完整、无歧义、不依赖上下文即可理解。
 
-示例 1：
+{_SUB_QUERY_SPLIT_RULES}
+
+示例 1（独立，拆）：
 当前问题：北京上海杭州的天气怎么样
 输出：{{"rewritten_query": "北京、上海、杭州的天气怎么样", "sub_queries": ["北京的天气怎么样", "上海的天气怎么样", "杭州的天气怎么样"]}}
+说明：三个城市的天气互不影响，任何一个的答案都不需要另一个。
 
-示例 2：
+示例 2（独立，拆）：
 当前问题：华为和苹果的旗舰手机对比
 输出：{{"rewritten_query": "华为和苹果的旗舰手机对比", "sub_queries": ["华为旗舰手机", "苹果旗舰手机"]}}
 
-示例 3：
+示例 3（单一主题，不拆）：
 当前问题：2024年英伟达财报表现如何
 输出：{{"rewritten_query": "2024年英伟达财报表现如何", "sub_queries": ["2024年英伟达财报表现如何"]}}
+
+示例 4（**有依赖，不拆**——反例）：
+当前问题：销售额最高的部门是哪个，该部门今年的招聘预算是多少
+输出：{{"rewritten_query": "销售额最高的部门是哪个，该部门今年的招聘预算是多少", "sub_queries": ["销售额最高的部门是哪个，该部门今年的招聘预算是多少"]}}
+说明：不先知道是哪个部门，就没法查"该部门"的预算，第二问依赖第一问的答案，**必须保持单查询**。
+
+示例 5（**有依赖，不拆**——反例）：
+当前问题：公司的年假制度是什么，它的审批人是谁
+输出：{{"rewritten_query": "公司的年假制度是什么，它的审批人是谁", "sub_queries": ["公司的年假制度是什么，它的审批人是谁"]}}
+说明："它"指代前一问里的年假制度，属于回指依赖，**必须保持单查询**。
 
 对话历史：
 {history_text}
@@ -169,16 +192,11 @@ async def analyze_query(query: str, messages: list, llm=None) -> QueryAnalysisRe
         structured_llm = llm.with_structured_output(QueryAnalysisResult, method="json_mode")
         result: QueryAnalysisResult = await structured_llm.ainvoke([HumanMessage(content=prompt)])
 
-        # 后处理：确保 sub_queries 非空
-        if not result.sub_queries:
-            result.sub_queries = [result.rewritten_query or cleaned]
-
-        # 清洗：去掉子查询前后的空白和标点
-        result.sub_queries = [
-            sq.strip(" ,，。？！?！")
-            for sq in result.sub_queries
-            if sq.strip(" ,，。？！?！")
-        ] or [result.rewritten_query or cleaned]
+        # 后处理：清洗 + 去重 + D1 依赖判据（有依赖则降级为单查询）
+        result.rewritten_query = result.rewritten_query or cleaned
+        result.sub_queries = _finalize_sub_queries(
+            result.rewritten_query, result.sub_queries
+        ) or [result.rewritten_query]
 
         return result
     except Exception as e:
@@ -192,8 +210,149 @@ async def analyze_query(query: str, messages: list, llm=None) -> QueryAnalysisRe
 
 
 def _fallback_split(query: str) -> List[str]:
-    """LLM 失败时的子查询拆分回退"""
-    return split_parallel_subqueries(query)
+    """LLM 失败时的子查询拆分回退。
+
+    走的也是 `_finalize_sub_queries`，因为规则拆分（按"和/与/以及"切）比 LLM
+    更容易切出有依赖的碎片（"年假制度和它的申请流程" -> ["年假制度", "它的申请流程"]），
+    D1 的依赖判据在这条路径上更有必要，不是可选项。"""
+    return _finalize_sub_queries(query, split_parallel_subqueries(query))
+
+
+# ============== D1：子查询拆分的依赖性判据 ==============
+#
+# 对应 `docs/orchestration_design.md` §4.3 决策 D1（防 F3"假并行"）。
+#
+# 问题：拆分提示词原来只有"多个并列主题就拆"这一条判据，三个示例（北京/上海/
+# 杭州天气、华为/苹果对比、单一主题）**全都是天然独立的**，没有任何一条规则
+# 要求判断子问题之间有没有依赖。于是"销售额最高的部门是哪个，该部门的年假
+# 有多少天"这种**第二问要用第一问的答案**的问题也会被拆成两个并行子查询，
+# 两路各自检索、各自拿到不相干的材料，再拼给生成模型——F3 假并行。
+#
+# 已拍板（2026-08-25）：**存在依赖时降级为单查询**，交给已有的 ReAct 子图
+# （max_iterations=5）自己决定要不要再查一轮，**不做显式多跳分解**。依据是
+# 业界基准把"agentic RAG / 复杂多步编排"列在"大厂特有、不必跟"
+# （`docs/review_2026-08-24/review_industry_baseline.md`），本项目不新增编排复杂度。
+#
+# 为什么除了改提示词还要加这层确定性兜底：线上意图分类跑的是
+# qwen2.5:1.5b-router（见 workflow.py `_intent_llm` 的说明），**纯 prompt 约束
+# 在 1.5b 上没有保证**。这层判据是纯字符串规则、零 LLM 调用、可单测。
+#
+# ⚠️ 与闲聊白名单短路的关系：本判据**只在 `len(sub_queries) > 1` 时才运行**。
+# 闲聊路径（`_match_chitchat_intent`）返回的永远是 `[cleaned]` 单元素，
+# 根本走不到这里，因此不可能误伤闲聊——
+# `tests/unit/test_intent_chitchat_routing.py` 的 132 条不受影响。
+
+# 一、回指/指代词：子查询里出现这些，说明它在引用另一个子查询的答案。
+# 每条都刻意加了否定环视，避开高频误伤：
+#   其他/其中/尤其  -> 不算"其"；应该/该怎么办 -> 不算"该"；
+#   因此/如此       -> 不算"此"；这个月/那个星期 -> 不算"这个/那个"
+#   （最后一条跟 `_has_vague_pronoun` 里那条实测教训是同一个坑）
+_ANAPHORA_PATTERNS = [
+    r"(?<!其)[他她]们?",
+    r"它们?",
+    r"(?<![应活])该(?![不当怎如何])",
+    r"(?<![尤极与])其(?![他它中实余次间所后])",
+    r"(?<![因如彼从由为])此(?![外前后时类])",
+    r"上述|前述|上面(?:提到|说的|那|的)|前者|后者|对方",
+    r"这[些位家者项]|那[些位家者项]",
+    r"这个(?!月|年|星期|周|季度|礼拜|次|时候|时间|问题)",
+    r"那个(?!月|年|星期|周|季度|礼拜|次|时候|时间)",
+    r"\b(?:it|its|they|them|their)\b",
+    r"\b(?:the\s+)?(?:former|latter)\b",
+]
+
+# 二、依赖链连接词：出现在整句里，说明用户自己就写明了"先算出A再拿A去问B"。
+_DEPENDENCY_CHAIN_PATTERNS = [
+    r"先[^，。；？?！!]{0,15}再",
+    r"根据(?:上述|上面|前面|第一步|第一问|查到的|检索到的|上一步|结果)",
+    r"基于(?:上述|上面|前面|结果|第一步)",
+    r"(?:然后|接着|之后)再?",
+    r"对应的|相应的|与之(?:对应|相关|匹配)",
+    r"由此|据此",
+]
+
+# 三、"先确定实体再查属性"型：整句里带一个**实体识别问**（谁/哪个部门/最……的），
+# 而模型又把它拆成了多问——这种组合几乎一定是多跳的第一跳 + 第二跳。
+# 刻意**不含**"哪个产品/哪个公司/哪家手机"这类比较型措辞，那些是真并列
+# （"华为和苹果哪个产品更好"），收进来会误伤 D1 本来要保护的正常拆分。
+_ENTITY_LOOKUP_PATTERNS = [
+    r"是谁",
+    r"^谁",
+    r"哪位",
+    r"哪个(?:部门|团队|岗位|员工|人员|负责人|项目|供应商|流程)",
+    r"(?:最高|最低|最多|最少|最大|最小|最长|最短|排名第一|第一名)的",
+]
+
+
+def _detect_sub_query_dependency(
+    rewritten_query: str, sub_queries: List[str]
+) -> Optional[str]:
+    """判断这组子查询之间是否**存在依赖**，存在则返回可读的原因串，否则 None。
+
+    只有"任何一个子问题的答案都不需要用到另一个子问题的结果"才算独立。
+    判不准时**偏向判成有依赖**——降级成单查询只是少一次并行检索（ReAct 仍可
+    再查一轮），而错误地并行拆分会直接制造 F3 假并行 + F4 跨材料编造。
+    """
+    if len(sub_queries) <= 1:
+        return None
+
+    for sq in sub_queries:
+        for pattern in _ANAPHORA_PATTERNS:
+            if re.search(pattern, sq, flags=re.IGNORECASE):
+                return f"子查询含回指（{pattern}）: {sq!r}"
+
+    whole = rewritten_query or ""
+    for pattern in _DEPENDENCY_CHAIN_PATTERNS:
+        if re.search(pattern, whole):
+            return f"整句含依赖链连接词（{pattern}）"
+
+    for text in [whole, *sub_queries]:
+        for pattern in _ENTITY_LOOKUP_PATTERNS:
+            if re.search(pattern, text):
+                return f"含实体识别问，属先定实体再查属性（{pattern}）: {text!r}"
+
+    return None
+
+
+def _finalize_sub_queries(rewritten_query: str, sub_queries: List[str]) -> List[str]:
+    """子查询列表的统一后处理：清洗 -> 去重 -> D1 依赖判据。
+
+    **不做扇出截断**——上限（D2）由 `workflow.py::_retrieve_multi` 这唯一一处
+    截断点负责，因为只有那里才能把"被丢弃了哪几条"记进 trace。
+    """
+    cleaned = [sq.strip(" ,，。？！?！") for sq in sub_queries]
+    cleaned = [sq for sq in cleaned if sq]
+
+    deduped: List[str] = []
+    seen = set()
+    for sq in cleaned:
+        if sq in seen:
+            continue
+        seen.add(sq)
+        deduped.append(sq)
+
+    fallback = rewritten_query.strip() if rewritten_query else ""
+    if not deduped:
+        return [fallback] if fallback else []
+
+    reason = _detect_sub_query_dependency(rewritten_query, deduped)
+    if reason is not None:
+        print(f"[Intent] D1 子查询存在依赖，降级为单查询（交给 ReAct 决定是否再查一轮）：{reason}")
+        return [fallback or deduped[0]]
+
+    return deduped
+
+
+# 拆分提示词里共用的 D1/D2 约束段。两个入口（analyze_query 的独立分析、
+# analyze_and_route 的合并调用）必须用同一份文本，否则降级路径的行为会和
+# 主路径不一致——这正是本项目踩过的"两条路径各写各的 prompt"那类坑。
+_SUB_QUERY_SPLIT_RULES = f"""拆分成子查询之前，必须先判断子问题之间**有没有依赖**：
+- **只有当每个子问题都能独立回答**——任何一个的答案都用不到另一个的结果——才允许拆分。
+- **只要存在依赖，就不要拆分**，sub_queries 只放一个元素（保留完整问题）。
+- 依赖的典型信号：后一问里出现"它/他/该/其/这个/上述/前者/后者"等指代前一问答案的词；
+  或者必须先确定某个实体（"最高的是哪个""谁是……"）才能问它的属性；
+  或者出现"先……再……""根据上面的结果"这类先后顺序表述。
+- 最多拆成 {MAX_SUB_QUERY_FANOUT} 个子查询；超过 {MAX_SUB_QUERY_FANOUT} 个主题时只保留最重要的 {MAX_SUB_QUERY_FANOUT} 个。"""
 
 
 async def rewrite_query(query: str, messages: list, llm=None) -> str:
@@ -814,8 +973,15 @@ async def analyze_and_route(
 
 第一步 —— 查询重写与拆分：
 1. 消除所有代词和指代（如"它"、"这个"、"that"、"这个文档"、"上面说的"、"前者"等），替换为对话历史中提到的具体实体。
-2. 如果当前问题包含多个并列主题（如多个城市、多个产品、多个时间段的比较），即使没有连词也必须拆分成可独立执行的子查询列表；只有单一主题时 sub_queries 只放一个元素。
+2. 如果当前问题包含多个**彼此独立**的并列主题（如多个城市、多个产品、多个时间段的比较），即使没有连词也必须拆分成可独立执行的子查询列表；只有单一主题时 sub_queries 只放一个元素。
 3. 每个子查询必须完整、无歧义、不依赖上下文即可理解。
+
+{_SUB_QUERY_SPLIT_RULES}
+
+拆分示例：
+- "北京上海杭州的天气怎么样" -> 拆成 3 个（三个城市互不影响，独立）
+- "销售额最高的部门是哪个，该部门今年的招聘预算是多少" -> **不拆**（不先知道是哪个部门就查不了"该部门"的预算，第二问依赖第一问）
+- "公司的年假制度是什么，它的审批人是谁" -> **不拆**（"它"回指前一问的答案）
 
 第二步 —— 基于第一步重写后的查询，判断用户的真实意图：
 {_INTENT_CLASSIFY_RULES}
@@ -845,10 +1011,10 @@ async def analyze_and_route(
         result: QueryAnalysisAndIntentResult = await structured_llm.ainvoke([HumanMessage(content=prompt)])
 
         rewritten_query = result.rewritten_query or cleaned
-        sub_queries = result.sub_queries or [rewritten_query]
-        sub_queries = [
-            sq.strip(" ,，。？！?！") for sq in sub_queries if sq.strip(" ,，。？！?！")
-        ] or [rewritten_query]
+        # 清洗 + 去重 + D1 依赖判据（有依赖则降级为单查询，见 _finalize_sub_queries）
+        sub_queries = _finalize_sub_queries(
+            rewritten_query, result.sub_queries or [rewritten_query]
+        ) or [rewritten_query]
 
         # Step 0 后置安全网：必须在下面的澄清检查之前（见 docstring 第 3 点）
         chitchat_override = _match_chitchat_intent(rewritten_query)

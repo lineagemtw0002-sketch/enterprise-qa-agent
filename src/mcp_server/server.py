@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from typing import TYPE_CHECKING
 
@@ -29,8 +30,16 @@ def _redirect_all_loggers_to_stderr() -> None:
 
     原因：MCP stdio 协议把 stdout 作为通信信道，
     一旦日志写入 stdout，会直接破坏 JSON-RPC 报文边界。
+
+    ⚠️ 光"此刻摘掉 stdout handler"是不够的：本函数之后还会有
+    `_preload_heavy_imports()` 和 `get_logger()` 触发
+    `configure_logging()`，它默认往 **stdout** 写。所以这里先把
+    `RAGENT_LOG_DEST` 钉死成 `stderr`，让后续任何一次配置都落在 stderr 上，
+    不依赖调用顺序。
     """
     import logging as _logging
+
+    os.environ["RAGENT_LOG_DEST"] = "stderr"
 
     root = _logging.getLogger()
     stderr_handler = _logging.StreamHandler(sys.stderr)

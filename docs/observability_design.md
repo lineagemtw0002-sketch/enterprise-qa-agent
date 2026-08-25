@@ -1,8 +1,18 @@
 # 结构化日志 + request id 贯穿链路 —— 设计方案
 
-> **状态：设计草案，未实施。零代码改动。**
-> 本文**未修改任何 `src/` 或 `tests/` 代码**，未做 git 操作，未联网。本次只新增本文件一个文件。
-> 落地后必须回来更新本行状态与 `CLAUDE.md` §4/§5。
+> **状态：阶段一已实施（2026-08-25）。阶段二/三/四未实施。**
+>
+> | 阶段 | 状态 |
+> |---|---|
+> | 阶段 0（清 `traces.jsonl`） | ✅ 已移出活跃路径（见文末「阶段一实施记录」） |
+> | **阶段一**（`context.py` / `redact.py` / `configure_logging` / 8 处 print / 轮转） | ✅ **已实施，117 条单测保护** |
+> | 阶段二（`app.py`：中间件 + 29 处 print） | ⬜ 未实施 |
+> | 阶段三（`workflow.py`：`_emit_trace` 双 sink + 13 处 print） | ⬜ 未实施 |
+> | 阶段四（前端短码 + 按 org 分文件 + 保留期运维） | ⬜ 未实施 |
+>
+> ⚠️ 本文 §1 / §2 的「现状」描述写于实施前，**阶段一涉及的部分已经过时**
+> （`logger.py` 已扩展、`write_trace` 已删、`traces.jsonl` 已移走）。
+> 当前实际状态以文末「阶段一实施记录」为准。
 >
 > **日期**：2026-08-25
 > **死期**：**2026-11-30**。到期仍未实施则本文作废（按 `CLAUDE.md` §7.4「还没实现的重要方案必须有死期」）；
@@ -1179,3 +1189,51 @@ grep -rn "print(" --include="*.py" src/ragent_backend src/tool_agent | grep -c "
 grep -rn "^logger = logging.getLogger(__name__)" --include="*.py" src/ | wc -l        # 27
 grep -rn "task_id\|taskId" frontend/src | wc -l                                        # 0
 ```
+
+---
+
+## 阶段一实施记录（2026-08-25）
+
+> 结论分档严格区分：**已验证通过** / **已跑通** / **已实现但未验证**。
+
+### 交付物
+
+| 文件 | 内容 | 状态 |
+|---|---|---|
+| `src/observability/context.py`（新增） | `RequestContext`（frozen）· `bind/get/clear_request_context` · `request_context` 上下文管理器 · `new_request_id` · `sanitize_request_id` | **已验证通过** |
+| `src/observability/redact.py`（新增） | S0/S1/S2/S2+ 分级表 + 纯函数 `redact()` / `classify_field()` / `hash_value()` / `sensitive_digest()` | **已验证通过** |
+| `src/observability/logger.py`（扩展） | `configure_logging` · `ContextInjectingFilter` · `RedactingFilter` · `reset_logging` · `get_trace_logger` 改按天轮转 · **删除 `write_trace`**（D-10） | **已验证通过** |
+| `src/mcp_server/server.py` | `_redirect_all_loggers_to_stderr` 钉死 `RAGENT_LOG_DEST=stderr` | **已实现但未验证**（无 stdio 端到端测试） |
+| 8 处 `print` → logger | `ltm_store` 1 · `audit_store` 1 · `auth` 1 · `store` 1 · `file_store` 2 · `memory_manager` 1 · `subgraph` 1 | **已验证通过** |
+| `tests/conftest.py` | `capture_json_logs` fixture · `_clear_request_context` autouse fixture | **已验证通过** |
+| `tests/unit/test_observability_context.py`（新增，24 条） | T-2/T-4/T-5/T-6/T-7/T-9 + 入站 id 校验 | **已验证通过** |
+| `tests/unit/test_log_redaction.py`（新增，28 条） | T-1/T-12 + `ltm_store` 泄漏定点回归 | **已验证通过** |
+| `tests/unit/test_jsonl_logger.py`（扩展） | T-10（`get_logger` 两次不同 level 都生效）+ 轮转 + 降级 | **已验证通过** |
+| `scripts/verify_request_id_propagation.py`（新增） | §5.4 的判别力自检 | **已验证通过** |
+
+### 与设计的差异（实施中发现，已在代码里落实）
+
+1. **新增 `dest="stderr"`**（设计里只有 stdout/file/both）。
+   原因：`configure_logging` 默认往 **stdout** 写，而 MCP stdio 服务把 stdout
+   当 JSON-RPC 通信信道——按设计原样实现会**破坏 MCP 协议报文边界**。
+   `src/mcp_server/server.py` 的 `_redirect_all_loggers_to_stderr()` 现在先
+   `os.environ["RAGENT_LOG_DEST"] = "stderr"`，让后续任何一次配置都落 stderr，
+   不依赖调用顺序（原来靠"basicConfig 恰好是 no-op"，是巧合不是设计）。
+2. **容器字段改为递归而非整体摘要**。`chunks=[{"chunk_id":…, "text":…}]`
+   若整体哈希，就丢掉了 S1 甜点（能顺着 id 查库、日志本身不含内容）。
+   现在递归到叶子逐个判级。配套加了一条防线：**列表里直接躺着字符串**
+   （`notes: ["用户说他要离职"]`）按 S2 处理，因为递归对标量是无操作的。
+3. **`_S1_SUFFIXES` 刻意不含 `_name`**。`file_name` 是用户上传的文件名，是内容不是标识符。
+4. **`auth.py` 的开发密钥告警测试从 capsys 改为 caplog**，并新增「级别必须仍是 WARNING」
+   的断言——专门防"迁移日志时顺手把安全告警降成 debug"。
+
+### 阶段一**没有**做的（明确留给后续阶段）
+
+- `app.py` / `workflow.py` / `intent.py` 的 45 处 `print`（写权限归属他人）
+- `RequestContextMiddleware` + `X-Request-Id` 出入站（阶段二，需 `app.py`）
+- `_emit_trace` → `emit_event` 双 sink（阶段三，D-8 要求先跑并发回归）
+- `query_knowledge_hub.py` 的 `TraceContext` 加 `request_id` + `final_results[].text` 关原文
+  —— **`logs/traces.jsonl` 的写入方仍未改**，重新跑聊天会重新长出含原文的文件
+- 按 org 分文件 + `_unassigned/`（阶段四，依赖阶段二的 `org_id` 进上下文）
+- `subgraph.py` 审计 `detail={"args": {...}}` 的字段收窄（属阶段三的逐节点字段工作）
+- **日志对延迟的影响未测**（§9.2 原有条目仍然成立）

@@ -26,7 +26,7 @@ from langgraph.graph import StateGraph, START, END
 from src.ragent_backend.schemas import RAGState, ensure_message_ids
 from src.ragent_backend.memory_manager import RollingMemoryManager
 from src.ragent_backend.store import ConversationArchiveStore
-from src.ragent_backend.intent import analyze_and_route
+from src.ragent_backend.intent import MAX_SUB_QUERY_FANOUT, analyze_and_route
 from src.ragent_backend.ltm_store import LTMStore
 from src.ragent_backend.workflow_store import WorkflowStore
 from src.mcp_server.tools.query_knowledge_hub import QueryKnowledgeHubTool
@@ -1170,7 +1170,33 @@ class RAGWorkflow:
         collection: str,
         top_k: int,
     ) -> Dict[str, Any]:
-        """并行检索多个子查询，逐个失败互不影响，最后合并成一份带子查询标签的上下文。"""
+        """并行检索多个子查询，逐个失败互不影响，最后合并成一份带子查询标签的上下文。
+
+        D2（`docs/orchestration_design.md` §4.3）：**这里是全仓唯一的扇出截断点**。
+        改之前 `asyncio.gather` 对拆出来的子查询数量没有任何上限——拆出几个就
+        并发打几个检索，既放大并发压力，又把越来越多互不相干的材料拍进同一个
+        生成 prompt（F2 上下文污染 / F4 跨材料编造的燃料）。上限已拍板取 3
+        （见 `intent.MAX_SUB_QUERY_FANOUT`）。
+
+        截断而不是报错：多问了几个主题不该让整轮问答失败，少答的部分用户可以
+        追问；但**必须留痕**——被丢弃的子查询同时进 `_emit_trace`（TracePanel
+        实时可见）和 `trace_events`（随 state 落库，非流式路径也有）。
+        """
+        dropped_sub_queries: List[str] = []
+        if len(sub_queries) > MAX_SUB_QUERY_FANOUT:
+            dropped_sub_queries = sub_queries[MAX_SUB_QUERY_FANOUT:]
+            sub_queries = sub_queries[:MAX_SUB_QUERY_FANOUT]
+            print(
+                f"[Retrieve] D2 子查询扇出超上限，截断到 {MAX_SUB_QUERY_FANOUT} 个，"
+                f"丢弃 {len(dropped_sub_queries)} 个: {dropped_sub_queries}"
+            )
+            self._emit_trace("retrieve", "sub_query_fanout_truncated", "success", {
+                "limit": MAX_SUB_QUERY_FANOUT,
+                "executed_sub_queries": sub_queries,
+                "dropped_sub_queries": dropped_sub_queries,
+                "dropped_count": len(dropped_sub_queries),
+            })
+
         self._emit_trace("retrieve", "knowledge_retrieval", "running", {
             "sub_queries": sub_queries,
             "collection": collection,
@@ -1207,20 +1233,24 @@ class RAGWorkflow:
             "errors": errors,
         })
         self._emit_trace("retrieve", "node_end", "success")
+
+        retrieve_event: Dict[str, Any] = {
+            "node": "retrieve",
+            "ts": time.time(),
+            "ok": True,
+            "collection": collection,
+            "result_count": total_count,
+            "sub_query_count": len(sub_queries),
+        }
+        if dropped_sub_queries:
+            retrieve_event["sub_query_fanout_truncated"] = True
+            retrieve_event["sub_query_fanout_limit"] = MAX_SUB_QUERY_FANOUT
+            retrieve_event["dropped_sub_queries"] = dropped_sub_queries
+
         return {
             "retrieval_context": context_text,
             "retrieval_contexts": contexts,
-            "trace_events": [
-                *state.get("trace_events", []),
-                {
-                    "node": "retrieve",
-                    "ts": time.time(),
-                    "ok": True,
-                    "collection": collection,
-                    "result_count": total_count,
-                    "sub_query_count": len(sub_queries),
-                }
-            ],
+            "trace_events": [*state.get("trace_events", []), retrieve_event],
         }
 
     async def _generate_node(self, state: RAGState) -> Dict[str, Any]:

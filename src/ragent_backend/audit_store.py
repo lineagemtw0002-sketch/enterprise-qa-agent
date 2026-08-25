@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 import uuid
@@ -29,6 +30,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -120,7 +123,22 @@ class AuditStore:
                     resource_id, json.dumps(detail or {}), success, time.time(),
                 )
         except Exception as e:
-            print(f"[AuditStore] Failed to record audit log: {e}")
+            # error：合规记录静默丢失。审计失败不拖垮业务操作（这是刻意的，
+            # 见上面的 docstring），但**必须在应用日志里留下痕迹**，
+            # 否则"审计表里为什么少了一段"永远查不出来。
+            # detail 不记——它可能含工具参数/提示词片段（S2）。
+            logger.error(
+                "[AuditStore] Failed to record audit log",
+                extra={
+                    "event": "audit.record.failed",
+                    "error_type": type(e).__name__,
+                    "org_id": org_id,
+                    "user_id": user_id,
+                    "action": action,
+                    "resource_type": resource_type,
+                },
+                exc_info=True,
+            )
 
     @staticmethod
     def _row_to_entry(row: asyncpg.Record) -> AuditLogEntry:

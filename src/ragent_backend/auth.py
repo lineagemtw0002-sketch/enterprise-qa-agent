@@ -18,6 +18,7 @@ JWT 登录鉴权。
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -25,6 +26,8 @@ from typing import Optional
 
 import jwt
 from fastapi import Depends, Header, HTTPException
+
+logger = logging.getLogger(__name__)
 
 # 这个字符串公开在源码里，任何拿到仓库的人都能用它签发任意 user_id 的 token。
 # 它只是让本地开发不用额外配置就能跑起来，绝不能出现在真实部署里。
@@ -65,9 +68,13 @@ def resolve_jwt_secret(
         debug_mode = os.getenv("RAGENT_DEBUG", "false").strip().lower() == "true"
 
     if debug_mode:
-        print(
+        # ⚠️ 这条必须是 WARNING 且必须显眼：它是"本地配置被带上生产"的唯一
+        # 早期信号。改造日志体系时**不许把它降成 debug**——root 没配置时
+        # logging 的 lastResort 也会把 WARNING 打到 stderr，可见性不弱于原来的 print。
+        logger.warning(
             "[Auth] 警告：正在使用源码内置的开发用 JWT 密钥，任何人都可以伪造身份。"
-            "仅限本地开发；部署前必须设置 RAGENT_JWT_SECRET。"
+            "仅限本地开发；部署前必须设置 RAGENT_JWT_SECRET。",
+            extra={"event": "auth.jwt_secret.dev_fallback_in_use"},
         )
         return _DEV_FALLBACK_SECRET
 

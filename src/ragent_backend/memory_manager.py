@@ -9,7 +9,10 @@
 
 from typing import List, Dict, Tuple, Optional, Any
 from langchain_core.messages import HumanMessage, AIMessage, AnyMessage
+import logging
 import time
+
+logger = logging.getLogger(__name__)
 
 
 class RollingMemoryManager:
@@ -135,8 +138,19 @@ class RollingMemoryManager:
             result = response.content.strip()
             return result if result else self._fallback_summary(existing_summary, archived_msgs)
         except Exception as e:
-            # 异常时降级
-            print(f"[MemoryManager] Summary rewrite failed: {e}, using fallback")
+            # warning 而不是 error：下一行就走 _fallback_summary，功能降级但可用。
+            # `fallback_used` 是可聚合的归因字段——"这周有多少轮摘要是拼接出来的"
+            # 直接影响长对话的回答质量，光靠一行文本日志统计不出来。
+            logger.warning(
+                "[MemoryManager] Summary rewrite failed, using fallback concatenation",
+                extra={
+                    "event": "memory.summary_rewrite.failed",
+                    "error_type": type(e).__name__,
+                    "fallback_used": True,
+                    "message_count": len(archived_msgs),
+                },
+                exc_info=True,
+            )
             return self._fallback_summary(existing_summary, archived_msgs)
     
     def _fallback_summary(

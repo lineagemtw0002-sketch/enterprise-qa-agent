@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shutil
 import uuid
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 import asyncpg
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -233,7 +236,19 @@ class ConversationFileStore:
         try:
             Path(file_info.file_path).unlink(missing_ok=True)
         except Exception as e:
-            print(f"[FileStore] Failed to delete file: {e}")
+            # error：磁盘文件删不掉但 DB 记录马上就删了 → 产生**孤儿文件**，
+            # 而且用户界面上看不到它了。这是静默失效，不是可用降级。
+            # 不记 file_path——上传文件名是用户内容（S2）；file_id 足够定位。
+            logger.error(
+                "[FileStore] Failed to delete file from disk",
+                extra={
+                    "event": "file_store.delete_file.failed",
+                    "error_type": type(e).__name__,
+                    "conversation_id": conversation_id,
+                    "file_id": file_id,
+                },
+                exc_info=True,
+            )
 
         pool = await self._get_pool()
         async with pool.acquire() as conn:
@@ -252,7 +267,17 @@ class ConversationFileStore:
             try:
                 shutil.rmtree(conv_dir)
             except Exception as e:
-                print(f"[FileStore] Failed to delete directory: {e}")
+                # 同上：整个会话目录留在盘上，DB 记录却清了。
+                logger.error(
+                    "[FileStore] Failed to delete conversation directory from disk",
+                    extra={
+                        "event": "file_store.delete_dir.failed",
+                        "error_type": type(e).__name__,
+                        "conversation_id": conversation_id,
+                        "file_count": len(files),
+                    },
+                    exc_info=True,
+                )
 
         pool = await self._get_pool()
         async with pool.acquire() as conn:
