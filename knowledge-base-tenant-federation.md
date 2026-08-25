@@ -1,6 +1,11 @@
 # 知识库多租户联邦查询（非结构化数据）技术方案
 
-> 状态：已实现（`src/ragent_backend/tenant_connector_store.py`、
+> **状态：已于 2026-08-23 停用（2026-08-25 核实）**
+> 委托模式已由 `scripts/migrate_delegated_orgs_to_local_kb.py` 迁回平台本地 Chroma。
+> 代码路径仍残留（`tenant_connector_store.py:39`、`app.py:1502,1816`、
+> `query_knowledge_hub.py:444,458`），属待清理死代码，**没有数据走这条路**。
+> 本文仅作历史参考，**不要按它改代码**。原状态行如下：
+> ~~已实现~~（`src/ragent_backend/tenant_connector_store.py`、
 > `src/mcp_server/tools/query_knowledge_hub.py::_execute_remote`、
 > `services/tenant_kb_demo/`、`scripts/seed_tenant_kb_demo.py`）
 > 关联现状代码：`src/mcp_server/tools/query_knowledge_hub.py`、`src/libs/vector_store/{chroma_store,vector_store_factory}.py`、

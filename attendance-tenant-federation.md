@@ -1,6 +1,9 @@
 # 考勤数据多租户联邦查询（方案四）技术方案
 
-> 状态：核心路由已实现（`src/ragent_backend/tenant_identity_store.py`、
+> **状态：核心路由仍在使用中（2026-08-25 核实：`tenant_identity_store` 仍接在
+> `builtin_tools.py:108` 的 `query_attendance` 上）。注意与知识库联邦不同——
+> 那套已于 08-23 拆除，这套没有。**
+> 原状态行：核心路由已实现（`src/ragent_backend/tenant_identity_store.py`、
 > `src/tool_agent/builtin_tools.py::_register_query_attendance`、
 > `services/tenant_attendance_demo/`）——落地的是第 1.3 节决策 3 里"更轻的 HTTP
 > webhook 兜底路径"（`connector_type=http_webhook`），第 2 节设想的 `mcp_sse`

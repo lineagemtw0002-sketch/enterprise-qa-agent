@@ -1,6 +1,7 @@
 # 工作流 前端展示方案
 
-> 状态：设计方案（未实现）
+> **状态：已实施（2026-08-25 核实：前端工作流相关组件已存在）**
+> 与 `work-flow.md`、`work-flow-v2.md` 讲同一件事，**待合并**。
 > 前置文档：`work-flow.md`（后端数据模型/意图状态机/审批 API，本方案在此基础上补前端）
 > 关联现状代码：`frontend/src/App.jsx`（view 切换、登录态、profile popover 的既有模式）；
 > `frontend/src/components/admin/{AdminPanel,RoleManagement,UserRoleAssignment}.jsx`（整页管理界面的现成范式）；

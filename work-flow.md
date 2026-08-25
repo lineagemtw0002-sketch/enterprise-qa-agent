@@ -1,6 +1,9 @@
 # 工作流（Workflow）接入系统 技术方案
 
-> 状态：设计方案（未实现）
+> **状态：已实施（2026-08-25 核实：`src/ragent_backend/workflow_store.py` 784 行、
+> 前端 `WorkflowTemplateManagement.jsx` 均已存在）**
+> 当前状态以 `CLAUDE.md` 为准。本文与 `work-flow-web.md`、`work-flow-v2.md`
+> 讲的是同一件事（合计 856 行），**待合并**。
 > 关联现状代码：`src/ragent_backend/workflow.py`、`intent.py`、`schemas.py`、`app.py`；
 > `src/tool_agent/{tool_registry,subgraph,builtin_tools,adapters,state}.py`；
 > `src/ragent_backend/{role_store,user_store,conversation_store,file_store}.py`

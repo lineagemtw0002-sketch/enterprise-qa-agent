@@ -1,6 +1,10 @@
 # 智能运维（Auto Operations）技术方案
 
-> 状态：设计方案（未实现）
+> **状态：部分实施（2026-08-25 核实）**
+> 已有：前端 `OperationsDashboard.jsx` 作为容器，组合了网关监控（`GatewayMonitor`）、
+> 组织管理、工作流模板管理与趋势图。
+> **未见实现**：本文描述的自动化运维能力本身（后端 grep `auto_operations` 无结果）。
+> 也就是说——**监控展示的壳子有了，自动运维的内核没有。**
 > 关联现状代码：`src/ragent_backend/{workflow_store,role_store,user_store,auth,app}.py`；
 > `src/tool_agent/{builtin_tools,adapters,tool_registry}.py`；
 > `frontend/src/components/ops/OpsPlaceholder.jsx`、`frontend/src/components/shell/TopNav.jsx`（`MODULES` 数组 `key: 'ops'`）、`frontend/src/App.jsx`（`view === 'ops'`）；
