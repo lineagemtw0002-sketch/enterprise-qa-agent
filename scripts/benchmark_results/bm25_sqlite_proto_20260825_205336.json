@@ -1,0 +1,824 @@
+{
+  "generated_at": "2026-08-25T20:53:36.106366",
+  "script": "/Users/david/Documents/enterprise-qa-agent/scripts/prototype_bm25_sqlite.py",
+  "code_state": "d4a4536",
+  "params": {
+    "sizes": [
+      1000,
+      16000,
+      50000
+    ],
+    "top_k": 10,
+    "repeat_fast": 5,
+    "repeat_slow": 2,
+    "k1": 1.5,
+    "b": 0.75,
+    "chunks_per_doc": 8,
+    "skip_json_build": false
+  },
+  "queries": [
+    {
+      "text": "员工年假怎么申请",
+      "terms": [
+        "员工",
+        "怎么",
+        "申请"
+      ]
+    },
+    {
+      "text": "报销单需要哪个部门审批",
+      "terms": [
+        "报销",
+        "需要",
+        "哪个",
+        "部门",
+        "审批"
+      ]
+    },
+    {
+      "text": "远程办公的考勤怎么算",
+      "terms": [
+        "远程",
+        "办公",
+        "考勤",
+        "怎么"
+      ]
+    },
+    {
+      "text": "差旅费用结算流程和时限",
+      "terms": [
+        "差旅费",
+        "结算",
+        "流程",
+        "时限"
+      ]
+    },
+    {
+      "text": "绩效考核结果什么时候公布",
+      "terms": [
+        "绩效考核",
+        "结果",
+        "什么",
+        "时候",
+        "公布"
+      ]
+    },
+    {
+      "text": "合同变更需要法务部复核吗",
+      "terms": [
+        "合同",
+        "变更",
+        "需要",
+        "法务部",
+        "复核"
+      ]
+    },
+    {
+      "text": "社保和公积金的缴纳基数",
+      "terms": [
+        "社保",
+        "公积金",
+        "缴纳",
+        "基数"
+      ]
+    },
+    {
+      "text": "采购预算超支怎么备案",
+      "terms": [
+        "采购",
+        "预算",
+        "超支",
+        "怎么",
+        "备案"
+      ]
+    },
+    {
+      "text": "离职手续归档由谁负责",
+      "terms": [
+        "离职",
+        "手续",
+        "归档",
+        "负责"
+      ]
+    },
+    {
+      "text": "培训申请被驳回可以延期吗",
+      "terms": [
+        "培训",
+        "申请",
+        "驳回",
+        "可以",
+        "延期"
+      ]
+    },
+    {
+      "text": "分公司负责人的审批权限",
+      "terms": [
+        "分公司",
+        "负责人",
+        "审批",
+        "权限"
+      ]
+    },
+    {
+      "text": "记录编号在系统里怎么查",
+      "terms": [
+        "记录",
+        "编号",
+        "系统",
+        "怎么"
+      ]
+    }
+  ],
+  "real_corpus_chunks": 999,
+  "measurements": [
+    {
+      "chunks": 1000,
+      "real_chunk_count": 334,
+      "encode_s": 0.19,
+      "json_build_s": 0.38,
+      "json_build_skipped": false,
+      "json_bytes": 5419397,
+      "json_mb": 5.17,
+      "json_build_fast_invert_s": 0.01,
+      "vocab_terms": 6374,
+      "json_dump_s": 0.1,
+      "json_dump_compact_s": 0.02,
+      "json_compact_mb": 2.77,
+      "sqlite_clustered_build_s": 0.07,
+      "sqlite_clustered_invert_s": 0.0,
+      "sqlite_clustered_write_s": 0.07,
+      "sqlite_clustered_mb": 3.69,
+      "postings_rows": 41691,
+      "sqlite_rowid_build_s": 0.07,
+      "sqlite_rowid_invert_s": 0.0,
+      "sqlite_rowid_write_s": 0.06,
+      "sqlite_rowid_mb": 4.07,
+      "peak_rss_after_build_mb": 191.5,
+      "query_latency": {
+        "json_load_per_query": {
+          "median_ms": 30.508,
+          "min_ms": 29.265,
+          "max_ms": 33.912,
+          "total_samples": 24
+        },
+        "json_warm_in_memory": {
+          "median_ms": 0.091,
+          "min_ms": 0.018,
+          "max_ms": 0.538,
+          "total_samples": 60
+        },
+        "sqlite_clustered_warm_conn": {
+          "median_ms": 0.203,
+          "min_ms": 0.072,
+          "max_ms": 1.01,
+          "total_samples": 60
+        },
+        "sqlite_clustered_new_conn": {
+          "median_ms": 0.36,
+          "min_ms": 0.208,
+          "max_ms": 1.144,
+          "total_samples": 60
+        },
+        "sqlite_rowid_warm_conn": {
+          "median_ms": 0.211,
+          "min_ms": 0.07,
+          "max_ms": 1.007,
+          "total_samples": 60
+        },
+        "sqlite_batched_in": {
+          "median_ms": 0.197,
+          "min_ms": 0.046,
+          "max_ms": 1.029,
+          "total_samples": 60
+        }
+      },
+      "consistency": {
+        "queries": 12,
+        "l1_full_score_map_bitwise_identical": 12,
+        "l1_candidate_sets_identical": 12,
+        "l2_topk_identical_as_is": 4,
+        "l3_topk_identical_with_tiebreak": 12,
+        "max_abs_score_diff": 0.0,
+        "per_query": [
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 290,
+            "topk_boundary_tied_candidates": 4,
+            "query": "员工年假怎么申请",
+            "n_terms": 3
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": true,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 415,
+            "topk_boundary_tied_candidates": 2,
+            "query": "报销单需要哪个部门审批",
+            "n_terms": 5
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 188,
+            "topk_boundary_tied_candidates": 16,
+            "query": "远程办公的考勤怎么算",
+            "n_terms": 4
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 144,
+            "topk_boundary_tied_candidates": 8,
+            "query": "差旅费用结算流程和时限",
+            "n_terms": 4
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": true,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 58,
+            "topk_boundary_tied_candidates": 1,
+            "query": "绩效考核结果什么时候公布",
+            "n_terms": 5
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": true,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 552,
+            "topk_boundary_tied_candidates": 3,
+            "query": "合同变更需要法务部复核吗",
+            "n_terms": 5
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 168,
+            "topk_boundary_tied_candidates": 4,
+            "query": "社保和公积金的缴纳基数",
+            "n_terms": 4
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 278,
+            "topk_boundary_tied_candidates": 2,
+            "query": "采购预算超支怎么备案",
+            "n_terms": 5
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 225,
+            "topk_boundary_tied_candidates": 2,
+            "query": "离职手续归档由谁负责",
+            "n_terms": 4
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 442,
+            "topk_boundary_tied_candidates": 4,
+            "query": "培训申请被驳回可以延期吗",
+            "n_terms": 5
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 363,
+            "topk_boundary_tied_candidates": 5,
+            "query": "分公司负责人的审批权限",
+            "n_terms": 4
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": true,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 740,
+            "topk_boundary_tied_candidates": 1,
+            "query": "记录编号在系统里怎么查",
+            "n_terms": 4
+          }
+        ]
+      },
+      "query_postings_scanned": {
+        "median": 326,
+        "max": 2077,
+        "min": 64
+      },
+      "deletion": {
+        "source_path": "data/uploads/policy_000000.md",
+        "postings_before": 317,
+        "sqlite_deleted_rows": 317,
+        "postings_after": 0,
+        "sqlite_ok": true,
+        "json_remove_document_returned": false
+      },
+      "peak_rss_mb": 410.8
+    },
+    {
+      "chunks": 16000,
+      "real_chunk_count": 5334,
+      "encode_s": 2.97,
+      "json_build_s": 50.11,
+      "json_build_skipped": false,
+      "json_bytes": 79410092,
+      "json_mb": 75.73,
+      "json_build_fast_invert_s": 0.16,
+      "vocab_terms": 26272,
+      "json_dump_s": 1.56,
+      "json_dump_compact_s": 0.34,
+      "json_compact_mb": 40.3,
+      "sqlite_clustered_build_s": 1.31,
+      "sqlite_clustered_invert_s": 0.09,
+      "sqlite_clustered_write_s": 1.22,
+      "sqlite_clustered_mb": 57.11,
+      "postings_rows": 667611,
+      "sqlite_rowid_build_s": 1.32,
+      "sqlite_rowid_invert_s": 0.09,
+      "sqlite_rowid_write_s": 1.23,
+      "sqlite_rowid_mb": 64.59,
+      "peak_rss_after_build_mb": 821.3,
+      "query_latency": {
+        "json_load_per_query": {
+          "median_ms": 482.003,
+          "min_ms": 430.115,
+          "max_ms": 859.396,
+          "total_samples": 24
+        },
+        "json_warm_in_memory": {
+          "median_ms": 1.753,
+          "min_ms": 0.302,
+          "max_ms": 64.583,
+          "total_samples": 60
+        },
+        "sqlite_clustered_warm_conn": {
+          "median_ms": 3.249,
+          "min_ms": 0.572,
+          "max_ms": 30.712,
+          "total_samples": 60
+        },
+        "sqlite_clustered_new_conn": {
+          "median_ms": 3.436,
+          "min_ms": 0.744,
+          "max_ms": 21.198,
+          "total_samples": 60
+        },
+        "sqlite_rowid_warm_conn": {
+          "median_ms": 3.692,
+          "min_ms": 0.593,
+          "max_ms": 24.551,
+          "total_samples": 60
+        },
+        "sqlite_batched_in": {
+          "median_ms": 3.335,
+          "min_ms": 0.609,
+          "max_ms": 19.84,
+          "total_samples": 60
+        }
+      },
+      "consistency": {
+        "queries": 12,
+        "l1_full_score_map_bitwise_identical": 12,
+        "l1_candidate_sets_identical": 12,
+        "l2_topk_identical_as_is": 0,
+        "l3_topk_identical_with_tiebreak": 12,
+        "max_abs_score_diff": 0.0,
+        "per_query": [
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 4751,
+            "topk_boundary_tied_candidates": 16,
+            "query": "员工年假怎么申请",
+            "n_terms": 3
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 6874,
+            "topk_boundary_tied_candidates": 16,
+            "query": "报销单需要哪个部门审批",
+            "n_terms": 5
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 3068,
+            "topk_boundary_tied_candidates": 19,
+            "query": "远程办公的考勤怎么算",
+            "n_terms": 4
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 2389,
+            "topk_boundary_tied_candidates": 16,
+            "query": "差旅费用结算流程和时限",
+            "n_terms": 4
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 929,
+            "topk_boundary_tied_candidates": 17,
+            "query": "绩效考核结果什么时候公布",
+            "n_terms": 5
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 8781,
+            "topk_boundary_tied_candidates": 1,
+            "query": "合同变更需要法务部复核吗",
+            "n_terms": 5
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 2668,
+            "topk_boundary_tied_candidates": 4,
+            "query": "社保和公积金的缴纳基数",
+            "n_terms": 4
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 4508,
+            "topk_boundary_tied_candidates": 1,
+            "query": "采购预算超支怎么备案",
+            "n_terms": 5
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 3408,
+            "topk_boundary_tied_candidates": 16,
+            "query": "离职手续归档由谁负责",
+            "n_terms": 4
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 7180,
+            "topk_boundary_tied_candidates": 5,
+            "query": "培训申请被驳回可以延期吗",
+            "n_terms": 5
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 5881,
+            "topk_boundary_tied_candidates": 6,
+            "query": "分公司负责人的审批权限",
+            "n_terms": 4
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 11850,
+            "topk_boundary_tied_candidates": 16,
+            "query": "记录编号在系统里怎么查",
+            "n_terms": 4
+          }
+        ]
+      },
+      "query_postings_scanned": {
+        "median": 5215,
+        "max": 33262,
+        "min": 1026
+      },
+      "deletion": {
+        "source_path": "data/uploads/policy_000000.md",
+        "postings_before": 317,
+        "sqlite_deleted_rows": 317,
+        "postings_after": 0,
+        "sqlite_ok": true,
+        "json_remove_document_returned": false
+      },
+      "peak_rss_mb": 1254.6
+    },
+    {
+      "chunks": 50000,
+      "real_chunk_count": 16667,
+      "encode_s": 9.58,
+      "json_build_s": 615.26,
+      "json_build_skipped": false,
+      "json_bytes": 247126077,
+      "json_mb": 235.68,
+      "json_build_fast_invert_s": 0.58,
+      "vocab_terms": 71066,
+      "json_dump_s": 4.97,
+      "json_dump_compact_s": 1.14,
+      "json_compact_mb": 125.4,
+      "sqlite_clustered_build_s": 4.65,
+      "sqlite_clustered_invert_s": 0.31,
+      "sqlite_clustered_write_s": 4.35,
+      "sqlite_clustered_mb": 178.16,
+      "postings_rows": 2086062,
+      "sqlite_rowid_build_s": 4.24,
+      "sqlite_rowid_invert_s": 0.31,
+      "sqlite_rowid_write_s": 3.93,
+      "sqlite_rowid_mb": 201.84,
+      "peak_rss_after_build_mb": 1870.1,
+      "query_latency": {
+        "json_load_per_query": {
+          "median_ms": 1737.821,
+          "min_ms": 1440.695,
+          "max_ms": 2188.22,
+          "total_samples": 24
+        },
+        "json_warm_in_memory": {
+          "median_ms": 7.162,
+          "min_ms": 0.905,
+          "max_ms": 74.854,
+          "total_samples": 60
+        },
+        "sqlite_clustered_warm_conn": {
+          "median_ms": 8.925,
+          "min_ms": 1.629,
+          "max_ms": 91.637,
+          "total_samples": 60
+        },
+        "sqlite_clustered_new_conn": {
+          "median_ms": 9.537,
+          "min_ms": 1.865,
+          "max_ms": 89.816,
+          "total_samples": 60
+        },
+        "sqlite_rowid_warm_conn": {
+          "median_ms": 9.38,
+          "min_ms": 1.677,
+          "max_ms": 63.324,
+          "total_samples": 60
+        },
+        "sqlite_batched_in": {
+          "median_ms": 9.842,
+          "min_ms": 1.813,
+          "max_ms": 55.769,
+          "total_samples": 60
+        }
+      },
+      "consistency": {
+        "queries": 12,
+        "l1_full_score_map_bitwise_identical": 12,
+        "l1_candidate_sets_identical": 12,
+        "l2_topk_identical_as_is": 0,
+        "l3_topk_identical_with_tiebreak": 12,
+        "max_abs_score_diff": 0.0,
+        "per_query": [
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 14884,
+            "topk_boundary_tied_candidates": 50,
+            "query": "员工年假怎么申请",
+            "n_terms": 3
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 21526,
+            "topk_boundary_tied_candidates": 50,
+            "query": "报销单需要哪个部门审批",
+            "n_terms": 5
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 9393,
+            "topk_boundary_tied_candidates": 14,
+            "query": "远程办公的考勤怎么算",
+            "n_terms": 4
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 7622,
+            "topk_boundary_tied_candidates": 50,
+            "query": "差旅费用结算流程和时限",
+            "n_terms": 4
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 2901,
+            "topk_boundary_tied_candidates": 51,
+            "query": "绩效考核结果什么时候公布",
+            "n_terms": 5
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 27421,
+            "topk_boundary_tied_candidates": 2,
+            "query": "合同变更需要法务部复核吗",
+            "n_terms": 5
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 8069,
+            "topk_boundary_tied_candidates": 16,
+            "query": "社保和公积金的缴纳基数",
+            "n_terms": 4
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 14141,
+            "topk_boundary_tied_candidates": 5,
+            "query": "采购预算超支怎么备案",
+            "n_terms": 5
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 10738,
+            "topk_boundary_tied_candidates": 18,
+            "query": "离职手续归档由谁负责",
+            "n_terms": 4
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 22203,
+            "topk_boundary_tied_candidates": 2,
+            "query": "培训申请被驳回可以延期吗",
+            "n_terms": 5
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 18457,
+            "topk_boundary_tied_candidates": 10,
+            "query": "分公司负责人的审批权限",
+            "n_terms": 4
+          },
+          {
+            "l1_full_score_map_bitwise_identical": true,
+            "l1_candidate_sets_identical": true,
+            "l2_topk_identical_as_is": false,
+            "l3_topk_identical_with_tiebreak": true,
+            "max_abs_score_diff": 0.0,
+            "candidates": 37033,
+            "topk_boundary_tied_candidates": 50,
+            "query": "记录编号在系统里怎么查",
+            "n_terms": 4
+          }
+        ]
+      },
+      "query_postings_scanned": {
+        "median": 16335,
+        "max": 103949,
+        "min": 3202
+      },
+      "deletion": {
+        "source_path": "data/uploads/policy_000000.md",
+        "postings_before": 317,
+        "sqlite_deleted_rows": 317,
+        "postings_after": 0,
+        "sqlite_ok": true,
+        "json_remove_document_returned": false
+      },
+      "peak_rss_mb": 1890.8
+    }
+  ],
+  "latency_scaling_min_to_max_size": {
+    "json_load_per_query": 56.96,
+    "json_warm_in_memory": 78.7,
+    "sqlite_clustered_warm_conn": 43.97,
+    "sqlite_clustered_new_conn": 26.49,
+    "sqlite_rowid_warm_conn": 44.45,
+    "sqlite_batched_in": 49.96
+  },
+  "speedup_vs_json_load_per_query": [
+    150.3,
+    148.4,
+    194.7
+  ],
+  "verdict": {
+    "q1_latency_independent_of_size": false,
+    "q1_ratio_min_to_max_size": 43.97,
+    "q1_max_size_median_ms": 8.925,
+    "q2_l1_full_score_map_bitwise_identical": true,
+    "q2_l2_topk_identical_as_is": false,
+    "q2_l3_topk_identical_with_tiebreak": true,
+    "q2_max_abs_score_diff": 0.0,
+    "t3_sqlite_delete_works": true,
+    "t3_json_remove_document_works": false
+  },
+  "not_covered": [
+    "只单进程单线程测，未测多库并行查询 / 多进程并发读同一 db（设计 §9 第 2 条仍未覆盖）",
+    "未测 OS page cache 冷启动：macOS 下无法在不 sudo 的前提下清 page cache，所有 SQLite 数字都建立在文件已被 OS 缓存的前提上；首查冷盘会更慢",
+    "未测增量摄入（add_documents）路径，只测了全量 build",
+    "语料沿用 measure_bm25_index_growth 的口径：约 1/3 仓库真实中文文本、2/3 模板扩充；模板文本重复度高，会低估真实词表、也会制造偏多的分数平局",
+    "未接 SparseRetriever / query_knowledge_hub，端到端 TTFT 未测",
+    "未测 SQLite 文件损坏、并发写、WAL 模式下的表现（建库用的是 journal_mode=OFF）",
+    "未测 50K 以上规模；143K/716K 仍是外推",
+    "建库时倒排表整个驻留内存（50K 块约几百 MB），大规模摄入需要改成分批落盘，本原型未验证"
+  ]
+}
