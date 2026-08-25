@@ -478,6 +478,41 @@ def create_app() -> FastAPI:
         audit_log=_audit_log,
     )
 
+    _llms_to_keep_warm = [m for m in {id(llm): llm, id(intent_llm): intent_llm}.values() if m is not None]
+
+    # 跟 _llms_to_keep_warm 是同一个问题的另一半：三个 QueryKnowledgeHubTool
+    # 实例各自持有自己的 embedding_client（见 _preload_retrieval_models 的
+    # 说明，互不共享），启动时预热过一次，但之前没有被纳入下面的周期保活——
+    # embedding 模型走的也是 Ollama，同样受 5 分钟 keep_alive 支配，空闲超过
+    # 这个窗口后一样会被换出。实测（logs/traces.jsonl 的 narrow_detail:
+    # embed_query 分段计时）：间隔 81s 时 46ms，间隔 6分18秒 时 834ms——
+    # 跟 llm/intent_llm 同款问题，只是漏了这一层保活。
+    _retrieval_tools_to_keep_warm = {
+        "chat_kb_tool": chat_kb_tool,
+        "kb_management_tool": _kb_management_tool,
+        "workflow_retrieval_tool": workflow._retrieval_tool,
+    }
+
+    async def _ping_llm_once(ping_llm) -> None:
+        try:
+            await ping_llm.bind(max_tokens=1).ainvoke([HumanMessage(content="ping")])
+        except Exception as e:
+            print(f"[KeepAlive] ping failed for {getattr(ping_llm, 'model_name', '?')}: {e}")
+
+    async def _warm_llms_at_startup() -> None:
+        """启动阶段预热 llm/intent_llm 本身（本轮追加，`_keep_models_warm` 之前
+        遗漏的一层）——`_preload_retrieval_models` 只预热了 retrieval 侧的
+        reranker/embedding client，从没让 Ollama 真正把 `llm`（7b）/`intent_llm`
+        （1.5b-router）这两个模型的权重加载进内存。而 `_keep_models_warm` 的
+        保活循环第一次 ping 是在 `asyncio.sleep(240)` 之后才发生——也就是说
+        重启后头 4 分钟内，谁的请求第一个真正走到需要这两个模型的节点
+        （intent / 工具决策 think_node / generate），谁就要现付 Ollama
+        把权重从磁盘搬进内存的钱（用户反馈"工具调用这一步第一次很慢"就是
+        撞在这里）。在这里跟 retrieval 预热一起、在 `yield` 之前跑完，
+        对用户完全不可见；单个失败只打日志，不阻断启动。"""
+        for ping_llm in _llms_to_keep_warm:
+            await _ping_llm_once(ping_llm)
+
     async def _keep_models_warm():
         """后台模型保活探测（docs/optimization_tracking.md 耗时优化任务）——
         Ollama 默认 keep_alive 是 5 分钟，空闲超时模型会被换出显存，下一次
@@ -490,18 +525,28 @@ def create_app() -> FastAPI:
         输出 1 个 token 的极短请求——Ollama 那边只要收到请求就会重置"最近
         使用时间"、顺延保活窗口，不需要改 Ollama 服务本身的 keep_alive 配置
         （那需要重启 Ollama daemon）。ping 失败只打日志，不影响正常请求
-        （下一次真实请求该走的重试/降级逻辑不受这里影响）。"""
-        ping_llms = [m for m in {id(llm): llm, id(intent_llm): intent_llm}.values() if m is not None]
-        if not ping_llms:
+        （下一次真实请求该走的重试/降级逻辑不受这里影响）。首次 ping 由
+        `_warm_llms_at_startup` 在启动阶段跑掉，这里的循环只负责之后的
+        周期性保活，避免重复预热一次。
+
+        同一个循环里顺带重跑一遍每个 QueryKnowledgeHubTool 的
+        `preload_models()`——理由见 `_retrieval_tools_to_keep_warm` 旁的
+        说明：embedding client 走的也是 Ollama，同样会被 5 分钟 keep_alive
+        换出，只在启动时预热一次不够。复用 `preload_models()` 而不是新写一次
+        embed 调用，跟"预热逻辑只有一份"的原则一致（`_ensure_shared_clients`
+        的说明），reranker 那部分重复调用是幂等的、warm 之后只有几十毫秒。"""
+        if not _llms_to_keep_warm and not _retrieval_tools_to_keep_warm:
             return
         while True:
             try:
                 await asyncio.sleep(240)
-                for ping_llm in ping_llms:
+                for ping_llm in _llms_to_keep_warm:
+                    await _ping_llm_once(ping_llm)
+                for name, tool in _retrieval_tools_to_keep_warm.items():
                     try:
-                        await ping_llm.bind(max_tokens=1).ainvoke([HumanMessage(content="ping")])
+                        await tool.preload_models()
                     except Exception as e:
-                        print(f"[KeepAlive] ping failed for {getattr(ping_llm, 'model_name', '?')}: {e}")
+                        print(f"[KeepAlive] retrieval warm-up failed for {name}: {e}")
             except asyncio.CancelledError:
                 break
 
@@ -520,12 +565,7 @@ def create_app() -> FastAPI:
         不能省下另外两个的加载，所以三个都要单独调一次 `preload_models()`。
         单个失败只打日志、不阻断启动：预热本身是优化手段，不是正确性前提，
         真出问题时该走的懒加载兜底路径仍然生效，只是退化成没预热的效果。"""
-        targets = {
-            "chat_kb_tool": chat_kb_tool,
-            "kb_management_tool": _kb_management_tool,
-            "workflow_retrieval_tool": workflow._retrieval_tool,
-        }
-        for name, tool in targets.items():
+        for name, tool in _retrieval_tools_to_keep_warm.items():
             try:
                 await tool.preload_models()
                 print(f"[Preload] {name}: reranker/embedding client warmed up")
@@ -536,6 +576,7 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await _preload_retrieval_models()
+        await _warm_llms_at_startup()
         keep_warm_task = asyncio.create_task(_keep_models_warm())
 
         # 启动时连接配置的 MCP Servers
