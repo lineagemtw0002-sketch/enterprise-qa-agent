@@ -279,3 +279,49 @@ class TestBuildIsSinglePass:
         reloaded = BM25Indexer(index_dir=str(tmp_path / "bm25"))
         assert reloaded.load(collection="disk") is True
         assert reloaded._index == in_memory
+
+
+class TestReingestDoesNotDoubleCountChunks:
+    """重摄入同一文档不能让同一个 chunk_id 在索引里出现两次。
+
+    2026-08-25 发现：这是 `remove_document` 那条 P0 的直接下游后果 ——
+    remove 恒失败 => 旧 chunk 留在索引里 => 与新 chunk 同 id 重复入表。
+    由 SQLite 后端的主键约束 (term, chunk_id) 顶出来，JSON 侧此前完全静默。
+    """
+
+    def test_reingesting_same_doc_does_not_duplicate_postings(self, indexer):
+        stats = [_stat("55556666_0000_cccc", {"年假": 2})]
+        doc_hash = "e" * 64
+
+        for _ in range(4):
+            indexer.add_documents(stats, collection="nodup", doc_id=doc_hash)
+
+        postings = indexer._index["年假"]["postings"]
+        assert len(postings) == 1, f"同一 chunk 被记了 {len(postings)} 次"
+        assert indexer._index["年假"]["df"] == 1
+        assert indexer._metadata["num_docs"] == 1
+
+    def test_reingest_does_not_flip_score_negative(self, indexer):
+        """最能说明危害的断言：重摄入曾让文档自己的分数变成负数。
+
+        df 被灌成 2、num_docs 也是 2 时，经典 IDF log((N-df+0.5)/(df+0.5))
+        = log(0.5/2.5) < 0，于是这份文档排到「压根不含该词的文档」后面。
+        """
+        stats = [_stat("55556666_0000_cccc", {"年假": 2})]
+        indexer.add_documents(stats, collection="neg", doc_id="e" * 64)
+        first = indexer.query(["年假"], top_k=5)[0]["score"]
+
+        indexer.add_documents(stats, collection="neg", doc_id="e" * 64)
+        second = indexer.query(["年假"], top_k=5)[0]["score"]
+
+        assert second == first, "重摄入改变了打分"
+
+    def test_new_content_for_same_chunk_id_wins(self, indexer):
+        """同 chunk_id 的新内容必须覆盖旧内容，而不是被旧的挡住。"""
+        indexer.add_documents(
+            [_stat("c_0", {"年假": 1})], collection="win", doc_id="h1"
+        )
+        indexer.add_documents(
+            [_stat("c_0", {"年假": 9})], collection="win", doc_id="h1"
+        )
+        assert indexer._index["年假"]["postings"][0]["tf"] == 9

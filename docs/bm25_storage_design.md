@@ -1,6 +1,7 @@
 # BM25 索引存储与缓存 · 设计方案
 
-> **状态：设计草案，未实施。零代码改动。最小原型已验证（见 §10）。**
+> **状态：阶段 1（SQLite 后端 + 影子双写）已实施，2026-08-25。读仍走 JSON。**
+> 阶段 2–4（切读 / 存量迁移 / 停写 JSON）未实施。实施记录见 §11。
 > **日期**：2026-08-25
 > **死期**：2026-11-30。到期未实施则本文作废（`CLAUDE.md` §7.4）。
 > **数据来源**：
@@ -532,3 +533,90 @@ vs 普通表 + `INDEX(term)`——**体积小 12%**（178 vs 202 MB @50K），
    **这条与方案 C 无关、独立收益极大**（143K 块从 1.1 小时降到 15 秒），
    而且万一方案 C 被推迟，它也已经落袋。
 2. 再按原 §6 的四阶段走 SQLite 迁移。
+
+---
+
+## 11. 阶段 1 实施记录（2026-08-25）
+
+> **状态：已实施并验证通过。** 代码 `src/ingestion/storage/bm25_sqlite_store.py`
+> + `bm25_indexer.py` 的双写接线；回归保护 `tests/unit/test_bm25_sqlite_store.py`（22 条）。
+
+### 做了什么
+
+新增 `BM25SQLiteStore`（一个 collection 一个 `.sqlite`，与现有
+`data/db/bm25/{collection}` 布局一致，**不合并成全局库**——`CLAUDE.md` §3.3
+把物理隔离列为已验证的隔离保证，合并会把它降级成「靠 WHERE 条件隔离」）。
+
+`BM25Indexer` 在 `build` / `add_documents` / `remove_document` 三个写入点做影子写。
+**读路径一行未改，仍全部走 JSON。** 影子写失败**不阻断摄入**，但以 ERROR 记
+`bm25.sqlite.dual_write_failed` —— 阶段 1 里 SQLite 没有生产读者，拿它去阻断
+正在用的老链路是本末倒置；可一旦静默，阶段 2 切读时就无从知道哪个 collection
+的副本掉过队。开关 `RAGENT_BM25_SQLITE_DUAL_WRITE=false` 可关。
+
+### 性能：三组语料给出三个差很远的答案，别只引用一个
+
+| 语料 | 50K 块 JSON | 50K 块 SQLite | 提速 | 说明 |
+|---|---|---|---|---|
+| 词条近似均匀（`random.sample`） | 1230.8 ms | 0.60 ms | **2044x** | ⚠️ **不真实**，postings 恒短，查询耗时是平的 |
+| Zipf + 查**最高频的 5 个词** | 1349.2 ms | 128.08 ms | **11x** | 最坏情况，扫描量 3.4 条/块 |
+| 原型语料 + 真实查询词（§10） | — | 8.5 ms | 139–187x | 扫描量 0.327 条/块，最有代表性 |
+
+**三组之间差 200 倍，差别全在「查询词命中多少 postings」。** 引用时必须带上
+是哪一组 —— 只报 2044x 会严重误导。
+真正确定的结论是**下界**：即使按最坏情况，50K 块也只要 128 ms，
+而 JSON 侧是 1349 ms × 6 库 = 8 秒，对 3 秒的 TTFT SLO 是硬伤。
+另外 SQLite 文件约为 JSON 的一半（50K 块：151 MB vs 310 MB）。
+
+### 顺带修掉一个真实的正确性 bug（不是性能问题）
+
+SQLite 的主键 `(term, chunk_id)` 顶出了 JSON 侧一个此前完全静默的错误：
+**重摄入同一份文档会让同一个 `chunk_id` 在索引里出现两次。**
+
+链路：`remove_document` 因为那条已知 P0（`chunk_id.startswith(doc_id)` 恒为假）
+根本没删掉旧数据 → `existing_stats` 里的旧 chunk 与新 `term_stats` 里的
+**是同一个 chunk_id** → 两条都进了 `combined`。
+
+后果不是多占空间，是**打分错**。实测同一文档摄入两次后：
+
+```
+第1次 -> postings=1  df=1  num_docs=1
+第2次 -> postings=2  df=2  num_docs=2   ← 真实只有 1 个 chunk
+```
+
+`df == num_docs` 时经典 IDF `log((N-df+0.5)/(df+0.5))` 为负，
+该文档自己的分数变成 **-4.598**，排到了「完全不含这个词的文档」后面。
+
+修法是 `add_documents` 按 `chunk_id` 收敛、新值覆盖旧值。
+回归保护 `tests/unit/test_bm25_tiebreak_and_build_complexity.py::TestReingestDoesNotDoubleCountChunks`（3 条，去掉修复后全红）。
+⚠️ **这不能替代修 `remove_document`** —— 旧文档**其他** chunk 的残留仍在，
+那是 `CLAUDE.md` §4 第 1 条那条 P0。
+
+### 一条被自己推翻的设计（记下来免得有人重走）
+
+实施中一度给 `chunks` 表加了 `ord` 列，用来复刻 postings 在 `term_stats` 里的
+原始顺序，理由是「浮点加法不满足结合律，累加顺序不同会差 1 ULP，
+逐 bit 等价会失守」。**担心是对的，落点是错的**：
+
+- 顺序敏感性实测成立 —— 20 万组真实 BM25 分数、朴素累加下 **62.8%** 的组合
+  重排后会差 1 ULP；
+- 但**单个 chunk 的分数累加顺序只由外层 `for term in query_terms` 决定**，
+  词条内 postings 的先后只影响「哪个 chunk 先拿到这一项」，不改变任何单个
+  chunk 自身的累加序列。两种后端外层都按 `query_terms` 原序走，等价天然成立。
+
+`ord` 列已删。判别力实测：去掉 `ORDER BY c.ord` 后测试全绿 —— 这正是它多余的证据。
+
+〔另一个坑：验证顺序敏感性时若用 `sum()` 会得出「不敏感」的错误结论 ——
+Python 3.12 起 `sum()` 改用 Neumaier 补偿求和，而生产代码是朴素累加。
+第一版探针就是这么测的，自检时用 `[1e16, 1.0, -1e16]` 才发现探针本身是坏的。〕
+
+### 三句话
+
+- **验收怎么做**：`pytest tests/unit/test_bm25_sqlite_store.py -q` 应 22 passed；
+  摄入任意文档后 `data/db/bm25/{collection}_bm25.sqlite` 应出现，
+  且与 JSON 侧同一查询的完整分数映射逐 bit 相同。
+- **回归怎么保**：`test_bm25_sqlite_store.py`（22 条）。三条真不变量的判别力
+  已逐条实测：括号位置改动 → 3 红；`repr` 换 `str` → 1 红；重复查询词去重 → 1 红。
+- **什么没做**：阶段 2–4 全部未做（**存量 99 个 collection 的 JSON 索引尚未迁移，
+  只有此后新写入的才有影子副本**）；`delete_by_doc_hash` 不重算 idf/df
+  （阶段 1 权威值来自 JSON 全量重建，切读前必须补）；未测多库并行/多进程并发读、
+  WAL 与崩溃恢复、50K 以上真实规模、端到端 TTFT。

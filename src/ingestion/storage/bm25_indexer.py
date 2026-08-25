@@ -14,10 +14,13 @@ Design Principles:
 """
 
 import json
+import logging
 import math
 import os
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 class BM25Indexer:
@@ -92,16 +95,24 @@ class BM25Indexer:
         self.index_dir = Path(index_dir)
         self.k1 = k1
         self.b = b
-        
+
         # In-memory index structure
         self._index: Dict[str, Dict[str, Any]] = {}
         self._metadata: Dict[str, Any] = {}
-        
+
+        # 方案 C 阶段 1：SQLite 影子写。**读路径完全不受影响，仍走 JSON。**
+        # 目的是让两种后端的数据先并存，好在切读之前逐条比对打分（设计文档 §6）。
+        # 默认开启；`RAGENT_BM25_SQLITE_DUAL_WRITE=false` 可关掉。
+        self.dual_write_sqlite = (
+            os.getenv("RAGENT_BM25_SQLITE_DUAL_WRITE", "true").strip().lower() != "false"
+        )
+
     def build(
         self,
         term_stats: List[Dict[str, Any]],
         collection: str = "default",
         trace: Optional[Any] = None,
+        doc_hash_by_chunk: Optional[Dict[str, str]] = None,
     ) -> None:
         """Build BM25 index from term statistics.
         
@@ -197,9 +208,10 @@ class BM25Indexer:
         }
         
         self._index = index
-        
+
         # Step 4: Persist to disk
         self._save(collection)
+        self._mirror_to_sqlite(collection, doc_hash_by_chunk)
     
     def load(
         self,
@@ -385,11 +397,41 @@ class BM25Indexer:
                     }
                 existing_stats[cid]["term_frequencies"][term] = posting["tf"]
 
-        # Merge: existing + new
-        combined = list(existing_stats.values()) + list(term_stats)
+        # Merge: existing + new，**按 chunk_id 去重，新的覆盖旧的**。
+        #
+        # 2026-08-25：不去重是一个真实的正确性 bug，由 SQLite 侧的主键约束
+        # (term, chunk_id) 顶出来。链路是这样的：上面的 `remove_document` 因为
+        # 那条已知 P0（`chunk_id.startswith(doc_id)` 恒为假）根本没删掉旧数据，
+        # 于是重摄入同一份文档时，`existing_stats` 里的旧 chunk 和 `term_stats`
+        # 里的新 chunk **是同一个 chunk_id**，两条都进了 combined。
+        #
+        # 后果不是"多占点空间"，是**打分错**：实测同一文档摄入两次后
+        # postings 里同一个 chunk_id 出现 2 条、`df` 和 `num_docs` 都变成 2，
+        # 而真实只有 1 个 chunk。df == num_docs 时经典 IDF
+        # log((N-df+0.5)/(df+0.5)) 为负 —— 该文档自己的分数变成 -4.598，
+        # 排到了「完全不含这个词的文档」后面。
+        #
+        # 用 dict 按 chunk_id 收敛、新值覆盖旧值：新摄入的内容天然更权威。
+        # 这不能替代修 `remove_document`（旧文档**其他** chunk 的残留仍在，
+        # 那是 CLAUDE.md §4 第 1 条那条 P0），只是让"同一 chunk 重复计数"
+        # 这个更直接的错误不再发生。
+        merged: Dict[str, Dict[str, Any]] = dict(existing_stats)
+        for stat in term_stats:
+            merged[stat["chunk_id"]] = stat
+        combined = list(merged.values())
 
-        # Rebuild full index from combined stats
-        self.build(combined, collection, trace)
+        # Rebuild full index from combined stats.
+        # `doc_id` 是文件内容 SHA256，透传给 SQLite 侧记进 chunks.doc_hash ——
+        # 这样删除就能按文档哈希精确定位，不再依赖 chunk_id 前缀匹配。
+        # 只标注**本次新增**的 chunk；老 chunk 的出处由 chunks 表自己保留。
+        self.build(
+            combined,
+            collection,
+            trace,
+            doc_hash_by_chunk=(
+                {s["chunk_id"]: doc_id for s in term_stats} if doc_id else None
+            ),
+        )
 
     def remove_document(
         self,
@@ -410,9 +452,14 @@ class BM25Indexer:
         Returns:
             ``True`` if any postings were removed, ``False`` otherwise.
         """
+        # SQLite 侧先删：它按 doc_hash 精确匹配，是这条 P0 的正解。
+        # 放在前面是因为下面 JSON 侧的前缀匹配恒不命中，会提前 return False，
+        # 跟在后面就永远执行不到。
+        sqlite_deleted = self._delete_from_sqlite(collection, doc_id)
+
         if not self._index:
             if not self.load(collection):
-                return False
+                return sqlite_deleted > 0
 
         removed_any = False
         terms_to_delete: list[str] = []
@@ -458,8 +505,11 @@ class BM25Indexer:
                 "collection": collection,
             }
             self._save(collection)
+            # JSON 侧真删掉了东西时才回镜像，否则会把上面刚做完的 SQLite 删除
+            # 用一份"还含着这些 postings"的 JSON 索引覆盖回去。
+            self._mirror_to_sqlite(collection)
 
-        return removed_any
+        return removed_any or sqlite_deleted > 0
     
     # ===== Private Helper Methods =====
     
@@ -534,6 +584,72 @@ class BM25Indexer:
                     f"got {stat['doc_length']}"
                 )
     
+    # ===== 方案 C 阶段 1：SQLite 影子写 =====
+
+    def _sqlite_path(self, collection: str) -> Path:
+        return self.index_dir / f"{collection}_bm25.sqlite"
+
+    def _mirror_to_sqlite(
+        self,
+        collection: str,
+        doc_hash_by_chunk: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """把当前内存索引镜像进 SQLite 侧。**失败不影响摄入。**
+
+        阶段 1 里 SQLite 没有任何生产读者，所以一次镜像失败不该让整篇文档
+        摄入失败——那是拿"还没人用的新后端"去阻断"正在用的老链路"。
+        但**必须以 ERROR 记下来**：两边静默分歧正是让阶段 2 切读变危险的东西，
+        切读之前要能从日志里查到"这个 collection 的影子副本什么时候掉过队"。
+        """
+        if not self.dual_write_sqlite:
+            return
+        try:
+            from src.ingestion.storage.bm25_sqlite_store import BM25SQLiteStore
+
+            with BM25SQLiteStore(self._sqlite_path(collection)) as store:
+                store.replace_all(
+                    index=self._index,
+                    metadata=self._metadata,
+                    doc_hash_by_chunk=doc_hash_by_chunk,
+                )
+        except Exception as exc:  # noqa: BLE001 —— 见 docstring：刻意不向上抛
+            logger.error(
+                "BM25 SQLite 影子写失败，该 collection 的副本已与 JSON 分歧；"
+                "切读前必须重建。collection=%s err=%s",
+                collection,
+                exc,
+                extra={
+                    "event": "bm25.sqlite.dual_write_failed",
+                    "collection": collection,
+                },
+            )
+
+    def _delete_from_sqlite(self, collection: str, doc_hash: str) -> int:
+        """SQLite 侧按 doc_hash 删除。同样失败不影响主流程。
+
+        这是 JSON 侧 `remove_document` 恒返回 False 那条 P0 的正解 ——
+        不再用 `chunk_id.startswith(doc_id)` 这种脆弱约定。
+        """
+        if not self.dual_write_sqlite:
+            return 0
+        try:
+            from src.ingestion.storage.bm25_sqlite_store import BM25SQLiteStore
+
+            with BM25SQLiteStore(self._sqlite_path(collection)) as store:
+                return store.delete_by_doc_hash(doc_hash)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "BM25 SQLite 影子删除失败。collection=%s doc_hash=%s err=%s",
+                collection,
+                doc_hash[:12],
+                exc,
+                extra={
+                    "event": "bm25.sqlite.dual_delete_failed",
+                    "collection": collection,
+                },
+            )
+            return 0
+
     def _get_index_path(self, collection: str) -> Path:
         """Get file path for index file.
         

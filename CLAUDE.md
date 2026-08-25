@@ -248,6 +248,38 @@ flowchart TB
 
    **剩下的仍是方案 C 本身**（词条级存储），见上一条。这两步是它的前置，
    但**独立成立**：即使 C 推迟也已落袋。
+
+2c. 🟡 **方案 C 阶段 1 已落地：SQLite 后端 + 影子双写，读仍走 JSON**
+   （2026-08-25。`src/ingestion/storage/bm25_sqlite_store.py`；
+   回归保护 `tests/unit/test_bm25_sqlite_store.py` 22 条；详见
+   `docs/bm25_storage_design.md` §11）
+
+   ⚠️ **存量 99 个 collection 尚未迁移** —— 只有此后新写入的才有影子副本。
+   阶段 2（切读）/ 3（存量迁移）/ 4（停写 JSON）均未做。
+
+   **性能：三组语料给出三个差 200 倍的答案，引用时必须说明是哪一组。**
+
+   | 语料 | 50K 块 JSON | 50K 块 SQLite | 提速 |
+   |---|---|---|---|
+   | 词条近似均匀 | 1230.8 ms | 0.60 ms | 2044x ⚠️ **不真实** |
+   | Zipf + 查最高频 5 词（最坏） | 1349.2 ms | 128.08 ms | **11x** |
+   | 原型语料 + 真实查询词 | — | 8.5 ms | 139–187x |
+
+   差别全在"查询词命中多少 postings"。**确定的是下界**：最坏情况 50K 块
+   也只要 128 ms，而 JSON 侧 1349 ms × 6 库 = 8 秒，对 3s TTFT SLO 是硬伤。
+   SQLite 文件约为 JSON 的一半（151 MB vs 310 MB）。
+
+2d. ✅ **顺带修掉一个此前完全静默的正确性 bug：重摄入导致同一 chunk 被记两次**
+   （2026-08-25，由 SQLite 主键 `(term, chunk_id)` 顶出来）
+
+   链路：`remove_document` 因第 7 条那个 P0 恒失败 → 旧 chunk 留在索引里 →
+   与新 `term_stats` 里**同一个 chunk_id** 一起进了 `combined`。
+   实测同一文档摄入两次后 `postings=2 / df=2 / num_docs=2`，而真实只有 1 个 chunk。
+   `df == num_docs` 时经典 IDF 为负 → **该文档自己的分数变成 -4.598，
+   排到了「完全不含这个词的文档」后面**。
+   修法：`add_documents` 按 `chunk_id` 收敛、新值覆盖旧值。
+   回归保护 `test_bm25_tiebreak_and_build_complexity.py::TestReingestDoesNotDoubleCountChunks`（3 条）。
+   ⚠️ **不能替代修 `remove_document`** —— 旧文档**其他** chunk 的残留仍在（第 1 条那条 P0）。
 3. **模型服务并发形态** —— `OLLAMA_NUM_PARALLEL` 默认 1，目标规模缺口约 10x
    > 那个"10x"是从旧 P50 24.2s 反推的估算。**延迟已经大幅下降（见 §2），
    > 但并发至今一次都没实测过**（2026-08-25 的基准是串行单用户），
@@ -342,6 +374,14 @@ flowchart TB
    且已核对 `document_manager.py:201` 传进来的确实是 `source_hash`（文件内容 SHA256）。
    **修复路径现在有了**：SQLite 后端下同一操作删掉 317 条 postings（317→0），
    即这条 P0 随方案 C 一起解决，不需要单独设计。
+
+   🟡 **阶段 1 已落地一半**（08-25，见第 2c 条）：`remove_document` 现在会先
+   调 `_delete_from_sqlite` 按 `doc_hash` 精确删除，SQLite 侧**确实删掉了**
+   （`test_remove_document_deletes_on_sqlite_side`）。
+   ⚠️ **但 JSON 侧依旧删不掉，而生产读路径还在读 JSON** ——
+   所以这条 P0 **对线上行为尚未闭环**，要等阶段 2 切读。
+   `test_json_backend_still_cannot_delete_this` 故意断言"现状是坏的"，
+   切读后它会变红，那正是提醒删掉它的信号，**不要在那之前把它改绿**。
 
 8. **跨主题数值幻觉（"把两份无关文档拼成一条因果链"）—— 大幅改善，未完全闭环** 🟡
    （2026-08-25 第二批：`_build_prompt` 落地了 `docs/orchestration_design.md`
