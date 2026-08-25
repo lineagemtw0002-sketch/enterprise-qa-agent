@@ -185,7 +185,7 @@ flowchart TB
 flowchart TB
     Q["用户提问"] --> IN["_intent_node"]
 
-    IN -->|"唯一使用点"| R15["<b>qwen2.5-1.5b-router</b><br/>LoRA 微调<br/>━━━━━━━━<br/>· query 改写（指代消解）<br/>· 子查询拆分<br/>· 四分类<br/><b>一次调用全做完</b>"]
+    IN -->|"唯一使用点"| R15["<b>qwen2.5-1.5b-router</b><br/>LoRA 微调<br/>━━━━━━━━<br/>· query 改写（指代消解）<br/>· 子查询拆分<br/>· 四分类<br/><b>一次调用全做完</b><br/>━━━━━━━━<br/>拆分结果再过一道<b>确定性依赖判据</b><br/>（_detect_sub_query_dependency）<br/>子问题间有依赖则退回单查询"]
 
     R15 --> ROUTE{路由结果}
     ROUTE --> G["_generate_node<br/>生成最终回答"]
@@ -229,7 +229,7 @@ flowchart TB
 flowchart TB
     Q["查询"] --> ACL{"ACL 收敛<br/>_org_owned_collections(org)<br/>∩ 角色 allowed_collections"}
     ACL -->|为空| DENY["直接拒绝"]
-    ACL -->|候选库列表| FAN["并行扇出<br/>每库一路"]
+    ACL -->|候选库列表| FAN["并行扇出<br/>每库一路<br/>━━━━━━━━<br/>子查询扇出上限 <b>3</b><br/>（intent.MAX_SUB_QUERY_FANOUT）<br/>唯一截断点在 _retrieve_multi"]
 
     FAN --> D["Dense<br/>Chroma 向量"]
     FAN --> S["Sparse<br/>BM25"]
@@ -471,6 +471,6 @@ reranker 推理预热 · MLX vs Ollama 实测）见 `docs/optimization_tracking.
 | 每查询重建检索组件 / 全链路无缓存 | ❌ **不能** —— 浪费按负载等比放大 |
 | 管理端 N+1 | ❌ 不能 —— 上万次串行往返 |
 | 连接池分散（累计上限约 68） | ❌ 不能 |
-| 无结构化日志 / request id | ❌ 不能 |
+| 无结构化日志 / request id | ❌ 不能 —— 🟡 **阶段一已落地**（2026-08-25）：<br/>`src/observability/` 提供 `RequestContext` contextvar + 分级脱敏 + JSON 日志；<br/>已替换 8 处 `print`。**`app.py`/`workflow.py`/`intent.py` 的 45 处仍在**，属阶段二三 |
 
 ---
