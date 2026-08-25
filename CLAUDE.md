@@ -568,7 +568,9 @@ flowchart TB
 - 测试/探测脚本落 `tests/` 或 `scripts/`，**禁止写临时目录后丢弃**
   —— 参考 `jailbreak_test.py` / `latency_probe.py` 丢失，两份报告的数字至今无法复现。
   耗时那半边已经补上：`scripts/benchmark_latency.py`（2026-08-25）；
-  `jailbreak_test.py` 那半边**仍然是丢的**，安全报告的数字依旧不可复现。
+  安全那半边已补上替代脚本 `scripts/verify_security_posture.py`（2026-08-25），
+  但**08-23 原报告的那批数字仍不可复现**——用例集与判据都不同，只能做趋势对照，
+  不能逐条对齐。
 - **被测代码带未提交改动时，报告里必须写清代码状态**（commit hash + 脏文件清单 +
   "这批数字对应含未提交改动的工作区"），否则数字将来无法从 git 复现
   —— `benchmark_latency.py` 的 `code_state` 字段就是干这个的
@@ -597,10 +599,11 @@ flowchart TB
 | `docs/review_2026-08-24/review_process_retro.md` | 过程复盘量化分析 | 时点快照 |
 | `docs/review_2026-08-24/review_industry_baseline.md` | 业界对标：必备 / 规模上来才需要 / 不必跟 | 时点快照 |
 | `docs/security_prompt_injection_test_report.md` | 提示注入测试结果 | 时点快照（**脚本已丢，不可复现**） |
-| `docs/prompt_injection_remediation_plan.md` | 对应修复方案 | 未实施 |
+| `docs/prompt_injection_remediation_plan.md` | 对应修复方案（P0–P3 分级） | **部分实施**：P0/P1 已落地（08-24 第一轮、08-25 两个批次，见 `optimization_tracking.md` 任务一）；P3（结构化数据源工具、上传可信度分层）未实施 |
 | `docs/latency_report.md` | **优化前**耗时基线 P50 24.2s / P95 46.8s（2026-08-23） | 时点快照（**脚本已丢，不可复现**；现行数字见 `architecture.md` §3.2） |
 | `scripts/benchmark_latency.py` | **现行耗时基准脚本**，6 场景 × 3 次，输出 JSON 到 `scripts/benchmark_results/` | **可复现，活脚本** |
-| `docs/optimization_tracking.md` | 优化前后对比 | 活文档 |
+| `docs/optimization_tracking.md` | 优化前后对比（任务一含两轮：08-24 第一轮、**08-25 第二轮安全批次 1+2**，按「修复前→怎样修→修复后→遗留」结构） | 活文档 |
+| `scripts/verify_security_posture.py` | **现行安全复测脚本**，18 用例 6 组（A 幻觉/B 越权话术/C 泄露/D 注入/E 跨租户/F 认证），结果 JSON 落 `scripts/security_results/` | **可复现，活脚本**（替代已丢失的 `jailbreak_test.py`） |
 | `docs/kb_permission_design.md` | 权限设计（截至 08-23） | 时点快照 |
 | `docs/qa_test_questions.md` | 问答测试题库，取材自实际库内容 | 可用 |
 | `docs/archive/` | 历史设计文档（已实施或已废弃） | **冻结，不维护** |

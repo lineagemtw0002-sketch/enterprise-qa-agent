@@ -134,3 +134,6 @@ src/参考.html
 
 # macOS
 .DS_Store
+
+# LibreOffice 锁文件
+.~lock.*#
