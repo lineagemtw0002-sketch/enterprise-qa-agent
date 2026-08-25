@@ -141,36 +141,53 @@ class BM25Indexer:
         total_length = sum(stat["doc_length"] for stat in term_stats)
         avg_doc_length = total_length / num_docs if num_docs > 0 else 0.0
         
-        # Calculate document frequency (DF) for each term
+        # Step 2: Invert in a single pass over term_stats.
+        #
+        # 2026-08-25：原实现是
+        #     for term in doc_freq:          # 词表
+        #         for stat in term_stats:    # 每篇文档
+        #             tf = stat["term_frequencies"].get(term, 0)
+        # 即为每个词条把整个语料重扫一遍，复杂度 O(词表 × 文档数)。原型实测
+        # 1K/16K/50K 块 = 0.35 / 31.08 / 393.97 s，16K→50K 段 α=2.23；
+        # 外推 143K 块约 1.1 小时、716K 块约 41 小时。
+        # （`scale_slo_and_priorities.md` 里「首次摄入 1.4–3.2 小时」的估算
+        #   没把这条算进去。）
+        #
+        # 单遍写法把复杂度降到 O(词条出现总次数)，且**与是否换存储后端无关** ——
+        # 改完仍写 JSON，50K 块也只要约 5s。
+        #
+        # 输出必须与旧实现逐字节等价，这依赖两条顺序性质，改动时不要破坏：
+        #   1. `index` 的键顺序 = 词条首次出现的顺序。doc_freq 和 postings 都在
+        #      同一遍里按 term_stats 顺序填充，dict 保序，因此与旧实现一致。
+        #   2. 每个 postings 列表内部 = term_stats 顺序。同样由单遍顺序追加保证。
+        # 有测试拿旧实现的逐行复刻当 oracle 对比整棵索引。
         doc_freq: Dict[str, int] = {}
+        postings_by_term: Dict[str, List[Dict[str, Any]]] = {}
+
         for stat in term_stats:
-            for term in stat["term_frequencies"].keys():
+            chunk_id = stat["chunk_id"]
+            doc_length = stat["doc_length"]
+            for term, tf in stat["term_frequencies"].items():
+                # ⚠️ df 统计所有出现过的键，而 postings 只收 tf > 0 —— 两者在
+                # tf == 0 时会对不上。这是旧实现的既有语义，此处原样保留：
+                # 真实的 SparseEncoder 不产生 tf == 0，要改它是另一个决策，
+                # 不该夹带在一次纯性能优化里。有测试钉住这个边界。
                 doc_freq[term] = doc_freq.get(term, 0) + 1
-        
-        # Step 2: Build inverted index with IDF
-        index: Dict[str, Dict[str, Any]] = {}
-        
-        for term, df in doc_freq.items():
-            # Calculate IDF using BM25 formula
-            idf = self._calculate_idf(num_docs, df)
-            
-            # Build posting list for this term
-            postings = []
-            for stat in term_stats:
-                tf = stat["term_frequencies"].get(term, 0)
-                if tf > 0:  # Only include docs that contain this term
-                    postings.append({
-                        "chunk_id": stat["chunk_id"],
+                if tf > 0:
+                    postings_by_term.setdefault(term, []).append({
+                        "chunk_id": chunk_id,
                         "tf": tf,
-                        "doc_length": stat["doc_length"]
+                        "doc_length": doc_length
                     })
-            
+
+        index: Dict[str, Dict[str, Any]] = {}
+        for term, df in doc_freq.items():
             index[term] = {
-                "idf": idf,
+                "idf": self._calculate_idf(num_docs, df),
                 "df": df,
-                "postings": postings
+                "postings": postings_by_term.get(term, [])
             }
-        
+
         # Step 3: Store metadata
         self._metadata = {
             "num_docs": num_docs,
@@ -281,13 +298,26 @@ class BM25Indexer:
                 
                 scores[chunk_id] = scores.get(chunk_id, 0.0) + term_score
         
-        # Sort by score descending and return top_k
+        # Sort by score descending, breaking ties on chunk_id.
+        #
+        # 2026-08-25：原本是 `key=lambda x: x["score"], reverse=True`。Python 的
+        # sorted 是稳定排序，reverse=True 也不会打乱同分组，所以同分候选的先后
+        # 完全取决于 `scores` 的插入顺序 —— 也就是 postings 的物理顺序，进而取决
+        # 于当初的摄入顺序。结果是「重建一次索引，top-k 就可能变一批」，而分数
+        # 一个都没变。原型实测：50K 块时截断线上有 14–19 个同分候选，换存储后端
+        # 后全量分数映射逐 bit 相同，top-10 却只对上 4/12。
+        #
+        # chunk_id 在一个 collection 内唯一，所以 (-score, chunk_id) 是全序，
+        # 排序结果与输入顺序无关。这是 BM25 存储层改造能被验收的前提：没有它，
+        # 「新旧结果是否一致」这个问题本身就没有答案。
+        #
+        # ⚠️ 必须排完整个列表再截断。先截断再排序会得到「摄入顺序里靠前的那几个」，
+        # 看着也有序，但换个摄入顺序结果就变了 —— 有测试专门抓这一点。
         sorted_results = sorted(
             [{"chunk_id": cid, "score": score} for cid, score in scores.items()],
-            key=lambda x: x["score"],
-            reverse=True
+            key=lambda x: (-x["score"], x["chunk_id"]),
         )
-        
+
         return sorted_results[:top_k]
     
     def rebuild(
