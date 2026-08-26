@@ -103,7 +103,27 @@ ingestion:
   doc_summary:
     use_llm: false  # Set to true to enable LLM-based summarization (requires LLM config)
     # When use_llm is false or LLM call fails, falls back to rule-based summary
-    top_docs: 5  # 摘要层召回的候选文档数上限，见 query_knowledge_hub.py _narrow_by_document_summary
+
+    # 检索时的文档级粗筛（query_knowledge_hub.py::_narrow_by_document_summary）。
+    # 预算分配与置信门控的逻辑在 src/core/query_engine/narrow_plan.py，
+    # 完整设计与实测见 docs/hierarchical_narrowing_redesign.md。
+    narrow:
+      # ⚠️ 默认关闭 = 平铺检索（层次化上线前的行为）。
+      # 理由不是"层次化检索设计错了"，而是**它的前提在当前全部语料上从未成立**：
+      # 实测 32 个非空 collection 里业务库的 块/文档 比全是 1.00（含 mmarco、
+      # product_req_kb），而 use_llm: false 时摘要就是"标题 + 正文前 600 字"，
+      # 摘要向量≈正文向量——这一层等于拿一份更差的正文副本给检索器当硬门禁。
+      # 同一批 30 条正向问题：开着 5/30，关掉 25/30。
+      # 重新评估的触发条件（不是到某个日期，是到某个数据形态）：
+      #   任一 collection 的 块/文档 比 > 5 且文档数 > 1000，
+      #   或 use_llm 改为 true / 换成中文更强的 embedding。
+      #   届时重跑 scripts/probe_summary_narrowing.py，
+      #   达标线：每库预算 ≤20% 时金标文档的库内覆盖率 ≥90%。
+      enabled: false
+      ratio: 0.4        # 每库预算 = clamp(ceil(ratio × 库内文档数), min_docs, max_docs)
+      min_docs: 20
+      max_docs: 100
+      min_top_score: 0.85  # 某库摘要 top1 低于它 → 该库整库参检（绝不是跳过该库）
 
 # =============================================================================
 # MCP Client Configuration (External Tool Servers)
