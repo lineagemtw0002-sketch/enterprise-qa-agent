@@ -219,3 +219,41 @@ class ConnectorUnavailable(RuntimeError):
         super().__init__(detail or reason)
         self.reason = reason
         self.detail = detail or reason
+
+
+# ---------------------------------------------------------------------------
+# 执行侧契约（§3.6 / §10.1 的 exec_request / exec_result 帧）
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ExecutionOutcome:
+    """一次修复动作在客户环境里的执行结果。"""
+
+    succeeded: bool
+    detail: str
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+
+@runtime_checkable
+class RemediationDispatcher(Protocol):
+    """把**已批准**的执行计划下发到客户环境的连接器。
+
+    ⚠️ **刻意跟 `ConnectorTransport` 分开，不合并成一个协议。**
+    查询是只读的、可以随便重试；执行是有副作用的、错一次就是生产事故。
+    两者放在同一个协议里，任何"拿到 transport 就什么都能干"的调用点都会
+    同时获得执行能力——设计文档 §3.3 把审批列为"不可分割的前置依赖"，
+    在类型上就把这两种能力分开，是同一个态度的落实。
+
+    实现方是连接器会话；本协议的实现**不负责检查审批状态**，
+    那是工具层的责任（§3.6：执行类工具必须在工具层强制检查，
+    不能只依赖上游"应该已经检查过"这种隐式假设）。
+    """
+
+    async def execute(
+        self,
+        connection_id: str,
+        org_id: str,
+        action_id: str,
+        plan: Dict[str, Any],
+        timeout_s: float,
+    ) -> ExecutionOutcome:
+        ...
