@@ -23,6 +23,38 @@ export function setUserRoles(userId, roleIds) {
   return axios.put(`${BASE}/users/${userId}/roles`, { role_ids: roleIds }).then((res) => res.data)
 }
 
+// 停用 / 重新启用（docs/account_lifecycle_design.md §4.2）。
+// 企业管理员能做的"离职处理"就是这个——删除自 2026-08-26 起只有平台管理员能做，
+// 因为删除会带走 conversations 的归属，"离职员工做过什么"就再也追溯不到了。
+export function setUserDisabled(userId, disabled) {
+  return axios.put(`${BASE}/users/${userId}/disabled`, { disabled }).then((res) => res.data)
+}
+
+// CSV 批量导入（§4.1）。
+//
+// ⚠️ **validateOnly 默认 true，跟后端默认值保持一致。** 这是一个能一次影响上万
+// 账号的操作，任何一层的默认值都必须是"什么都不做"。真跑必须由调用方显式传
+// false —— 不要因为"前端反正会传"就把这里的默认值改掉，那样两边就都没有兜底了。
+export function bulkImportUsers(file, validateOnly = true) {
+  const form = new FormData()
+  form.append('file', file)
+  form.append('validate_only', String(validateOnly))
+  return axios.post(`${BASE}/users/bulk-import`, form).then((res) => res.data)
+}
+
+// 席位上限（§4.4）。仅平台管理员，后端 require_platform_admin 兜底。
+export function setSeatLimit(orgId, seatLimit) {
+  return axios.put(`${BASE}/organizations/${orgId}/seat-limit`, { seat_limit: seatLimit }).then((res) => res.data)
+}
+
+// 账号激活。**唯一一个不在 /admin 下、也不需要登录态的接口** ——
+// 调用它的人正是"还没有密码所以登不进来"的那个员工（§4.1b、风险 R-4）。
+export function activateAccount({ username, activation_code, new_password }) {
+  return axios
+    .post('/api/v1/activate', { username, activation_code, new_password })
+    .then((res) => res.data)
+}
+
 // ==================== 组织管理 ====================
 
 export function listOrganizations() {

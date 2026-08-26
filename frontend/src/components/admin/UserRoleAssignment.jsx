@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
-import { Table, Button, Modal, Input, Select, Tag, Popconfirm, message, Empty } from 'antd'
-import { Plus, Trash2 } from 'lucide-react'
+import { Table, Button, Modal, Input, Select, Tag, Popconfirm, message, Empty, Switch, Tooltip } from 'antd'
+import { Plus, Trash2, UploadCloud } from 'lucide-react'
 import * as adminApi from '../../api/admin.js'
+import BulkUserImport from './BulkUserImport.jsx'
 
 // meProfile 从 App.jsx 一路传下来（AdminPanel -> 这里），只用来读
 // meProfile.organization.is_platform：平台管理员能看到/新建所有企业的用户
@@ -28,6 +29,8 @@ export default function UserRoleAssignment({ meProfile }) {
   const [createVisible, setCreateVisible] = useState(false)
   const [createForm, setCreateForm] = useState({ username: '', password: '', role_ids: [], org_id: null })
   const [createLoading, setCreateLoading] = useState(false)
+  const [importVisible, setImportVisible] = useState(false)
+  const [togglingUserId, setTogglingUserId] = useState(null)
 
   async function loadAll() {
     setLoading(true)
@@ -88,6 +91,29 @@ export default function UserRoleAssignment({ meProfile }) {
       await loadAll()
     } finally {
       setSavingUserId(null)
+    }
+  }
+
+  // 停用 / 重新启用（docs/account_lifecycle_design.md §4.2）。
+  //
+  // ⚠️ **生效时机不对称，提示文案必须说清楚。** 管理端 19 个端点立刻生效
+  // （它们本来就实时查库），问答等 35 个端点最长 24 小时——token 24 小时不
+  // 过期且没有黑名单。不写出来的话，管理员停用后看到对方还能提问，会以为
+  // 功能坏了然后反复点。新登录是立刻拒的，所以窗口不会越拖越长。
+  async function handleToggleDisabled(user, disabled) {
+    setTogglingUserId(user.user_id)
+    try {
+      await adminApi.setUserDisabled(user.user_id, disabled)
+      message.success(
+        disabled
+          ? '已停用。管理后台立即生效；对方若已登录，问答等页面最长 24 小时后失效（无法再次登录）'
+          : '已重新启用',
+      )
+      await loadAll()
+    } catch (error) {
+      message.error('操作失败: ' + (error.response?.data?.detail || error.message))
+    } finally {
+      setTogglingUserId(null)
     }
   }
 
@@ -233,20 +259,56 @@ export default function UserRoleAssignment({ meProfile }) {
       ),
     },
     {
+      title: '状态',
+      key: 'status',
+      width: 190,
+      // 三种状态是互斥的，按严重程度排：已停用 > 待激活 > 正常。
+      // "待激活"不是错误——它是批量导入建号后的正常中间态，员工还没用激活码
+      // 设密码。把它显示出来是为了让管理员知道"码发出去了但没人用"。
+      render: (_, user) => (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Tooltip title={user.disabled_at ? '点击重新启用' : '点击停用（保留会话与审计记录，可随时恢复）'}>
+            <Switch
+              size="small"
+              checked={!user.disabled_at}
+              loading={togglingUserId === user.user_id}
+              onChange={(checked) => handleToggleDisabled(user, !checked)}
+            />
+          </Tooltip>
+          {user.disabled_at
+            ? <Tag color="red">已停用</Tag>
+            : user.pending_activation
+              ? <Tooltip title="已生成激活码但员工还没用它设密码。激活码 7 天过期，过期后需要重新导入。">
+                  <Tag color="orange">待激活</Tag>
+                </Tooltip>
+              : <Tag color="green">正常</Tag>}
+        </div>
+      ),
+    },
+    {
       title: '操作',
       key: 'actions',
       width: 100,
+      // ⚠️ **2026-08-26 起删除只有平台管理员能做**（设计 §4.2，O-3）。
+      // 企业管理员看到的是一句说明而不是一个会 403 的按钮——给一个点了必然
+      // 失败的入口，比不给更糟。企业侧的"离职处理"是上面那个停用开关。
       render: (_, user) => (
-        <Popconfirm
-          title="删除用户"
-          description="此操作不可逆，确定删除该用户吗？"
-          okText="确认删除"
-          cancelText="取消"
-          okButtonProps={{ danger: true }}
-          onConfirm={() => handleDelete(user)}
-        >
-          <Button size="small" danger icon={<Trash2 size={14} />}>删除</Button>
-        </Popconfirm>
+        isPlatformAdmin ? (
+          <Popconfirm
+            title="删除用户"
+            description="不可逆，且会一并失去该用户历史会话的归属（审计追溯）。除非是数据清除请求，否则请改用「停用」。"
+            okText="确认删除"
+            cancelText="取消"
+            okButtonProps={{ danger: true }}
+            onConfirm={() => handleDelete(user)}
+          >
+            <Button size="small" danger icon={<Trash2 size={14} />}>删除</Button>
+          </Popconfirm>
+        ) : (
+          <Tooltip title="删除会破坏审计追溯，仅平台管理员可操作；请使用左侧「停用」">
+            <span style={{ color: 'var(--text-tertiary, #999)', fontSize: 12 }}>停用即可</span>
+          </Tooltip>
+        )
       ),
     },
   ]
@@ -257,8 +319,17 @@ export default function UserRoleAssignment({ meProfile }) {
         <p style={{ margin: 0, color: 'var(--text-tertiary, #888)' }}>
           给用户分配一个角色（一人一个，决定权限档位；企业角色还自带知识库权限），变更不需要重新登录，立即生效。
         </p>
-        <Button type="primary" icon={<Plus size={16} />} onClick={openCreate}>新建用户</Button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <Button icon={<UploadCloud size={16} />} onClick={() => setImportVisible(true)}>批量导入</Button>
+          <Button type="primary" icon={<Plus size={16} />} onClick={openCreate}>新建用户</Button>
+        </div>
       </div>
+
+      <BulkUserImport
+        open={importVisible}
+        onClose={() => setImportVisible(false)}
+        onImported={loadAll}
+      />
 
       <Table
         rowKey="user_id"

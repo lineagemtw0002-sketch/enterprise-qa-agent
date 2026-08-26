@@ -44,6 +44,14 @@ class User:
     # 有默认值、放在最后，是为了不破坏既有的位置构造调用。
     disabled_at: Optional[float] = None
     activated_at: Optional[float] = None
+    # 「这个账号还没设过密码」。
+    #
+    # ⚠️ **判据必须是 `password_hash IS NULL`，不能用 `activated_at IS NULL`。**
+    # 存量的 33 个账号是 `create_user` 建的，有密码但从来没走过激活流程，
+    # `activated_at` 同样是 NULL —— 拿它当判据会把全部存量用户标成"待激活"。
+    # 前端状态列一开始用创建时间做启发式判断绕过这个问题，是错的：
+    # 魔法时间戳既不准也无法解释，真实信号就在库里，如实取出来即可。
+    pending_activation: bool = False
 
 
 class UserStore:
@@ -129,6 +137,11 @@ class UserStore:
             created_at=row["created_at"],
             disabled_at=row["disabled_at"] if "disabled_at" in keys else None,
             activated_at=row["activated_at"] if "activated_at" in keys else None,
+            # 查询里用 `password_hash IS NULL AS pending_activation` 取出布尔，
+            # **不把 password_hash 本身 SELECT 出来** —— 管理后台列表不需要
+            # 哈希，多拉一列就是多一个泄露面。
+            pending_activation=bool(row["pending_activation"])
+            if "pending_activation" in keys else False,
         )
 
     # ------------------------------------------------------------------
@@ -209,7 +222,9 @@ class UserStore:
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                """SELECT id, username, allowed_collections, role, created_at
+                """SELECT id, username, allowed_collections, role, created_at,
+                          disabled_at, activated_at,
+                          (password_hash IS NULL) AS pending_activation
                    FROM users WHERE id = $1""",
                 user_id,
             )
@@ -225,7 +240,8 @@ class UserStore:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """SELECT id, username, allowed_collections, role, created_at,
-                          disabled_at, activated_at
+                          disabled_at, activated_at,
+                          (password_hash IS NULL) AS pending_activation
                    FROM users WHERE username = $1""",
                 username,
             )
@@ -236,7 +252,9 @@ class UserStore:
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                """SELECT id, username, allowed_collections, role, created_at
+                """SELECT id, username, allowed_collections, role, created_at,
+                          disabled_at, activated_at,
+                          (password_hash IS NULL) AS pending_activation
                    FROM users ORDER BY created_at ASC"""
             )
         return [self._row_to_user(row) for row in rows]

@@ -809,6 +809,9 @@ def create_app() -> FastAPI:
             allowed_collections=await role_store.get_allowed_collections_for_user(user.user_id),
             organization=await _org_summary_for_user(user.user_id),
             created_at=user.created_at,
+            disabled_at=user.disabled_at,
+            activated_at=user.activated_at,
+            pending_activation=user.pending_activation,
         )
 
     @app.post("/api/v1/auth/change-password")
@@ -963,6 +966,14 @@ def create_app() -> FastAPI:
                     if (org := orgs_by_user.get(u.user_id)) is not None else None
                 ),
                 created_at=u.created_at,
+                # 账号生命周期三个字段（2026-08-26）。批量版和
+                # `_build_admin_user_response` 是同一个响应模型的两个构造点，
+                # **加字段时两处必须一起改** —— 漏掉这里的话，用户列表页
+                # （唯一真正用到它们的地方）会静默拿到默认值：所有人都显示
+                # "正常"，停用和待激活状态完全看不见，而且不报任何错。
+                disabled_at=u.disabled_at,
+                activated_at=u.activated_at,
+                pending_activation=u.pending_activation,
             )
             for u in users
         ]

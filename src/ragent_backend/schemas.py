@@ -75,6 +75,9 @@ class AdminUserResponse(BaseModel):
     # 都给默认值，既有的构造点不用全改。
     disabled_at: Optional[float] = None
     activated_at: Optional[float] = None
+    # 还没设过密码（判据是 password_hash IS NULL，不是 activated_at IS NULL——
+    # 后者会把全部存量账号误判成待激活，见 user_store.User 的说明）。
+    pending_activation: bool = False
 
 
 class AdminCreateUserRequest(BaseModel):

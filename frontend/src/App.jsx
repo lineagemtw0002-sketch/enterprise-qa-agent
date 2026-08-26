@@ -11,6 +11,7 @@ import {
 import AppShell from './components/shell/AppShell.jsx'
 import { KbTag, KbSourceIcon } from './components/shell/TopNav.jsx'
 import TracePanel from './components/TracePanel.jsx'
+import ActivateAccountForm from './components/shell/ActivateAccountForm.jsx'
 import AdminPanel from './components/admin/AdminPanel.jsx'
 import OperationsDashboard from './components/admin/OperationsDashboard.jsx'
 import WorkflowPanel from './components/workflow/WorkflowPanel.jsx'
@@ -274,6 +275,11 @@ export default function App() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authToken])
+
+  // 首次激活（docs/account_lifecycle_design.md §4.1b）。登录页的一个分支，
+  // 不是独立路由——本应用没有路由库，而且激活是一次性的低频动作，
+  // 为它引入 react-router 不划算。
+  const [showActivate, setShowActivate] = useState(false)
 
   // ==================== 登录 / 登出 ====================
   async function login() {
@@ -808,9 +814,22 @@ export default function App() {
             </div>
             <div>
               <h2>RAG Agent</h2>
-              <p className="login-subtitle">登录以继续</p>
+              <p className="login-subtitle">{showActivate ? '首次使用，请先激活账号' : '登录以继续'}</p>
             </div>
           </div>
+          {showActivate ? (
+            <ActivateAccountForm
+              onCancel={() => setShowActivate(false)}
+              onDone={(username) => {
+                // 激活成功后不自动登录：后端 /activate 只设密码、不签发 token
+                // （它是无鉴权端点，让它能签 token 会把攻击面从"改一个密码"
+                // 扩大成"直接拿到会话"）。这里把用户名带回登录表单，
+                // 员工只需要再输一次刚设的密码。
+                setShowActivate(false)
+                setLoginForm({ username, password: '' })
+              }}
+            />
+          ) : (
           <form className="login-form" onSubmit={(e) => { e.preventDefault(); login() }}>
             <div className="login-input-wrap">
               <UserRound size={16} className="login-input-icon" />
@@ -846,7 +865,18 @@ export default function App() {
             <button type="submit" className="login-submit-btn" disabled={loginLoading}>
               {loginLoading ? '登录中…' : '登录'}
             </button>
+            <button
+              type="button"
+              onClick={() => setShowActivate(true)}
+              style={{
+                background: 'none', border: 'none', cursor: 'pointer', marginTop: 4,
+                color: 'var(--accent)', fontSize: 13,
+              }}
+            >
+              收到激活码？首次激活账号
+            </button>
           </form>
+          )}
         </div>
       </div>
     )
