@@ -56,10 +56,20 @@ class FakeScope:
     scope_config: Dict[str, Any]
 
 
+@dataclass
+class FakeSummary:
+    summary_id: str
+    org_id: str
+
+
 class FakeStore:
-    def __init__(self, action: Optional[FakeAction] = None, scope: Optional[FakeScope] = None) -> None:
+    def __init__(
+        self, action: Optional[FakeAction] = None, scope: Optional[FakeScope] = None,
+        summaries: Optional[Dict[str, FakeSummary]] = None,
+    ) -> None:
         self.action = action
         self.scope = scope
+        self.summaries = summaries or {}
         self.created: List[Dict[str, Any]] = []
         self.advanced: List[tuple] = []
         self.marked_executing: List[str] = []
@@ -70,6 +80,9 @@ class FakeStore:
 
     async def get_remediation_scope(self, connection_id, action_type):
         return self.scope
+
+    async def get_analysis_summary(self, summary_id):
+        return self.summaries.get(summary_id)
 
     async def create_proposed_action(self, **kw):
         self.created.append(kw)
@@ -266,6 +279,47 @@ class TestPropose:
         assert out.ok is True
         assert store.advanced == [("remact_new", "pending_approval")]
         assert "尚未执行" in out.message, "必须让用户知道这只是建议、还没动手"
+
+    @pytest.mark.asyncio
+    async def test_valid_same_org_summary_id_is_linked(self):
+        """§9.2 事后复盘视图的链路——LLM 紧接着一次 analyze_ops_incident 提议
+        修复时，传回来的 summary_id 应该原样存进 create_proposed_action。"""
+        store = FakeStore(
+            scope=IN_SCOPE, summaries={"opssum_1": FakeSummary("opssum_1", ORG)},
+        )
+        out = await _toolset(store).propose_remediation(
+            ORG, CONN, "u1", "restart_service", "重启 order-service", PLAN,
+            summary_id="opssum_1",
+        )
+        assert out.ok is True
+        assert store.created[0]["summary_id"] == "opssum_1"
+
+    @pytest.mark.asyncio
+    async def test_unknown_summary_id_is_silently_dropped_not_refused(self):
+        """判别式：不存在的 summary_id 不该拒掉整条修复提议——链接只是复盘
+        视图的辅助信息，不是这次提议正确性的前提。"""
+        store = FakeStore(scope=IN_SCOPE, summaries={})
+        out = await _toolset(store).propose_remediation(
+            ORG, CONN, "u1", "restart_service", "重启 order-service", PLAN,
+            summary_id="opssum_does_not_exist",
+        )
+        assert out.ok is True
+        assert store.created[0]["summary_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_cross_org_summary_id_is_silently_dropped(self):
+        """判别式：另一家企业的 summary_id 同样不该被链接——即使 id 本身存在，
+        跨 org 引用会在复盘视图里泄露"这个企业知道另一家企业发生过什么分析"
+        这件事，哪怕只是一个不透明的 id 字符串。"""
+        store = FakeStore(
+            scope=IN_SCOPE, summaries={"opssum_1": FakeSummary("opssum_1", "org_other")},
+        )
+        out = await _toolset(store).propose_remediation(
+            ORG, CONN, "u1", "restart_service", "重启 order-service", PLAN,
+            summary_id="opssum_1",
+        )
+        assert out.ok is True
+        assert store.created[0]["summary_id"] is None
 
     @pytest.mark.asyncio
     async def test_bad_scope_config_is_not_reported_as_ai_overreach(self):

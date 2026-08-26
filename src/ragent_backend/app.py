@@ -70,6 +70,7 @@ from src.ragent_backend.schemas import (
     RemediationActionResponse, ProposeRemediationActionRequest,
     RoleOpsPermissionResponse, SetRoleOpsPermissionRequest,
     AnalysisSummaryResponse, SetOutcomeEffectiveRequest, OpsMetricsResponse,
+    PostmortemEntryResponse,
 )
 from src.ragent_backend import account_import as _acct_import
 from src.ragent_backend import activation as _activation
@@ -2082,7 +2083,7 @@ def create_app() -> FastAPI:
             approver_user_id=a.approver_user_id, approved_at=a.approved_at,
             executed_at=a.executed_at, result=a.result, rollback_plan=a.rollback_plan,
             outcome_effective=a.outcome_effective, created_at=a.created_at,
-            scope_check_reason=scope_check_reason,
+            scope_check_reason=scope_check_reason, summary_id=a.summary_id,
         )
 
     async def _get_owned_action(org_id: str, action_id: str):
@@ -2109,9 +2110,18 @@ def create_app() -> FastAPI:
         都会在 `remediation_actions` 表里留下记录，不是"判定失败就当没发生过"，
         审计需要看到"AI/管理员提议过这个、但被拦下了"这件事本身。
 
-        ⚠️ **V1 还没有 AI 分析**（§3 待实现），`proposed_by` 目前只能是发起
-        这次调用的 org_admin 本人——这是"手动提议"当占位符，不是设计终态，
-        等 AI 分析阶段落地后 `proposed_by` 应该能是系统身份。"""
+        ⚠️ **这是管理员手动提议的入口**，`proposed_by` 是发起这次调用的
+        org_admin 本人——AI 分析后的自动提议走的是另一条路（`analyze_ops_
+        incident` → LLM 决定调用 `propose_remediation` 工具，`proposed_by`
+        在那条路径上是发起对话的用户），两条路径共用同一个状态机和越界判定，
+        不是"占位符等 AI 落地后再改"，AI 分析已经落地了，这条注释早前的说法
+        已经过期，一并更正。
+
+        `summary_id` 可选：如果这次提议关联到之前某次分析（§9.2 事后复盘
+        视图用），先校验它属于同一个 org 才链接——跨 org 引用静默丢弃，
+        不拒绝这次提议本身（链接只是复盘辅助信息，不是提议正确性的前提，
+        跟 `src/ops/tools.py::propose_remediation` 走 LLM 路径时的处理
+        逻辑一致，两条路径的行为需要保持对称）。"""
         org = await _require_aiops_enabled_org(current_user)
         try:
             aiops_scope.validate_action_type(request.action_type)
@@ -2119,9 +2129,16 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(e))
         await _get_owned_connector(org.org_id, connection_id)
 
+        summary_id = request.summary_id
+        if summary_id is not None:
+            summary = await ops_store.get_analysis_summary(summary_id)
+            if summary is None or summary.org_id != org.org_id:
+                summary_id = None
+
         action = await ops_store.create_proposed_action(
             org.org_id, connection_id, current_user.user_id, request.intent,
             request.plan, impact_radius=request.impact_radius, rollback_plan=request.rollback_plan,
+            summary_id=summary_id,
         )
 
         scope = await ops_store.get_remediation_scope(connection_id, request.action_type)
@@ -2224,6 +2241,25 @@ def create_app() -> FastAPI:
         viewable = await ops_store.viewable_connection_ids_for_user(current_user.user_id, org.org_id)
         metrics = await ops_store.compute_ops_metrics(org.org_id, connection_ids=viewable)
         return OpsMetricsResponse(**metrics)
+
+    @app.get("/api/v1/admin/ops/postmortems", response_model=List[PostmortemEntryResponse])
+    async def admin_list_postmortems(
+        limit: int = 100,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> List[PostmortemEntryResponse]:
+        """§9.2"事后复盘聚合视图"的最小可行版——设计文档原话："没有这个视图，
+        本模块的自动修复到底有没有用将无法被回顾评估，是一条真实的遗留风险"。
+        列出全部终态动作（completed/failed），附上触发它的分析摘要（如果提议
+        时链接过）。权限跟其余总览类端点同一套。"""
+        org = await _require_aiops_enabled_org(current_user)
+        viewable = await ops_store.viewable_connection_ids_for_user(current_user.user_id, org.org_id)
+        entries = await ops_store.list_postmortems(org.org_id, connection_ids=viewable, limit=limit)
+        return [
+            PostmortemEntryResponse(
+                action=_remediation_action_response(e.action), linked_summary=e.linked_summary,
+            )
+            for e in entries
+        ]
 
     async def _require_can_approve(user_id: str, connection_id: str) -> None:
         perm = await ops_store.get_ops_permission(user_id, connection_id)

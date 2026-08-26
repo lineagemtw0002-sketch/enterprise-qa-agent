@@ -1346,6 +1346,64 @@ flowchart TB
   对一个还没真正执行过的动作没有答案）；四个指标目前只有 API，没有接进
   总览大屏的 UI（那是下一步，看要不要现在做）。
 
+  ✅ **同一晚追加：刘德华把四个指标接进了总览大屏。** 分母为 0 时显示"暂无
+  数据"（字号/颜色刻意弱于真实数字，它不是一个成绩）；同时显示样本量
+  （1 个样本的 100% 和 200 个样本的 100% 在决策上不是一回事，只给百分比
+  会把这个差别藏起来）；事后有效性按三态显示，不折成比例；审批队列表格
+  加"事后有效性"列，只对 completed/failed 显示标注按钮。
+  ⚠️ **真机跑出的第二次"猜字段名"教训**：第一版按语义猜了
+  `outcome_effective_counts.unmarked`/`sample_sizes.approval_decisions`
+  等四个键名，全部猜错——真实返回的是 `unlabeled` 和分状态计数
+  （`approved`/`rejected`/`expired`/`completed`/`failed`/`alert_count`/
+  `incident_count`）。**这类错不会让页面报错**，只会让样本量默默显示成
+  "—"，是在真机上才看出来的。加上上一轮 `Segmented` 白屏，这条线已经是
+  第二次"构建通过、类型也没有（JS 没有静态类型检查），只有真跑一遍才知道
+  对不对"，值得当成这条产品线的常态而不是意外来对待。
+  真机验证：造 1 待审批 + 1 已完成的动作，四个指标显示真实值，点"有效"后
+  表格/总览联动更新，验完用 DELETE 端点级联清理，共用库零残留。
+
+- ✅ **2026-08-27　§9.2 事后复盘聚合视图——最小可行版**（用户当晚要求现在
+  就补，不等 V2；设计文档原话："没有这个视图，本模块的自动修复到底有没有
+  用将无法被回顾评估，是一条真实的遗留风险"）
+
+  **不是完整 postmortem 工作流**（标签分类/根因归档/改进项跟踪仍然不在
+  范围内，那是明显更大的范围，超出这次要补的空白）——只做设计文档点名的
+  最小要求：把"这次修复解决了没有"这件事能被回顾。
+
+  `remediation_actions` 新增可空外键 `summary_id`（指向
+  `ops_analysis_summaries.id`）：提议一条修复动作时可以选择性链接"这是因为
+  哪次分析而做的"。⚠️ **这个外键列不能内联进它自己的 `CREATE TABLE` 语句
+  ——`remediation_actions` 在 schema 创建顺序里排在 `ops_analysis_summaries`
+  之前，内联外键在全新数据库上会因为引用了还不存在的表而建表失败**，改成
+  `ALTER TABLE ADD COLUMN IF NOT EXISTS`，放在 `ops_analysis_summaries`
+  建完之后执行，新库老库都安全。
+
+  **两条路径都支持链接，且行为对称**：LLM 走 `analyze_ops_incident` →
+  `propose_remediation` 工具链时可以带上分析返回的 `summary_id`；管理员在
+  控制台手动提议时 `ProposeRemediationActionRequest` 同样接受这个可选字段。
+  **无效或跨 org 的 `summary_id` 一律静默丢弃，不拒绝这次提议**——链接只是
+  复盘视图的辅助信息，不是提议正确性的前提，没必要因为一个无关紧要的字段
+  填错就拒掉整条修复建议；跨 org 引用如果不挡会在复盘视图里泄露"这个企业
+  知道另一家企业发生过什么分析"这件事，哪怕只是一个不透明的 id。
+
+  `GET /api/v1/admin/ops/postmortems`：列出全部终态动作（`completed`/
+  `failed`），LEFT JOIN 出链接的分析摘要文本（没链接时是 `None` 不是空
+  字符串）。权限跟总览类端点同一套 `viewable_connection_ids_for_user`
+  过滤。
+
+  **验证**：`tests/integration/test_ops_store_postmortems.py`（4 条，真实
+  Postgres，含"只列终态不列中间状态""JOIN 真的拿到摘要文本而不是空字符串"
+  ""connection_ids 过滤真的隔离"三条判别式）+ `tests/unit/test_ops_tools.py`
+  新增 3 条（合法链接/无效 summary_id 静默丢弃/跨 org 静默丢弃）+
+  `scripts/verify_aiops_endpoints.py` 新增 1 项（跑完整条状态机产生一条
+  终态动作，验证 HTTP 端点真的能读到链接的摘要文本）。全量 `tests/unit`
+  2349 通过。
+
+  **本次未覆盖**：只有 API，没有接进总览大屏或任何页面的 UI；`AI 分析`→
+  `修复提议`这条链路虽然工具层支持传 `summary_id`，但没有验证过真实 LLM
+  在同一轮对话里会不会真的把上一次工具调用返回的 `summary_id` 记住并传
+  过去（假件单测只验证了"传了就正确处理"，没验证"LLM 会不会传"）。
+
 - ✅ **2026-08-26　`role_ops_systems` 细粒度审批权限落地（§10.6 设计已实施）**
   ——本会话「张学友」实现，闭环了 §5 上面多处"任何本企业 org_admin 都能
   批准，不是只有被指定的审批人"这条反复记录的已知差距。

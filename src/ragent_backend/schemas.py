@@ -341,6 +341,12 @@ class RemediationActionResponse(BaseModel):
     # 落库（remediation_actions 表没有这个字段，越界原因是判定时才有的临时
     # 信息，落库的只有"结果是 rejected_pre"这个状态本身）。
     scope_check_reason: Optional[str] = None
+    summary_id: Optional[str] = None
+
+
+class PostmortemEntryResponse(BaseModel):
+    action: RemediationActionResponse
+    linked_summary: Optional[str] = None
 
 
 class ProposeRemediationActionRequest(BaseModel):
@@ -355,6 +361,11 @@ class ProposeRemediationActionRequest(BaseModel):
         description="AI 定性推断，非实时拓扑图，不允许当成唯一决策依据（§3.3）",
     )
     rollback_plan: Optional[Dict[str, Any]] = None
+    summary_id: Optional[str] = Field(
+        default=None,
+        description="可选，关联到哪次 analyze_ops_incident 分析（§9.2 事后复盘视图用）。"
+        "跨企业引用会被静默丢弃，不会报错。",
+    )
 
 
 # 2026-08-26 已删除：这里原有 AdminTestKBQueryRequest/Response、

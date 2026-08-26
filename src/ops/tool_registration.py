@@ -63,6 +63,14 @@ PROPOSE_REMEDIATION_SCHEMA = {
         "intent": {"type": "string", "description": "一句话说明为什么要做这个修复"},
         "plan": {"type": "object", "description": "动作参数，例如 {\"target\": \"order-service\"}"},
         "impact_radius": {"type": "string", "description": "预计影响范围，供审批人判断"},
+        "summary_id": {
+            "type": "string",
+            "description": (
+                "可选。如果这条提议是紧接着一次 analyze_ops_incident 分析做出的，"
+                "把那次分析返回的 summary_id 填在这里，让审批人和事后复盘能看到"
+                "『这次修复是因为哪次分析而做的』。不确定就留空，不影响这次提议本身。"
+            ),
+        },
     },
     "required": ["connection_id", "action_type", "intent", "plan"],
 }
@@ -146,14 +154,15 @@ def register_ops_tools(
             org_id=org_id, target=target, metric=metric, window_minutes=window_minutes)
 
     async def _propose(connection_id: str, action_type: str, intent: str, plan: dict,
-                       impact_radius: str = None, user_id: str = None,
+                       impact_radius: str = None, summary_id: str = None, user_id: str = None,
                        **_: Any) -> Any:
         org_id = await _resolve_org_id(user_id)
         if not org_id or not user_id:
             return ToolOutcome(ok=False, message="缺少调用方身份，无法提交修复建议。")
         return await toolset.propose_remediation(
             org_id=org_id, connection_id=connection_id, proposed_by=user_id,
-            action_type=action_type, intent=intent, plan=plan, impact_radius=impact_radius)
+            action_type=action_type, intent=intent, plan=plan, impact_radius=impact_radius,
+            summary_id=summary_id)
 
     async def _analyze(target: str, metric: str = "error_rate", window_minutes: int = 60,
                        user_id: str = None, **_: Any) -> Any:

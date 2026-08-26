@@ -124,6 +124,20 @@ class RemediationAction:
     rollback_plan: Optional[Dict[str, Any]]
     outcome_effective: Optional[bool]
     created_at: float
+    # 可选，2026-08-27 新增（§9.2"事后复盘聚合视图"的最小可行版）：这次提议
+    # 是不是由某一次 `analyze_ops_incident` 分析引出的，指向
+    # `ops_analysis_summaries.id`。放在末尾且有默认值——这个 dataclass 在
+    # 好几处是按位置构造的（`_row_to_action`），加个新字段插进中间会错位。
+    summary_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PostmortemEntry:
+    """`list_postmortems` 的一行——一条终态修复动作 + 它引用的分析摘要文本
+    （没有链接时是 `None`，不是空字符串，区分"没关联"和"关联了但摘要是空
+    字符串"这两件不该混淆的事）。"""
+    action: RemediationAction
+    linked_summary: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -279,6 +293,13 @@ class OpsStore:
                     created_at         DOUBLE PRECISION NOT NULL
                 )
                 """
+                # ⚠️ `summary_id` 故意不放在这张 CREATE TABLE 里，即使它逻辑上
+                # 属于这张表——`remediation_actions` 在 schema 创建顺序里排在
+                # `ops_analysis_summaries` 之前（见下面那张表的 CREATE 语句），
+                # 这里内联一个指向还不存在的表的外键，在全新数据库上会直接
+                # 建表失败。改成 ALTER TABLE，放在 `ops_analysis_summaries`
+                # 建表之后执行，见下方"给 remediation_actions 补 summary_id
+                # 外键列"那一段。
             )
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_remediation_org_status "
@@ -298,6 +319,20 @@ class OpsStore:
                 )
                 """
                 # 刻意不存原始运维数据——只存"分析结论摘要 + 依据引用"（§3.2 BYOC）。
+            )
+
+            # 给 remediation_actions 补 summary_id 外键列（2026-08-27，
+            # §9.2"事后复盘聚合视图"的最小可行版）——必须放在这里（这张表建
+            # 完之后），`remediation_actions` 的 CREATE TABLE 排在它前面，
+            # 不能内联这个外键。`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+            # 幂等，新库/老库都安全：新库上这条其实不需要（下面 CREATE TABLE
+            # 已经没有这一列，需要它才有意义），老库（本机开发库今晚已经建过
+            # 表）靠这条才能真正拿到这一列。可空 + 无历史回填——早于这次改动
+            # 创建的动作永远不会有这个链接，复盘视图里显示"未关联分析"，
+            # 这是诚实的空，不是缺陷。
+            await conn.execute(
+                "ALTER TABLE remediation_actions ADD COLUMN IF NOT EXISTS "
+                "summary_id TEXT REFERENCES ops_analysis_summaries(id)"
             )
 
     async def close(self) -> None:
@@ -1042,17 +1077,23 @@ class OpsStore:
             executed_at=row["executed_at"], result=_maybe_json(row["result"]),
             rollback_plan=_maybe_json(row["rollback_plan"]),
             outcome_effective=row["outcome_effective"], created_at=row["created_at"],
+            summary_id=row["summary_id"],
         )
 
     async def create_proposed_action(
         self, org_id: str, connection_id: str, proposed_by: str, intent: str,
         plan: Dict[str, Any], impact_radius: Optional[str] = None,
         rollback_plan: Optional[Dict[str, Any]] = None,
+        summary_id: Optional[str] = None,
     ) -> RemediationAction:
         """总是从 `proposed` 状态开始——是否放行到 `pending_approval` 由调用方
         先跑 `aiops_scope.check_target_in_scope`，再调 `advance_status` 转移，
         不在这里内联判断（越界判定是纯函数，故意保持可以脱离数据库单独测试）。
-        """
+
+        `summary_id` 可选——这次提议是不是由某次 `analyze_ops_incident` 分析
+        引出的。这里不校验它是否真的存在、是否属于同一个 org（外键约束会
+        挡掉不存在的 id；跨 org 引用则留给调用方在 app.py 端点层做归属校验，
+        Store 层不重复判断权限）。"""
         import json
 
         action_id = f"remact_{uuid.uuid4().hex[:12]}"
@@ -1063,18 +1104,19 @@ class OpsStore:
                 """
                 INSERT INTO remediation_actions
                     (id, org_id, connection_id, proposed_by, intent, plan, impact_radius,
-                     status, rollback_plan, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                     status, rollback_plan, created_at, summary_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 """,
                 action_id, org_id, connection_id, proposed_by, intent, json.dumps(plan),
                 impact_radius, STATUS_PROPOSED,
-                json.dumps(rollback_plan) if rollback_plan is not None else None, now,
+                json.dumps(rollback_plan) if rollback_plan is not None else None, now, summary_id,
             )
         return RemediationAction(
             action_id=action_id, org_id=org_id, connection_id=connection_id,
             proposed_by=proposed_by, intent=intent, plan=plan, impact_radius=impact_radius,
             status=STATUS_PROPOSED, approver_user_id=None, approved_at=None, executed_at=None,
             result=None, rollback_plan=rollback_plan, outcome_effective=None, created_at=now,
+            summary_id=summary_id,
         )
 
     async def get_action(self, action_id: str) -> Optional[RemediationAction]:
@@ -1254,6 +1296,42 @@ class OpsStore:
                     org_id,
                 )
         return [self._row_to_action(r) for r in rows]
+
+    async def list_postmortems(
+        self, org_id: str, connection_ids: Optional[List[str]] = None, limit: int = 100,
+    ) -> List["PostmortemEntry"]:
+        """§9.2"事后复盘聚合视图"的最小可行版——设计文档原话："没有这个视图，
+        本模块的自动修复到底有没有用将无法被回顾评估，是一条真实的遗留风险"。
+        这里做的**不是**完整 postmortem 工作流（标签分类/根因归档/改进项跟踪，
+        那是明显更大的范围，不在这次要补的空白之内），只做设计文档点名的
+        最小要求：把"这次修复解决了没有"这件事能被回顾——列出全部终态动作
+        （`completed`/`failed`），附上触发它的分析摘要（如果提议时链接过）。
+
+        `connection_ids` 语义跟 `compute_ops_metrics` 一致：`None` 不过滤，
+        列表（含空列表）按连接器隔离。"""
+        pool = await self._get_pool()
+        base_sql = (
+            "SELECT ra.*, s.summary AS linked_summary "
+            "FROM remediation_actions ra "
+            "LEFT JOIN ops_analysis_summaries s ON s.id = ra.summary_id "
+            "WHERE ra.org_id = $1 AND ra.status = ANY($2::text[])"
+        )
+        terminal_statuses = [STATUS_COMPLETED, STATUS_FAILED]
+        async with pool.acquire() as conn:
+            if connection_ids is None:
+                rows = await conn.fetch(
+                    base_sql + " ORDER BY ra.created_at DESC LIMIT $3",
+                    org_id, terminal_statuses, limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    base_sql + " AND ra.connection_id = ANY($3::text[]) ORDER BY ra.created_at DESC LIMIT $4",
+                    org_id, terminal_statuses, connection_ids, limit,
+                )
+        return [
+            PostmortemEntry(action=self._row_to_action(row), linked_summary=row["linked_summary"])
+            for row in rows
+        ]
 
     async def expire_stale_pending_approvals(self) -> List[str]:
         """给超时扫描用（§3.3 的 `expired` 状态）——扫描全部 `pending_approval`

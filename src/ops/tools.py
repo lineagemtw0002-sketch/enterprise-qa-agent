@@ -62,12 +62,14 @@ class RemediationStore(Protocol):
         self, org_id: str, connection_id: Optional[str], summary: str,
         evidence_refs: list,
     ) -> Any: ...
+    async def get_analysis_summary(self, summary_id: str) -> Optional[Any]: ...
     async def get_action(self, action_id: str) -> Optional[Any]: ...
     async def get_remediation_scope(self, connection_id: str, action_type: str) -> Optional[Any]: ...
     async def create_proposed_action(
         self, org_id: str, connection_id: str, proposed_by: str, intent: str,
         plan: Dict[str, Any], impact_radius: Optional[str] = None,
         rollback_plan: Optional[Dict[str, Any]] = None,
+        summary_id: Optional[str] = None,
     ) -> Any: ...
     async def advance_status(self, action_id: str, target_status: str) -> Any: ...
     async def mark_executing(self, action_id: str) -> Any: ...
@@ -188,12 +190,27 @@ class OpsToolset:
         self, org_id: str, connection_id: str, proposed_by: str, action_type: str,
         intent: str, plan: Dict[str, Any], impact_radius: Optional[str] = None,
         rollback_plan: Optional[Dict[str, Any]] = None,
+        summary_id: Optional[str] = None,
     ) -> ToolOutcome:
         """生成一条待审批的修复提议。
 
         §3.3.1：越界的目标**在进入 pending_approval 之前**就被挡掉，
         不允许流到审批人那一步再靠人肉发现。
-        """
+
+        `summary_id` 可选——如果这次提议是紧接着一次 `analyze_ops_incident`
+        分析提出的，LLM 可以把那次分析返回的 `summary_id` 传进来，给
+        §9.2"事后复盘视图"留一条"这次修复是因为哪次分析而做"的链路。传了一个
+        不属于这个 org 的 summary_id 时**静默不链接**（不报错、不拒绝这次
+        提议）——链接只是复盘视图的辅助信息，不是这次提议本身的正确性前提，
+        没必要因为一个无关紧要的字段填错就拒掉整条修复建议。"""
+        if summary_id is not None:
+            summary = await self._store.get_analysis_summary(summary_id)
+            if summary is None or summary.org_id != org_id:
+                logger.info(
+                    "propose_remediation 的 summary_id 无效或跨 org，静默丢弃: "
+                    "summary_id=%s caller_org=%s", summary_id, org_id,
+                )
+                summary_id = None
         from src.ragent_backend.aiops_scope import (
             InvalidActionType,
             InvalidScopeConfig,
@@ -239,6 +256,7 @@ class OpsToolset:
         action = await self._store.create_proposed_action(
             org_id=org_id, connection_id=connection_id, proposed_by=proposed_by,
             intent=intent, plan=plan, impact_radius=impact_radius, rollback_plan=rollback_plan,
+            summary_id=summary_id,
         )
         await self._store.advance_status(action.action_id, STATUS_PENDING_APPROVAL)
         return ToolOutcome(

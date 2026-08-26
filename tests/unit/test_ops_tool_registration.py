@@ -141,6 +141,7 @@ class TestOrgIdResolvedFromInjectedUserId:
             "org_id": "org_acme", "connection_id": "conn1", "proposed_by": "u1",
             "action_type": "restart_service", "intent": "服务卡死",
             "plan": {"target": "order-service"}, "impact_radius": None,
+            "summary_id": None,
         })]
 
     @pytest.mark.asyncio

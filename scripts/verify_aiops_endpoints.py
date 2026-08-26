@@ -583,6 +583,28 @@ async def main() -> None:
         assert resp.status_code == 200
         assert resp.json()["outcome_effective"] is True
 
+        # 17j) §9.2 事后复盘视图——用 ops_store_direct 把一条动作真的推到
+        # completed（没有 HTTP 端点能做到这个，mark_executing/mark_result
+        # 要等真实 BYOC 连接器），并链接刚才 17f 存的那条分析摘要（重新查一次
+        # 拿到它的 id），验证 GET /postmortems 能通过 HTTP 拿到关联的摘要文本。
+        recent_summaries = await ops_store_direct.list_analysis_summaries(org.org_id, connection_id)
+        linked_summary_id = recent_summaries[0].summary_id if recent_summaries else None
+        pm_action = await ops_store_direct.create_proposed_action(
+            org.org_id, connection_id, user.user_id, "根据分析结果重启",
+            {"target": "order-service"}, summary_id=linked_summary_id,
+        )
+        pm_action = await ops_store_direct.advance_status(pm_action.action_id, "pending_approval")
+        pm_action = await ops_store_direct.approve_action(pm_action.action_id, approver_user_id=user.user_id)
+        pm_action = await ops_store_direct.mark_executing(pm_action.action_id)
+        await ops_store_direct.mark_result(pm_action.action_id, "completed", result={"ok": True})
+
+        resp = await client.get("/api/v1/admin/ops/postmortems", headers=headers)
+        print("17j) postmortems:", resp.status_code, len(resp.json()))
+        assert resp.status_code == 200
+        entries = {e["action"]["action_id"]: e for e in resp.json()}
+        assert pm_action.action_id in entries
+        assert entries[pm_action.action_id]["linked_summary"] == "order-service 错误率突增，怀疑近期部署回归"
+
         # 18) 生成 register_token
         resp = await client.post(
             f"/api/v1/admin/ops/connectors/{connection_id}/register-token", headers=headers,
