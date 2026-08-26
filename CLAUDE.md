@@ -840,8 +840,8 @@ flowchart TB
 
 ## 5. 已修复（防止重新引入）
 
-- 🔵 **2026-08-26　智能运维模块阶段一 + 阶段二 + 阶段三：数据模型 + 目标越界
-  判定 + 审批状态机存储层 + 管理面 API 端点 + 审批工作流端点**
+- 🔵 **2026-08-26　智能运维模块阶段一～四：数据模型 + 目标越界
+  判定 + 审批状态机存储层 + 管理面 API 端点 + 审批工作流端点 + BYOC 连接器协议**
   设计 `docs/aiops_module_design.md`。2026-08-26 用户明确要求插队开工，覆盖了
   该文档自己"排期维持在 12 条 P0 之后"的原始决定——那条决定没有作废，是被
   这次显式覆盖，如实记录。
@@ -913,28 +913,68 @@ flowchart TB
      `rejected_pre` 带原因；没配白名单的动作类型 → `rejected_pre`；批准
      `pending_approval` → `approved`；已经是终态的动作再批准 → 409。
 
-  ⚠️ **未做的（阶段三之后，比做了的还是多）**：
-  - BYOC 连接器的 WebSocket 协议（§10.1：注册握手、心跳帧、token 轮换）
-    完全未实现，`connector_status`/`last_heartbeat_at` 已有存储方法和
-    `record_heartbeat`/`mark_offline`，但**没有任何东西会去调用它们**——
-    注册的连接器目前只是"元数据存在"，不会真的连上任何客户系统
-  - 联邦查询层、AI 分析（异常检测/告警关联/RCA）完全未实现——`propose`
-    端点目前只能由 org_admin **手动**发起，是占位而非设计终态，等 AI
-    分析阶段落地后 `proposed_by` 应该能是系统身份
+  **阶段四追加落地了什么**（同日，与另一会话并行——它做 §3.5 联邦查询层 +
+  §3.6 工具注册，本阶段做 §3.2 + §10.1 连接器协议，接缝是 `src/ops/types.py`
+  定义的 `ConnectorTransport`/`RemediationDispatcher` 两个 Protocol）：
+  10. `src/ops/connector_session.py`（纯函数，同 `activation.py` 模式）：
+      三层令牌各自的生命周期——`register_token`（一次性/10 分钟，只存哈希）、
+      `connector_session_token`（JWT/1 小时）、`refresh_token`（30 天/单次
+      使用即轮换）。**连接器 JWT 用从主密钥派生的独立密钥签名**
+      （`derive_connector_jwt_secret`），不是复用 `get_jwt_secret()`——
+      原因是防止连接器 token 和用户登录 token 互相被拿去冒充对方；心跳新鲜度
+      判定（`is_heartbeat_fresh`）现算不缓存，呼应 §3.2"不能缓存连接器在线
+      假设"的要求。回归：`tests/unit/test_connector_session.py`（28 条，含
+      "用户 token 不能被当连接器 token 解出来、反过来也一样"两条安全用例）。
+  11. `ops_store.py` 新增两张表（`ops_connector_register_tokens`、
+      `ops_connector_refresh_tokens`）+ 对应 CRUD，`online_status()` 批量心跳
+      查询方法（供联邦查询层用，避免 fan-out 场景下的 N+1）。
+  12. `WS /ws/ops/connector/register`（`app.py`）：注册握手（校验在
+      `accept()` 之前，同 trace WebSocket 那次 P0 教训）、心跳帧、refresh
+      帧轮换、**重放已消费的 refresh_token 会撤销该连接器全部会话并强制
+      断线**（§10.1 硬性要求）。`POST .../connectors/{id}/register-token`
+      给 org_admin 生成一次性握手凭证。
+  13. `src/ops/connector_transport.py`：`ConnectorTransport`/
+      `RemediationDispatcher` 的 WebSocket 实现——按消息 `id` 关联
+      请求/响应帧（`app.py` 的 `active_ops_pending_requests` 注册表 +
+      WS 接收循环里对 `query_result`/`exec_result`/`error` 帧的分发）。
+      **越权连接器一次请求都不发**（校验 org 归属在发送之前），超时/离线/
+      上游错误分别映射到 `ERROR_TIMEOUT`/`ERROR_OFFLINE`/`ERROR_UPSTREAM`。
+      回归：`tests/unit/test_connector_transport.py`（12 条，全假件）。
+  14. **真实端到端验证追加 6 项**（同一个脚本，共 24 项）：错误 register_token
+      拒绝、正确 token 握手成功拿到 session+refresh token、心跳帧、refresh
+      轮换出新一代 token、**重放检测触发强制断线**、一次性 token 用过不能
+      再用——走 `fastapi.testclient.TestClient` 真实 WebSocket，不是 mock。
+
+  ⚠️ **一处踩坑记录，别重犯**：验证脚本混用了 `httpx.AsyncClient`（走当前
+  事件循环）和 `TestClient` 的 WebSocket 测试（内部另起一个事件循环的
+  portal 线程）访问同一个 `app` 实例，asyncpg 连接池绑定着创建它的事件
+  循环，跨循环复用直接报 `InterfaceError: another operation is in
+  progress`。**只清 `db_pool._POOL_CACHE` 不够**——P1-2 之后每个 Store 类
+  自己还有一份类级别的 `_pool` 缓存（`OpsStore._pool` 等），两处都要清，
+  见脚本里的 `_reset_pool_caches()`。
+
+  ⚠️ **未做的（阶段四之后）**：
+  - `execute_approved_remediation` 下发前重新跑一次 `check_target_in_scope`
+    这道复查（另一会话负责，理由：提议到批准之间可能隔 30 分钟，管理员
+    完全可能在这期间把目标从白名单摘掉）**在他们的工具层实现，不在这里**
+  - `ops_toolset`/`register_ops_tools` 的实际接线到 `app.py`/`builtin_tools.py`
+    **还没做**——`src/ops/types.py`/`federation/`/`tools.py` 目前在另一条
+    未合并的分支（`claude/aiops-federation`）上，本阶段为了能独立测试
+    `connector_transport.py`，从那条分支**只读复制**了一份 `types.py`
+    过来（内容逐字节相同，未修改），真正的合并 + 工具注册接线要等两条
+    分支合并之后
   - `role_ops_systems`（can_view/can_approve 精细权限位）、
     `ops_analysis_summaries` 只建了表，**CRUD 方法未实现**——当前的权限
     粒度只有"org_admin 能管自己企业的一切 / super_admin 管开关"两档，
     §10.6 设想的"审批权限比查看权限更窄"这层还没有落地，**任何本企业
     org_admin 都能批准，不是只有被指定的审批人**，这条差距已如实记录在
     `admin_approve_remediation_action` 的函数注释里
-  - **`approved` 之后没有下文**：`mark_executing`/`mark_result` 状态机方法
-    阶段一就有了，但没有对应端点——真正执行需要 BYOC 连接器的运行时把
-    "已批准的执行计划"发给客户环境本地执行，那部分完全没做，`approved`
-    目前是实际能走到的终点
   - LangGraph 接入（`intent_type=ops`/`ops_subgraph`，§10.2）、
     前端"运维塔台"UI 全部未实现
   - 审批超时扫描任务未实现（`list_pending_approval_older_than` 只提供
     查询方法，没有定时调用它的后台任务）
+  - 真实的 BYOC 连接器进程（客户环境里响应 `query_request`/`exec_request`
+    帧的那一端）不在本项目范围内，本阶段只做平台侧协议
   - `CLAUDE.md` §3 权限模型正文**没有**回填 §10.6 的 `role_ops_systems`
     草稿——按 §7.4"§3 只描述已经实现的现状"，`role_ops_systems` 实际还没
     接线，现在写进去就是"文档说了算但代码不算数"，等真正接细粒度权限那一步
@@ -1498,7 +1538,7 @@ flowchart TB
 | **`docs/architecture.md`** | **架构图 · 核心链路 · 双模型 · 性能测试**（与本文同属当前状态正本） | **活文档** |
 | `docs/scale_slo_and_priorities.md` | 容量测算 · 最小 SLO · 27+3 条发现重新分级（12 条 P0） | 活文档 |
 | `docs/orchestration_design.md` | 编排层设计：并行防护 + 记忆异步化 | **部分实施**：A 部分 D4/D5（08-25 第二批）、**D1/D2（08-25 第三批，见 §4.5）** 已落地；D3/D6 未实施；**B 部分整体未实施**（阻塞项 B-R1 已实测查清） |
-| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **部分实施**：2026-08-26 用户明确要求插队开工（覆盖了文档自己"排期维持在 12 条 P0 之后"的原始决定）。阶段一（数据模型 + 修复目标越界判定纯函数 + 审批状态机存储层）+ 阶段二（连接器/模块开关/修复范围白名单的管理面 API 端点）+ 阶段三（提议/批准/拒绝的审批工作流端点，§3.3.1 越界拦截真正接线）已落地，粗粒度 org_admin/super_admin 门禁，见 §5。BYOC 连接器协议、联邦查询/AI 分析、LangGraph 接入、`approved` 之后的真实执行、前端、`role_ops_systems` 细粒度权限均未实施 |
+| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **部分实施**：2026-08-26 用户明确要求插队开工（覆盖了文档自己"排期维持在 12 条 P0 之后"的原始决定）。阶段一～三（数据模型/越界判定/审批状态机/管理面端点/审批工作流端点）+ 阶段四（BYOC 连接器协议：注册握手/心跳/refresh 轮换/重放检测，`ConnectorTransport` 实现）已落地，粗粒度 org_admin/super_admin 门禁，见 §5。与另一会话并行做的 §3.5 联邦查询层+§3.6 工具注册在未合并分支 `claude/aiops-federation` 上，尚未接线进 `app.py`。LangGraph 接入、`role_ops_systems` 细粒度权限、前端均未实施 |
 | `docs/collaboration_retrospective.md` | 协作复盘与开发流程指南（**每周自查只需读 §1**） | 活文档 |
 | `docs/review_2026-08-24/review_codebase_findings.md` | 代码审计，带行号证据 | 时点快照 |
 | `docs/review_2026-08-24/review_process_retro.md` | 过程复盘量化分析 | 时点快照 |

@@ -22,10 +22,15 @@
   10. 批准一条 pending_approval 的动作 -> approved
   11. 已经是终态的动作不能再被批准 -> 409（状态机不允许非法转移）
   12. 跨企业访问应 404（不是 403，避免泄露"这个连接器/动作存在但不是你的"）
+  13. 生成 register_token，走 §10.1 WebSocket 握手：错误 token 拒绝、正确
+      token 握手成功拿到 session_token+refresh_token、心跳帧、refresh 帧
+      轮换出新一代 token、**重放已消费的 refresh_token 被判定为泄露信号并
+      强制断线**、一次性 register_token 用过不能再用
 
-本次未覆盖：BYOC 连接器的真实 WebSocket 心跳/联邦查询/AI 分析/审批后的真实
-执行链路（approved 之后没有对应端点把它推进到 executing，见 CLAUDE.md §5
-该条"什么没做"）；`role_ops_systems` 的 can_view/can_approve 精细权限（尚未
+本次未覆盖：`query_request`/`exec_request` 帧（联邦查询/执行分发到活连接，
+`ConnectorTransport.query()` 还没实现，见 CLAUDE.md §5 该条"什么没做"）；
+AI 分析/审批后的真实执行链路（approved 之后没有对应端点把它推进到
+executing）；`role_ops_systems` 的 can_view/can_approve 精细权限（尚未
 接线，当前只有 org_admin/super_admin 两档粗粒度门禁——任何本企业 org_admin
 都能批准，不是只有被指定的审批人）；并发场景（两个 org_admin 同时批准同一条
 动作等）；`reject` 端点本次没有单独测（跟 `approve` 共用同一段状态机校验，
@@ -40,13 +45,32 @@ import os
 os.environ.setdefault("RAGENT_DEBUG", "true")
 
 import httpx
+from fastapi.testclient import TestClient
 
 from src.ragent_backend.app import create_app
 from src.ragent_backend.auth import create_access_token
+from src.ragent_backend import db_pool
 from src.ragent_backend.db_pool import close_shared_pools
+from src.ragent_backend.ops_store import OpsStore
 from src.ragent_backend.org_store import ORG_PLATFORM_ID, OrgStore
 from src.ragent_backend.role_store import ROLE_ORG_ADMIN, ROLE_SUPER_ADMIN, RoleStore
 from src.ragent_backend.user_store import UserStore
+
+
+def _reset_pool_caches() -> None:
+    """P1-2 之后，14+ 个 Store 类各自的 `_pool` 是**类级别**属性缓存
+    （见 `ops_store.py::_get_pool`），不是只有 `db_pool.py` 那一份模块级
+    缓存——只清 `db_pool._POOL_CACHE` 不够，`OpsStore._pool` 这类类属性
+    还攥着绑定旧事件循环的池对象，下次 `_get_pool()` 会直接返回它、根本
+    不会重新走 `get_shared_pool()`。
+
+    这里为什么需要清：接下来要在另一个事件循环（`TestClient` 内部的
+    anyio portal 线程）里复用同一个 `app`，asyncpg 的连接/池是绑定着
+    创建它的事件循环的，跨循环用会报 `InterfaceError: another operation
+    is in progress`（真实踩过）。"""
+    db_pool._POOL_CACHE.clear()
+    for store_cls in (OpsStore, UserStore, OrgStore, RoleStore):
+        store_cls._pool = None
 
 _TEST_ORG_NAME = "AIOps-smoke-test-org"
 _TEST_ORG_NAME_2 = "AIOps-smoke-test-org-2"
@@ -79,6 +103,12 @@ async def _cleanup(user_store: UserStore) -> None:
             ]
             if conn_ids:
                 await conn.execute(
+                    "DELETE FROM ops_connector_refresh_tokens WHERE connection_id = ANY($1::text[])", conn_ids,
+                )
+                await conn.execute(
+                    "DELETE FROM ops_connector_register_tokens WHERE connection_id = ANY($1::text[])", conn_ids,
+                )
+                await conn.execute(
                     "DELETE FROM remediation_actions WHERE connection_id = ANY($1::text[])", conn_ids,
                 )
                 await conn.execute(
@@ -92,6 +122,83 @@ async def _cleanup(user_store: UserStore) -> None:
             await conn.execute("DELETE FROM users WHERE id = ANY($1::text[])", user_ids)
         if org_ids:
             await conn.execute("DELETE FROM organizations WHERE id = ANY($1::text[])", org_ids)
+
+
+def _verify_websocket_flow(app, connection_id: str, register_token: str) -> None:
+    """§10.1 的 WebSocket 握手/心跳/refresh 轮换/重放检测，同步跑（见上面
+    调用点的说明）。"""
+    import starlette.websockets
+
+    with TestClient(app) as client:
+        # 19) 错误的 register_token 应该被拒绝，握手不成功——`accept()` 之前
+        # 就 `close()` 时，连接会在 `websocket_connect()` 的 `__enter__` 这一步
+        # 就直接抛 WebSocketDisconnect（不是等进了 `with` 块再抛），所以整个
+        # `with` 语句都要包在 try 里，不能只包 `receive_json()`。
+        try:
+            with client.websocket_connect(
+                f"/ws/ops/connector/register?connection_id={connection_id}&token=wrong-token"
+            ):
+                raise AssertionError("用错误 token 握手不应该成功")
+        except starlette.websockets.WebSocketDisconnect:
+            pass
+        print("19) register with wrong token rejected: OK")
+
+        # 20) 正确的 register_token 应该握手成功，拿到 session_token + refresh_token
+        with client.websocket_connect(
+            f"/ws/ops/connector/register?connection_id={connection_id}&token={register_token}"
+        ) as ws:
+            registered = ws.receive_json()
+            print("20) register with correct token:", registered["type"])
+            assert registered["type"] == "registered"
+            session_token = registered["payload"]["session_token"]
+            refresh_token_1 = registered["payload"]["refresh_token"]
+            assert session_token and refresh_token_1
+
+            # 21) 心跳帧
+            ws.send_json({"type": "heartbeat", "id": "hb-1", "connector_id": connection_id, "ts": 0, "payload": {}})
+            hb_ack = ws.receive_json()
+            print("21) heartbeat ack:", hb_ack["type"])
+            assert hb_ack["type"] == "heartbeat"
+
+            # 22) refresh 帧——用第一代 refresh_token 换第二代
+            ws.send_json({
+                "type": "refresh", "id": "rf-1", "connector_id": connection_id, "ts": 0,
+                "payload": {"refresh_token": refresh_token_1},
+            })
+            refresh_ack = ws.receive_json()
+            print("22) refresh rotates token:", refresh_ack["type"])
+            assert refresh_ack["type"] == "refresh"
+            refresh_token_2 = refresh_ack["payload"]["refresh_token"]
+            assert refresh_token_2 != refresh_token_1
+
+            # 23) 用已经被消费的第一代 refresh_token 重放——必须被判定为泄露信号，
+            # 断开连接（而不是安静地拒绝这一次请求就完事）。
+            ws.send_json({
+                "type": "refresh", "id": "rf-2", "connector_id": connection_id, "ts": 0,
+                "payload": {"refresh_token": refresh_token_1},
+            })
+            replay_error = ws.receive_json()
+            print("23) replayed refresh_token flagged:", replay_error["type"], replay_error["payload"]["reason"])
+            assert replay_error["type"] == "error"
+            assert replay_error["payload"]["reason"] == "refresh_token_replayed"
+            try:
+                ws.receive_json()
+                raise AssertionError("重放检测后连接应该被关闭")
+            except starlette.websockets.WebSocketDisconnect:
+                pass
+        print("    connection closed after replay detected: OK")
+
+        # 24) register_token 是一次性的——第一次握手已经把它标记 used，
+        # 同一个 token 不能再握手第二次。跟 19) 一样，拒绝发生在 accept()
+        # 之前，disconnect 在 __enter__ 这一步就抛。
+        try:
+            with client.websocket_connect(
+                f"/ws/ops/connector/register?connection_id={connection_id}&token={register_token}"
+            ):
+                raise AssertionError("已用过的 register_token 不应该能再握手")
+        except starlette.websockets.WebSocketDisconnect:
+            pass
+        print("24) reusing a consumed register_token rejected: OK")
 
 
 async def main() -> None:
@@ -272,6 +379,26 @@ async def main() -> None:
         )
         print("17) cross-org access:", resp.status_code)
         assert resp.status_code == 404
+
+        # 18) 生成 register_token
+        resp = await client.post(
+            f"/api/v1/admin/ops/connectors/{connection_id}/register-token", headers=headers,
+        )
+        print("18) generate register token:", resp.status_code)
+        assert resp.status_code == 200
+        register_token = resp.json()["register_token"]
+
+    # WebSocket 测试要用 TestClient（同步）——FastAPI 的 WebSocket 测试没有
+    # 官方异步客户端，`TestClient` 内部在独立线程里跑自己的事件循环
+    # （anyio portal）。这意味着接下来对 `app` 的调用会经过一个**跟上面
+    # httpx.AsyncClient 不同的事件循环**，asyncpg 的池/连接绑定着创建它的
+    # 循环，跨循环用会报 "another operation is in progress"（真实踩过）。
+    # 前后各重置一次池缓存（`db_pool.py` 模块级 + 各 Store 类级），让两侧
+    # 各自建一份绑定到自己循环的池，牺牲一点效率换正确性，反正这只是
+    # 一次性验证脚本。
+    _reset_pool_caches()
+    await asyncio.to_thread(_verify_websocket_flow, app, connection_id, register_token)
+    _reset_pool_caches()
 
     print("\nALL CHECKS PASSED")
     await _cleanup(user_store)

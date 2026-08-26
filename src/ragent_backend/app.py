@@ -65,6 +65,7 @@ from src.ragent_backend.schemas import (
     AdminCreatedUserCredential, SetSeatLimitRequest, SetUserDisabledRequest,
     ActivateAccountRequest, BulkImportRowResult, BulkImportResponse,
     OpsConnectorResponse, RegisterOpsConnectorRequest, SetAiopsModuleEnabledRequest,
+    OpsConnectorRegisterTokenResponse,
     RemediationScopeResponse, UpsertRemediationScopeRequest,
     RemediationActionResponse, ProposeRemediationActionRequest,
 )
@@ -91,6 +92,7 @@ from src.ragent_backend.ops_store import (
     STATUS_PENDING_APPROVAL, STATUS_REJECTED, STATUS_REJECTED_PRE,
 )
 from src.ragent_backend import aiops_scope
+from src.ops import connector_session
 from src.ragent_backend.auth import (
     AuthenticatedUser, create_access_token, get_current_user, require_role,
     require_same_org_or_platform, require_platform_admin, get_jwt_secret,
@@ -197,6 +199,19 @@ INGEST_SEMAPHORE = asyncio.Semaphore(2)
 
 # WebSocket 连接管理：conversation_id -> list[WebSocket]
 active_trace_ws: dict[str, list[WebSocket]] = {}
+
+# 智能运维模块（docs/aiops_module_design.md §10.1）：connection_id -> 当前存活
+# 的 WebSocket 连接。进程内内存字典，不落库——"这个连接器现在是不是真的连着"
+# 这件事的最权威来源就是这个进程持不持有它的 socket，落库的
+# ops_system_connections.connector_status/last_heartbeat_at 是心跳驱动的
+# 派生状态，用于跨进程/重启后的展示，两者不是同一个概念，不要混用。
+active_ops_connector_ws: dict[str, WebSocket] = {}
+
+# `message id -> Future`：`WebSocketConnectorTransport`/`WebSocketRemediationDispatcher`
+# （src/ops/connector_transport.py）发出 query_request/exec_request 时在这里登记，
+# WS 接收循环收到关联的 query_result/exec_result 帧时按 id 找到对应的 Future 并
+# resolve 它——这是"请求-响应"语义叠加在"消息帧"这种发布/订阅式协议上的标准做法。
+active_ops_pending_requests: dict[str, "asyncio.Future"] = {}
 
 async def broadcast_trace(conversation_id: str, data: dict) -> None:
     """向该对话的所有 WebSocket 客户端广播 trace 事件"""
@@ -1628,6 +1643,173 @@ def create_app() -> FastAPI:
         org = await _require_aiops_enabled_org(current_user)
         connectors = await ops_store.list_connectors_for_org(org.org_id)
         return [_ops_connector_response(c) for c in connectors]
+
+    @app.post(
+        "/api/v1/admin/ops/connectors/{connection_id}/register-token",
+        response_model=OpsConnectorRegisterTokenResponse,
+    )
+    async def admin_generate_ops_connector_register_token(
+        connection_id: str,
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> OpsConnectorRegisterTokenResponse:
+        """§10.1 步骤 1：org 管理员在连接器管理页生成 register_token，给客户
+        环境的连接器进程用来发起第一次 WebSocket 握手。**明文只在这次响应里
+        出现一次**，平台数据库只存哈希（`connector_session.hash_token`）。
+        生成新的会顶掉这个连接器上一个还没握手成功的 token（`set_register_token`
+        是 UPSERT），符合"管理员重新点一次生成，上一个就该失效"的直觉。"""
+        org = await _require_aiops_enabled_org(current_user)
+        await _get_owned_connector(org.org_id, connection_id)
+
+        raw_token = connector_session.generate_register_token()
+        expires_at = time.time() + connector_session.REGISTER_TOKEN_TTL_SECONDS
+        await ops_store.set_register_token(connection_id, connector_session.hash_token(raw_token), expires_at)
+        await _audit_log(
+            current_user.user_id, "generate_ops_register_token", "ops_connector", connection_id, {},
+        )
+        return OpsConnectorRegisterTokenResponse(
+            connection_id=connection_id, register_token=raw_token, expires_at=expires_at,
+        )
+
+    @app.websocket("/ws/ops/connector/register")
+    async def ops_connector_register_ws(
+        websocket: WebSocket,
+        connection_id: str = Query(...),
+        token: str = Query(...),
+    ):
+        """§10.1 的 WebSocket 注册握手 + 心跳 + refresh 循环。
+
+        浏览器/客户端原生 WebSocket API 握手阶段不能带自定义 header，所以
+        `connection_id` 与一次性 `register_token` 都走查询参数——跟
+        `trace_websocket` 的 `?token=` 是同一个约定。**握手校验在
+        `accept()` 之前完成**，不满足直接 `close()`，不建立连接（同一条
+        既有安全教训：trace WebSocket 那次 P0 就是"先 accept 再鉴权"）。
+
+        成功后连接进入长连接状态，处理两类帧：`heartbeat`（更新
+        `last_heartbeat_at`）、`refresh`（refresh_token 轮换，检测到重放会
+        撤销该连接器全部会话并断开，逼它重新走一遍这个握手）。
+
+        ⚠️ **这里还没有 `query_request`/`exec_request` 帧的处理**——那需要
+        `ConnectorTransport.query()` 把请求路由到这个活连接、等待关联的
+        `query_result` 帧返回，是下一步要做的事，本次只做到"连接器能连上、
+        能被判断在线"，见 `CLAUDE.md` §5 该条"未做的"。
+        """
+        conn = await ops_store.get_connector(connection_id)
+        if conn is None:
+            await websocket.close(code=4404)
+            return
+        if not await ops_store.is_module_enabled(conn.org_id):
+            await websocket.close(code=4403)
+            return
+
+        token_state = await ops_store.get_register_token_state(connection_id)
+        check = connector_session.check_register_token(
+            stored_hash=token_state["token_hash"] if token_state else None,
+            provided_token=token, used=token_state["used"] if token_state else False,
+            expires_at=token_state["expires_at"] if token_state else None,
+        )
+        if not check.ok:
+            await websocket.close(code=4401)
+            return
+
+        await websocket.accept()
+        await ops_store.mark_register_token_used(connection_id)
+
+        secret = connector_session.derive_connector_jwt_secret(get_jwt_secret())
+        session_token = connector_session.create_connector_session_jwt(connection_id, conn.org_id, secret)
+        refresh_token = connector_session.generate_refresh_token()
+        await ops_store.issue_refresh_token(
+            connection_id, connector_session.hash_token(refresh_token),
+            ttl_seconds=connector_session.REFRESH_TOKEN_TTL_SECONDS,
+        )
+        await ops_store.record_heartbeat(connection_id)
+        active_ops_connector_ws[connection_id] = websocket
+
+        await websocket.send_json({
+            "type": "registered", "id": str(uuid.uuid4()), "connector_id": connection_id,
+            "ts": time.time(),
+            "payload": {"session_token": session_token, "refresh_token": refresh_token},
+        })
+
+        try:
+            while True:
+                frame = await websocket.receive_json()
+                frame_type = frame.get("type")
+
+                if frame_type == "heartbeat":
+                    await ops_store.record_heartbeat(connection_id)
+                    await websocket.send_json({
+                        "type": "heartbeat", "id": frame.get("id"), "connector_id": connection_id,
+                        "ts": time.time(), "payload": {},
+                    })
+
+                elif frame_type == "refresh":
+                    provided = (frame.get("payload") or {}).get("refresh_token", "")
+                    provided_hash = connector_session.hash_token(provided)
+                    rt_state = await ops_store.get_refresh_token_state(connection_id, provided_hash)
+                    rcheck = connector_session.check_refresh_token(
+                        stored_hash=rt_state["token_hash"] if rt_state else None,
+                        provided_token=provided,
+                        consumed_at=rt_state["consumed_at"] if rt_state else None,
+                        expires_at=rt_state["expires_at"] if rt_state else None,
+                    )
+                    if rcheck.is_replay:
+                        # §10.1：视为泄露信号，强制该连接器重新走注册流程——
+                        # 撤销全部会话令牌并断开，不只是拒绝这一次刷新。
+                        await ops_store.revoke_all_refresh_tokens(connection_id)
+                        await websocket.send_json({
+                            "type": "error", "id": frame.get("id"), "connector_id": connection_id,
+                            "ts": time.time(),
+                            "payload": {"reason": "refresh_token_replayed", "detail": "检测到已消费的 refresh_token 被重复使用，视为泄露信号，请重新注册"},
+                        })
+                        await websocket.close(code=4409)
+                        break
+                    if not rcheck.ok:
+                        await websocket.send_json({
+                            "type": "error", "id": frame.get("id"), "connector_id": connection_id,
+                            "ts": time.time(), "payload": {"reason": "refresh_token_invalid"},
+                        })
+                        continue
+
+                    await ops_store.consume_refresh_token(connection_id, provided_hash)
+                    new_session_token = connector_session.create_connector_session_jwt(
+                        connection_id, conn.org_id, secret,
+                    )
+                    new_refresh_token = connector_session.generate_refresh_token()
+                    await ops_store.issue_refresh_token(
+                        connection_id, connector_session.hash_token(new_refresh_token),
+                        ttl_seconds=connector_session.REFRESH_TOKEN_TTL_SECONDS,
+                    )
+                    await websocket.send_json({
+                        "type": "refresh", "id": frame.get("id"), "connector_id": connection_id,
+                        "ts": time.time(),
+                        "payload": {"session_token": new_session_token, "refresh_token": new_refresh_token},
+                    })
+
+                elif frame_type in ("query_result", "exec_result", "error"):
+                    # 这些帧是连接器对之前 query_request/exec_request 的响应，
+                    # 找到对应的等待中 Future 并 resolve——真正解析 payload 的
+                    # 逻辑在 WebSocketConnectorTransport/WebSocketRemediationDispatcher
+                    # 里（src/ops/connector_transport.py），这里不关心内容，
+                    # 只按 id 转发。**没有匹配的 pending 项就静默丢弃**，不是
+                    # bug：调用方可能已经超时放弃了这次等待（`_send_and_await_response`
+                    # 的 finally 会清理 pending），连接器晚到的响应不该让整个
+                    # WS 连接报错。
+                    msg_id = frame.get("id")
+                    fut = active_ops_pending_requests.get(msg_id) if msg_id else None
+                    if fut is not None and not fut.done():
+                        fut.set_result(frame)
+
+                else:
+                    await websocket.send_json({
+                        "type": "error", "id": frame.get("id"), "connector_id": connection_id,
+                        "ts": time.time(),
+                        "payload": {"reason": "unsupported_frame_type", "detail": f"暂不支持的帧类型：{frame_type}"},
+                    })
+        except WebSocketDisconnect:
+            pass
+        finally:
+            active_ops_connector_ws.pop(connection_id, None)
+            await ops_store.mark_offline(connection_id)
 
     @app.put(
         "/api/v1/admin/organizations/{org_id}/aiops-module-enabled",

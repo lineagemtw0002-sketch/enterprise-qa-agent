@@ -176,6 +176,42 @@ class OpsStore:
                 "CREATE INDEX IF NOT EXISTS idx_ops_conn_org ON ops_system_connections(org_id)"
             )
 
+            # 连接器注册握手用的一次性 token（§10.1）——只存哈希，一个连接器
+            # 同一时刻只有一个有效的 register_token（生成新的会顶掉旧的，见
+            # set_register_token 用 UPSERT），跟激活码"单次使用"的模式一致，
+            # 只是这里的"作废"是覆盖而不是标记 used，因为握手成功后这个
+            # token 就该失效，没有必要保留历史。
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ops_connector_register_tokens (
+                    connection_id TEXT PRIMARY KEY REFERENCES ops_system_connections(id),
+                    token_hash    TEXT NOT NULL,
+                    expires_at    DOUBLE PRECISION NOT NULL,
+                    used_at       DOUBLE PRECISION
+                )
+                """
+            )
+
+            # refresh_token 需要保留"已消费"历史才能做重放检测（§10.1：
+            # "如果检测到一个已消费的 refresh_token 被重复使用，视为泄露信号"）
+            # ——这是它不能像 register_token 那样直接覆盖、必须用独立表存
+            # 每一代 token 的原因。
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ops_connector_refresh_tokens (
+                    id            TEXT PRIMARY KEY,
+                    connection_id TEXT NOT NULL REFERENCES ops_system_connections(id),
+                    token_hash    TEXT NOT NULL,
+                    issued_at     DOUBLE PRECISION NOT NULL,
+                    consumed_at   DOUBLE PRECISION,
+                    expires_at    DOUBLE PRECISION NOT NULL
+                )
+                """
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ops_refresh_conn ON ops_connector_refresh_tokens(connection_id)"
+            )
+
             # role_ops_systems（§4 权限模型扩展）：表已建，CRUD 留给权限接入阶段。
             await conn.execute(
                 """
@@ -346,6 +382,139 @@ class OpsStore:
             await conn.execute(
                 "UPDATE ops_system_connections SET connector_status = 'offline' WHERE id = $1",
                 connection_id,
+            )
+
+    async def online_status(self, connection_ids: List[str]) -> Dict[str, bool]:
+        """批量在线状态——一次 DB 往返覆盖任意多个 connection_id，不是按 id
+        循环调。是 `ConnectorTransport.online_status` 的存储层实现，专门为
+        联邦查询 fan-out 场景设计（跟 P1-14 那批 N+1 是同一个教训：调用方
+        循环调用单个查询方法，会随并发扇出的连接器数量线性增加 DB 往返）。
+
+        "在线"用 `connector_session.is_heartbeat_fresh` 现算，不直接信
+        `connector_status` 这个写路径缓存的字符串——见该函数的说明。"""
+        from src.ops.connector_session import is_heartbeat_fresh
+
+        result: Dict[str, bool] = {cid: False for cid in connection_ids}
+        if not connection_ids:
+            return result
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, last_heartbeat_at FROM ops_system_connections WHERE id = ANY($1::text[])",
+                connection_ids,
+            )
+        for row in rows:
+            result[row["id"]] = is_heartbeat_fresh(row["last_heartbeat_at"])
+        return result
+
+    # ------------------------------------------------------------------
+    # 连接器会话令牌（§10.1：register_token 一次性握手 + refresh_token 轮换）
+    # 判定逻辑在 src/ops/connector_session.py（纯函数），这里只管落库/取数。
+    # ------------------------------------------------------------------
+
+    async def set_register_token(self, connection_id: str, token_hash: str, expires_at: float) -> None:
+        """生成新的 register_token 会顶掉旧的（UPSERT，不保留历史）——旧的
+        没握手成功就作废是刻意的，管理员重新点一次"生成"就该让上一个失效。
+        """
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO ops_connector_register_tokens (connection_id, token_hash, expires_at, used_at)
+                VALUES ($1, $2, $3, NULL)
+                ON CONFLICT (connection_id) DO UPDATE SET
+                    token_hash = EXCLUDED.token_hash,
+                    expires_at = EXCLUDED.expires_at,
+                    used_at = NULL
+                """,
+                connection_id, token_hash, expires_at,
+            )
+
+    async def get_register_token_state(self, connection_id: str) -> Optional[Dict[str, Any]]:
+        """返回喂给 `connector_session.check_register_token` 的原始字段，
+        不在这里做判定——判定是纯函数的职责。"""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT token_hash, expires_at, used_at FROM ops_connector_register_tokens "
+                "WHERE connection_id = $1",
+                connection_id,
+            )
+        if row is None:
+            return None
+        return {
+            "token_hash": row["token_hash"], "expires_at": row["expires_at"],
+            "used": row["used_at"] is not None,
+        }
+
+    async def mark_register_token_used(self, connection_id: str) -> None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE ops_connector_register_tokens SET used_at = $1 WHERE connection_id = $2",
+                time.time(), connection_id,
+            )
+
+    async def issue_refresh_token(
+        self, connection_id: str, token_hash: str, *, ttl_seconds: int
+    ) -> None:
+        """签发新一代 refresh_token——旧的那一代（如果这是一次轮换而不是
+        首次签发）由调用方在同一次业务操作里先调 `consume_refresh_token`
+        标记消费，两步不合并成一个方法，是为了让"消费旧的"和"签发新的"
+        在测试里能分别验证。"""
+        pool = await self._get_pool()
+        now = time.time()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO ops_connector_refresh_tokens
+                    (id, connection_id, token_hash, issued_at, expires_at)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                f"opsrt_{uuid.uuid4().hex[:16]}", connection_id, token_hash, now, now + ttl_seconds,
+            )
+
+    async def get_refresh_token_state(self, connection_id: str, token_hash: str) -> Optional[Dict[str, Any]]:
+        """按 `(connection_id, token_hash)` 精确查——同一个连接器历史上会有
+        多代 refresh_token（每次轮换都插一条新的），必须按哈希定位到调用方
+        实际提交的那一代，不能只按 connection_id 取"最新一条"（如果取最新
+        一条，用旧的已消费 token 来"刷新"会被误判成 NOT_FOUND 而不是
+        REPLAYED，重放检测就失效了）。"""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT token_hash, consumed_at, expires_at FROM ops_connector_refresh_tokens "
+                "WHERE connection_id = $1 AND token_hash = $2",
+                connection_id, token_hash,
+            )
+        if row is None:
+            return None
+        return {
+            "token_hash": row["token_hash"], "consumed_at": row["consumed_at"],
+            "expires_at": row["expires_at"],
+        }
+
+    async def consume_refresh_token(self, connection_id: str, token_hash: str) -> None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE ops_connector_refresh_tokens SET consumed_at = $1 "
+                "WHERE connection_id = $2 AND token_hash = $3",
+                time.time(), connection_id, token_hash,
+            )
+
+    async def revoke_all_refresh_tokens(self, connection_id: str) -> None:
+        """§10.1 吊销 + 重放检测触发的"强制重新注册"共用这个方法：把这个
+        连接器名下**所有未消费**的 refresh_token 标记成已消费——之后任何一个
+        旧 token 拿来刷新都会被判成 REPLAYED（如果是攻击者手里还有一份的话）
+        或者单纯失效（如果是合法连接器但会话已被吊销），两种情况都应该逼它
+        重新走一遍 register_token 握手，不需要在这里区分。"""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE ops_connector_refresh_tokens SET consumed_at = $1 "
+                "WHERE connection_id = $2 AND consumed_at IS NULL",
+                time.time(), connection_id,
             )
 
     # ------------------------------------------------------------------

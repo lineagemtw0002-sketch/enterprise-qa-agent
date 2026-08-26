@@ -250,6 +250,12 @@ class SetAiopsModuleEnabledRequest(BaseModel):
     enabled: bool
 
 
+class OpsConnectorRegisterTokenResponse(BaseModel):
+    connection_id: str
+    register_token: str = Field(..., description="只在这次响应里明文出现一次，平台只存哈希")
+    expires_at: float
+
+
 class RemediationScopeResponse(BaseModel):
     scope_id: str
     org_id: str
