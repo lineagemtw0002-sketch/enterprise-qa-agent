@@ -539,7 +539,10 @@ export default function App() {
     disconnectTraceWs()
     setTraceEvents([])
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = `${protocol}//${window.location.host}/ws/trace/${convId}`
+    // 2026-08-26：trace WS 现在要求鉴权，浏览器原生 WebSocket API 握手阶段不能带
+    // 自定义 header，token 走查询参数（后端用同一份 JWT 解码 + 校验会话归属）。
+    const wsToken = localStorage.getItem('ragent_token') || ''
+    const wsUrl = `${protocol}//${window.location.host}/ws/trace/${convId}?token=${encodeURIComponent(wsToken)}`
     const ws = new WebSocket(wsUrl)
     traceWsRef.current = ws
 

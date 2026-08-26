@@ -113,27 +113,10 @@ export function getCostTrend(metric, window) {
   return axios.get(`${BASE}/dashboard/cost-trend`, { params: { metric, window } }).then((res) => res.data)
 }
 
-// ==================== 【测试专用，正式上线前删除】知识库超权测试查询 ====================
-// 见 app.py admin_test_query_knowledge_base 端点旁的说明。
-
-export function adminTestQueryKnowledgeBase({ org_id, query, top_k }) {
-  return axios.post(`${BASE}/test/knowledge-query`, { org_id, query, top_k }).then((res) => res.data)
-}
-
-// 临时测试便利功能：查看/清空某企业知识库，方便反复测试"导入知识库->查询知识库"。
-// 同样是【测试专用，正式上线前删除】的一部分。
-
-export function adminTestListKbCollections(org_id) {
-  return axios.get(`${BASE}/test/knowledge-query/collections`, { params: { org_id } }).then((res) => res.data)
-}
-
-export function adminTestListKbChunks({ org_id, collection, limit = 50 }) {
-  return axios.get(`${BASE}/test/knowledge-query/chunks`, { params: { org_id, collection, limit } }).then((res) => res.data)
-}
-
-export function adminTestClearKbCollection({ org_id, collection }) {
-  return axios.delete(`${BASE}/test/knowledge-query/collection`, { params: { org_id, collection } }).then((res) => res.data)
-}
+// 2026-08-26 已删除：这里原有 adminTestQueryKnowledgeBase/adminTestListKbCollections/
+// adminTestListKbChunks/adminTestClearKbCollection 四个函数，对应已删除的
+// 【测试专用】知识库超权测试端点，见 `CLAUDE.md` §5「已修复」。企业知识库自助
+// 管理走 deleteCollection/listCollectionChunks（见上方）。
 
 // ==================== 审计日志（治理与合规） ====================
 // 平台管理员能看全平台记录（可选 org_id 过滤某一家企业）；企业管理员只能看

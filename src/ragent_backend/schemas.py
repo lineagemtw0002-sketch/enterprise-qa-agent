@@ -143,27 +143,10 @@ class GatewayConnectorResponse(BaseModel):
     last_error: Optional[str]
 
 
-# ============== 【测试专用，正式上线前删除】知识库超权测试查询 ==============
-# 见 app.py `admin_test_query_knowledge_base` 端点旁的说明。
-
-class AdminTestKBQueryRequest(BaseModel):
-    org_id: str = Field(..., min_length=1)
-    query: str = Field(..., min_length=1, max_length=2000)
-    top_k: int = Field(default=5, ge=1, le=20)
-
-
-class AdminTestKBQueryResponse(BaseModel):
-    content: str
-    collections: List[str] = Field(default_factory=list)
-    is_empty: bool
-
-
-class AdminKbCollectionStat(BaseModel):
-    collection_name: str
-    display_name: str
-    source: Literal["local", "delegated"]
-    chunk_count: int
-
+# 2026-08-26 已删除：这里原有 AdminTestKBQueryRequest/Response、
+# AdminKbCollectionStat 三个类，专供已删除的【测试专用】知识库超权测试端点使用，
+# 随端点一并删除，见 `CLAUDE.md` §5「已修复」。AdminKbChunkPreview 继续保留，
+# 它是 `admin_list_collection_chunks`（企业管理员自助管理的正式功能）在用的。
 
 class AdminKbChunkPreview(BaseModel):
     chunk_id: str

@@ -699,84 +699,17 @@ class QueryKnowledgeHubTool:
             TraceCollector().collect(trace)
             return self._build_error_response(query, ",".join(candidate_collections), str(e))
 
-    # ============================================================
-    # 【测试专用，正式上线前删除】管理员知识库测试查询
-    # ============================================================
-    async def execute_admin_bypass(
-        self, query: str, org_id: str, top_k: Optional[int] = None,
-    ) -> MCPToolResponse:
-        """管理员测试页专用（app.py `admin_test_query_knowledge_base`）——绕过任何
-        用户级 ACL，直接对指定企业名下的知识库能力做一次查询，用来验证"这家企业
-        的知识库到底能查到什么、内容对不对"，不代表任何真实用户的实际可见范围。
-
-        调用方必须在路由层用 super_admin 权限守住，这个方法本身不做任何权限
-        判断——它存在的意义就是绕开 execute() 里那一整套 ACL，仅供内部测试工具
-        使用，不能注册成 MCP 工具或暴露给任何非管理员路径。
-
-        跟 execute() 共用同一套本地/委托检索实现（_org_owned_collections /
-        _execute_local_multi / _execute_remote），只是候选集直接取"这家企业名下
-        全部 collection"，不跟任何用户的 allowed_collections 取交集。
-
-        这是一次性测试工具，正式上线前应当整体删除：本方法、app.py 里对应的
-        /api/v1/admin/test/knowledge-query 端点、schemas.py 里的
-        AdminTestKBQueryRequest/Response、前端 KnowledgeBaseTestQuery.jsx 及其
-        在 OperationsDashboard.jsx 里的入口。
-        """
-        from src.ragent_backend.tenant_connector_store import (
-            CAPABILITY_KNOWLEDGE_BASE,
-            CONNECTOR_TYPE_HTTP_API,
-        )
-
-        if not query or not query.strip():
-            raise ValueError("Query cannot be empty")
-
-        effective_top_k = min(top_k or self.config.default_top_k, self.config.max_top_k)
-
-        org = await self.org_store.get_organization(org_id)
-        if org is None:
-            raise ValueError(f"Organization '{org_id}' not found")
-
-        connector = await self.tenant_connector_store.get(org_id, CAPABILITY_KNOWLEDGE_BASE)
-        if connector is not None and connector.connector_type == CONNECTOR_TYPE_HTTP_API:
-            effective_collection = f"tenant_{org_id}_kb"
-            trace = TraceContext(trace_type="query")
-            trace.metadata["query"] = query[:200]
-            trace.metadata["top_k"] = effective_top_k
-            trace.metadata["collection"] = effective_collection
-            trace.metadata["source"] = "admin_test_bypass"
-            trace.metadata["connector_type"] = connector.connector_type
-            return await self._execute_remote(query, effective_top_k, effective_collection, connector, trace)
-
-        candidate_collections = await self._org_owned_collections(org)
-        if not candidate_collections:
-            return self._build_empty_response_for_org(query, org_id)
-
-        trace = TraceContext(trace_type="query")
-        trace.metadata["query"] = query[:200]
-        trace.metadata["top_k"] = effective_top_k
-        trace.metadata["candidate_collections"] = candidate_collections
-        trace.metadata["source"] = "admin_test_bypass"
-        trace.metadata["connector_type"] = "internal_chroma"
-        try:
-            response = await self._execute_local_multi(
-                query, effective_top_k, candidate_collections, trace,
-                user_id=user_id,
-                org_id=(org.org_id if org else None),
-            )
-            TraceCollector().collect(trace)
-            return response
-        except Exception as e:
-            logger.exception(f"execute_admin_bypass (parallel recall) failed: {e}")
-            TraceCollector().collect(trace)
-            return self._build_error_response(query, ",".join(candidate_collections), str(e))
-
-    # ==================== 内部 QA 测试用：清空/查看某企业知识库 ====================
-    # 跟 execute_admin_bypass 是同一批"绕过正常权限边界的内部工具"，调用方（app.py）
-    # 已经用 super_admin + platform_admin + RAGENT_DEBUG=true 三层守住，这里不
-    # 重复做权限判断。本地检索企业直接读写共享 Chroma/BM25；委托模式企业代理到
-    # 企业自己知识库微服务的管理端点（见 services/tenant_kb_demo/app.py 的
-    # /v1/collection/*，那几个端点本身也不是统一契约的一部分，只是参考实现
-    # 额外加的测试入口，真实客户接入的服务不需要实现它们）。
+    # ==================== 统计/查看/清空某企业知识库 ====================
+    # 2026-08-26 更新：这三个方法原来同时服务两类调用方——已删除的【测试专用】
+    # execute_admin_bypass 系（绕过权限边界，靠 RAGENT_DEBUG 三层守门）和企业
+    # 管理员自助管理的正式端点（app.py 的 admin_delete_collection /
+    # admin_list_collection_chunks，只传调用方自己的 org_id）。前者已随
+    # execute_admin_bypass 一并删除，现在只服务后者，调用方必须自行保证传入的
+    # org_id 是调用方自己企业的，不做任何越权收窄。本地检索企业直接读写共享
+    # Chroma/BM25；委托模式企业代理到企业自己知识库微服务的管理端点（见
+    # services/tenant_kb_demo/app.py 的 /v1/collection/*，那几个端点本身也不是
+    # 统一契约的一部分，只是参考实现额外加的测试入口，真实客户接入的服务不需要
+    # 实现它们）。
 
     async def _resolve_org_and_connector(self, org_id: str):
         from src.ragent_backend.tenant_connector_store import CAPABILITY_KNOWLEDGE_BASE, CONNECTOR_TYPE_HTTP_API
@@ -963,19 +896,6 @@ class QueryKnowledgeHubTool:
             )
         resp.raise_for_status()
         return resp.json().get("cleared_chunks", 0)
-
-    @staticmethod
-    def _build_empty_response_for_org(query: str, org_id: str) -> MCPToolResponse:
-        """管理员测试页专用：这家企业压根没有登记任何知识库 collection 时的提示，
-        跟 _build_access_denied_response 语义不同（不是权限问题，是这家企业还
-        没建过库）。"""
-        content = f"## 该企业暂无知识库\n\n查询: **{query}**\n企业: `{org_id}`\n\n这家企业名下还没有登记任何知识库 collection。\n"
-        return MCPToolResponse(
-            content=content,
-            citations=[],
-            metadata={"query": query, "org_id": org_id, "error": "no_collections"},
-            is_empty=True,
-        )
 
     async def _execute_local_single(
         self, query: str, effective_top_k: int, effective_collection: str, trace: TraceContext,

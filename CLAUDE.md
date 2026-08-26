@@ -361,8 +361,11 @@ flowchart TB
    > 但并发至今一次都没实测过**（2026-08-25 的基准是串行单用户），
    > 缺口倍数因此**既没被验证、也没被推翻**，本条维持 P0。
 
-4. **安全四条** —— 绕过 ACL 的测试端点（`app.py:1120,1141,1155`，**上线前必删**）·
-   CORS 全放开 + 允许携带凭证 · 租户凭证明文存库 · trace WebSocket 无鉴权
+4. **安全四条 —— 3/4 已修复（2026-08-26），见 §5**：
+   ~~绕过 ACL 的测试端点~~ ✅ 已整体删除 ·
+   ~~CORS 全放开 + 允许携带凭证~~ ✅ 已改为显式来源清单 ·
+   **租户凭证明文存库** 🔴 仍未闭环（方案已在独立 worktree 里设计验证，待重新应用到当前分支）·
+   ~~trace WebSocket 无鉴权~~ ✅ 已加鉴权
 
 5. **知识库文档投毒 → 间接提示注入**，可跨话题传染，ACL 拦不住
    （`docs/security_prompt_injection_test_report.md` 案例2）
@@ -671,6 +674,40 @@ flowchart TB
 
 ## 5. 已修复（防止重新引入）
 
+- ✅ **2026-08-26　P0：绕过 ACL 的测试端点**
+  `app.py` 里一组【测试专用，正式上线前删除】的知识库管理员工具端点
+  （`admin_test_query_knowledge_base`/`admin_test_list_kb_collections`/
+  `admin_test_list_kb_chunks`/`admin_test_clear_kb_collection`），能绕过任何
+  用户级 ACL 直接查询/清空任意企业的知识库，此前只靠 `RAGENT_DEBUG` 一个开关
+  兜底（生产默认 false，但注释自己承认"运行时开关不能替代上线前整体删除"）。
+  已整体删除：这四个端点本身、`_require_debug_mode`、`schemas.py` 的
+  `AdminTestKBQueryRequest`/`Response`/`AdminKbCollectionStat`、
+  `query_knowledge_hub.py` 的 `execute_admin_bypass`/`_build_empty_response_for_org`、
+  前端 `KnowledgeBaseTestQuery.jsx` 及其在 `OperationsDashboard.jsx`/`admin.js` 里的入口。
+  **`_kb_management_tool` 实例与 `list_org_collection_stats`/`list_org_collection_chunks`/
+  `clear_org_collection` 三个方法保留**——它们同时服务企业管理员自助管理知识库的
+  正式端点（`admin_delete_collection`/`admin_list_collection_chunks`），删除前已逐一核对
+  调用方，删的只是那组绕权限的调用路径。
+
+- ✅ **2026-08-26　P0：CORS 全放开 + 允许携带凭证**
+  原为 `allow_origins=["*"]` + `allow_credentials=True`，任意网站可携带用户凭证
+  跨域调用本服务 API。改为 `resolve_cors_origins()`：显式来源清单
+  （`RAGENT_ALLOWED_ORIGINS`，逗号分隔），未配置且非 `RAGENT_DEBUG=true` 时返回
+  空列表（请求会被浏览器挡在 CORS 层，不是悄悄放行）；`*` 即使被显式配置也会被
+  过滤掉，不会重新变回通配符。参数可注入，纯函数，10 条单测
+  `tests/unit/test_cors_origins.py`。
+
+- ✅ **2026-08-26　P0：trace WebSocket 无鉴权**
+  `/ws/trace/{conversation_id}` 原来握手即 `accept()`，零鉴权——trace 内容含检索
+  片段与 prompt，等同旁路读取他人会话。改为握手阶段先用查询参数 `?token=`
+  （浏览器原生 WebSocket API 不能带自定义 header）解出的 JWT 校验用户身份，
+  再复用 `_require_conversation_owner` 校验该用户是这条 conversation 的所有者，
+  两者都不满足则 `close()`、不 `accept()`。前端 `App.jsx` 的 `connectTraceWs`
+  同步改为带上 `ragent_token`。
+  ⚠️ **暂无端到端回归测试**——现有测试基础设施跑不起来一个真实的 WebSocket +
+  鉴权 + 会话归属的集成场景（`conftest.py` 无 DB fixture，见 §4 第 12 条），
+  这次是手工验证鉴权逻辑走查，不是"已验证通过"档位，如实标注。
+
 - ✅ **2026-08-24　P0：并发请求跨用户串流**
   token/trace 队列原为 `RAGWorkflow` 实例属性，而全进程共用一个实例 → 并发请求互相覆盖，
   一个用户的回答会混进另一个用户的 SSE 流。
@@ -854,7 +891,7 @@ flowchart TB
 | **`docs/architecture.md`** | **架构图 · 核心链路 · 双模型 · 性能测试**（与本文同属当前状态正本） | **活文档** |
 | `docs/scale_slo_and_priorities.md` | 容量测算 · 最小 SLO · 27+3 条发现重新分级（12 条 P0） | 活文档 |
 | `docs/orchestration_design.md` | 编排层设计：并行防护 + 记忆异步化 | **部分实施**：A 部分 D4/D5（08-25 第二批）、**D1/D2（08-25 第三批，见 §4.5）** 已落地；D3/D6 未实施；**B 部分整体未实施**（阻塞项 B-R1 已实测查清） |
-| `docs/aiops_module_design.md` | **新功能提案**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复），BYOC 架构 | **提案，未实施**，死期 2026-09-25。⚠️ 与 §30秒必读"停止新增功能"矛盾，用户已明确要求立项，但排期顺序（是否插队于 12 条 P0 之前）待用户另行确认 |
+| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **设计已确认（2026-08-26），未排期，零代码改动**，死期 2026-09-25（超期需在实施前重新核对时效性）。⚠️ 与 §30秒必读"停止新增功能"矛盾，用户已明确要求立项；**排期已确认维持在 12 条 P0 之后**，不插队 |
 | `docs/collaboration_retrospective.md` | 协作复盘与开发流程指南（**每周自查只需读 §1**） | 活文档 |
 | `docs/review_2026-08-24/review_codebase_findings.md` | 代码审计，带行号证据 | 时点快照 |
 | `docs/review_2026-08-24/review_process_retro.md` | 过程复盘量化分析 | 时点快照 |

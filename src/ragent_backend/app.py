@@ -34,7 +34,7 @@ except ImportError:
     pass  # python-dotenv 未安装
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -61,8 +61,7 @@ from src.ragent_backend.schemas import (
     WorkflowApproverAssignmentResponse, SetWorkflowApproverRequest,
     WorkflowInstanceResponse, WorkflowActionRequest, WorkflowReturnRequest, WorkflowRejectRequest,
     NotificationResponse,
-    AdminTestKBQueryRequest, AdminTestKBQueryResponse,  # 【测试专用，正式上线前删除】
-    AdminKbCollectionStat, AdminKbChunkPreview,  # 同上
+    AdminKbChunkPreview,
 )
 from src.ragent_backend.store import build_archive_store, ConversationArchiveStore
 from src.ragent_backend.workflow import RAGWorkflow
@@ -82,6 +81,7 @@ from src.ragent_backend.audit_store import AuditStore
 from src.ragent_backend.auth import (
     AuthenticatedUser, create_access_token, get_current_user, require_role,
     require_same_org_or_platform, require_platform_admin, get_jwt_secret,
+    _decode_token,
 )
 from src.ingestion.pipeline import IngestionPipeline
 from src.ingestion.delegated_compute import compute_chunks_for_delegation
@@ -89,7 +89,7 @@ from src.core.settings import load_settings, resolve_path
 from src.tool_agent.tool_registry import ToolRegistry
 from src.tool_agent.builtin_tools import register_builtin_tools
 from src.tool_agent.mcp_client import MCPClient
-from src.mcp_server.tools.query_knowledge_hub import QueryKnowledgeHubTool  # 【测试专用，正式上线前删除】
+from src.mcp_server.tools.query_knowledge_hub import QueryKnowledgeHubTool
 
 
 def create_checkpointer():
@@ -288,6 +288,37 @@ def _build_active_workflow_summary(active_workflow: Optional[dict]) -> Optional[
     )
 
 
+def resolve_cors_origins(
+    raw: Optional[str] = None,
+    debug_mode: Optional[bool] = None,
+) -> List[str]:
+    """决定 CORS 允许的来源列表，不再使用通配符。
+
+    2026-08-26 P0：原本是 `allow_origins=["*"]` + `allow_credentials=True`——
+    这个组合允许任意网站携带用户凭证跨域调用本服务的 API，是明确的错误配置。
+    改为显式来源清单：`RAGENT_ALLOWED_ORIGINS`（逗号分隔）。未配置时，
+    只有 `RAGENT_DEBUG=true` 才回退到本地前端开发常见来源；生产环境未配置
+    则返回空列表——请求会被浏览器挡在 CORS 这一层，是"看得见的失败"，
+    不是"悄悄放行"，不需要像 JWT 密钥那样拒绝启动。
+
+    参数可注入是为了能直接单测，不依赖进程环境变量。
+
+    `*` 在这里永远不被当成合法来源——哪怕有人把它显式配进
+    `RAGENT_ALLOWED_ORIGINS`，也会被过滤掉，不会重新变回原缺陷那样的通配符。
+    """
+    if raw is None:
+        raw = os.getenv("RAGENT_ALLOWED_ORIGINS", "")
+    if debug_mode is None:
+        debug_mode = os.getenv("RAGENT_DEBUG", "false").strip().lower() == "true"
+
+    origins = [o.strip() for o in raw.split(",") if o.strip() and o.strip() != "*"]
+    if origins:
+        return origins
+    if debug_mode:
+        return ["http://localhost:5173", "http://127.0.0.1:5173"]
+    return []
+
+
 def create_app() -> FastAPI:
     # 最先校验 JWT 密钥：配置不安全时在这里就崩掉，不要等到有人登录才发现。
     # 密钥用了源码内置默认值意味着任何人都能伪造任意用户身份，下面这一整套
@@ -325,20 +356,18 @@ def create_app() -> FastAPI:
     # audit_store：治理与合规——管理后台变更操作 + 工具调用的审计记录（见
     # audit_store.py）
     audit_store: AuditStore = AuditStore()
-    # 知识库管理工具：统计/查看/清空一家企业名下知识库的数据，供两类调用方
-    # 共用同一个实例（复用已经建好的 org_store/tenant_connector_store，不重开
-    # 一份数据库连接池）——
-    # 1. 企业管理员在「知识库权限」页面自助删除知识库/分页查看数据（正式功能，
-    #    见下面 admin_delete_collection / admin_list_collection_chunks，只传
-    #    调用方自己的 org_id，不会越权碰到别的企业）。
-    # 2.【测试专用，正式上线前删除】admin_test_query_knowledge_base 等几个
-    #    debug 端点，它们额外调用这个实例上会绕过 ACL 的 execute_admin_bypass。
-    #    实例本身不是"绕过权限的东西"——list_org_collection_stats/chunks/
-    #    clear_org_collection 这几个方法内部仍然做 org 归属校验，只是调用方
-    #    传的 org_id 由谁负责收窄（自己的 org 还是任意 org）决定安全边界，正式
-    #    端点固定传调用方自己的 org_id，debug 端点才是"允许调用方指定任意
-    #    org_id"的那个例外，需要额外的 super_admin + platform_admin + debug
-    #    模式三层守门。
+    # 知识库管理工具：统计/查看/清空一家企业名下知识库的数据。
+    # 企业管理员在「知识库权限」页面自助删除知识库/分页查看数据（见下面
+    # admin_delete_collection / admin_list_collection_chunks，只传调用方自己的
+    # org_id，不会越权碰到别的企业）。
+    #
+    # 2026-08-26 已删除：曾经还有一组【测试专用，正式上线前删除】的
+    # admin_test_query_knowledge_base 等 debug 端点，额外调用这个实例上
+    # 绕过 ACL 的 execute_admin_bypass（允许调用方指定任意 org_id，不收窄到
+    # 自己的企业）。那组端点本身、其专属的 execute_admin_bypass /
+    # _build_empty_response_for_org、对应的 schemas、对应的前端页面已一并删除，
+    # 见 `CLAUDE.md` §5「已修复」。list_org_collection_stats/chunks/
+    # clear_org_collection 这几个方法继续保留，只服务上面这条正式路径。
     _kb_management_tool: QueryKnowledgeHubTool = QueryKnowledgeHubTool(
         org_store=org_store, tenant_connector_store=tenant_connector_store,
     )
@@ -637,7 +666,7 @@ def create_app() -> FastAPI:
     # 添加 CORS 中间件
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # 允许所有来源
+        allow_origins=resolve_cors_origins(),
         allow_credentials=True,
         allow_methods=["*"],  # 允许所有方法
         allow_headers=["*"],  # 允许所有头
@@ -1138,112 +1167,6 @@ def create_app() -> FastAPI:
                 last_called_at=c.last_called_at, last_latency_ms=c.last_latency_ms, last_error=c.last_error,
             ))
         return results
-
-    # ==================== 【测试专用，正式上线前删除】知识库超权测试查询 ====================
-    # 管理员调试用：选一家企业 + 输入查询词，直接看这家企业的知识库能查到什么、
-    # 命中的是哪几个 collection——绕过任何用户级 ACL（不模拟任何真实用户的可见
-    # 范围），只用来验证"这家企业的知识库摄入得对不对、检索质量怎么样"。这组
-    # 端点底下还挂着"清空/查看某企业知识库"（见下面 admin_test_kb_collections
-    # 等），都是同一类"内部 QA 专用、直接绕过正常权限边界"的工具。
-    #
-    # 光靠 super_admin + platform_admin 这两层角色校验不够——2026-08-22 加了
-    # 第三层 `_require_debug_mode`：这组端点只在 RAGENT_DEBUG=true 时可用（见
-    # .env / .env.example，生产环境默认 false）。这是吸取的一个真实教训：这几个
-    # 端点最早上线时只标了"测试专用，正式上线前删除"这行注释，没有任何运行时
-    # 硬限制——注释总有被漏掉、没人记得删的风险，尤其是这类"能绕过 ACL 直接看到
-    # 任何企业知识库内容"的工具，一旦真的漏删并且被误当成正式功能，就是一个
-    # 平台层面的权限漏洞。运行时开关不能替代"上线前整体删除"这个最终目标，但
-    # 能保证即使有人忘记删，只要生产环境的 RAGENT_DEBUG 没有被显式打开，这组
-    # 端点就是一律 403，不会被真正调用到。
-    #
-    # 上线前需要整体删除的部分：这几个端点本身、schemas.py 的
-    # AdminTestKBQueryRequest/Response 等、query_knowledge_hub.py 的
-    # execute_admin_bypass/_build_empty_response_for_org、前端
-    # KnowledgeBaseTestQuery.jsx 及其在 OperationsDashboard.jsx 里的入口、
-    # admin.js 的 adminTestQueryKnowledgeBase 等。`_kb_management_tool` 这个
-    # 实例本身不在删除范围内——它同时也是下面 admin_delete_collection /
-    # admin_list_collection_chunks（企业管理员知识库自助管理的正式功能）在用
-    # 的共享实例，删的话会连带砸掉正式功能，只删这组 debug 端点对它的调用
-    # 就够了。
-    async def _require_debug_mode(
-        current_user: AuthenticatedUser = Depends(get_current_user),
-    ) -> AuthenticatedUser:
-        if os.getenv("RAGENT_DEBUG", "false").strip().lower() != "true":
-            raise HTTPException(
-                status_code=403,
-                detail="这组知识库测试工具只在 RAGENT_DEBUG=true 时可用（生产环境默认关闭）",
-            )
-        return current_user
-
-    @app.post("/api/v1/admin/test/knowledge-query", response_model=AdminTestKBQueryResponse)
-    async def admin_test_query_knowledge_base(
-        request: AdminTestKBQueryRequest,
-        _: AuthenticatedUser = Depends(_require_super_admin),
-        __: AuthenticatedUser = Depends(require_platform_admin),
-        ___: AuthenticatedUser = Depends(_require_debug_mode),
-    ) -> AdminTestKBQueryResponse:
-        try:
-            response = await _kb_management_tool.execute_admin_bypass(
-                query=request.query, org_id=request.org_id, top_k=request.top_k,
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=404, detail=str(e))
-        return AdminTestKBQueryResponse(
-            content=response.content,
-            collections=sorted(response.metadata.get("collections") or (
-                [response.metadata["collection"]] if response.metadata.get("collection") else []
-            )),
-            is_empty=response.is_empty,
-        )
-
-    @app.get("/api/v1/admin/test/knowledge-query/collections", response_model=List[AdminKbCollectionStat])
-    async def admin_test_list_kb_collections(
-        org_id: str,
-        _: AuthenticatedUser = Depends(_require_super_admin),
-        __: AuthenticatedUser = Depends(require_platform_admin),
-        ___: AuthenticatedUser = Depends(_require_debug_mode),
-    ) -> List[AdminKbCollectionStat]:
-        """列出这家企业名下的知识库 collection + 每个的 chunk 数——先看有没有
-        摄入、摄入了多少，再决定要不要点进去看 chunk 列表或者清空重试。"""
-        try:
-            return await _kb_management_tool.list_org_collection_stats(org_id)
-        except ValueError as e:
-            raise HTTPException(status_code=404, detail=str(e))
-
-    @app.get("/api/v1/admin/test/knowledge-query/chunks", response_model=List[AdminKbChunkPreview])
-    async def admin_test_list_kb_chunks(
-        org_id: str,
-        collection: str,
-        limit: int = 50,
-        _: AuthenticatedUser = Depends(_require_super_admin),
-        __: AuthenticatedUser = Depends(require_platform_admin),
-        ___: AuthenticatedUser = Depends(_require_debug_mode),
-    ) -> List[AdminKbChunkPreview]:
-        try:
-            return await _kb_management_tool.list_org_collection_chunks(org_id, collection, limit=limit)
-        except ValueError as e:
-            raise HTTPException(status_code=404, detail=str(e))
-
-    @app.delete("/api/v1/admin/test/knowledge-query/collection")
-    async def admin_test_clear_kb_collection(
-        org_id: str,
-        collection: str,
-        current_user: AuthenticatedUser = Depends(_require_super_admin),
-        __: AuthenticatedUser = Depends(require_platform_admin),
-        ___: AuthenticatedUser = Depends(_require_debug_mode),
-    ) -> dict:
-        """清空一个 collection 里的全部内容（向量库 + BM25 索引 + 摄入/去重历史
-        记录），不删除 collection 本身的登记信息——方便反复测试"导入知识库 ->
-        查询知识库"这条链路，不用每次都手动清数据库。"""
-        try:
-            cleared = await _kb_management_tool.clear_org_collection(org_id, collection)
-        except ValueError as e:
-            raise HTTPException(status_code=404, detail=str(e))
-        await _audit_log(
-            current_user.user_id, "admin_test_clear_kb", "collection", collection,
-            {"org_id": org_id, "cleared_chunks": cleared},
-        )
-        return {"cleared_chunks": cleared}
 
     # ==================== 运营仪表盘 API（仅平台管理员，见 dashboard_stats.py） ====================
     # _require_platform_tier 目前只剩 super_admin 一档（2026-08-24 起平台侧
@@ -2833,8 +2756,26 @@ def create_app() -> FastAPI:
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     @app.websocket("/ws/trace/{conversation_id}")
-    async def trace_websocket(websocket: WebSocket, conversation_id: str):
-        """LangGraph 实时追踪 WebSocket：推送节点级执行进度"""
+    async def trace_websocket(
+        websocket: WebSocket, conversation_id: str, token: str = Query(default=""),
+    ):
+        """LangGraph 实时追踪 WebSocket：推送节点级执行进度。
+
+        2026-08-26 P0：原来握手即 accept，零鉴权——trace 里含检索片段与 prompt，
+        等同于旁路读取该会话的完整问答内容。浏览器原生 WebSocket API 握手阶段
+        不能带自定义 header，所以约定 token 走查询参数 `?token=`（跟 Authorization
+        header 里那份是同一张 JWT，解码逻辑复用 `_decode_token`）。鉴权要求跟同一份
+        对话的 REST 接口一致：token 需要解出真实用户，且该用户必须是这条
+        conversation 的所有者（复用 `_require_conversation_owner` 的同一判断），
+        不满足则在 `accept()` 之前拒绝，不建立连接。
+        """
+        try:
+            current_user = _decode_token(token)
+            await _require_conversation_owner(conversation_id, current_user)
+        except HTTPException:
+            await websocket.close(code=4401)
+            return
+
         await websocket.accept()
         active_trace_ws.setdefault(conversation_id, []).append(websocket)
         try:

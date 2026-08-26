@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { Segmented, Card, Statistic, Spin, Menu, message, Empty } from 'antd'
 import {
   MessageSquare, Users, Clock, TrendingUp, TrendingDown, RefreshCw,
-  LayoutDashboard, ListChecks, Building2, Plug, Coins, FlaskConical,
+  LayoutDashboard, ListChecks, Building2, Plug, Coins,
 } from 'lucide-react'
 import * as adminApi from '../../api/admin.js'
 import SimpleTrendChart from './SimpleTrendChart.jsx'
@@ -10,7 +10,6 @@ import WorkflowTemplateManagement from './WorkflowTemplateManagement.jsx'
 import OrganizationManagement from './OrganizationManagement.jsx'
 import GatewayMonitor from './GatewayMonitor.jsx'
 import CostQualityDashboard from './CostQualityDashboard.jsx'
-import KnowledgeBaseTestQuery from './KnowledgeBaseTestQuery.jsx'  // 【测试专用，正式上线前删除】
 import './OperationsDashboard.css'
 
 const WINDOW_OPTIONS = [
@@ -29,8 +28,6 @@ const SECTIONS = [
   { key: 'workflows', label: '工作流管理', icon: ListChecks },
   { key: 'organizations', label: '组织管理', icon: Building2 },
   { key: 'gateway', label: '网关', icon: Plug },
-  // 【测试专用，正式上线前删除】见 KnowledgeBaseTestQuery.jsx 顶部说明
-  { key: 'kb-test', label: '知识库测试（临时）', icon: FlaskConical },
 ]
 const SECTION_MENU_ITEMS = SECTIONS.map((s) => ({
   key: s.key,
@@ -199,13 +196,6 @@ export default function OperationsDashboard() {
       {section === 'gateway' && (
         <div className="dashboard-section-body">
           <GatewayMonitor />
-        </div>
-      )}
-
-      {/* 【测试专用，正式上线前删除】 */}
-      {section === 'kb-test' && (
-        <div className="dashboard-section-body">
-          <KnowledgeBaseTestQuery />
         </div>
       )}
     </div>
