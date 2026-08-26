@@ -926,12 +926,27 @@ flowchart TB
   `_execute_local_single` 单库路径，从不经过粗筛。
   完整实测与四个设计问题的回答见 `docs/hierarchical_narrowing_redesign.md`。
 
-  **顺带查清、本次未修**：`_execute_local_multi` 现在每个候选库的
-  `DenseRetriever` 都会把同一句 query 重新 embed 一次（`dense_retriever.py:140`），
-  6 个库 = 6 次 Ollama 往返、空载 76ms/次 ≈ 460ms，而粗筛层其实已经算过一次该向量。
-  这 6 次是**纯累加**——§4 第 3 条同日实测确认 `NUM_PARALLEL=1` 下 Ollama 完全串行。
-  复用向量可白省约 380ms、零召回代价；重排候选池 60 条 566ms（10/20/30 条 =
-  155/262/391ms）截到 30 条可再省约 175ms，但**对召回的影响未实测**。两条都未实施。
+  **顺带做掉的**：`_execute_local_multi` 原来每个候选库的 `DenseRetriever` 都把
+  同一句 query 重新 embed 一次（`dense_retriever.py:140`），6 库 = 6 次 Ollama 往返。
+  现在整条链路只 embed 一次，粗筛与全部候选库共用（`query_vector` 参数一路透传到
+  `HybridSearch.search` → `DenseRetriever.retrieve`；embedding 失败退回各自算，
+  保持旧行为）。回归保护 `tests/unit/test_query_embedding_reuse.py` 3 条。
+  ⚠️ 改这一处时撞到 `tests/unit/test_opensearch_read_switch.py` 那条
+  "两个 dense retriever 签名必须逐字相同"的契约测试（少一个参数会让 HybridSearch
+  捕获 TypeError 后**静默退化成 sparse-only**），所以 `OpenSearchDenseRetriever`
+  也同步加了并**真的实现**了这个参数。
+
+  ⚠️ **一个必须记下来的估算错误**：当初估"复用向量能省 380ms"，**实测只有约 80ms**。
+  错在把本文 §4 第 3 条那个"`NUM_PARALLEL=1` 下完全串行"的结论从**生成**外推到了
+  **embedding**——实测 embedding 是**部分并行**的（单次热态 32ms，6 并发墙钟 114ms，
+  完全串行应为 192ms）。**跨接口外推别人的实测结论**是这次估错的根源。
+
+  **真正的大头是 cross-encoder 重排**：实施后按 trace 分段，单条查询 6 库候选共
+  ~1072ms，其中 rerank（候选池 60 条）**931.7ms，占 87%**，embedding 93ms，
+  6 个库的 dense+sparse 墙钟只有 31.6ms。候选池随候选库数量线性增长
+  （每库 `top_k × 2`），cross-encoder 大致按候选数线性收费。
+  **下一步值钱的优化是给进重排的候选池设上限，但它直接动"谁能进最终排序"，
+  必须先用 `scripts/probe_narrowing_strategies.py` 测召回影响——本次未做。**
 
 - ✅ **2026-08-26　P1-2：14 个 Store 各建连接池 → 合并为一个按 DSN 缓存的共享池**
   `attendance_store` / `audit_store` / `dashboard_stats` / `conversation_store` /

@@ -121,6 +121,7 @@ class OpenSearchDenseRetriever:
         top_k: Optional[int] = None,
         filters: Optional[Dict[str, Any]] = None,
         trace: Optional[Any] = None,
+        query_vector: Optional[List[float]] = None,
     ) -> List[RetrievalResult]:
         """⚠️ 签名必须与 `DenseRetriever.retrieve` **逐字对齐**，包括 `filters`。
 
@@ -131,11 +132,16 @@ class OpenSearchDenseRetriever:
 
         `filters` 也**不能只接受不实现** —— 那样元数据过滤会静默失效，
         同样是"能跑但结果错"。
+
+        `query_vector` 同理：**接受了就要真的用**。只接受不实现不会算错结果，
+        但会白白多打一次 embedding 往返（Ollama 默认 NUM_PARALLEL=1 下是串行的，
+        见 CLAUDE.md §4 第 3 条），而调用方以为自己已经省掉了——
+        同样是"能跑但你以为的和实际发生的不是一回事"。
         """
         if not query or not query.strip():
             return []
         col = self.default_collection
-        vector = self._embedding.embed([query])[0]
+        vector = query_vector if query_vector is not None else self._embedding.embed([query])[0]
         k = top_k or self.default_top_k
         if col.startswith("conv_"):
             assert self.org_id and self.owner_user_id, (

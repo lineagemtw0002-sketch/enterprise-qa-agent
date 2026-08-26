@@ -997,11 +997,17 @@ class QueryKnowledgeHubTool:
         top_k: int,
         trace: Optional[Any] = None,
         filters: Optional[Dict[str, Any]] = None,
+        query_vector: Optional[List[float]] = None,
     ) -> List[RetrievalResult]:
         """跟 _perform_search 逻辑一样，但接收显式传入的 HybridSearch 实例，
         不读 self._hybrid_search——"全库混合召回"并发查多个 collection 时，
         每个 collection 自己的 HybridSearch 局部变量互不干扰，靠的就是这个
         方法不碰共享的 self 状态（见 _build_hybrid_search_for 的说明）。
+
+        query_vector 是"这句 query 的向量已经算过了"——全库并行召回时每个
+        collection 各有一个 DenseRetriever，不传的话它们会把同一句话各自
+        重新 embed 一次（实测每次 ~76ms，而 Ollama 默认 OLLAMA_NUM_PARALLEL=1
+        下这些调用完全串行，见 CLAUDE.md §4 第 3 条），6 个库就是 ~460ms 的纯重复。
 
         filters 透传给 HybridSearch.search()——层次化检索粗筛后按
         {"source_ref": [doc_id, ...]} 收窄到摘要层选中的那几份文档时用
@@ -1017,6 +1023,7 @@ class QueryKnowledgeHubTool:
                 filters=filters,
                 trace=trace,
                 return_details=False,
+                query_vector=query_vector,
             )
             return results if isinstance(results, list) else results.results
         except Exception as e:
@@ -1131,6 +1138,7 @@ class QueryKnowledgeHubTool:
 
     async def _narrow_by_document_summary(
         self, query: str, candidate_collections: List[str], trace: Optional["TraceContext"] = None,
+        query_vector: Optional[List[float]] = None,
     ) -> List["NarrowDecision"]:
         """层次化检索的"粗筛"阶段——在每个候选 collection 的 `{collection}__summary`
         摘要层各查一次（只做向量相似度，不跑 BM25/rerank），**各库各自**决定要不要
@@ -1198,11 +1206,16 @@ class QueryKnowledgeHubTool:
             # 一个摘要 store 都打不开：全部整库参检，不是全部跳过。
             return [NarrowDecision(c, None, "no_summary_store", 0, 0.0) for c in candidate_collections]
 
+        # 调用方（_execute_local_multi）通常已经算过这个向量了，直接复用；
+        # 只有单独调用这个方法时才自己算一次。
         _t0 = time.monotonic()
-        query_vector = (await asyncio.to_thread(self._embedding_client.embed, [query]))[0]
+        if query_vector is None:
+            query_vector = (await asyncio.to_thread(self._embedding_client.embed, [query]))[0]
         _t_embed = (time.monotonic() - _t0) * 1000.0
         if trace is not None:
-            trace.record_stage("narrow_detail", {"step": "embed_query"}, elapsed_ms=_t_embed)
+            trace.record_stage("narrow_detail", {
+                "step": "embed_query", "reused": _t_embed < 1.0,
+            }, elapsed_ms=_t_embed)
 
         def _doc_count_sync(collection: str) -> int:
             try:
@@ -1268,8 +1281,27 @@ class QueryKnowledgeHubTool:
         """
         from src.core.query_engine.narrow_plan import decisions_to_filters
 
+        # 整条链路只把 query embed 一次，粗筛和每个 collection 的稠密检索共用。
+        # 改这一处之前：粗筛 1 次 + 每个候选库各 1 次 = 6 库 7 次，而 Ollama 默认
+        # OLLAMA_NUM_PARALLEL=1 下这些调用完全串行（CLAUDE.md §4 第 3 条同日实测），
+        # 每次 ~76ms，也就是 ~460ms 花在把同一句话反复算成同一个向量上。
+        # embedding 失败不该让整次检索失败——退回 None，各 retriever 自己算，
+        # 就是改这一处之前的行为。
+        query_vector: Optional[List[float]] = None
+        try:
+            self._ensure_shared_clients()
+            _t0 = time.monotonic()
+            query_vector = (await asyncio.to_thread(self._embedding_client.embed, [query]))[0]
+            trace.record_stage("embed_query_once", {
+                "reused_by_collections": len(candidate_collections),
+            }, elapsed_ms=(time.monotonic() - _t0) * 1000.0)
+        except Exception as e:
+            logger.warning(f"Shared query embedding failed, each retriever will embed on its own: {e}")
+
         _t0 = time.monotonic()
-        decisions = await self._narrow_by_document_summary(query, candidate_collections, trace=trace)
+        decisions = await self._narrow_by_document_summary(
+            query, candidate_collections, trace=trace, query_vector=query_vector,
+        )
         _t_narrow_total = (time.monotonic() - _t0) * 1000.0
         narrowed = decisions_to_filters(decisions)
 
@@ -1328,7 +1360,10 @@ class QueryKnowledgeHubTool:
             hybrid_search = hybrid_searches[collection]
             initial_top_k = top_k * 2 if self.config.enable_rerank else top_k
             doc_filter = {"source_ref": doc_filters[collection]} if collection in doc_filters else None
-            results = self._search_with(hybrid_search, query, initial_top_k, trace=None, filters=doc_filter)
+            results = self._search_with(
+                hybrid_search, query, initial_top_k, trace=None,
+                filters=doc_filter, query_vector=query_vector,
+            )
             # 打上来源标记，供合并后统计"最终结果实际来自哪几个库"（response
             # metadata 的 collections 字段，UI 来源角标用），以及排查问题时
             # 一眼看出某条结果是从哪个库召回的。
