@@ -996,9 +996,79 @@ flowchart TB
     接线，现在写进去就是"文档说了算但代码不算数"，等真正接细粒度权限那一步
     再回填
   - `scripts/verify_aiops_endpoints.py` 只覆盖了粗粒度的 org_admin/
-    super_admin 门禁，没有测并发场景（两个 org_admin 同时批准同一条动作等）；
-    `reject` 端点没有单独测（跟 `approve` 共用同一段状态机校验，判别力已经
-    在 `approve` 的 409 用例里验过）
+    super_admin 门禁；`reject` 端点没有单独测（跟 `approve` 共用同一段状态机
+    校验，判别力已经在 `approve` 的 409 用例里验过）。
+    〔并发场景这条已在下方"审批状态机竞态修复"里补上，不再是空白〕
+
+- ✅ **2026-08-26　智能运维模块安全加固：修 6 处越界判定漏洞 + 审批状态机 TOCTOU 竞态**
+  （由并行会话「梁朝伟」的变异测试 `tests/unit/test_aiops_scope_boundaries.py`
+  `tests/unit/test_ops_store_transition_matrix.py`（提交 `0ea692e`）与另一次
+  变异测试发现，本会话「张学友」修复并验证，两次协作均未改动生产代码之外的
+  归属边界——发现方只记录不改，归属会话（我）负责修）
+
+  **`aiops_scope.py`：7 条已确认缺陷中的 6 条已修**（第 7 条见下方"未修"）：
+  1. **路径穿越绕过排除规则**（`_check_clean_disk`）—— `/var/log/app/../../lib/
+     postgresql/data/base.dat` 字面串命中允许模式、不命中排除模式，绕开
+     §10.3 要求的"排除规则优先"。修法：`if ".." in path.split("/")` 直接拒绝
+     + `posixpath.normpath` 规范化后再 `fnmatch`，双保险。
+  2. **`excluded_path_patterns` 缺 isinstance 校验**（allowed 侧原来就有，
+     两侧不对称）——配成裸字符串会被逐字符迭代，排除规则静默失效，
+     是这次唯一一条 **fail-open**（更该拿安全等级最高的排除侧比 allowed 侧
+     还宽松，本身就是设计上的不对称）。修法：新增与 allowed 侧对称的
+     isinstance 校验，非法值抛 `InvalidScopeConfig`。
+  3. **`max_multiplier_of_baseline`/`max_versions_back` 配成字符串时漏出裸
+     `TypeError`**（`_check_scale_instances`/`_check_rollback_deployment`）——
+     管理员从表单/JSON 填错类型是很现实的场景，裸异常会让调用方判断不了
+     "这是配置错误"还是"程序炸了"。新增 `_require_config_number`（管理员配置
+     侧）与 `_require_proposed_number`（AI 提议侧，属不同错误档位，提议侧
+     畸形值判 `allowed=False` 而不是抛异常）两个校验辅助函数堵上。
+  4. **`validate_approval_timeout_minutes` 对字符串/浮点数不设防**——字符串
+     分钟数漏出裸 TypeError，浮点数（如 30.5）被原样接受返回，落库后语义
+     不明（函数签名承诺 `-> int`）。修法：`isinstance(minutes, bool) or not
+     isinstance(minutes, int)` 一并拒绝（bool 是 int 子类，必须显式排除）。
+
+  **未修、仍是 xfail（需要设计评审，不是实现手滑）**：`scale_instances` 的
+  上界 = `baseline_instances × max_multiplier_of_baseline`，而
+  `baseline_instances` 跟 `target_instances` 一样来自**同一份 AI 提议**，
+  边界因此自指——提议方自报一个虚高基线就能把天花板抬到任意高度（§3.3.1
+  举的反例"扩容到 10000"当前实现拦不住）。根因是 scope schema 没规定
+  baseline 该从哪来（该取连接器实测上报值，还是别的），这是设计层缺口，
+  本次没有擅自拍板修法，保留 `test_self_reported_baseline_cannot_inflate_
+  the_ceiling` 为 `xfail(strict=True)`，留给设计评审。
+
+  **`ops_store.py`：审批状态机的 TOCTOU 竞态已修**——`approve_action`/
+  `mark_executing`/`advance_status`/`mark_result` 原来是"先 `SELECT` 读状态
+  判断、再无条件 `UPDATE`"，两个并发请求会双双通过 Python 侧的状态检查、
+  后写覆盖先写，两个人都以为自己批准成功了，`approver_user_id` 最终只记录
+  后到的那次调用。修法：新增 `_conditional_update`，把"检查+修改"做成数据库
+  层面的原子操作（`UPDATE ... SET status=$1 WHERE id=$2 AND status=$3`），
+  解析 asyncpg 返回的 `"UPDATE N"` 命令标签取受影响行数，`N=0` 说明状态已被
+  别的请求抢先改变，转成 `IllegalStatusTransition` 而不是静默覆盖。
+
+  ⚠️ **判别力自查踩了两次坑，教训比修复本身更值得记住**：先以为
+  `asyncio.gather` 天然会在真实网络 I/O 点交错，本机 localhost 太快，
+  `git stash` 回退到旧实现后自然并发测试**依然 3/3 全过**，测不出竞态；
+  改成无差别 `asyncio.sleep(0.05)` 撑窗口依然测不出来——`sleep` 醒来不等于
+  调度器真的会切换协程，常见情形是一个协程的 sleep 一醒就把读+判断+写
+  一口气跑完，另一个协程的 sleep 还没醒。最终用显式的 `asyncio.Event`
+  屏障（拦住"全局第一、第二次" `get_action` 调用互相等待，因为哪个协程
+  都不可能在自己首次读返回前发起第二次调用）才真正逼出交错，用 `git
+  stash` 反证过：撑开这个窗口后回退到旧实现，两个请求真的都写成功了
+  （`len(successes) == 2`），现在的条件 UPDATE 稳定 1 赢 1 输。
+  详细教训记在 `tests/integration/test_ops_store_concurrent_approval.py`
+  模块 docstring 里。
+
+  **验证**：`tests/unit/test_aiops_scope_boundaries.py`（合入 `0ea692e`，
+  303 通过 + 1 xfail，7 条 XPASS 后已摘除 xfail 标记只保留正向断言）+
+  `tests/unit/test_ops_store_transition_matrix.py`（431 行，同一批合入，
+  修好两处 mock 未配置 `execute()` 返回值导致的 `TypeError`）+
+  `tests/integration/test_ops_store_concurrent_approval.py`（新增，连真实
+  Postgres，4 条，含上面那条用屏障强制交错的判别力证据）。全量 `tests/unit`
+  2310 通过（另 1 skipped、1 xfailed、1 xpassed 均为预先记录的无关项）；
+  `scripts/verify_aiops_endpoints.py` 24 项复跑全过。**本次未覆盖**：
+  §3.3.1 之外的其余越界判定路径的并发正确性未测（只测了审批状态机这一层）；
+  `_conditional_update` 目前只用于 `remediation_actions` 表，其余表若未来
+  出现类似"先读后写"模式需要单独排查。
 
 - ✅ **2026-08-26　P1-14 扩展审计：逐个核对全部管理端点，修复 2 处同类问题**
   `/admin/users` 本身的 N+1 早前已修（同一条 P1-14），但 CLAUDE.md 一直如实

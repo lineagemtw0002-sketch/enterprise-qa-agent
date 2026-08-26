@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import fnmatch
+import posixpath
 from dataclasses import dataclass
 from typing import Any, Dict
 
@@ -82,14 +83,57 @@ def validate_action_type(action_type: str) -> None:
         )
 
 
-def validate_approval_timeout_minutes(minutes: int) -> int:
-    """越界直接拒绝，不静默夹紧（夹紧会让管理员以为自己配置的值生效了）。"""
+def validate_approval_timeout_minutes(minutes: Any) -> int:
+    """越界直接拒绝，不静默夹紧（夹紧会让管理员以为自己配置的值生效了）。
+
+    2026-08-26 修复两条类型缺陷（变异测试实测发现）：① 字符串输入原来会在
+    区间比较那一步直接抛裸 `TypeError`，不是这个函数自己的 `InvalidApprovalTimeout`
+    ——调用方没法用一致的方式捕获"配置不合法"这类错误。② 函数签名声称
+    `-> int`，但 `30.5` 这样的浮点数会被原样接受并返回，落库后语义不明
+    （"30.5 分钟"不是一个有意义的超时配置）。`bool` 同样显式排除，
+    理由跟 `_require_config_number` 一致：`isinstance(True, int)` 为真，
+    不排除的话 `approval_timeout_minutes=True` 会被当成 1 分钟接受。"""
+    if isinstance(minutes, bool) or not isinstance(minutes, int):
+        raise InvalidApprovalTimeout(
+            f"approval_timeout_minutes 必须是整数分钟数，收到 {minutes!r}"
+        )
     if not (MIN_APPROVAL_TIMEOUT_MINUTES <= minutes <= MAX_APPROVAL_TIMEOUT_MINUTES):
         raise InvalidApprovalTimeout(
             f"approval_timeout_minutes={minutes} 超出允许范围 "
             f"[{MIN_APPROVAL_TIMEOUT_MINUTES}, {MAX_APPROVAL_TIMEOUT_MINUTES}]"
         )
     return minutes
+
+
+def _require_config_number(scope_config: Dict[str, Any], field: str, action_type: str) -> float:
+    """`scope_config` 里的数值字段必须是真的数字，不是字符串/None/其它——
+    2026-08-26 变异测试实测发现：不校验的话，管理员把 `max_multiplier_of_baseline`
+    填成字符串会在比较/乘法运算时直接抛裸 `TypeError`，把"配置本身有问题"
+    伪装成一次未知的服务器错误，而不是 `check_target_in_scope` docstring
+    承诺的"能被调用方区分成 InvalidScopeConfig"。`bool` 显式排除——
+    `isinstance(True, int)` 在 Python 里是 `True`，混进数值字段会是一个
+    容易被忽略的行为，宁可拒绝也不要让 `min_instances=true` 被当成 1。"""
+    value = scope_config.get(field)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise InvalidScopeConfig(
+            f"{action_type} 的 scope_config 字段 '{field}' 必须是数字，收到 {value!r}"
+        )
+    return value
+
+
+def _require_proposed_number(proposed: Dict[str, Any], field: str) -> Any:
+    """返回一个 `float`（合法时）或 `ScopeCheckResult`（不合法时）——调用方
+    用 `isinstance(value, ScopeCheckResult)` 判断，命中就直接 `return value`。
+    `proposed`（AI 提议）里的数值字段类型不对时不抛异常：跟
+    `_require_config_number` 的区别是这里错的是 AI 的提议，不是管理员的
+    配置，属于"越界/不合法的提议"这个既有分类，不该升级成
+    `InvalidScopeConfig`（那个专门留给管理员配置本身的问题）。"""
+    value = proposed.get(field)
+    if value is None:
+        return ScopeCheckResult(allowed=False, reason=f"提议缺少 {field}")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return ScopeCheckResult(allowed=False, reason=f"提议的 {field} 不是合法数字：{value!r}")
+    return value
 
 
 def _check_restart_service(scope_config: Dict[str, Any], proposed: Dict[str, Any]) -> ScopeCheckResult:
@@ -106,16 +150,27 @@ def _check_restart_service(scope_config: Dict[str, Any], proposed: Dict[str, Any
 
 
 def _check_scale_instances(scope_config: Dict[str, Any], proposed: Dict[str, Any]) -> ScopeCheckResult:
-    min_instances = scope_config.get("min_instances")
-    max_multiplier = scope_config.get("max_multiplier_of_baseline")
-    if min_instances is None or max_multiplier is None:
+    if "min_instances" not in scope_config or "max_multiplier_of_baseline" not in scope_config:
         raise InvalidScopeConfig(
             "scale_instances 的 scope_config 缺少 min_instances 或 max_multiplier_of_baseline"
         )
-    target_instances = proposed.get("target_instances")
-    baseline_instances = proposed.get("baseline_instances")
-    if target_instances is None or baseline_instances is None:
-        return ScopeCheckResult(allowed=False, reason="提议缺少 target_instances 或 baseline_instances")
+    min_instances = _require_config_number(scope_config, "min_instances", "scale_instances")
+    max_multiplier = _require_config_number(scope_config, "max_multiplier_of_baseline", "scale_instances")
+
+    target_instances = _require_proposed_number(proposed, "target_instances")
+    if isinstance(target_instances, ScopeCheckResult):
+        return target_instances
+    baseline_instances = _require_proposed_number(proposed, "baseline_instances")
+    if isinstance(baseline_instances, ScopeCheckResult):
+        return baseline_instances
+
+    # ⚠️ **已知设计缺口，本次不修**（2026-08-26 变异测试实测发现）：
+    # target_instances 和 baseline_instances 都来自同一份 AI 提议，AI 谎报
+    # 一个虚高的 baseline 就能把自己的上界一起抬高（baseline=5000/target=10000
+    # 在 multiplier=2.0 下会被判合法）。真正的修复需要 baseline 来自连接器
+    # 实测的当前实例数，而不是提议里的自陈述字段——这是 scope_config/
+    # proposed 数据形状的设计变更，不是这个函数内部能悄悄改掉的实现细节，
+    # 按 §7.1 需要单独走一次设计评审。
     max_allowed = baseline_instances * max_multiplier
     if target_instances < min_instances:
         return ScopeCheckResult(
@@ -136,22 +191,56 @@ def _check_scale_instances(scope_config: Dict[str, Any], proposed: Dict[str, Any
 def _check_clean_disk(scope_config: Dict[str, Any], proposed: Dict[str, Any]) -> ScopeCheckResult:
     allowed_patterns = scope_config.get("allowed_path_patterns")
     excluded_patterns = scope_config.get("excluded_path_patterns", [])
-    if not isinstance(allowed_patterns, list):
-        raise InvalidScopeConfig("clean_disk 的 scope_config 缺少 allowed_path_patterns 列表")
+    if not isinstance(allowed_patterns, list) or not all(isinstance(p, str) for p in allowed_patterns):
+        raise InvalidScopeConfig("clean_disk 的 scope_config 缺少 allowed_path_patterns 字符串列表")
+    # 2026-08-26 修复：原来只校验了 allowed_patterns 是不是 list，
+    # excluded_patterns 完全没校验——而排除规则才是安全侧那一半，配置错误在
+    # 这里比在 allowed 那边危险得多（allowed 配错顶多误拒，excluded 配错是
+    # 误放行）。含 "*" 的坏字符串会在 fnmatch 里被当成"匹配一切"（意外地
+    # fail-closed，不危险但会造成"整条规则失效"这种难排查的现象）；不含
+    # "*" 的坏字符串会静默永远不匹配（fail-open，真正的危险形态）；None
+    # 混进列表会在 fnmatch.fnmatch 里直接抛 TypeError。三种情形只有在这里
+    # 提前拒绝配置才能统一处理，不能指望 fnmatch 自己报出有意义的错误。
+    if not isinstance(excluded_patterns, list) or not all(isinstance(p, str) for p in excluded_patterns):
+        raise InvalidScopeConfig("clean_disk 的 scope_config 的 excluded_path_patterns 必须是字符串列表")
+
     path = proposed.get("path")
-    if not path:
+    if not path or not isinstance(path, str):
         return ScopeCheckResult(allowed=False, reason="提议缺少 path")
+
+    # 2026-08-26 修复：路径穿越可以击穿排除规则——`fnmatch` 是纯字面串匹配，
+    # 不做路径规范化。`/var/log/app/../../lib/postgresql/data/base.dat`
+    # 字面上匹配 `allowed_path_patterns=["/var/log/app/*"]`（`*` 吞掉了
+    # 后面的 `../..`），却完全不匹配
+    # `excluded_path_patterns=["/var/lib/postgresql/*"]`（字符串不是以这个
+    # 前缀开头）——但操作系统真正处理这个路径时会规范化成
+    # `/var/lib/postgresql/data/base.dat`，正是排除规则要保护的那个文件。
+    # 這不是"边界条件没考虑周全"，是排除规则这道闸本身可以被绕过去。
+    #
+    # 修法：**先拒绝任何包含 `..` 路径段的提议**，不试图"规范化之后再判断"
+    # ——一个真实的清理目标（AI 从连接器实际观察到的磁盘路径）永远不需要
+    # `..`，允许它存在没有任何合法理由，直接拒绝比"规范化+信任结果"更简单
+    # 也更不容易被绕过（规范化本身要考虑符号链接、大小写等一整类新问题，
+    # 不该在这一层引入）。同时也拒绝非绝对路径——相对路径的"允许/排除前缀"
+    # 判断在语义上没有意义（相对于哪里？），一律按不合法处理。
+    if not path.startswith("/"):
+        return ScopeCheckResult(allowed=False, reason=f"路径 '{path}' 不是绝对路径，拒绝")
+    if ".." in path.split("/"):
+        return ScopeCheckResult(allowed=False, reason=f"路径 '{path}' 包含 '..'，拒绝（路径穿越防护）")
+    # 规范化只用来处理冗余分隔符（"//", 结尾 "/" 等无害差异），不是穿越防护
+    # 本身——真正的防护是上面那条 ".." 硬拒绝。两者都做是纵深防御。
+    normalized_path = posixpath.normpath(path)
 
     # §10.3 硬性要求：排除规则优先——即便命中了允许模式，只要也命中排除模式
     # 就必须拒绝，顺序不能反过来（不是"先匹配到哪条算哪条"）。
     for pattern in excluded_patterns:
-        if fnmatch.fnmatch(path, pattern):
+        if fnmatch.fnmatch(normalized_path, pattern):
             return ScopeCheckResult(
                 allowed=False,
                 reason=f"路径 '{path}' 命中排除规则 '{pattern}'（排除规则优先于允许规则）",
             )
     for pattern in allowed_patterns:
-        if fnmatch.fnmatch(path, pattern):
+        if fnmatch.fnmatch(normalized_path, pattern):
             return ScopeCheckResult(allowed=True)
     return ScopeCheckResult(
         allowed=False,
@@ -160,12 +249,13 @@ def _check_clean_disk(scope_config: Dict[str, Any], proposed: Dict[str, Any]) ->
 
 
 def _check_rollback_deployment(scope_config: Dict[str, Any], proposed: Dict[str, Any]) -> ScopeCheckResult:
-    max_versions_back = scope_config.get("max_versions_back")
-    if max_versions_back is None:
+    if "max_versions_back" not in scope_config:
         raise InvalidScopeConfig("rollback_deployment 的 scope_config 缺少 max_versions_back")
-    target_version_offset = proposed.get("target_version_offset")
-    if target_version_offset is None:
-        return ScopeCheckResult(allowed=False, reason="提议缺少 target_version_offset")
+    max_versions_back = _require_config_number(scope_config, "max_versions_back", "rollback_deployment")
+
+    target_version_offset = _require_proposed_number(proposed, "target_version_offset")
+    if isinstance(target_version_offset, ScopeCheckResult):
+        return target_version_offset
     if target_version_offset < 1:
         return ScopeCheckResult(allowed=False, reason="target_version_offset 必须 >= 1（至少回滚一个版本）")
     if target_version_offset > max_versions_back:

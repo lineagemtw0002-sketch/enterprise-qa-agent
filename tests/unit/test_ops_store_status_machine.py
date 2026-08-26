@@ -150,6 +150,11 @@ class TestApproveActionRequiresPendingApproval:
         monkeypatch.setattr(store, "get_action", get_action_mock)
 
         fake_conn = AsyncMock()
+        # asyncpg 的 execute() 对 UPDATE 返回 "UPDATE <行数>" 这样的命令标签
+        # 字符串（不是行数本身）——_conditional_update 靠 rsplit 解析它，
+        # 假件必须如实模拟这个返回形状，不能让 AsyncMock 默认返回一个
+        # MagicMock 糊弄过去。
+        fake_conn.execute = AsyncMock(return_value="UPDATE 1")
         monkeypatch.setattr(store, "_get_pool", AsyncMock(return_value=_FakePool(fake_conn)))
 
         result = await store.approve_action("remact_1", approver_user_id="admin-1")
@@ -195,6 +200,7 @@ class TestMarkExecutingRequiresApproverFields:
         monkeypatch.setattr(store, "get_action", get_action_mock)
 
         fake_conn = AsyncMock()
+        fake_conn.execute = AsyncMock(return_value="UPDATE 1")
         monkeypatch.setattr(store, "_get_pool", AsyncMock(return_value=_FakePool(fake_conn)))
 
         result = await store.mark_executing("remact_1")

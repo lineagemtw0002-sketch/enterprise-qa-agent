@@ -640,6 +640,51 @@ class OpsStore:
             row = await conn.fetchrow("SELECT * FROM remediation_actions WHERE id = $1", action_id)
         return self._row_to_action(row) if row else None
 
+    async def _conditional_update(
+        self, action_id: str, expected_status: str, target_status: str,
+        set_clause: str = "", set_params: tuple = (),
+    ) -> int:
+        """状态转移的唯一落库入口——**条件 UPDATE**（`WHERE id = ... AND
+        status = expected_status`），不是"先 SELECT 读状态判断、再无条件
+        UPDATE"。
+
+        2026-08-26 修复的 TOCTOU（变异测试实测发现）：原来 `approve_action`/
+        `mark_executing`/`advance_status`/`mark_result` 都是"读出
+        `current.status`，在 Python 里判断允不允许转移，再执行一条不带
+        `WHERE status` 的 UPDATE"——两个并发请求可以都读到同一个"读时刻"的
+        旧状态、都通过 Python 侧检查、都执行 UPDATE，后写的直接覆盖先写的，
+        `approver_user_id`/`approved_at` 最终只记录了后到的那次调用，前一次
+        调用却以为自己成功了，返回的也是"看起来成功"的响应。设计文档 §6
+        明确要求"两个有 can_approve 权限的用户同时点批准，只能有一个生效，
+        必须用真并发测试"，条件 UPDATE 是数据库层面唯一能真正保证这一点的
+        机制——Python 里的先读后判断不管写得多严密，两个并发请求之间永远
+        插得进第二个 UPDATE；数据库把"检查 + 修改"做成一条原子语句，才是
+        真正堵死这条竞态的地方。
+
+        返回受影响行数（0 或 1）。`set_clause`/`set_params` 是 `status`/
+        `id`/预期旧 `status` 之外要一并设置的字段（比如 `approve_action`
+        还要写 `approver_user_id`/`approved_at`），拼在 SET 子句里、参数
+        顺序对齐 `$1` 开始。
+        """
+        extra = f", {set_clause}" if set_clause else ""
+        query = (
+            f"UPDATE remediation_actions SET status = $1{extra} "
+            f"WHERE id = $2 AND status = $3"
+        )
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(query, target_status, action_id, expected_status, *set_params)
+        # asyncpg 的 execute() 对 UPDATE 返回形如 "UPDATE 1" 的命令标签，
+        # 不是行数本身——按空格切出最后一段解析成整数。
+        return int(result.rsplit(" ", 1)[-1])
+
+    async def _raise_conflict(self, action_id: str, target_status: str, expected_status: str) -> None:
+        latest = await self.get_action(action_id)
+        raise IllegalStatusTransition(
+            f"并发冲突：转移到 '{target_status}' 时状态已不是预期的 '{expected_status}'"
+            f"（当前实际是 '{latest.status if latest else '(不存在)'}'），请重新加载后重试"
+        )
+
     async def advance_status(self, action_id: str, target_status: str) -> RemediationAction:
         """状态机的通用转移入口，给不需要额外字段的转移用
         （`proposed`→`pending_approval`/`rejected_pre`，`pending_approval`→
@@ -658,38 +703,44 @@ class OpsStore:
             raise ValueError(f"remediation_action '{action_id}' 不存在")
         _assert_transition_allowed(current.status, target_status)
 
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE remediation_actions SET status = $1 WHERE id = $2",
-                target_status, action_id,
-            )
+        affected = await self._conditional_update(action_id, current.status, target_status)
+        if affected == 0:
+            await self._raise_conflict(action_id, target_status, current.status)
         return await self.get_action(action_id)
 
     async def approve_action(self, action_id: str, approver_user_id: str) -> RemediationAction:
         """§3.3 硬性不变量：`executing` 状态只能从 `approved` 转移而来，且必须
         有 `approver_user_id` + `approved_at`——这条不允许任何调试开关绕过。
-        这里在写入前就校验当前状态是 `pending_approval`，不是先写后验。"""
+        这里在写入前就校验当前状态是 `pending_approval`，不是先写后验；
+        真正防并发靠的是下面条件 UPDATE 的 `AND status = 'pending_approval'`，
+        不是这一步的 Python 判断（判断只是为了给不满足条件时一个更早、更
+        准确的报错，竞态发生时条件 UPDATE 才是最终裁判）。"""
         current = await self.get_action(action_id)
         if current is None:
             raise ValueError(f"remediation_action '{action_id}' 不存在")
         _assert_transition_allowed(current.status, STATUS_APPROVED)
 
         approved_at = time.time()
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE remediation_actions SET status = $1, approver_user_id = $2, "
-                "approved_at = $3 WHERE id = $4",
-                STATUS_APPROVED, approver_user_id, approved_at, action_id,
-            )
+        affected = await self._conditional_update(
+            action_id, STATUS_PENDING_APPROVAL, STATUS_APPROVED,
+            set_clause="approver_user_id = $4, approved_at = $5",
+            set_params=(approver_user_id, approved_at),
+        )
+        if affected == 0:
+            # 两个 org_admin 并发点批准时，只有一个会走到这里——另一个的
+            # current.status 读到的还是 pending_approval（读的时候确实是），
+            # 但条件 UPDATE 执行时状态已经被第一个请求改成 approved 了，
+            # 这里如实报出"并发冲突"，不是"不存在"或别的误导性错误。
+            await self._raise_conflict(action_id, STATUS_APPROVED, STATUS_PENDING_APPROVAL)
         return await self.get_action(action_id)
 
     async def mark_executing(self, action_id: str) -> RemediationAction:
         """硬性前置条件：当前状态必须是 `approved`，且 `approver_user_id` +
         `approved_at` 必须已经落库——不是"转移到 executing 就顺便查一下"，
         是"没有这两个字段就不允许转移"，这条不变量在这里第二次校验
-        （第一次在 `approve_action` 写入时），双重保险。"""
+        （第一次在 `approve_action` 写入时），双重保险。条件 UPDATE 的
+        `AND status = 'approved'` 同时也挡住了并发场景下两次 `mark_executing`
+        同时生效的问题。"""
         current = await self.get_action(action_id)
         if current is None:
             raise ValueError(f"remediation_action '{action_id}' 不存在")
@@ -700,12 +751,12 @@ class OpsStore:
                 "这条硬性不变量不接受任何绕过"
             )
 
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE remediation_actions SET status = $1, executed_at = $2 WHERE id = $3",
-                STATUS_EXECUTING, time.time(), action_id,
-            )
+        affected = await self._conditional_update(
+            action_id, STATUS_APPROVED, STATUS_EXECUTING,
+            set_clause="executed_at = $4", set_params=(time.time(),),
+        )
+        if affected == 0:
+            await self._raise_conflict(action_id, STATUS_EXECUTING, STATUS_APPROVED)
         return await self.get_action(action_id)
 
     async def mark_result(
@@ -721,12 +772,12 @@ class OpsStore:
 
         import json
 
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE remediation_actions SET status = $1, result = $2 WHERE id = $3",
-                target_status, json.dumps(result), action_id,
-            )
+        affected = await self._conditional_update(
+            action_id, STATUS_EXECUTING, target_status,
+            set_clause="result = $4", set_params=(json.dumps(result),),
+        )
+        if affected == 0:
+            await self._raise_conflict(action_id, target_status, STATUS_EXECUTING)
         return await self.get_action(action_id)
 
     async def set_outcome_effective(self, action_id: str, effective: bool) -> RemediationAction:

@@ -383,6 +383,11 @@ class TestAdvanceStatusLegalPathWritesTargetStatus:
             AsyncMock(side_effect=[_action(status=current), _action(status=target)]),
         )
         fake_conn = AsyncMock()
+        # asyncpg 的 execute() 对 UPDATE 返回 "UPDATE <行数>" 命令标签字符串
+        # （不是行数本身）——TOCTOU 修复后 `_conditional_update` 靠 rsplit 解析
+        # 它来判断本次 UPDATE 是否真的命中了一行，裸 AsyncMock() 的默认返回值
+        # 不是字符串，会在这一步直接 TypeError。
+        fake_conn.execute = AsyncMock(return_value="UPDATE 1")
         monkeypatch.setattr(store, "_get_pool", AsyncMock(return_value=_FakePool(fake_conn)))
 
         result = await store.advance_status("remact_1", target)

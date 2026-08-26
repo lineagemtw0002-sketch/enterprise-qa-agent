@@ -18,13 +18,19 @@
 - **回归保护**：当前行为的快照，改实现不一定变红（比如"缺字段返回 allowed=False
   而不是抛异常"这种契约），价值在于防止将来无意改变契约。
 
-## 三条已确认的实现与设计不符（以 `xfail(strict=True)` 记录，未改生产代码）
+## 已确认缺陷的处置（2026-08-26 更新）
 
-`TestExclusionRuleCannotBeBypassed` / `TestMalformedScopeConfigFailsClosed` /
-`TestNumericScopeConfigTypeContract` 里带 `xfail(strict=True)` 的用例断言的是
-**设计要求的行为**，当前实现做不到，所以现在是 xfail（不是绿灯，是"已知红"）。
-一旦生产代码修好，strict xfail 会以 XPASS 报错，强制那次修复顺手把标记摘掉——
-不会出现"修了但测试还挂着 xfail"的沉默状态。详见交付报告里的 bug 清单。
+原始版本用 `xfail(strict=True)` 记录了 8 条已确认的实现与设计不符
+（详见提交 `0ea692e`）。同一天，归属会话（张学友）修复了其中 **7 条**
+（`aiops_scope.py::_check_clean_disk` 补路径穿越防护 + 排除侧 isinstance
+校验，`_check_scale_instances`/`_check_rollback_deployment` 补数值类型
+校验，`validate_approval_timeout_minutes` 补 bool/非 int 拒绝），XPASS
+后已摘除对应 xfail 标记（就地保留原有断言，改成纯粹的回归保护）。
+
+**剩 1 条仍是 xfail，未修**：`TestScaleInstancesBoundaries::
+test_self_reported_baseline_cannot_inflate_the_ceiling`——baseline
+自指问题是设计层缺口（scope schema 没规定 baseline 该从哪来，不是单纯的
+实现手滑），需要先过设计评审再动代码，本次未擅自决定修法，见 `CLAUDE.md` §5。
 """
 
 from __future__ import annotations
@@ -90,22 +96,11 @@ class TestExclusionRuleCannotBeBypassed:
         result = check_target_in_scope("clean_disk", scope, {"path": "/etc/shadow"})
         assert result.allowed is False
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "已确认 bug：_check_clean_disk 用 fnmatch 做字面串匹配，不做路径规范化，"
-            "`..` 可以绕过排除规则。修复方向需要 aiops_scope.py 的归属会话定夺"
-            "（os.path.normpath + 拒绝含 .. 的路径，或改用 PurePath.match），"
-            "本次只记录不改生产代码。"
-        ),
-    )
     def test_path_traversal_defeats_exclusion_rule(self):
         """`/var/log/app/../../lib/postgresql/data/base.dat` 实际指向被排除的
-        postgres 数据目录，但字面串既命中允许模式 `/var/log/app/*`、又**不**命中
-        排除模式 `/var/lib/postgresql/*`，于是被放行。
-
-        这条直接击穿 §3.3.1 "AI 提议的目标必须落在管理员预先配置的白名单/边界内"
-        —— 排除规则可以被一个 `..` 绕过，等于 §10.3 想守的东西没守住。
+        postgres 数据目录——**已于 2026-08-26 修复**（`aiops_scope.py::_check_clean_disk`
+        新增 `if ".." in path.split("/")` 拒绝 + `posixpath.normpath` 规范化）。
+        本条曾以 `xfail(strict=True)` 记录该 bug，XPASS 后已摘除标记，见 `CLAUDE.md` §5。
         """
         scope = {
             "allowed_path_patterns": ["/var/log/app/*"],
@@ -198,19 +193,10 @@ class TestMalformedScopeConfigFailsClosed:
                 "restart_service", {"allowed_targets": "order-service"}, {"target": "order"}
             )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "已确认 bug：excluded_path_patterns 没有 isinstance 校验（allowed 侧有），"
-            "误配成字符串时被逐字符迭代，排除规则静默失效 —— fail-open。"
-            "修复方向：与 allowed 侧对称地加一条 isinstance 校验，抛 InvalidScopeConfig。"
-        ),
-    )
     def test_exclusion_as_bare_string_silently_disables_exclusion(self):
-        """管理员漏了方括号，把排除列表写成一个字符串。
-
-        逐字符迭代后，每个字符（`/`、`v`、`a`…）都不匹配整条路径，
-        排除规则等于不存在，本该被保护的 postgres 数据目录被放行。
+        """管理员漏了方括号，把排除列表写成一个字符串——**已于 2026-08-26 修复**
+        （`_check_clean_disk` 新增与 allowed 侧对称的 isinstance 校验）。
+        本条曾以 `xfail(strict=True)` 记录该 bug，XPASS 后已摘除标记。
         """
         with pytest.raises(InvalidScopeConfig):
             check_target_in_scope(
@@ -222,11 +208,8 @@ class TestMalformedScopeConfigFailsClosed:
                 {"path": "/var/lib/postgresql/data/base.dat"},
             )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="同上：excluded_path_patterns=None 时抛裸 TypeError，不是 InvalidScopeConfig。",
-    )
     def test_exclusion_as_none_is_rejected_as_config_error(self):
+        # 同上，excluded_path_patterns=None 曾漏出裸 TypeError，已随上一条一并修复。
         with pytest.raises(InvalidScopeConfig):
             check_target_in_scope(
                 "clean_disk",
@@ -458,12 +441,8 @@ class TestNumericScopeConfigTypeContract:
     这三条都是**已确认 bug**（契约被打破），以 xfail(strict=True) 记录。
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="已确认 bug：max_multiplier_of_baseline 是字符串时漏出裸 TypeError，"
-        "而不是 InvalidScopeConfig（管理员从 JSON/表单填错类型是很现实的场景）。",
-    )
     def test_string_multiplier_raises_config_error(self):
+        # 已于 2026-08-26 修复（新增 `_require_config_number` 数值类型校验）。
         with pytest.raises(InvalidScopeConfig):
             check_target_in_scope(
                 "scale_instances",
@@ -471,11 +450,8 @@ class TestNumericScopeConfigTypeContract:
                 {"target_instances": 10, "baseline_instances": 4},
             )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="已确认 bug：max_versions_back 是字符串时漏出裸 TypeError。",
-    )
     def test_string_max_versions_back_raises_config_error(self):
+        # 已于 2026-08-26 修复（同一个 `_require_config_number` 校验覆盖）。
         with pytest.raises(InvalidScopeConfig):
             check_target_in_scope(
                 "rollback_deployment", {"max_versions_back": "5"}, {"target_version_offset": 6}
@@ -517,20 +493,13 @@ class TestApprovalTimeoutBoundaryEdges:
         with pytest.raises(InvalidApprovalTimeout):
             validate_approval_timeout_minutes(False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="已确认 bug：字符串分钟数漏出裸 TypeError，而不是 InvalidApprovalTimeout。"
-        "这个值来自管理员在连接器配置里填的表单，字符串是最常见的输入形态。",
-    )
     def test_string_minutes_raises_domain_error(self):
+        # 已于 2026-08-26 修复：`validate_approval_timeout_minutes` 新增
+        # `isinstance(minutes, bool) or not isinstance(minutes, int)` 校验。
         with pytest.raises(InvalidApprovalTimeout):
             validate_approval_timeout_minutes("30")
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="已确认 bug（轻微）：函数签名是 `-> int`，但 30.5 这样的浮点数会被"
-        "原样接受并返回，落库后语义不明。",
-    )
     def test_fractional_minutes_rejected(self):
+        # 同上一条修复覆盖：非 int（含 float）一律拒绝，不再原样接受 30.5。
         with pytest.raises(InvalidApprovalTimeout):
             validate_approval_timeout_minutes(30.5)
