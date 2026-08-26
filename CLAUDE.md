@@ -38,7 +38,7 @@
 |---|---|---|
 | 1 | [项目定位](#1-项目定位) | 交付给谁 / 怎么用 / 什么算做完 / 功能边界 |
 | 2 | [架构速览](#2-架构速览) | 一屏看懂全貌，细节见 `docs/architecture.md` |
-| 3 | [权限与多租户](#3-权限与多租户) | 权限模型 · 隔离层次 · 已验证的保证 |
+| 3 | [权限与多租户](#3-权限与多租户) | 权限模型 · **账号生命周期 · 席位** · 隔离层次 · 已验证的保证 |
 | 4 | [已知未闭环](#4-已知未闭环) | P0 / P1 清单 |
 | 5 | [已修复](#5-已修复防止重新引入) | 防止重新引入（含代码级约束） |
 | 6 | [已作废的设计](#6-已作废的设计) | 不要复活 |
@@ -133,6 +133,51 @@ generate 1.85s（65 字）/ 12.0s（354 字）· session/memory/archive ≈ 0。
 - **不存在 `kb_group`** —— 2026-08-22 曾拆分出去，08-23 合并回 roles
   （`scripts/migrate_kb_groups_to_roles.py`）。`role_store.py:41,192` 注释里仍提到该词，仅为历史说明
 
+**全局角色只有两个**（`roles.org_id IS NULL`）：`super_admin`（平台运营方）、
+`org_admin`（企业管理员）。它们是**权限档位**，回答"能不能进管理后台"。
+其余角色全部带 `org_id`，是**部门身份 + 知识库权限**（`role_collections` 挂在其上）。
+⚠️ 2026-08-26 实测：本库**没有全局部门角色**，别写代码依赖"会有全局 HR/IT 角色"。
+授予边界见 `app.py::_validate_role_assignment` 的四条：`super_admin` 只有 super_admin
+能发、`org_admin` 只有平台层能发——**"任命管理员"和"分配部门"是两件事**。
+
+### 3.1b 账号生命周期
+
+*(2026-08-26 落地，设计 `docs/account_lifecycle_design.md`)*
+
+| 动作 | 谁能做 | 说明 |
+|---|---|---|
+| 建号（单个） | 企业管理员 / 平台管理员 | 管理员直接设密码 |
+| **批量导入（CSV）** | 同上 | **`validate_only` 默认 True**，必须先预演 |
+| **停用 / 启用** | 同上 | 企业侧的"离职处理"就是这个 |
+| **删除** | 🔴 **仅平台管理员** | 2026-08-26 从企业管理员手里收走 |
+| **席位上限** | 🔴 **仅平台管理员** | 合同条款，不是配置项 |
+| 激活（设初始密码） | 员工自己 | `POST /api/v1/activate`，**唯一无鉴权写端点** |
+
+**删除为什么收走**：删除会带走 `conversations.user_id` 的归属，
+"离职员工做过什么"就再也追溯不到。停用是人事操作（天天要做），
+删除是不可逆的数据销毁（只该用于 GDPR 那类清除请求）。
+
+**初始凭证不走密码，走一次性激活码**（7 天过期、单次使用、库里只存 SHA-256）。
+用户已定**不做邮件、不做短信**，分发必然是人工的——既然如此就让被分发的东西
+尽可能不值钱。**CSV 里出现密码列会被整份拒收**，不是忽略该列。
+
+⚠️ **`users.username` 是全局 UNIQUE，不是企业内唯一。** 任何"已存在就更新"的
+逻辑必须先看归属，否则 Acme 的管理员写一行 `zhangsan` 就能改掉 Globex 那个
+`zhangsan` —— 跨企业账号接管。三档：本企业已有→更新、别家已有→**拒绝**、没有→新建。
+
+⚠️ **`password_hash` 已改为可空**（未激活账号还没有密码）。
+任何读它的地方都要判 NULL，`authenticate` 里已经判了。
+这一步顺带解掉第二档 SSO 的阻塞——SSO 用户永远不会有本地密码。
+
+### 3.1c 席位
+
+占用口径：**该企业下 `disabled_at IS NULL` 的用户数。停用的人不占席位。**
+这条口径把删除权限和席位绑在了一起——如果停用仍占席位，客户为了腾名额就会去
+删除离职员工，那正是上面要避免的。**三个校验点**：建号、批量导入（含 dry-run
+预演报告）、**重新启用**（最容易漏：它不建号却让占用数 +1）。
+`organizations.seat_limit` 为 NULL 表示不限；**不要给它设非空默认值**，
+那会在升级瞬间把已超过该值的存量企业全部锁死。
+
 ### 3.2 隔离层次
 
 ```mermaid
@@ -148,6 +193,23 @@ flowchart TB
     style L1 fill:#ffe8e8
     style L6 fill:#e8ffe8
 ```
+
+⚠️ **停用（`disabled_at`）的生效时机是不对称的，这是刻意的**
+（2026-08-26，`docs/account_lifecycle_design.md` §4.2 / O-2）：
+
+| 守卫 | 端点数 | 本来就查库？ | 停用何时生效 |
+|---|---|---|---|
+| `require_role` / `require_platform_admin` / `require_same_org_or_platform` / `_require_*_tier` | **28** | **是** | **立刻**（`auth.py::reject_if_disabled`） |
+| 仅 `get_current_user` | **35** | 否（纯 JWT 解码） | **最长 24 小时** |
+
+（数字为 2026-08-26 AST 实测：按**路由函数**去重计，不是按 `Depends(...)` 出现次数。
+早前用 grep 数出的 19 是低估——漏掉了 `require_same_org_or_platform` 和
+运营仪表盘那一档守卫。要复核就数路由，别数 `Depends`。）
+
+在 `get_current_user` 里加检查 = 给**每一个**请求加一次 DB 查询，已明确拒绝付这个代价。
+高权限面立刻关闭、低权限面留有界窗口，是对的风险排序；反过来才是问题。
+**窗口不会因为对方反复登录而延长**——`authenticate` 挡着，停用账号拿不到新 token。
+彻底关闭要等 token 吊销（账号体系第四档，随 SCIM 一起做）。
 
 ### 3.3 ✅ 已验证成立的隔离保证
 
@@ -702,6 +764,51 @@ flowchart TB
 
 ## 5. 已修复（防止重新引入）
 
+- ✅ **2026-08-26　账号体系阶段一落地（批量导入 / 激活码 / 停用 / 席位）**
+  设计 `docs/account_lifecycle_design.md`（四档演进，本次只做第一档；
+  后三档 SSO/SCIM 只写了触发条件）。当前状态见 §3.1b / §3.1c / §3.2。
+  实现分四次提交：纯函数层 → 存储层与守卫 → 端点接线 → 前端。
+
+  **判定逻辑一律做成纯函数**（`account_import.py` / `activation.py`），
+  只接收"已经从库里读出来的数据"，不做 IO——本仓库 `tests/` 从没有测试碰过
+  Postgres，判定写进 async 端点函数就等于永远没有测试。照的是
+  `auth.py::resolve_jwt_secret` 那个已验证有效的模式。
+
+  ⚠️ **激活码用 SHA-256 而不是 bcrypt**，两条理由缺一不可：
+  ① `/activate` 无鉴权，每次调用做一遍 bcrypt 等于送一个高放大倍数的 CPU
+  消耗入口；② bcrypt 的慢是为了补低熵，而激活码是 128 bit 随机数，不需要补。
+  **这个理由只在码是高熵随机数时成立**——改成"6 位数字方便电话里念"就必须换回
+  bcrypt，`test_activation_code.py` 有一条测试专门钉住熵值。
+
+  ⚠️ **`/activate` 的四条防护只落地了三条：限流没做。** 全仓没有任何限流
+  基础设施可复用。在补上之前这个端点可以被无限次尝试——128 bit 的码扛得住
+  爆破，但扛不住有人拿它当免费的 CPU 消耗入口。
+
+  **回归保护**：`test_account_import_validation.py`（32）·
+  `test_activation_code.py`（21）· `test_org_store_select_completeness.py`（3）·
+  `test_admin_user_response_sites_agree.py`（4）——**以上 60 条已实测核对**·
+  `scripts/verify_account_lifecycle.py`（27，真库）·
+  `scripts/verify_account_endpoints_e2e.py`（30，真 HTTP，默认打 8011 不打 8010）。
+
+  ⚠️ **本次三个缺陷全是同一形态：不报错，只是某条路径悄悄失效。**
+  值得记住这个形态本身，它在本仓库已经反复出现（另见 §4 第 9 条 OpenSearch
+  漏 `filters` 退化成纯稀疏检索）：
+  1. `get_organization` 的 SELECT 漏了 `seat_limit`，而 `_row_to_org` 对缺失列
+     有兜底 → `org.seat_limit` 恒为 None，**"有上限"被读成"不限"，席位校验
+     形同虚设**。真库冒烟才发现。
+  2. 三个生命周期字段被 `str.replace(..., 1)` 打到了 `get_me` 上（那段锚点文本
+     在文件里更靠前），`_build_admin_user_response` 没拿到 → **停用接口返回的
+     `disabled_at` 恒为 null**；而列表页走批量版是好的，所以只有停用这一条路径坏。
+     HTTP 端到端才发现。
+  3. `assert "compare_digest" in inspect.getsource(fn)` **命中的是 docstring**
+     里我自己写的那句话——把实现换成 `==` 测试照样绿。变异检查才发现。
+     **本仓库第二次踩这个**（第一次是 `test_last_turn_tokens_reset.py`）：
+     **源码字符串匹配一律改用 AST**，`getsource` 会连注释和 docstring 一起返回。
+
+  ⚠️ **未做**：`/activate` 限流；端点层的自动化测试（T-1/T-2/T-14/T-19/T-20
+  仍只有纯函数证据 + 上面那个 E2E 脚本，仓库仍无 postgres fixture）；
+  SSO / SCIM / token 吊销（第二～四档，等客户提出）。
+
 - ✅ **2026-08-26　P1-14：`/admin/users` N+1（约 300 次串行查询 → 固定常数次）**
   原来 `admin_list_users` 对每个用户单独 await
   `get_org_for_user`（过滤时 1 次）+ `_build_admin_user_response` 内
@@ -1017,6 +1124,9 @@ flowchart TB
 | `scripts/benchmark_latency.py` | **现行耗时基准脚本**，6 场景 × 3 次，输出 JSON 到 `scripts/benchmark_results/` | **可复现，活脚本** |
 | `docs/optimization_tracking.md` | 优化前后对比（任务一含两轮：08-24 第一轮、**08-25 第二轮安全批次 1+2**，按「修复前→怎样修→修复后→遗留」结构） | 活文档 |
 | `scripts/verify_security_posture.py` | **现行安全复测脚本**，18 用例 6 组（A 幻觉/B 越权话术/C 泄露/D 注入/E 跨租户/F 认证），结果 JSON 落 `scripts/security_results/` | **可复现，活脚本**（替代已丢失的 `jailbreak_test.py`） |
+| `docs/account_lifecycle_design.md` | 账号体系四档演进设计（批量导入/激活码/停用/席位；SSO·SCIM 只写触发条件） | **阶段一已实施（08-26）**，二～四档未实施，死期 2026-11-26 |
+| `scripts/verify_account_lifecycle.py` | 账号体系真库冒烟（27 条：schema 迁移 / 激活 / 单次使用 / 停用 / 席位口径） | **可复现，活脚本** |
+| `scripts/verify_account_endpoints_e2e.py` | 账号体系 HTTP 端到端（30 条），验"端点真的调了规则吗" | **可复现，活脚本**（默认 8011） |
 | `docs/kb_permission_design.md` | 权限设计（截至 08-23） | 时点快照 |
 | `docs/qa_test_questions.md` | 问答测试题库，取材自实际库内容 | 可用 |
 | `docs/archive/` | 历史设计文档（已实施或已废弃） | **冻结，不维护** |
