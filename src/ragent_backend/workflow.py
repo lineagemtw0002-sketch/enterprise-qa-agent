@@ -573,7 +573,24 @@ class RAGWorkflow:
         # 了一个部门知识库，角标却会多出好几个跟本轮回答毫无关系的库。
         state["tool_execution_trace"] = []
         state["tool_summary"] = ""
-        
+
+        # last_turn_tokens 跟 tool_execution_trace 是**完全相同的形态**：
+        # schemas.py:533 声明的普通字段，没有 Annotated 累加 reducer，
+        # 会被 checkpointer 原样带到下一轮。上面那段注释解释了为什么必须清空，
+        # 而这个字段当初被漏掉了 —— 全仓只有三处（声明、_generate_node:1509 写、
+        # _archive_node:1713 读），**没有任何重置点**。
+        #
+        # 后果不是"多占点内存"，是**用量被重复计数**：三条短路路径
+        # （越权话术拦截、无权访问、检索空命中）都不经过 _generate_node，
+        # 返回的 dict 里没有这个字段，于是 _archive_node 把**上一轮的 token 数**
+        # 原样盖在这一轮的消息上。同一份用量进两次库。
+        #
+        # 这不是理论风险：dashboard_stats.py 的成本面板正在展示被污染的
+        # total_tokens（实测 994 条 assistant 消息里 417 条有值，
+        # 面板显示 562,004，而 SUM 会跳过 NULL，所以 58% 的缺失还是隐形的）。
+        state["last_turn_tokens"] = None
+
+
         # 召回长期记忆（跨会话认知连续）
         if self._ltm_store and state.get("user_id"):
             try:
