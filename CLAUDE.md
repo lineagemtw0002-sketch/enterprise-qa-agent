@@ -1244,6 +1244,46 @@ flowchart TB
   端到端验证——上面的真机验证止于直接调用 `_available_tools_for` 这一层，
   没有经过真实 HTTP `/api/v1/chat` 请求 + SSE 流。
 
+- ✅ **2026-08-27　审批队列/事后复盘/总览三处展示逻辑统一——UUID 换用户名 +
+  `plan` 不再 JSON 直出**（「刘德华」开发，本会话合并）
+
+  背景：总览大屏（`OpsOverview.jsx`）早前已经把 `proposed_by` 从 UUID 解析
+  成用户名（`userNames` 映射，`adminApi.listUsers()`），但审批队列表格和
+  事后复盘卡片是后补的两个视图，各自独立写成，一直原样显示 UUID——"抄一遍
+  总览的做法"会把同一个坑埋第三次（三处各写各的，任何一处漏改都测不出来，
+  这次审批队列/复盘卡片没跟上总览正是这个坑的一次真实发生）。改法是抽出
+  `frontend/src/components/ops/opsDisplay.jsx`（`useUserNames`/`displayUser`/
+  `formatPlan`/`formatResult`），三个视图共用同一份实现，不再各写各的。
+
+  `plan` 字段从原始 JSON 直出改成人话渲染，但**认不出的字段原样列出
+  （key=value）、不丢弃**——修复动作的参数决定了它在生产环境实际执行什么，
+  为了排版好看隐藏一个未预料到的字段，在这类界面里是不可接受的取舍。真机
+  验证时特意构造了一条带自定义字段的 `plan`，确认该字段原样显示、没有被
+  格式化逻辑吞掉。
+
+  **真机验证**：审批队列"提议人"/"审批"两列、复盘卡片"提议人/审批人"均
+  显示用户名而非 UUID；控制台无 JS 报错；测试数据用 DELETE 端点级联清理，
+  复核连接器和复盘条目均已清空。本会话额外复核：合并后重启后端，
+  `tests/unit` 2359 通过、`scripts/verify_aiops_endpoints.py` 全过，
+  真机点开总览/审批队列/事后复盘三个 tab 确认渲染正常、控制台零错误
+  （此次因为没有真实数据，UUID→用户名这条没能在复核环节重新目测到，
+  依据的是刘德华的真机验证记录 + 代码审查，不是本会话独立复现）。
+
+  **本模块 V1 阶段至此收尾**：智能运维模块从 2026-08-26 插队开工到本条，
+  设计文档（`docs/aiops_module_design.md`）列出的 V1 范围（异常检测/告警
+  关联降噪/RCA 辅助、BYOC 连接器协议、四类动作审批状态机、`role_ops_systems`
+  细粒度权限、§9.2 事后复盘最小可行版、§10.5 验收指标、运维塔台 UI）已全部
+  落地并真机验证。剩余两条**有意不做**，理由记录在案：
+  - **P1-4**（`ragent_backend`+`tool_agent` 12,200 行零测试覆盖）：真正的
+    阻塞是"没有 DB fixture 隔离方案"，这是需要拍板的设计问题，不是可以
+    连夜堆出来的体力活，不属于本次可单方面推进的范围。
+  - **§10.3 `scale_instances` baseline 自指**（`baseline_instances` 与
+    `target_instances` 来自同一份 AI 提议，2 倍上限拦不住自报虚高基线）：
+    修法需要改 scope schema（baseline 改成取连接器实测值），是设计变更，
+    按 §7.1 不能由执行会话单方面拍板。`xfail(strict=True)` 继续保留——
+    真正修好那天它会 XPASS 报错，逼那次修复顺手摘掉标记，缺陷不会被
+    悄悄遗忘。
+
 - ✅ **2026-08-26　AI 分析层（异常检测/告警关联降噪/RCA 辅助，§2 三项 V1
   已确认能力）落地**（「刘德华」开发，本会话合并 + 接上 `llm` 依赖）
 
@@ -2092,7 +2132,7 @@ flowchart TB
 | **`docs/architecture.md`** | **架构图 · 核心链路 · 双模型 · 性能测试**（与本文同属当前状态正本） | **活文档** |
 | `docs/scale_slo_and_priorities.md` | 容量测算 · 最小 SLO · 27+3 条发现重新分级（12 条 P0） | 活文档 |
 | `docs/orchestration_design.md` | 编排层设计：并行防护 + 记忆异步化 | **部分实施**：A 部分 D4/D5（08-25 第二批）、**D1/D2（08-25 第三批，见 §4.5）** 已落地；D3/D6 未实施；**B 部分整体未实施**（阻塞项 B-R1 已实测查清） |
-| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **部分实施**：2026-08-26 用户明确要求插队开工（覆盖了文档自己"排期维持在 12 条 P0 之后"的原始决定）。阶段一～四全部落地并合并：数据模型/越界判定/审批状态机/管理面端点/审批工作流端点/BYOC 连接器协议（`ConnectorTransport` 实现）+ 联邦查询层/工具注册，粗粒度门禁已升级为 `role_ops_systems` 细粒度审批权限（§10.6，org_admin 通配符 + super_admin 零权限 + can_approve 隐含 can_view）；6 处越界判定漏洞 + 审批状态机 TOCTOU 竞态 + 运维工具 `org_id` 从未被注入过的阻塞 bug 均已修复，见 §5。**LangGraph 接入已确认不需要新增 `intent_type`/`ops_subgraph`**（§10.2 已更正）——既有 `tool_subgraph` 的 `general_agent` 路由天然覆盖。审批超时扫描任务已接线；前端"运维塔台"UI 已完成并真机联调验收（刘德华开发）；`ops_analysis_summaries` CRUD 已实现。**AI 分析层（异常检测/告警关联降噪/RCA 辅助，§2 三项 V1 已确认能力）已实现**（刘德华开发）：异常检测用中位数+MAD 稳健统计（不用均值+标准差，抗遮蔽效应）、告警关联走时间窗+标签规则，两者都不用 LLM；RCA 复用既有生成用 7b LLM，依据引用只从输入推导、不采信模型输出，降级结果不落库；整合点是 `tool_registration.py` 新增的 `analyze_ops_incident` 工具，走既有 `intent_type="tool"` 路由。`role_ops_systems`、`ops_analysis_summaries`、AI 分析层、前端、工具列表按调用者动态过滤（2026-08-27）、§9.2 事后复盘聚合视图最小可行版、§10.5 验收指标公式均已实现；真实 BYOC 连接器进程（客户环境那一端）未实施 |
+| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **V1 范围已收尾（2026-08-27）**：2026-08-26 用户明确要求插队开工（覆盖了文档自己"排期维持在 12 条 P0 之后"的原始决定）。阶段一～四全部落地并合并：数据模型/越界判定/审批状态机/管理面端点/审批工作流端点/BYOC 连接器协议（`ConnectorTransport` 实现）+ 联邦查询层/工具注册，粗粒度门禁已升级为 `role_ops_systems` 细粒度审批权限（§10.6，org_admin 通配符 + super_admin 零权限 + can_approve 隐含 can_view）；6 处越界判定漏洞 + 审批状态机 TOCTOU 竞态 + 运维工具 `org_id` 从未被注入过的阻塞 bug 均已修复，见 §5。**LangGraph 接入已确认不需要新增 `intent_type`/`ops_subgraph`**（§10.2 已更正）——既有 `tool_subgraph` 的 `general_agent` 路由天然覆盖。审批超时扫描任务已接线；前端"运维塔台"UI 已完成并真机联调验收（刘德华开发）；`ops_analysis_summaries` CRUD 已实现。**AI 分析层（异常检测/告警关联降噪/RCA 辅助，§2 三项 V1 已确认能力）已实现**（刘德华开发）：异常检测用中位数+MAD 稳健统计（不用均值+标准差，抗遮蔽效应）、告警关联走时间窗+标签规则，两者都不用 LLM；RCA 复用既有生成用 7b LLM，依据引用只从输入推导、不采信模型输出，降级结果不落库；整合点是 `tool_registration.py` 新增的 `analyze_ops_incident` 工具，走既有 `intent_type="tool"` 路由。`role_ops_systems`、`ops_analysis_summaries`、AI 分析层、前端、工具列表按调用者动态过滤（2026-08-27）、§9.2 事后复盘聚合视图最小可行版、§10.5 验收指标公式、三视图展示逻辑统一（UUID→用户名 + `plan` 可读化）均已实现；真实 BYOC 连接器进程（客户环境那一端）未实施。**有意不做**：P1-4 零测试覆盖（阻塞在"无 DB fixture 隔离方案"这个设计问题，非体力活）、§10.3 `scale_instances` baseline 自指（需要 scope schema 设计变更，`xfail(strict=True)` 留作提醒） |
 | `docs/collaboration_retrospective.md` | 协作复盘与开发流程指南（**每周自查只需读 §1**） | 活文档 |
 | `docs/review_2026-08-24/review_codebase_findings.md` | 代码审计，带行号证据 | 时点快照 |
 | `docs/review_2026-08-24/review_process_retro.md` | 过程复盘量化分析 | 时点快照 |
