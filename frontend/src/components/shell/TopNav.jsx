@@ -101,7 +101,17 @@ const MODULES = [
   // 会让企业管理员以为这也是权限相关的东西（见 App.jsx isPlatformAdmin 的说明）。
   { key: 'dashboard', label: '运营仪表盘', icon: LayoutDashboard, platformOnly: true },
   { key: 'admin', label: '权限系统', icon: ShieldCheck, adminOnly: true },
-  { key: 'ops', label: '智能运维', icon: Activity, soon: true },
+  // 智能运维（运维塔台）：连接器 / 修复动作允许范围 / 审批队列。
+  // 跟「权限系统」里那几个企业页面同一个道理——平台运营方不代表任何一家具体企业，
+  // 也不该去批准别人环境里的修复动作，所以 hideForPlatform（模块的**开关**才是
+  // 平台的事，那个在运营仪表盘的组织管理里）。
+  // 企业没开通这个模块时，这个入口**本身就不出现**（needsAiops），而不是让人点进去
+  // 撞一个 403——跟上面平台级页面"不是权限拒绝页、是压根不给入口"是同一个原则。
+  // 依据是 /auth/me 里的 organization.aiops_module_enabled（后端 2026-08-26 补的字段，
+  // 在那之前前端无从提前知道，只能等点进去才发现）。
+  // OpsConsole 内部那层 403 探测保留当兜底：开关是别人（平台管理员）在改的，
+  // 用户这一侧的 meProfile 可能是开关变更之前拉的，入口藏不藏得住不能只靠它。
+  { key: 'ops', label: '智能运维', icon: Activity, adminOnly: true, hideForPlatform: true, needsAiops: true },
 ]
 
 // 顶部导航：登录后所有界面共用的壳——模块切换 + 通知 + 个人信息，替代原来
@@ -198,7 +208,9 @@ export default function TopNav({
       </div>
 
       <div className="nav-modules">
-        {MODULES.filter((m) => (!m.adminOnly || isAdmin) && (!m.platformOnly || isPlatformAdmin)).map((m) => (
+        {MODULES.filter((m) => (!m.adminOnly || isAdmin) && (!m.platformOnly || isPlatformAdmin)
+          && (!m.hideForPlatform || !isPlatformAdmin)
+          && (!m.needsAiops || !!meProfile?.organization?.aiops_module_enabled)).map((m) => (
           <div
             key={m.key}
             className={[

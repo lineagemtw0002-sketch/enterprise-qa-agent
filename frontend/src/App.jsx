@@ -16,7 +16,7 @@ import AdminPanel from './components/admin/AdminPanel.jsx'
 import OperationsDashboard from './components/admin/OperationsDashboard.jsx'
 import WorkflowPanel from './components/workflow/WorkflowPanel.jsx'
 import WorkflowStatusPill from './components/workflow/WorkflowStatusPill.jsx'
-import OpsPlaceholder from './components/ops/OpsPlaceholder.jsx'
+import OpsConsole from './components/ops/OpsConsole.jsx'
 import UploadToKbModal from './components/kb/UploadToKbModal.jsx'
 import './App.css'
 
@@ -915,7 +915,7 @@ export default function App() {
         />
       )}
 
-      {view === 'ops' && <OpsPlaceholder />}
+      {view === 'ops' && <OpsConsole />}
 
       {view === 'chat' && (
       <>
