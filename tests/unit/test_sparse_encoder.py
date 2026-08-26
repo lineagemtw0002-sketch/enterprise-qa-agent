@@ -21,7 +21,10 @@ from src.core.types import Chunk
 def test_constructor_default():
     """Test default constructor."""
     encoder = SparseEncoder()
-    assert encoder.min_term_length == 2
+    # 2026-08-26：默认值从 2 改成 1。旧值把中文单字整个丢出索引，而查询侧
+    # 保留单字 —— 见 tests/unit/test_tokenizer_alignment.py 与
+    # src/core/tokenization.py 的模块 docstring。
+    assert encoder.min_term_length == 1
     assert encoder.lowercase is True
 
 
@@ -190,8 +193,11 @@ def test_tokenize_handles_numbers():
     """Test that numbers are tokenized.
 
     See test_tokenize_handles_hyphens_and_underscores: 'gpt-4' splits into
-    'gpt' and '4' via jieba, and the standalone '4' then gets dropped by the
-    min_term_length=2 filter (a single digit isn't a useful BM25 term).
+    'gpt' and '4' via jieba.
+
+    2026-08-26：'4' 现在**会**进索引（min_term_length 默认 1）。单字符数字
+    在中文语境里是有用的检索词（"提前3天"），旧的 min_term_length=2 把它们
+    连同中文单字一起丢了，而查询侧一直保留着 —— 那正是这次修的缺陷。
     """
     encoder = SparseEncoder()
     chunks = [
@@ -355,8 +361,14 @@ def test_get_corpus_stats_calculates_average_doc_length():
     encoded = encoder.encode(chunks)
     stats = encoder.get_corpus_stats(encoded)
     
-    # First doc: 1 term ("short"), Second doc: 4 terms ("this", "is", "longer", "document" - "a" filtered), avg = 2.5
-    assert stats["avg_doc_length"] == 2.5
+    # First doc: 1 term ("short"), Second doc: 5 terms
+    # ("this", "is", "a", "longer", "document"), avg = 3.0
+    #
+    # 2026-08-26：以前 "a" 会被 min_term_length=2 滤掉，avg 是 2.5。现在单字
+    # 词条一律入索引 —— 索引侧**刻意不过滤停用词**（"a" 是查询侧停用词，
+    # 永远不会被查到，留在索引里只影响 doc_length）。为什么不在索引侧过滤，
+    # 见 src/core/tokenization.py::index_tokens 的 docstring。
+    assert stats["avg_doc_length"] == 3.0
 
 
 def test_get_corpus_stats_handles_empty_list():

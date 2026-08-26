@@ -106,13 +106,43 @@ def pick_verify_queries(bm25_dir: Path, collection: str) -> List[List[str]]:
 
     高频词的 postings 最长、最能暴露差异；只用低频词是自欺 —— 它们可能只有
     一两条 postings，随便怎么实现都对得上。
+
+    ⚠️ **但"最高频"不等于"生产查得到"，这里必须先滤一道**（2026-08-26）。
+
+    分词器对齐（`src.core.tokenization`）之后索引开始收录中文单字，于是这个
+    函数挑出来的最热词变成了 `的` / `是` / `在` —— 而生产的查询侧
+    (`QueryProcessor`) 把它们当停用词全部丢掉，**这三个词永远不会出现在
+    真实查询里**。拿它们比对，比的是一条不存在的链路。
+
+    更要命的是它们正好踩在两个引擎的一处**真实分歧**上，会把比对结果直接
+    打成 0%：`BM25Indexer._calculate_idf` 用经典式 `log((N-df+.5)/(df+.5))`，
+    df 超过 N/2 就**变负**（mmarco 实测 `的` df=584/604 → idf=-3.35，
+    top-5 分数全是负的，等于"越不含这个词排越前"）；而 Lucene 的 BM25 用的是
+    `log(1 + (N-df+.5)/(df+.5))`，恒非负。两边对超高频词的排序方向**相反**。
+
+    这个分歧是真的，但它落在生产打不到的区间里。所以做法是：
+    **比对查询只从"生产侧可能真的查出来的词"里挑**（滤掉停用词与负 IDF 词），
+    同时把分歧本身写在这里，而不是把比对阈值调松了事 —— 后者会把这条
+    分歧一起藏掉。
     """
     p = bm25_dir / collection / f"{collection}_bm25.json"
     if not p.exists():
         return []
     idx = json.load(open(p, encoding="utf-8"))["index"]
+
+    from src.core.query_engine.query_processor import DEFAULT_STOPWORDS
+
+    def _queryable(term: str, entry: Dict[str, Any]) -> bool:
+        if term in DEFAULT_STOPWORDS or term.lower() in DEFAULT_STOPWORDS:
+            return False
+        # idf < 0 的词条两个引擎排序方向相反，见上面 docstring
+        return entry.get("idf", 0.0) > 0
+
+    candidates = {t: e for t, e in idx.items() if _queryable(t, e)}
+    if not candidates:
+        return []
     hot = [
-        t for t, _ in sorted(idx.items(), key=lambda kv: -len(kv[1]["postings"]))
+        t for t, _ in sorted(candidates.items(), key=lambda kv: -len(kv[1]["postings"]))
     ][: _VERIFY_QUERIES * _VERIFY_TERMS]
     return [
         hot[i : i + _VERIFY_TERMS]
@@ -243,7 +273,18 @@ def migrate_one(
             res["status"] = "ok" if overlap >= _MIN_OVERLAP else "LOW-OVERLAP"
         else:
             res["status"] = "ok-unverified"
-            res["reason"] = "该库无 BM25 索引，无法比对"
+            # 两种情况都会走到这里，报告里不要混为一谈：
+            #   ① 该库压根没建 BM25 索引（`__summary` 层就是这样，它是纯向量层）
+            #   ② 建了，但**挑不出可比对的词条** —— 见 pick_verify_queries：
+            #      停用词和负 IDF 词被排除掉了。小语料里所有文档雷同时
+            #      （df == num_docs）全部词条都是负 IDF，会整库剩不下东西。
+            bm25_json = bm25_dir / collection / f"{collection}_bm25.json"
+            res["reason"] = (
+                "该库有 BM25 索引，但挑不出可比对词条（全是停用词/负 IDF），"
+                "**这不等于通过**"
+                if bm25_json.exists()
+                else "该库无 BM25 索引，无法比对"
+            )
     except Exception as exc:  # noqa: BLE001
         res["status"] = "failed"
         res["reason"] = f"{type(exc).__name__}: {exc}"

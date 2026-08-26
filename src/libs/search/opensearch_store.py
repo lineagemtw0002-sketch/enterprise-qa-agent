@@ -74,9 +74,9 @@ _CONV_PREFIX = "conv_"
 
 _DEFAULT_URL = "http://localhost:9200"
 
-# 分词器实例复用：jieba 首次加载词典要几百毫秒，不该每次查询都付。
-# ⚠️ 索引侧与查询侧是**两个不同的分词器**，见 tokenize_for_query 的说明。
-_INDEX_TOKENIZER: Any = None
+# `QueryProcessor` 实例复用：jieba 首次加载词典要几百毫秒，不该每次查询都付。
+# ⚠️ 索引侧与查询侧走**不同的函数**（契约是"索引侧 ⊇ 查询侧"，见
+# `src.core.tokenization`），但两侧的分词实现只有那一个模块一处。
 _QUERY_TOKENIZER: Any = None
 
 
@@ -98,39 +98,27 @@ def chunk_doc_id(source_path: str, chunk_index: int) -> str:
 
 
 def tokenize_for_index(text: str) -> List[str]:
-    """**索引侧**分词 —— 复用 `SparseEncoder` 的 jieba 实现。
+    """**索引侧**分词 —— 转发给 `src.core.tokenization.index_tokens`。
 
-    不要在这里另写一份：迁移的判据是"检索结果与现状一致"，而现状的索引
-    就是 `SparseEncoder._tokenize` 建的。换个分词器会让比对失去意义。
+    不要在这里另写一份：写进 `content` 字段的词条必须与 BM25 侧建索引用的
+    完全相同，否则同一个查询在两个后端会得到不同结果，而灰度期正是靠
+    "两个后端结果重叠率"做判据的。
     """
-    from src.ingestion.embedding.sparse_encoder import SparseEncoder
+    from src.core.tokenization import index_tokens
 
-    global _INDEX_TOKENIZER
-    if _INDEX_TOKENIZER is None:
-        _INDEX_TOKENIZER = SparseEncoder()
-    return _INDEX_TOKENIZER._tokenize(text)
+    return index_tokens(text)
 
 
 def tokenize_for_query(text: str) -> List[str]:
-    """**查询侧**分词 —— 复用 `QueryProcessor`。
+    """**查询侧**分词 —— 复用 `QueryProcessor`（它比纯分词多了停用词与去重）。
 
-    ⚠️ **索引侧和查询侧用的是两个不同的东西，而且产出确实不一致。**
-    这是现有系统的既有状态，不是本次引入的。对同一批 22 条真实 chunk 实测：
+    索引侧与查询侧不是同一个函数，但这是**设计**而不是缺陷：契约是
+    "索引侧词条 ⊇ 查询侧词条"，不是两边输出相同。完整理由见
+    `src.core.tokenization` 的模块 docstring。
 
-        两侧都产出      132 词 (69%)
-        只有索引侧       41 词 (21%)   hr / it / 主管 / 丢失 / 为期 …
-        只有查询侧       29 词 (15%)   3 / 5 / b / 不 / 为 / 假 …
-
-    根因是两者定位不同：`SparseEncoder` 是分词器（过滤单字），
-    `QueryProcessor` 是关键词抽取器（保留单字、丢弃部分实词）。
-    而 `sparse_encoder.py::_tokenize` 的注释声称"必须与查询侧一致"——
-    **那个声称与实现不符**，属注释里的未证实断言（`CLAUDE.md` §7.2）。
-
-    **本次刻意不修。** 迁移要回答的是"换存储引擎会不会出问题"，
-    修分词一致性会同时改变检索结果，两个变量一起动就无法归因。
-    这里如实复刻现状：索引走 SparseEncoder，查询走 QueryProcessor，
-    连同这个缺陷一起搬过去，切读时的比对才有意义。
-    修它是独立课题，判据应该是黄金测试集通过率。
+    ⚠️ 返回值保留原始大小写；真正拼进查询串之前由 `_as_query_text` 统一
+    过 `match_terms()`。**别在这里提前小写化** —— `ProcessedQuery.keywords`
+    还要进 trace 和前端展示。
     """
     from src.core.query_engine.query_processor import QueryProcessor
 
@@ -149,7 +137,24 @@ def _term_clause(field: str, value: Any) -> Dict[str, Any]:
 
 
 def _as_query_text(query: str, tokens: Optional[Sequence[str]]) -> str:
-    return " ".join(tokens if tokens is not None else tokenize_for_query(query))
+    """把词条拼成送进 `match` 的查询串。
+
+    ⚠️ **`match_terms()` 这一步不能省。** `content` 字段用的是 `whitespace`
+    分析器，它只按空白切分，**不做小写化**；而索引侧写入的是已经小写化的
+    词条。少了这一步，查询 `HR` / `iTunes` / `B` 在 OpenSearch 上永远匹配不到
+    索引里的 `hr` / `itunes` / `b` —— 而同样的查询在 BM25 后端是能命中的
+    （`BM25Indexer.query` 自己 `lower()` 了）。
+    也就是说这个缺陷只在 OpenSearch 后端出现，灰度切读时才会显形，
+    单元测试和"跑起来没报错"都抓不到（2026-08-26 修）。
+
+    调用方传进来的 `tokens` 也要过这一层：`opensearch_retrievers` 传的是
+    `QueryProcessor` 的 keywords，**是保留原始大小写的**。
+    """
+    from src.core.tokenization import match_terms
+
+    return " ".join(
+        match_terms(tokens if tokens is not None else tokenize_for_query(query))
+    )
 
 
 def build_chunk_doc(
@@ -167,7 +172,7 @@ def build_chunk_doc(
 ) -> Dict[str, Any]:
     """把一个 chunk 组装成 OpenSearch 文档。
 
-    `tokens` 必须来自 `tokenize_for_index()`（即 `SparseEncoder._tokenize`）—— **不要在这里自己分词**，
+    `tokens` 必须来自 `tokenize_for_index()`（即 `src.core.tokenization.index_tokens`）—— **不要在这里自己分词**，
     与摄入侧用不同的分词器会让 BM25 匹配不上，而且这种错误在小语料上测不出来。
     """
     doc: Dict[str, Any] = {
@@ -197,15 +202,16 @@ def _mapping(dense_dims: Optional[int]) -> Dict[str, Any]:
         # 不用 OpenSearch 内置分析器是刻意的。实测同一句话三种切法：
         #   standard（默认）    年 假 可 以 顺 延 到 次 年 三 月   ← 逐字切
         #   cjk（内置）         年假 假可 可以 以顺 顺延 …          ← 二元组
-        #   项目 SparseEncoder  年 假 顺延到 次年 三月              ← jieba 真分词
+        #   项目 index_tokens   年 假 可以 顺延 延到 顺延到 次年 三月 ← jieba 搜索模式
         # 默认分析器会让「关键词4」匹配上「关键词0」（共享 关/键/词）。
         #
-        # 更重要的是**隔离变量**：这次迁移要回答"换存储引擎会不会出问题"，
-        # 不是"换分词器好不好"。tokenization 保持完全不变，任何检索质量变化
-        # 都能归因到存储层。analysis-ik 作为迁移后的独立课题，判据是黄金测试集。
+        # 迁移期 tokenization 刻意保持不变（隔离变量：任何检索质量变化都能
+        # 归因到存储层）。2026-08-26 迁移验完之后单独动了一次分词，
+        # 判据是 mmarco 100 条人工标注的 recall@k + 端到端黄金测试集，
+        # 见 `src.core.tokenization`。analysis-ik 仍是未做的独立课题。
         #
         # 这意味着写入方必须先分词（见 `build_chunk_doc`），且
-        # `SparseEncoder._tokenize` / `QueryProcessor` 都不能删。
+        # `src.core.tokenization` 的 index_tokens / query_tokens 都不能删。
         "content": {"type": "text", "analyzer": "whitespace"},
         # 原文只存不索引 —— 检索走 content，展示走这里。
         "content_raw": {"type": "text", "index": False},
@@ -414,8 +420,10 @@ class OpenSearchStore:
 
         ⚠️ `content` 用的是 `whitespace` 分析器，所以**查询串必须先用同一个
         jieba 分词器切好**，否则整句会被当成一个 token，什么都匹配不上。
-        生产调用方应传 `query_tokens`（来自 `QueryProcessor`）；
-        不传时这里兜底调 `SparseEncoder._tokenize`，行为一致但多一次分词。
+        生产调用方应传 `query_tokens`（来自 `QueryProcessor`，**保留原始大小写**）；
+        不传时这里兜底自己调 `tokenize_for_query()`。两条路径最后都会过
+        `_as_query_text` 的 `match_terms()` 做匹配层小写化 —— 那一步不能省，
+        `whitespace` 分析器不做小写化。
         """
         index = kb_index_name(collection)
         if not self._client.indices.exists(index=index):

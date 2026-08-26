@@ -94,11 +94,9 @@ class TestStaleChunksDisappear:
         store.index_chunks(index, [_chunk(src, 0, "年假可以顺延到次年六月")], refresh=True)
 
         assert store.count(index) == 1, "旧版本没被覆盖，库里现在有两版"
-        # ⚠️ 查询词要选**两侧分词器产出一致**的。索引侧切出 `顺延到`、
-        # 查询 "顺延" 切出 `顺延`，whitespace 分析器下二者不等 —— 匹配不上。
-        # 这不是本模块的 bug，是现有 SparseEncoder / QueryProcessor 分词不一致
-        # 的直接后果（见 tokenize_for_query 的说明），现有 BM25 同样中招，
-        # 只是从来没人测过。本次刻意不修，如实复刻。
+        # 这里用 "次年" 而不是 "顺延"：本条要测的是**覆盖写**，不是分词。
+        # 分词那条契约由 TestIndexTokensCoverQueryTokens 单独守着，
+        # 混在一起的话这条失败时分不清是哪个原因。
         hits = store.search_kb(name, "次年")
         assert len(hits) == 1
         assert "六月" in hits[0]["content"]
@@ -276,58 +274,61 @@ class TestFailureIsLoud:
             )
 
 
-# ───────────────── 分词一致性：如实记录现状，不是修复 ─────────────────
+# ───────────────── 分词一致性：索引侧必须是查询侧的超集 ─────────────────
 
 
-class TestTokenizerMismatchIsFaithfullyReproduced:
-    """⚠️ **这组断言的是"现状是坏的"，不是"我们修好了"。**
+class TestIndexTokensCoverQueryTokens:
+    """2026-08-26：这里原来是 `TestTokenizerMismatchIsFaithfullyReproduced`，
+    **断言的是"两侧分词不一致"这个坏现状**（迁移期刻意不修，为了隔离变量）。
+    分词已修，按那组测试自己 docstring 的约定**整组删除**，换成正向断言。
 
-    索引侧（`SparseEncoder`，分词器）与查询侧（`QueryProcessor`，关键词抽取器）
-    产出不一致，是现有系统的既有状态。对同一批 22 条真实 chunk 实测：
-    两侧都产出 132 词（69%）、只有索引侧 41 词（21%）、只有查询侧 29 词（15%）。
-
-    而 `sparse_encoder.py::_tokenize` 的注释声称"必须与查询侧一致" ——
-    **那个声称与实现不符**，属注释里的未证实断言（`CLAUDE.md` §7.2 明令
-    这类断言要么验证要么标为假设）。
-
-    本次迁移**刻意不修**：修分词会同时改变检索结果，与"换存储引擎"两个变量
-    一起动就无法归因。这里如实复刻，切读时的新旧比对才有意义。
-
-    **修好之后这组测试会变红，那正是提醒删掉它的信号** ——
-    不要在修分词之前把它改绿。
+    现在守的契约是 `src.core.tokenization` 里的那条：
+    索引侧词条 ⊇ 查询侧词条。这一组从 OpenSearch 端到端地验它 ——
+    单测只能验两个函数的输出关系，验不了 `whitespace` 分析器有没有把
+    大小写这一步吃掉。
     """
 
-    def test_index_and_query_tokenizers_currently_disagree(self):
-        from src.libs.search.opensearch_store import (
-            tokenize_for_index,
-            tokenize_for_query,
-        )
+    def test_shortened_form_retrieves_longer_compound(self, store, kb):
+        """索引里是 `顺延到`，用户搜 `顺延` —— 修复前搜不到。
 
-        text = "年假可以顺延到次年三月"
-        idx = set(tokenize_for_index(text))
-        qry = set(tokenize_for_query(text))
-
-        assert idx != qry, (
-            "两侧分词已经一致了 —— 说明分词问题被修好了。"
-            "这是好事，但请连同这整组测试一起删掉，别改绿它。"
-        )
-        assert qry - idx, "查询侧独有的词（单字/数字）消失了"
-        assert idx - qry, "索引侧独有的词消失了"
-
-    def test_mismatched_term_cannot_be_retrieved(self, store, kb):
-        """具体后果：索引里是 `顺延到`，用户搜 `顺延` 搜不到。
-
-        现有 BM25 有完全相同的问题（词条级精确匹配），只是从来没被测过。
+        注意这条**不是**"两侧配置不一致"造成的：两侧都用 jieba 精确模式也
+        照样中招（同一串字在不同上下文粒度不同）。修法是索引侧改用搜索
+        引擎模式产出子词。
         """
         name, index = kb
         store.index_chunks(
             index, [_chunk("/docs/x.pdf", 0, "年假可以顺延到次年三月")], refresh=True
         )
 
-        assert store.search_kb(name, "顺延") == [], (
-            "如果这条通过了，说明分词已对齐 —— 请同上，删掉这组测试"
+        assert store.search_kb(name, "顺延"), "索引侧没产出子词 `顺延`，精确匹配落空"
+        assert store.search_kb(name, "次年"), "两侧一致的词本来就该能检索到"
+
+    def test_single_char_query_terms_are_retrievable(self, store, kb):
+        """jieba 词典里没有「年假」，查询被切成 `年`/`假` 两个单字。
+
+        旧 `min_term_length=2` 把文档侧的这两个单字丢了 —— 于是**一个专门讲
+        年假的库，搜「年假」在稀疏侧零命中**。
+        """
+        name, index = kb
+        store.index_chunks(
+            index, [_chunk("/docs/x.pdf", 0, "年假可以顺延到次年三月")], refresh=True
         )
-        assert store.search_kb(name, "次年"), "两侧一致的词应该能检索到"
+
+        assert store.search_kb(name, "年假"), "单字词条没进索引，「年假」查不到"
+
+    def test_uppercase_query_matches_lowercased_index(self, store, kb):
+        """`whitespace` 分析器**不做小写化**，而索引侧写入的是小写词条。
+
+        这条缺陷只在 OpenSearch 后端存在（`BM25Indexer.query` 自己 lower 了），
+        所以只能在这里测。修复前 `HR` 匹配不上索引里的 `hr`。
+        """
+        name, index = kb
+        store.index_chunks(
+            index, [_chunk("/docs/x.pdf", 0, "HR主管负责审批 iTunes 报销")], refresh=True
+        )
+
+        assert store.search_kb(name, "HR"), "大写查询词没归一化，匹配不上索引里的 hr"
+        assert store.search_kb(name, "iTunes"), "混合大小写同理"
 
 
 # ───────────── 摄入侧影子写：dense 向量 + conv_ 路由 ─────────────
