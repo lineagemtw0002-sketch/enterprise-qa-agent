@@ -1736,6 +1736,25 @@ def create_app() -> FastAPI:
         connectors = await ops_store.list_connectors_for_org(org.org_id)
         return [_ops_connector_response(c) for c in connectors]
 
+    @app.delete("/api/v1/admin/ops/connectors/{connection_id}")
+    async def admin_delete_ops_connector(
+        connection_id: str,
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> dict:
+        """硬删除，级联清掉这个连接器下的权限授权/令牌/修复动作/白名单/分析
+        摘要——原来没有这个端点，登记了就撤不掉（刘德华摸底"授权管理"时
+        为了清理自己建的联调用连接器发现的真实缺口）。跟 `admin_delete_
+        collection` 同一个信任模型：管理员的显式硬删除，不检查在飞状态，
+        见 `ops_store.delete_connector` 的类内说明。"""
+        org = await _require_aiops_enabled_org(current_user)
+        await _get_owned_connector(org.org_id, connection_id)
+        await ops_store.delete_connector(connection_id)
+        await _audit_log(
+            current_user.user_id, "delete_ops_connector", "ops_connector", connection_id,
+            {"org_id": org.org_id},
+        )
+        return {"success": True}
+
     @app.post(
         "/api/v1/admin/ops/connectors/{connection_id}/register-token",
         response_model=OpsConnectorRegisterTokenResponse,

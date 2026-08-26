@@ -443,6 +443,50 @@ class OpsStore:
             result[row["id"]] = is_heartbeat_fresh(row["last_heartbeat_at"])
         return result
 
+    async def delete_connector(self, connection_id: str) -> bool:
+        """硬删除，级联清掉全部挂在这个连接器下的数据。原来这个方法不存在
+        ——刘德华摸底"授权管理"时想清理自己建的联调用连接器才发现登记了就
+        撤不掉，只能直接动数据库。返回 `False` 表示连接器本来就不存在
+        （调用方决定是否要转成 404，跟 `_get_owned_connector` 的既有约定
+        一致，这里不重复判断归属）。
+
+        ⚠️ **不检查在飞状态就删**——跟 `admin_delete_collection` 硬删知识库
+        是同一个信任模型：这是管理员的显式操作，不是自动清理，管理员要为
+        "删掉一个还有未执行修复动作的连接器"这个后果负责，不由代码替他
+        拦下来。真要加"有 pending/approved 动作时拒绝删除"这层防护，是
+        一个独立的产品决策（要不要允许强制删除、要不要级联标记那些动作
+        为某种"连接器已删除"的终态），本次没有擅自拍板。"""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                # 子表没有 ON DELETE CASCADE（外键默认 RESTRICT），必须先删
+                # 子表再删父表——顺序反了会撞上 ForeignKeyViolationError
+                # （这里不是猜的，`scripts/verify_aiops_endpoints.py` 早前
+                # 清理测试数据时真实撞过一次同样的错误，见该脚本 `_cleanup`
+                # 里的注释）。
+                await conn.execute(
+                    "DELETE FROM role_ops_systems WHERE connection_id = $1", connection_id,
+                )
+                await conn.execute(
+                    "DELETE FROM ops_connector_register_tokens WHERE connection_id = $1", connection_id,
+                )
+                await conn.execute(
+                    "DELETE FROM ops_connector_refresh_tokens WHERE connection_id = $1", connection_id,
+                )
+                await conn.execute(
+                    "DELETE FROM remediation_actions WHERE connection_id = $1", connection_id,
+                )
+                await conn.execute(
+                    "DELETE FROM ops_remediation_scopes WHERE connection_id = $1", connection_id,
+                )
+                await conn.execute(
+                    "DELETE FROM ops_analysis_summaries WHERE connection_id = $1", connection_id,
+                )
+                result = await conn.execute(
+                    "DELETE FROM ops_system_connections WHERE id = $1", connection_id,
+                )
+        return result != "DELETE 0"
+
     # ------------------------------------------------------------------
     # 连接器会话令牌（§10.1：register_token 一次性握手 + refresh_token 轮换）
     # 判定逻辑在 src/ops/connector_session.py（纯函数），这里只管落库/取数。

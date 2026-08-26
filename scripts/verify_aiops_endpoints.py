@@ -502,6 +502,32 @@ async def main() -> None:
         print("17) cross-org access:", resp.status_code)
         assert resp.status_code == 404
 
+        # 17b) DELETE 端点——原来不存在，"登记了就撤不掉"，用一个独立的
+        # 一次性连接器测，不动主 connection_id（下面步骤还要用它）。
+        resp = await client.post(
+            "/api/v1/admin/ops/connectors", headers=headers,
+            json={"name": "delete-endpoint-test", "system_type": "prometheus"},
+        )
+        assert resp.status_code == 200
+        throwaway_conn_id = resp.json()["connection_id"]
+
+        resp = await client.delete(
+            f"/api/v1/admin/ops/connectors/{throwaway_conn_id}", headers=other_headers,
+        )
+        print("17c) cross-org delete rejected:", resp.status_code)
+        assert resp.status_code == 404
+
+        resp = await client.delete(
+            f"/api/v1/admin/ops/connectors/{throwaway_conn_id}", headers=headers,
+        )
+        print("17d) delete connector:", resp.status_code)
+        assert resp.status_code == 200
+
+        resp = await client.get("/api/v1/admin/ops/connectors", headers=headers)
+        assert all(c["connection_id"] != throwaway_conn_id for c in resp.json()), (
+            "删除之后不该再出现在列表里"
+        )
+
         # 18) 生成 register_token
         resp = await client.post(
             f"/api/v1/admin/ops/connectors/{connection_id}/register-token", headers=headers,

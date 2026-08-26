@@ -1287,8 +1287,33 @@ flowchart TB
   `TestGetOpsPermissionSummary`（3 条，含上面那条判别式）+
   `scripts/verify_aiops_endpoints.py` 新增 2 项（授权前 `/auth/me` 两个
   字段为 False，授权后为 True），全量复跑 14+33 项、`tests/unit` 2346 通过。
-  前端接这两个字段做门禁（`isAdmin || ops_can_view`）由刘德华跟进，
-  同时在做"授权管理"界面（PUT/DELETE 那两个端点目前只能直接调 API）。
+
+  **前端两项后续都已由刘德华完成并合并**：导航门禁接上
+  `isAdmin || ops_can_view`；新增"授权管理"分段（选连接器 → 列本企业自建
+  角色 → 勾 can_view/can_approve → 存/撤销，勾 approve 时前端自动带上 view
+  并置灰——后端本来就会拉齐，但放任界面显示"两个都没勾却存出两个都勾"会
+  被当成 bug）；顺带更正了审批队列上一句已经过期的文案（"任何管理员都能
+  审批"在细粒度权限落地后不再成立）。真机验证过完整往返。
+
+  ⚠️ **顺带发现并补上一个真实缺口：连接器登记了就撤不掉**——刘德华摸底
+  "授权管理"时为了清理自己建的联调用连接器才发现 `ops_store.py` 从来没有
+  `delete_connector` 方法，也没有对应端点。已补：`DELETE /api/v1/admin/
+  ops/connectors/{connection_id}`（org_admin 专属），级联清掉 6 张挂在
+  这个连接器下的子表（`role_ops_systems`/两张令牌表/`remediation_actions`/
+  `ops_remediation_scopes`/`ops_analysis_summaries`）。跟 `admin_delete_
+  collection` 同一个信任模型——管理员的显式硬删除，不检查在飞状态，
+  真要加"有 pending/approved 动作时拒绝删除"这层防护是独立的产品决策，
+  本次没有擅自拍板。
+  ⚠️ **删除顺序是判别力核心，不是随便写的**：子表没有 `ON DELETE CASCADE`
+  （外键默认 RESTRICT），必须先删子表再删父表——这不是猜的，
+  `scripts/verify_aiops_endpoints.py` 早前清理测试数据时真实撞过
+  `ForeignKeyViolationError`。回归：`tests/integration/
+  test_ops_store_delete_connector.py`（2 条，每张子表删除前先插一行、
+  删除后逐张确认真的清空，不是只测"删除不报错"）+
+  `scripts/verify_aiops_endpoints.py` 新增 3 项（跨企业删除 404、正常删除
+  200、删除后不再出现在列表里）。**用这个新端点顺手清理了刘德华留在共用
+  开发库里的那个联调用连接器**（`opsconn_7ac8e3646167`），一次操作同时是
+  真实的手工验证。
 
 - ✅ **2026-08-26　P1-14 扩展审计：逐个核对全部管理端点，修复 2 处同类问题**
   `/admin/users` 本身的 N+1 早前已修（同一条 P1-14），但 CLAUDE.md 一直如实
