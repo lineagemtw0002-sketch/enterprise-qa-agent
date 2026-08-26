@@ -107,9 +107,15 @@ class OrgStore:
 
     @staticmethod
     def _row_to_org(row: asyncpg.Record) -> Organization:
-        # 库里多数查询只 SELECT 前四列（含 `get_orgs_for_users_batch` 那条
-        # JOIN），而 asyncpg 的 Record 对缺失 key 抛 KeyError 不返回 None，
-        # 所以这里按 key 是否存在取值。
+        # asyncpg 的 Record 对缺失 key 抛 KeyError 不返回 None，所以按 key
+        # 是否存在取值。
+        #
+        # ⚠️ **这个兜底会把"忘了改 SELECT"变成静默降级，加字段时务必连同
+        # 本文件所有 SELECT 一起改。** 2026-08-26 加 seat_limit 时就踩了：
+        # `get_seat_limit()` 读得对，但 `get_organization()` 的 SELECT 没带这一列，
+        # 于是 `org.seat_limit` 恒为 None ——**"有上限"被读成"不限"，
+        # 席位校验形同虚设，而且不报任何错**。单测和"app 能不能构造起来"
+        # 都抓不到它，是 `scripts/verify_account_lifecycle.py` 连真库才发现的。
         return Organization(
             org_id=row["id"],
             name=row["name"],
@@ -150,7 +156,7 @@ class OrgStore:
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT id, name, is_platform, created_at FROM organizations ORDER BY created_at ASC"
+                "SELECT id, name, is_platform, created_at, seat_limit FROM organizations ORDER BY created_at ASC"
             )
         return [self._row_to_org(r) for r in rows]
 
@@ -158,7 +164,7 @@ class OrgStore:
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT id, name, is_platform, created_at FROM organizations WHERE id = $1", org_id,
+                "SELECT id, name, is_platform, created_at, seat_limit FROM organizations WHERE id = $1", org_id,
             )
         return self._row_to_org(row) if row else None
 
@@ -178,7 +184,7 @@ class OrgStore:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT o.id, o.name, o.is_platform, o.created_at
+                SELECT o.id, o.name, o.is_platform, o.created_at, o.seat_limit
                 FROM users u JOIN organizations o ON o.id = u.org_id
                 WHERE u.id = $1
                 """,
@@ -198,7 +204,7 @@ class OrgStore:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT u.id AS user_id, o.id, o.name, o.is_platform, o.created_at
+                SELECT u.id AS user_id, o.id, o.name, o.is_platform, o.created_at, o.seat_limit
                 FROM users u JOIN organizations o ON o.id = u.org_id
                 WHERE u.id = ANY($1::text[])
                 """,

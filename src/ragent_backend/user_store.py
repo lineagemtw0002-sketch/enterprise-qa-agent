@@ -215,6 +215,22 @@ class UserStore:
             )
         return self._row_to_user(row) if row else None
 
+    async def get_user_by_username(self, username: str) -> Optional[User]:
+        """按用户名取用户。批量导入的更新路径要用它把 username 换成 user_id。
+
+        跟 `authenticate` 分开：那个要拿密码哈希做校验，这个只读身份，
+        不该把 password_hash 拉出来。
+        """
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT id, username, allowed_collections, role, created_at,
+                          disabled_at, activated_at
+                   FROM users WHERE username = $1""",
+                username,
+            )
+        return self._row_to_user(row) if row else None
+
     async def list_users(self) -> List[User]:
         """管理后台用：列出所有用户（不含密码哈希）。"""
         pool = await self._get_pool()

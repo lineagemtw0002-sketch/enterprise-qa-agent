@@ -62,7 +62,11 @@ from src.ragent_backend.schemas import (
     WorkflowInstanceResponse, WorkflowActionRequest, WorkflowReturnRequest, WorkflowRejectRequest,
     NotificationResponse,
     AdminKbChunkPreview,
+    AdminCreatedUserCredential, SetSeatLimitRequest, SetUserDisabledRequest,
+    ActivateAccountRequest, BulkImportRowResult, BulkImportResponse,
 )
+from src.ragent_backend import account_import as _acct_import
+from src.ragent_backend import activation as _activation
 from src.ragent_backend.store import build_archive_store, ConversationArchiveStore
 from src.ragent_backend.workflow import RAGWorkflow
 from src.ragent_backend.ltm_store import LTMStore
@@ -713,6 +717,70 @@ def create_app() -> FastAPI:
 
     # ==================== 鉴权 API ====================
 
+    @app.post("/api/v1/activate")
+    async def activate_account(request: ActivateAccountRequest) -> dict:
+        """凭一次性激活码设置初始密码。**全系统唯一不带鉴权的写端点。**
+
+        设计 `docs/account_lifecycle_design.md` §4.1b、风险 R-4。
+        用户已定不做邮件短信（O-1），所以凭证分发是人工的；既然如此就让被分发
+        的东西尽可能不值钱——码是 7 天一次性的，而任何形式的"初始密码"都长期有效。
+
+        ## 四条防护，这里落地了三条
+
+        1. **只存哈希** —— 库里是 SHA-256，`activation.hash_activation_code`。
+        2. **≥128 bit 熵** —— `secrets.token_urlsafe(16)`，有测试钉住熵值本身
+           （它是"用 SHA-256 而不是 bcrypt"这个选择成立的前提）。
+        3. **恒定时间比较 + 失败原因不可区分** —— 见下面的注释。
+        4. **限流** —— ⚠️ **没做。** 全仓没有任何限流基础设施可复用，
+           要么引入（如 slowapi）要么手写，属独立一项工作。
+           **在补上之前，这个端点可以被无限次尝试。** 128 bit 的码扛得住爆破，
+           但扛不住有人拿它当免费的 CPU 消耗入口。已在设计 §9 记为未覆盖。
+
+        ## 为什么失败一律同一句话
+
+        它无鉴权，任何人都能调。如果"用户不存在"和"码不对"返回不同的错误，
+        攻击者随便试一个 username，就能从差异里反推出这家企业的员工花名册。
+        `ActivationCheck.public_detail` 把四种失败塌缩成同一句，
+        内部原因只进审计日志。
+        """
+        state = await user_store.get_activation_state(request.username)
+        check = _activation.check_activation(
+            submitted_code=request.activation_code,
+            stored_hash=(state or {}).get("activation_code_hash"),
+            expires_at=(state or {}).get("activation_expires_at"),
+            activated_at=(state or {}).get("activated_at"),
+            now=time.time(),
+            user_exists=state is not None,
+        )
+
+        # 被停用的账号即使手里有有效的码也不能激活——否则"停用"就能被一张
+        # 旧的激活码清单绕过。这一条走跟其他失败完全相同的对外文案。
+        if check.ok and state and state.get("disabled_at") is not None:
+            check = _activation.ActivationCheck(
+                False, _activation.ActivationFailure.NO_SUCH_USER
+            )
+
+        if not check.ok:
+            # ⚠️ **审计日志里记内部原因，但绝不记提交上来的码。**
+            # 那串东西要么是有效凭证（记下来等于明文存凭证），要么是攻击载荷。
+            await _audit_log(
+                None, "activate_account_failed", "user", None,
+                {"username": request.username,
+                 "reason": check.failure.value if check.failure else "unknown"},
+                success=False,
+            )
+            raise HTTPException(status_code=400, detail=check.public_detail)
+
+        # 单次使用的最后一道闸在 SQL 里（`WHERE activated_at IS NULL`），
+        # 不是靠上面那次读——两个请求拿同一个码同时打进来，只有一条改得到行。
+        # 上面的检查是为了给出正确的错误信息，不是并发正确性的依据。
+        if not await user_store.complete_activation(state["id"], request.new_password):
+            raise HTTPException(status_code=400, detail=_activation.PUBLIC_FAILURE_DETAIL)
+
+        await _audit_log(state["id"], "activate_account", "user", state["id"],
+                         {"username": request.username})
+        return {"success": True}
+
     @app.post("/api/v1/auth/login", response_model=LoginResponse)
     async def login(request: LoginRequest) -> LoginResponse:
         user = await user_store.authenticate(request.username, request.password)
@@ -899,6 +967,219 @@ def create_app() -> FastAPI:
             for u in users
         ]
 
+    async def _enforce_seat_capacity(org_id: str, delta: int) -> None:
+        """席位校验的**唯一**入口。三个调用点共用：建号、批量导入、重新启用。
+
+        判定本身在 `account_import.check_seat_capacity`（纯函数、有单测），
+        这里只负责取数和翻译成 HTTP —— 跟 `activation` 那边同样的分工。
+
+        403 而不是 400：这不是请求写错了，是超出了这家企业的合同额度。
+        """
+        check = _acct_import.check_seat_capacity(
+            seats_used=await user_store.count_active_users(org_id),
+            seat_limit=await org_store.get_seat_limit(org_id),
+            delta=delta,
+        )
+        if not check.ok:
+            raise HTTPException(status_code=403, detail=check.detail)
+
+    async def _import_context(actor: AuthenticatedUser, org_id: str, usernames: list) -> "_acct_import.ImportContext":
+        """把批量导入要的库内事实一次性查好。
+
+        ⚠️ **`assignable_roles` 必须先按企业过滤再传进去。** 跨企业角色校验在
+        纯函数层退化成一次字典查找，"别家企业的角色"能不能被分配，
+        完全取决于这里放没放进去。这是 `_validate_role_assignment` 那四条边界
+        在导入路径上的等价物——不能因为走了新端点就漏掉（设计 §6 风险 R-2）。
+        """
+        # `list_roles_for_org` = 全局角色（部门身份）+ 这家企业自建的角色，
+        # 正好是企业管理员在「用户管理」下拉框里能选的那一组。
+        #
+        # ⚠️ **只再排除两个平台档位角色。** super_admin / org_admin 是"任命"
+        # 而不是"分配部门"，必须走 `admin_set_user_roles` 那条有
+        # `_validate_role_assignment` 四条边界把关的路径。让导入能发这两个，
+        # 等于给了一条"上传一个 CSV 就把自己提成超管"的近路。
+        #
+        # ⚠️ 反过来也不能收得太紧：第一版写的是 `r.org_id == org_id`，
+        # 把 org_id 为 NULL 的**全局部门角色**（HR/IT 这些）全排除了，
+        # 而那恰恰是最常见的一类，导入会全线报"角色不存在"。
+        assignable = {
+            r.name: r.role_id
+            for r in await role_store.list_roles_for_org(org_id)
+            if r.name not in (ROLE_SUPER_ADMIN, ROLE_ORG_ADMIN)
+        }
+        return _acct_import.ImportContext(
+            actor_org_id=org_id,
+            assignable_roles=assignable,
+            existing_users=await user_store.get_org_ids_for_usernames(usernames),
+            seat_limit=await org_store.get_seat_limit(org_id),
+            seats_used=await user_store.count_active_users(org_id),
+        )
+
+    @app.put("/api/v1/admin/users/{user_id}/disabled", response_model=AdminUserResponse)
+    async def admin_set_user_disabled(
+        user_id: str,
+        request: SetUserDisabledRequest,
+        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
+        _same_org: AuthenticatedUser = Depends(require_same_org_or_platform),
+    ) -> AdminUserResponse:
+        """停用 / 重新启用。企业管理员能做的"离职处理"就是这个（设计 §4.2）。
+
+        ⚠️ 生效时机不对称，见 `CLAUDE.md` §3.2：管理端 19 个端点立刻生效，
+        问答等 35 个端点最长 24 小时。新登录会被立刻拒（`authenticate`），
+        所以窗口有界。
+        """
+        if user_id == current_user.user_id and request.disabled:
+            # 停用自己会立刻把自己锁在管理后台外面，且没有第二个人能救
+            # （企业里可能只有一个管理员）。
+            raise HTTPException(status_code=400, detail="不能停用自己")
+
+        user = await user_store.get_user_by_id(user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+
+        # ⚠️ **重新启用也要过席位校验** —— 三个校验点里最容易漏的一个：
+        # 它不创建账号，却会让占用数 +1（设计 §4.4）。
+        if not request.disabled:
+            target_org = await org_store.get_org_for_user(user_id)
+            if target_org:
+                await _enforce_seat_capacity(target_org.org_id, delta=1)
+
+        await user_store.set_disabled(user_id, request.disabled)
+        await _audit_log(
+            current_user.user_id,
+            "disable_user" if request.disabled else "enable_user",
+            "user", user_id, {"username": user.username},
+        )
+        refreshed = await user_store.get_user_by_id(user_id)
+        return await _build_admin_user_response(refreshed or user)
+
+    @app.put("/api/v1/admin/organizations/{org_id}/seat-limit", response_model=AdminOrganizationResponse)
+    async def admin_set_seat_limit(
+        org_id: str,
+        request: SetSeatLimitRequest,
+        current_user: AuthenticatedUser = Depends(require_platform_admin),
+    ) -> AdminOrganizationResponse:
+        """⚠️ **仅平台管理员。** 席位是合同条款不是配置项——企业管理员能改
+        自己企业的上限，这个功能就等于不存在（设计 §4.4）。"""
+        try:
+            ok = await org_store.set_seat_limit(org_id, request.seat_limit)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if not ok:
+            raise HTTPException(status_code=404, detail="企业不存在")
+        await _audit_log(
+            current_user.user_id, "set_seat_limit", "organization", org_id,
+            {"seat_limit": request.seat_limit},
+        )
+        org = await org_store.get_organization(org_id)
+        return AdminOrganizationResponse(
+            org_id=org.org_id, name=org.name, is_platform=org.is_platform,
+            created_at=org.created_at, seat_limit=org.seat_limit,
+            seats_used=await user_store.count_active_users(org_id),
+        )
+
+    @app.post("/api/v1/admin/users/bulk-import", response_model=BulkImportResponse)
+    async def admin_bulk_import_users(
+        file: UploadFile = File(...),
+        validate_only: bool = Form(default=True),
+        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
+    ) -> BulkImportResponse:
+        """CSV 批量导入（设计 §4.1）。
+
+        ⚠️ **`validate_only` 默认 True。** 这是一个能一次影响上万账号的操作，
+        默认值必须是"什么都不做"——前端漏传、curl 手敲、脚本写错，任何一种
+        意外都只会得到一份预演报告，而不是一万个账号。真跑必须显式说要真跑。
+
+        **预演和真跑走同一个 `plan_import`**，只是前者算完就返回。
+        如果两者走不同代码路径，预演就保证不了真跑会发生同样的事。
+
+        企业归属**强制用调用者自己的**，请求里没有任何地方能指定它 ——
+        跟 `admin_create_user` 同一条防护，批量导入是同一个越权面。
+        """
+        actor_org = await org_store.get_org_for_user(current_user.user_id)
+        if actor_org is None:
+            raise HTTPException(status_code=400, detail="当前账号没有所属企业，无法导入")
+
+        raw = await file.read()
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            try:
+                # Excel「另存为 CSV」在中文 Windows 上默认就是 GBK，
+                # 直接报"文件编码不对"等于把问题丢回给不懂编码的人事同事。
+                text = raw.decode("gbk")
+            except UnicodeDecodeError:
+                raise HTTPException(
+                    status_code=400,
+                    detail="文件编码无法识别，请另存为 UTF-8 或 GBK 编码的 CSV",
+                )
+
+        # 先扫一遍拿 username 列去查归属；解析失败时 rows 为空，
+        # plan_import 会把同一个 fatal 再报一次，这里不用重复处理。
+        pre_rows, _ = _acct_import.parse_csv(text)
+        usernames = [r.get("username", "").strip() for r in pre_rows]
+        ctx = await _import_context(current_user, actor_org.org_id, [u for u in usernames if u])
+        plan = _acct_import.plan_import(text, ctx)
+
+        def _resp(applied: bool, creds: list) -> BulkImportResponse:
+            return BulkImportResponse(
+                applied=applied,
+                summary=_acct_import.format_dry_run_summary(plan),
+                to_create=len(plan.to_create), to_update=len(plan.to_update),
+                errors=[
+                    BulkImportRowResult(
+                        line_no=e.line_no, username=e.username,
+                        action=e.action.value, reason=e.reason,
+                    ) for e in plan.errors
+                ],
+                seat_ok=plan.seat_check.ok, seats_used=plan.seat_check.seats_used,
+                seat_limit=plan.seat_check.seat_limit, fatal_error=plan.fatal_error,
+                credentials=creds,
+            )
+
+        if validate_only or not plan.applicable:
+            await _audit_log(
+                current_user.user_id, "bulk_import_users_dry_run", "organization",
+                actor_org.org_id,
+                {"to_create": len(plan.to_create), "to_update": len(plan.to_update),
+                 "errors": len(plan.errors), "seat_ok": plan.seat_check.ok},
+            )
+            return _resp(applied=False, creds=[])
+
+        now = time.time()
+        credentials: list = []
+        for row in plan.to_create:
+            code, code_hash, expires = _activation.issue_activation(now)
+            try:
+                user = await user_store.create_pending_user(
+                    username=row.username, activation_code_hash=code_hash,
+                    activation_expires_at=expires, org_id=actor_org.org_id,
+                )
+            except ValueError:
+                # 两次并发导入，或者 plan 算完到这里之间有人手工建了同名账号。
+                # 逐行隔离：跳过这一行，其余照做，不整体回滚。
+                continue
+            if row.role_id:
+                await role_store.assign_user_roles(user.user_id, [row.role_id])
+            credentials.append(AdminCreatedUserCredential(
+                username=row.username, activation_code=code, expires_at=expires,
+            ))
+
+        for row in plan.to_update:
+            # ⚠️ **更新只动角色，绝不碰密码/激活状态**（设计 T-5）。
+            # 幂等的意义就是"修正后重传整份文件是安全的"，如果重传会重置密码，
+            # 一次误传就能把全公司锁在外面。
+            existing = await user_store.get_user_by_username(row.username)
+            if existing and row.role_id:
+                await role_store.assign_user_roles(existing.user_id, [row.role_id])
+
+        await _audit_log(
+            current_user.user_id, "bulk_import_users", "organization", actor_org.org_id,
+            {"created": len(credentials), "updated": len(plan.to_update),
+             "errors": len(plan.errors)},
+        )
+        return _resp(applied=True, creds=credentials)
+
     @app.post("/api/v1/admin/users", response_model=AdminUserResponse)
     async def admin_create_user(
         request: AdminCreateUserRequest,
@@ -925,6 +1206,12 @@ def create_app() -> FastAPI:
             if unknown:
                 raise HTTPException(status_code=400, detail=f"角色不存在: {sorted(unknown)}")
 
+        # 席位（docs/account_lifecycle_design.md §4.4）。三个校验点之一，
+        # 另两个是批量导入与「重新启用已停用用户」。口径由 count_active_users
+        # 保证：只数 disabled_at IS NULL 的，停用的人不占席位。
+        if target_org_id:
+            await _enforce_seat_capacity(target_org_id, delta=1)
+
         try:
             user = await user_store.create_user(request.username, request.password)
         except ValueError as e:
@@ -944,9 +1231,20 @@ def create_app() -> FastAPI:
     @app.delete("/api/v1/admin/users/{user_id}")
     async def admin_delete_user(
         user_id: str,
-        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
-        _same_org: AuthenticatedUser = Depends(require_same_org_or_platform),
+        current_user: AuthenticatedUser = Depends(require_platform_admin),
     ) -> dict:
+        """⚠️ **2026-08-26 起仅平台管理员可用**（设计 §4.2，O-3 已拍板）。
+
+        原来挂的是 `_require_user_admin_tier`，企业管理员能删自己企业的员工。
+        改掉的理由是这两件事性质不同：停用是**人事操作**，企业自己天天要做；
+        删除是**不可逆的数据销毁**——`conversations.user_id` 会一起失去归属，
+        "离职员工做过什么"就再也追溯不到了。企业管理员现在只能停用
+        （`admin_set_user_disabled`），删除只保留给真正的数据清除请求
+        （如 GDPR 删除权），需要一次跨组织的确认。
+
+        `require_same_org_or_platform` 一并去掉：平台管理员本来就跨企业，
+        那个依赖对他恒真，留着只是多两次查询。
+        """
         if user_id == current_user.user_id:
             raise HTTPException(status_code=400, detail="不能删除自己")
         found = await user_store.delete_user(user_id)
@@ -1056,8 +1354,17 @@ def create_app() -> FastAPI:
     # ==================== 组织管理 API（仅平台管理员） ====================
 
     def _org_response(org) -> AdminOrganizationResponse:
+        """⚠️ **刻意不填 `seats_used`。**
+
+        它要 `await user_store.count_active_users(org_id)`，而这个函数被企业
+        列表逐个调用——填进去就是一个 N+1，正是 2026-08-26 刚在
+        `admin_list_users` 上修掉的那类问题（P1-14，约 300 次串行查询）。
+        列表页只给上限，用量在单个企业的详情/改上限响应里给。
+        真要在列表上显示用量，得先写一个 `count_active_users_batch`。
+        """
         return AdminOrganizationResponse(
-            org_id=org.org_id, name=org.name, is_platform=org.is_platform, created_at=org.created_at,
+            org_id=org.org_id, name=org.name, is_platform=org.is_platform,
+            created_at=org.created_at, seat_limit=org.seat_limit,
         )
 
     @app.get("/api/v1/admin/organizations", response_model=List[AdminOrganizationResponse])

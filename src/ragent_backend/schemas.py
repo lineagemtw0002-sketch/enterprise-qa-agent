@@ -71,6 +71,10 @@ class AdminUserResponse(BaseModel):
     allowed_collections: List[str]
     organization: Optional[OrganizationSummary] = None
     created_at: float
+    # 2026-08-26 账号生命周期（docs/account_lifecycle_design.md §4.2 §4.1b）。
+    # 都给默认值，既有的构造点不用全改。
+    disabled_at: Optional[float] = None
+    activated_at: Optional[float] = None
 
 
 class AdminCreateUserRequest(BaseModel):
@@ -83,6 +87,70 @@ class AdminCreateUserRequest(BaseModel):
     )
 
 
+class AdminCreatedUserCredential(BaseModel):
+    """建号 / 导入之后，一次性回给管理员的激活凭证。
+
+    ⚠️ **`activation_code` 是明文，全系统只在这一个响应里出现一次。**
+    它不落库（库里只有 SHA-256）、不写日志、刷新页面就没了。
+    管理员必须当场保存并分发——用户已定不做邮件短信（O-1），
+    分发只能是人工的。
+    """
+
+    username: str
+    activation_code: str
+    expires_at: float
+
+
+class SetSeatLimitRequest(BaseModel):
+    # None = 不限。0 是合法的：用来暂停一家企业的新建号。
+    seat_limit: Optional[int] = Field(default=None, ge=0)
+
+
+class SetUserDisabledRequest(BaseModel):
+    disabled: bool
+
+
+class ActivateAccountRequest(BaseModel):
+    """无鉴权端点 `/api/v1/activate` 的入参。
+
+    ⚠️ 这是全系统唯一不带 Authorization 的写端点（设计 §6 风险 R-4）。
+    密码长度下限跟 `AdminCreateUserRequest.password` 保持一致（6），
+    不能因为这条路径没有管理员盯着就放松。
+    """
+
+    username: str = Field(..., min_length=1)
+    activation_code: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=6)
+
+
+class BulkImportRowResult(BaseModel):
+    line_no: int
+    username: str
+    action: str  # create / update / error
+    reason: Optional[str] = None
+
+
+class BulkImportResponse(BaseModel):
+    """导入结果。**dry-run 与真跑用同一个响应模型**，靠 `applied` 区分。
+
+    同一个模型是刻意的：如果预演和真跑返回不同的形状，前端就要写两套渲染，
+    而两套渲染必然会漂移——预演展示的东西就不再等于真跑会发生的事，
+    预演也就失去了意义。
+    """
+
+    applied: bool  # False = 仅预演，什么都没落库
+    summary: str
+    to_create: int
+    to_update: int
+    errors: List[BulkImportRowResult] = Field(default_factory=list)
+    seat_ok: bool = True
+    seats_used: int = 0
+    seat_limit: Optional[int] = None
+    fatal_error: Optional[str] = None
+    # 只有 applied=True 且真的建了号时才有值，见 AdminCreatedUserCredential
+    credentials: List[AdminCreatedUserCredential] = Field(default_factory=list)
+
+
 # ============== 组织管理 API（仅平台管理员） ==============
 
 class AdminOrganizationResponse(BaseModel):
@@ -90,6 +158,12 @@ class AdminOrganizationResponse(BaseModel):
     name: str
     is_platform: bool
     created_at: float
+    # 2026-08-26 席位（docs/account_lifecycle_design.md §4.4）。
+    # seat_limit=None 表示不限；seats_used 是当前在用（只数未停用的）。
+    # 两个一起给，是因为平台管理员改上限时必须看得到当前用量——
+    # 只给上限的话，把 5 改成 3 会不会当场锁死一家企业，他不知道。
+    seat_limit: Optional[int] = None
+    seats_used: Optional[int] = None
 
 
 class AdminCreateOrganizationRequest(BaseModel):
