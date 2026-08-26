@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { Button, Empty, Space, Spin, Tag, message } from 'antd'
 import { RefreshCw } from 'lucide-react'
 import * as opsApi from '../../api/ops.js'
+import { displayUser, formatPlan, formatResult, useUserNames } from './opsDisplay.jsx'
 
 // 事后复盘（`docs/aiops_module_design.md` §9.2 最小可行版）。
 //
@@ -48,6 +49,7 @@ export default function OpsPostmortems({ onModuleDisabled }) {
   const [entries, setEntries] = useState([])
   const [loading, setLoading] = useState(true)
   const [marking, setMarking] = useState('')
+  const userNames = useUserNames()
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -112,15 +114,16 @@ export default function OpsPostmortems({ onModuleDisabled }) {
 
               <p className="ap-intent">{action.intent}</p>
               <div className="ap-meta">
-                {action.plan?.target && <span>目标 <b>{action.plan.target}</b></span>}
-                <span>审批人 <b>{action.approver_user_id ? `${String(action.approver_user_id).slice(0, 8)}…` : '—'}</b></span>
+                <span>动作 <b>{formatPlan(action.plan)}</b></span>
+                <span>提议人 <b>{displayUser(userNames, action.proposed_by)}</b></span>
+                <span>审批人 <b>{displayUser(userNames, action.approver_user_id)}</b></span>
               </div>
 
               {/* 执行结果：失败时最该看的就是这里，不要折叠 */}
               {action.result && (
                 <div className="pm-result">
                   <div className="pm-section-label">执行结果</div>
-                  <code>{action.result.detail || JSON.stringify(action.result)}</code>
+                  <code>{formatResult(action.result)}</code>
                 </div>
               )}
 

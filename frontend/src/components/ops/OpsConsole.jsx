@@ -6,6 +6,7 @@ import {
 import { Plug, KeyRound, ShieldCheck, ClipboardCheck, RefreshCw, Copy, Users, Trash2, LayoutDashboard, History } from 'lucide-react'
 import OpsOverview from './OpsOverview.jsx'
 import OpsPostmortems from './OpsPostmortems.jsx'
+import { displayUser, formatPlan, useUserNames } from './opsDisplay.jsx'
 import * as adminApi from '../../api/admin.js'
 import * as opsApi from '../../api/ops.js'
 import './OpsConsole.css'
@@ -452,6 +453,7 @@ function ApprovalsSection({ onModuleDisabled }) {
   const [loading, setLoading] = useState(false)
   const [acting, setActing] = useState('')
   const [marking, setMarking] = useState('')
+  const userNames = useUserNames()
   const timer = useRef(null)
 
   const load = useCallback(async (silent = false) => {
@@ -521,12 +523,16 @@ function ApprovalsSection({ onModuleDisabled }) {
       render: (plan, row) => (
         <div>
           <Tag>{ACTION_LABEL[row.plan?.action_type] || row.plan?.action_type || '—'}</Tag>
-          <code className="ops-console-plan">{JSON.stringify(plan)}</code>
+          {/* 原来这里是 JSON.stringify 直出。改成人话，但**不丢字段**——
+              认不出的键原样列成 key=value（见 formatPlan）：修复动作的参数
+              决定它在生产环境做什么，为了排版好看藏掉一个没预料到的字段，
+              是这类界面最不该犯的错。 */}
+          <div className="ops-console-plan">{formatPlan(plan)}</div>
         </div>
       ),
     },
     { title: '影响范围', dataIndex: 'impact_radius', render: (v) => v || '—' },
-    { title: '提议人', dataIndex: 'proposed_by' },
+    { title: '提议人', dataIndex: 'proposed_by', render: (v) => displayUser(userNames, v) },
     { title: '状态', dataIndex: 'status', render: (s) => <StatusTag status={s} /> },
     { title: '提议时间', dataIndex: 'created_at', render: fmtTime },
     {
@@ -552,7 +558,7 @@ function ApprovalsSection({ onModuleDisabled }) {
       render: (_, row) => {
         if (row.status !== 'pending_approval') {
           return row.approver_user_id
-            ? <Text type="secondary">{row.approver_user_id} · {fmtTime(row.approved_at)}</Text>
+            ? <Text type="secondary">{displayUser(userNames, row.approver_user_id)} · {fmtTime(row.approved_at)}</Text>
             : <Text type="secondary">—</Text>
         }
         return (

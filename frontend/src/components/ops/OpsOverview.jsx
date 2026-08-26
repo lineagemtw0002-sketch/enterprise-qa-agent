@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Button, Popconfirm, Spin, message } from 'antd'
 import { RefreshCw } from 'lucide-react'
-import * as adminApi from '../../api/admin.js'
 import * as opsApi from '../../api/ops.js'
+import { displayUser, useUserNames } from './opsDisplay.jsx'
 
 // 运维塔台「总览」大屏。视觉照 docs/design_reference/aiops_console_mockup.html，
 // **数据全部来自真实接口**——设计稿里那些示例数字（1,284 条告警合并、MTTR 6.4 分钟、
@@ -140,10 +140,8 @@ export default function OpsOverview({ canManage, onModuleDisabled }) {
   const [summaries, setSummaries] = useState([])
   const [loading, setLoading] = useState(true)
   const [acting, setActing] = useState('')
-  // user_id → 用户名。大屏上直接显示 36 位 UUID 是"技术上正确但没法用"——
-  // 审批人需要一眼看出是谁提的。拉不到（非管理员没有用户列表权限）就退回短 id，
-  // 不是报错：这只是显示优化，不该因为它失败就让整块面板不可用。
-  const [userNames, setUserNames] = useState({})
+  // user_id → 用户名，三个视图共用同一份实现（见 opsDisplay.jsx）
+  const userNames = useUserNames(canManage)
 
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
@@ -171,13 +169,6 @@ export default function OpsOverview({ canManage, onModuleDisabled }) {
       if (!silent) setLoading(false)
     }
   }, [canManage, onModuleDisabled])
-
-  useEffect(() => {
-    if (!canManage) return
-    adminApi.listUsers()
-      .then((list) => setUserNames(Object.fromEntries(list.map((u) => [u.user_id, u.username]))))
-      .catch(() => {})
-  }, [canManage])
 
   useEffect(() => {
     load()
@@ -342,7 +333,7 @@ export default function OpsOverview({ canManage, onModuleDisabled }) {
                   <p className="ap-intent">{a.intent}</p>
                   <div className="ap-meta">
                     {a.plan?.target && <span>目标 <b>{a.plan.target}</b></span>}
-                    <span>提议 <b>{userNames[a.proposed_by] || `${String(a.proposed_by).slice(0, 8)}…`}</b></span>
+                    <span>提议 <b>{displayUser(userNames, a.proposed_by)}</b></span>
                     <span>时间 <b>{fmtFull(a.created_at)}</b></span>
                   </div>
                   {a.impact_radius && (
