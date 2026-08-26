@@ -26,6 +26,8 @@ from typing import List, Optional
 
 import asyncpg
 
+from src.ragent_backend.db_pool import get_shared_pool
+
 # 种子平台组织：现有唯一部署里的所有历史用户都会被回填到这个组织，
 # is_platform=TRUE 意味着"能看到/管理所有企业的用户"——迁移前后行为完全
 # 一致（人人都能管所有用户），符合零回归要求。
@@ -61,7 +63,7 @@ class OrgStore:
         async with self._pool_lock:
             if self._pool is not None:
                 return self._pool
-            type(self)._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
+            type(self)._pool = await get_shared_pool(self._dsn)
             await self._ensure_schema()
         return self._pool
 
@@ -222,6 +224,8 @@ class OrgStore:
             await conn.execute("UPDATE users SET org_id = $1 WHERE id = $2", org_id, user_id)
 
     async def close(self) -> None:
-        if self._pool is not None:
-            await self._pool.close()
-            type(self)._pool = None
+        # 池现在是跨 14 个 Store 共享的（db_pool.py，P1-2），这里只清掉
+        # 本 Store 持有的引用，不触发真实关闭——那会把其它 Store 正在用的
+        # 连接一起关掉。真正关闭见 db_pool.close_shared_pools()，只在 app
+        # 关闭时调一次。
+        type(self)._pool = None

@@ -19,6 +19,8 @@ import uuid
 from typing import Any, List, Optional
 
 import asyncpg
+
+from src.ragent_backend.db_pool import get_shared_pool
 from langchain_core.messages import HumanMessage
 
 from src.observability.redact import sensitive_digest
@@ -50,7 +52,7 @@ class LTMStore:
         async with self._pool_lock:
             if self._pool is not None:
                 return self._pool
-            type(self)._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=3)
+            type(self)._pool = await get_shared_pool(self._dsn)
             await self._ensure_schema()
         return self._pool
 
@@ -265,6 +267,8 @@ class LTMStore:
             return int(result.split()[-1]) if result.split()[-1].isdigit() else 0
 
     async def close(self) -> None:
-        if self._pool is not None:
-            await self._pool.close()
-            type(self)._pool = None
+        # 池现在是跨 14 个 Store 共享的（db_pool.py，P1-2），这里只清掉
+        # 本 Store 持有的引用，不触发真实关闭——那会把其它 Store 正在用的
+        # 连接一起关掉。真正关闭见 db_pool.close_shared_pools()，只在 app
+        # 关闭时调一次。
+        type(self)._pool = None

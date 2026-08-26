@@ -832,6 +832,50 @@ flowchart TB
 
 ## 5. 已修复（防止重新引入）
 
+- ✅ **2026-08-26　P1-2：14 个 Store 各建连接池 → 合并为一个按 DSN 缓存的共享池**
+  `attendance_store` / `audit_store` / `dashboard_stats` / `conversation_store` /
+  `ltm_store` / `collection_store` / `org_store` / `user_store` / `role_store` /
+  `tenant_connector_store` / `tenant_identity_store` / `store`（
+  `ConversationArchiveStore`）/ `workflow_store` / `file_store` 这 14 个类
+  原来各自 `asyncpg.create_pool`，但核对后确认**全部读同一个
+  `RAGENT_POSTGRES_URL`**（同一环境变量、同一默认值），累计连接数上限约 68
+  （13 个 `max_size=5` + `ltm_store` 的 `max_size=3`），而
+  `docs/scale_slo_and_priorities.md` 重估的并发在飞请求数只有 4（合成
+  P50）～19（合成 P95）——68 本身不是问题，问题是分散在 14 处无法统一
+  治理/观测/调参。
+
+  改法：新增 `src/ragent_backend/db_pool.py`，提供按 dsn 缓存的
+  `get_shared_pool()`（与 `chroma_store.py::_get_or_create_client` 是
+  同一个模式，上面 P1-8 那条的姊妹修复），14 个 Store 的 `_get_pool()`
+  改成从这里取，不再各自维护 class-level `_pool`。**`_ensure_schema()`
+  仍然逐个 Store 类只跑一次**——这条不变量原来靠"池是 class-level 单例、
+  首次创建即触发 schema"来保证，合并成共享池后改成靠同样的
+  `_pool_lock` + `_pool is None` 双检锁守护，语义没变。
+  共享池上限 `RAGENT_DB_POOL_MAX_SIZE`（默认 **20**，用户拍板），
+  覆盖重估的 P95（19）并留一点余量，远低于原来累加的 68。
+
+  ⚠️ **`close()` 语义变了，必须知道**：14 个 Store 的 `close()` 原来会
+  真的 `pool.close()`；池变成跨 14 个 Store 共享之后，任何单个 Store 自己
+  关池会把其它 13 个正在用的连接一起关掉，所以现在 `close()` 只清自己的
+  引用，不触发真实关闭。真正的关闭收到 `close_shared_pools()`，只在
+  `app.py` 的 `shutdown` 钩子里调一次（原来那里逐个调 10 个 Store 的
+  `close()`，现在改成一行）。
+  **已知的次要副作用**：仓库里一批一次性脚本（`scripts/create_user.py`、
+  `scripts/migrate_to_roles.py` 等）结尾会调某个 Store 的 `close()`
+  期望干净退出——现在这个调用不再真正关闭连接，进程退出时可能带着未关闭
+  的 asyncpg 连接池收尾（进程马上就退出，OS 会回收，不是功能性 bug，
+  但`ResourceWarning` 级别的不整洁，本次未修，不在这条 P0 的范围内）。
+
+  真实验证（连真实本机 Postgres，不是 mock）：14 个 Store 各自
+  `_get_pool()` 后确认全部拿到同一个池对象、`_ensure_schema()` 全部正常
+  跑过没报错；14 个 Store 各自 `close()` 后共享池仍然活着（缓存条目数
+  不变）；`close_shared_pools()` 之后缓存清空。全量 `tests/unit`
+  （1871 条，含新增 7 条）通过。
+  回归保护：`tests/unit/test_db_pool.py`（7 条），含并发判别力测试
+  ——真并发（`asyncio.gather` + 人为延迟撑开竞争窗口）调用
+  `get_shared_pool` 8 次，断言底层 `create_pool` 只被真正调用 1 次
+  （回退到旧的"每次都新建"实现会让这条和"两次调用拿到同一对象"那条都变红）。
+
 - ✅ **2026-08-26　P1-8（部分）：`ChromaStore` 改成共享 client，顺带修掉一个
   真实存在的并发 bug**
   `ChromaStore.__init__` 原来每次构造都无条件新建一个

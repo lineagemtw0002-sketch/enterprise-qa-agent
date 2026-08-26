@@ -39,6 +39,8 @@ from typing import List, Optional
 
 import asyncpg
 
+from src.ragent_backend.db_pool import get_shared_pool
+
 # 保留名单（tenant_*_kb / 6 个部门角色名等）不在这个模块里判断——直接 import
 # query_knowledge_hub.py 会形成循环引用（那边反过来会 import 本模块判断 org
 # 归属），校验逻辑放在调用方 app.py `admin_create_collection` 里做。
@@ -81,7 +83,7 @@ class OrgCollectionStore:
         async with self._pool_lock:
             if self._pool is not None:
                 return self._pool
-            type(self)._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
+            type(self)._pool = await get_shared_pool(self._dsn)
             await self._ensure_schema()
         return self._pool
 
@@ -166,6 +168,8 @@ class OrgCollectionStore:
         return result.split()[-1] != "0"
 
     async def close(self) -> None:
-        if self._pool is not None:
-            await self._pool.close()
-            type(self)._pool = None
+        # 池现在是跨 14 个 Store 共享的（db_pool.py，P1-2），这里只清掉
+        # 本 Store 持有的引用，不触发真实关闭——那会把其它 Store 正在用的
+        # 连接一起关掉。真正关闭见 db_pool.close_shared_pools()，只在 app
+        # 关闭时调一次。
+        type(self)._pool = None

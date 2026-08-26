@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional
 
 import asyncpg
 
+from src.ragent_backend.db_pool import get_shared_pool
+
 logger = logging.getLogger(__name__)
 
 
@@ -66,7 +68,7 @@ class ConversationArchiveStore:
         async with self._pool_lock:
             if self._pool is not None:
                 return self._pool
-            type(self)._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
+            type(self)._pool = await get_shared_pool(self._dsn)
             await self._ensure_schema()
         return self._pool
 
@@ -185,10 +187,13 @@ class ConversationArchiveStore:
             return None
 
     async def close(self) -> None:
-        """关闭连接池"""
-        if self._pool is not None:
-            await self._pool.close()
-            type(self)._pool = None
+        """清掉本 Store 持有的共享池引用。
+
+        池现在是跨 14 个 Store 共享的（db_pool.py，P1-2），这里不再触发真实
+        关闭——那会把其它 Store 正在用的连接一起关掉。真正关闭见
+        db_pool.close_shared_pools()，只在 app 关闭时调一次。
+        """
+        type(self)._pool = None
 
     async def _ensure_schema(self) -> None:
         """确保表结构存在"""

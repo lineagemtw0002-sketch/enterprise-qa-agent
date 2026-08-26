@@ -68,6 +68,7 @@ from src.ragent_backend.schemas import (
 from src.ragent_backend import account_import as _acct_import
 from src.ragent_backend import activation as _activation
 from src.ragent_backend.store import build_archive_store, ConversationArchiveStore
+from src.ragent_backend.db_pool import close_shared_pools
 from src.ragent_backend.workflow import RAGWorkflow
 from src.ragent_backend.ltm_store import LTMStore
 from src.ragent_backend.file_store import build_file_store, ConversationFileStore
@@ -3362,17 +3363,13 @@ def create_app() -> FastAPI:
 
     @app.on_event("shutdown")
     async def shutdown():
-        """关闭时清理资源"""
-        await archive_store.close()
-        await file_store.close()
-        await conversation_store.close()
-        await user_store.close()
-        await role_store.close()
-        await workflow_store.close()
-        await attendance_store.close()
-        await org_store.close()
-        await tenant_connector_store.close()
-        await tenant_identity_store.close()
+        """关闭时清理资源。
+
+        14 个 Store 现在共享同一批连接池（db_pool.py，P1-2），逐个调用各
+        Store 的 close() 不再有意义（那只清引用，不做真实关闭，见各 Store
+        close() 方法的注释）——真正的关闭只需要调一次共享池的关闭入口。
+        """
+        await close_shared_pools()
 
     return app
 

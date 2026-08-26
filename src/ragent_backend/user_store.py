@@ -25,6 +25,8 @@ from typing import Any, Dict, List, Optional
 import asyncpg
 import bcrypt
 
+from src.ragent_backend.db_pool import get_shared_pool
+
 # 角色先分三档：超级管理员（管理后台，能增删用户、配权限）、管理用户（比普通用户
 # 权限更高，但不能管别人）、普通用户（默认）。数据库里存的就是这几个字符串。
 ROLE_SUPER_ADMIN = "super_admin"
@@ -71,7 +73,7 @@ class UserStore:
         async with self._pool_lock:
             if self._pool is not None:
                 return self._pool
-            type(self)._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
+            type(self)._pool = await get_shared_pool(self._dsn)
             await self._ensure_schema()
         return self._pool
 
@@ -467,6 +469,8 @@ class UserStore:
         return bool(row and row["disabled_at"] is not None)
 
     async def close(self) -> None:
-        if self._pool is not None:
-            await self._pool.close()
-            type(self)._pool = None
+        # 池现在是跨 14 个 Store 共享的（db_pool.py，P1-2），这里只清掉
+        # 本 Store 持有的引用，不触发真实关闭——那会把其它 Store 正在用的
+        # 连接一起关掉。真正关闭见 db_pool.close_shared_pools()，只在 app
+        # 关闭时调一次。
+        type(self)._pool = None
