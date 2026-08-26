@@ -125,6 +125,16 @@ class RemediationAction:
     created_at: float
 
 
+@dataclass(frozen=True)
+class AnalysisSummary:
+    summary_id: str
+    org_id: str
+    connection_id: str
+    summary: str
+    evidence_refs: List[Dict[str, Any]]
+    created_at: float
+
+
 class OpsStore:
     """智能运维模块存储 (PostgreSQL)。"""
 
@@ -597,6 +607,81 @@ class OpsStore:
                 connection_id,
             )
         return [self._row_to_scope(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # AI 分析结论摘要（§3.1：只落库摘要 + 依据引用，不落库原始运维数据）
+    # ------------------------------------------------------------------
+
+    def _row_to_summary(self, row) -> AnalysisSummary:
+        import json
+
+        evidence_refs = row["evidence_refs"]
+        if isinstance(evidence_refs, str):
+            evidence_refs = json.loads(evidence_refs)
+        return AnalysisSummary(
+            summary_id=row["id"], org_id=row["org_id"], connection_id=row["connection_id"],
+            summary=row["summary"], evidence_refs=evidence_refs, created_at=row["created_at"],
+        )
+
+    async def save_analysis_summary(
+        self, org_id: str, connection_id: str, summary: str,
+        evidence_refs: List[Dict[str, Any]],
+    ) -> AnalysisSummary:
+        """调用方（AI 分析层）负责保证 `summary`/`evidence_refs` 里不含原始运维
+        数据本身（完整日志行、完整指标序列等）——这里不做内容过滤，只管落库。
+        `evidence_refs` 的字段格式由分析层自己定义（比如
+        `{"source": "prometheus", "query": "...", "window": "..."}`），Store 层
+        不解析其内部结构，只当作不透明的 JSON 存取，避免两边为了"该有哪些
+        字段"反复改这个方法签名。"""
+        import json
+
+        summary_id = f"opssum_{uuid.uuid4().hex[:16]}"
+        now = time.time()
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO ops_analysis_summaries
+                    (id, org_id, connection_id, summary, evidence_refs, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                summary_id, org_id, connection_id, summary, json.dumps(evidence_refs), now,
+            )
+        return AnalysisSummary(
+            summary_id=summary_id, org_id=org_id, connection_id=connection_id,
+            summary=summary, evidence_refs=evidence_refs, created_at=now,
+        )
+
+    async def get_analysis_summary(self, summary_id: str) -> Optional[AnalysisSummary]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM ops_analysis_summaries WHERE id = $1", summary_id,
+            )
+        return self._row_to_summary(row) if row else None
+
+    async def list_analysis_summaries(
+        self, org_id: str, connection_id: Optional[str] = None, limit: int = 50,
+    ) -> List[AnalysisSummary]:
+        """按 org 归属列出，供审批 UI 或 `propose_remediation` 关联"提议依据来自
+        哪次分析"用。`connection_id` 可选——不传则列出该企业全部连接器的分析
+        摘要（跨连接器场景，比如告警关联本来就可能横跨多个系统）。"""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            if connection_id is not None:
+                rows = await conn.fetch(
+                    "SELECT * FROM ops_analysis_summaries "
+                    "WHERE org_id = $1 AND connection_id = $2 "
+                    "ORDER BY created_at DESC LIMIT $3",
+                    org_id, connection_id, limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT * FROM ops_analysis_summaries WHERE org_id = $1 "
+                    "ORDER BY created_at DESC LIMIT $2",
+                    org_id, limit,
+                )
+        return [self._row_to_summary(r) for r in rows]
 
     # ------------------------------------------------------------------
     # 审批工作流（remediation_actions 状态机）
