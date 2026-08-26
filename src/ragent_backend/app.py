@@ -809,9 +809,6 @@ def create_app() -> FastAPI:
             allowed_collections=await role_store.get_allowed_collections_for_user(user.user_id),
             organization=await _org_summary_for_user(user.user_id),
             created_at=user.created_at,
-            disabled_at=user.disabled_at,
-            activated_at=user.activated_at,
-            pending_activation=user.pending_activation,
         )
 
     @app.post("/api/v1/auth/change-password")
@@ -923,6 +920,14 @@ def create_app() -> FastAPI:
             allowed_collections=await role_store.get_allowed_collections_for_user(user.user_id),
             organization=await _org_summary_for_user(user.user_id),
             created_at=user.created_at,
+            # ⚠️ AdminUserResponse 有**两个**构造点：这里（单个用户，建号/改角色/
+            # 停用的响应）和 `admin_list_users` 里的批量版。**加字段必须两处一起改。**
+            # 2026-08-26 就漏过一次：只改了批量版，于是列表页显示正常，
+            # 而停用接口返回的 disabled_at 恒为 null，前端开关点完不刷新状态。
+            # 单测和 create_app 都抓不到，是 HTTP 端到端跑出来的。
+            disabled_at=user.disabled_at,
+            activated_at=user.activated_at,
+            pending_activation=user.pending_activation,
         )
 
     @app.get("/api/v1/admin/users", response_model=List[AdminUserResponse])
@@ -1010,9 +1015,13 @@ def create_app() -> FastAPI:
         # `_validate_role_assignment` 四条边界把关的路径。让导入能发这两个，
         # 等于给了一条"上传一个 CSV 就把自己提成超管"的近路。
         #
-        # ⚠️ 反过来也不能收得太紧：第一版写的是 `r.org_id == org_id`，
-        # 把 org_id 为 NULL 的**全局部门角色**（HR/IT 这些）全排除了，
-        # 而那恰恰是最常见的一类，导入会全线报"角色不存在"。
+        # ⚠️ 用 `list_roles_for_org` 而不是自己写 `r.org_id == org_id` 过滤：
+        # 前者是"这个企业管理员能分配什么"的**权威定义**，「用户管理」下拉框
+        # 用的就是它，两处口径必须一致，否则会出现"界面上能选、导入却说角色
+        # 不存在"。它包含全局角色 + 本企业角色。
+        # （2026-08-26 实测本库里全局角色只有 super_admin / org_admin 两个，
+        # 部门角色全是企业级的——所以这两种写法当前结果相同。但依赖这个巧合
+        # 是错的：只要将来加一个全局部门角色，自己写的过滤就会漏掉它。）
         assignable = {
             r.name: r.role_id
             for r in await role_store.list_roles_for_org(org_id)
