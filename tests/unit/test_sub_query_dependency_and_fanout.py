@@ -283,8 +283,24 @@ class _RecordingRetrievalTool:
     def __init__(self):
         self.calls: List[str] = []
 
-    async def execute(self, query: str, collection: str, top_k: int):  # noqa: ARG002
+    async def execute(  # noqa: ARG002
+        self,
+        query: str,
+        collection: str,
+        top_k: int,
+        user_id: str | None = None,
+        org_id: str | None = None,
+    ):
+        """⚠️ 签名要跟真实 `QueryKnowledgeHubTool.execute` 保持一致。
+
+        `_retrieve_multi` 的 `_run_one` 用 `except Exception` 兜住每个子查询
+        （单个失败不影响其他），所以假工具**少一个参数不会报错**——
+        TypeError 被吞掉，表现为 `calls` 为空、检索"什么都没做"。
+        2026-08-26 给 execute 加 user_id 时这 4 条就是这么红的，
+        而红出来的信息是"断言 [] == [...]"，跟真实原因差很远。
+        """
         self.calls.append(query)
+        self.last_user_id = user_id
         await asyncio.sleep(0)
         return _FakeRetrievalResult(query)
 

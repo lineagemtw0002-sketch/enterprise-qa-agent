@@ -39,11 +39,22 @@ logger = logging.getLogger(__name__)
 class OpenSearchSparseRetriever:
     """BM25 检索，走 OpenSearch。"""
 
-    def __init__(self, collection: str, store: Any, default_top_k: int = 10):
+    def __init__(
+        self,
+        collection: str,
+        store: Any,
+        default_top_k: int = 10,
+        org_id: Optional[str] = None,
+        owner_user_id: Optional[str] = None,
+    ):
         self.collection = collection
         self.default_collection = collection
         self._store = store
         self.default_top_k = default_top_k
+        # 仅 conv_* 对话私有库需要：它在 OpenSearch 侧是"每企业一个 index +
+        # 按所有者过滤"，这两个值决定查哪个 index、以及能看到谁的文档。
+        self.org_id = org_id
+        self.owner_user_id = owner_user_id
 
     def retrieve(
         self,
@@ -57,13 +68,30 @@ class OpenSearchSparseRetriever:
         if not keywords:
             return []
         col = collection or self.default_collection
-        hits = self._store.search_kb(
-            col,
-            "",
-            top_k=top_k or self.default_top_k,
-            # keywords 已经是 QueryProcessor 分好的词条，不要再过一遍分词器
-            query_tokens=keywords,
-        )
+        k = top_k or self.default_top_k
+        if col.startswith("conv_"):
+            # 调用方（_build_hybrid_search_for）在缺身份时已经回退旧链路了，
+            # 走到这里两个值必然都有。断言而不是静默降级 —— 少了过滤条件
+            # 就是越权返回，宁可炸也不能悄悄查到别人的文档。
+            assert self.org_id and self.owner_user_id, (
+                "conv_ 检索缺 org_id/owner_user_id —— 这会导致越权"
+            )
+            hits = self._store.search_conv(
+                self.org_id,
+                col[len("conv_"):],
+                self.owner_user_id,
+                "",
+                top_k=k,
+                query_tokens=keywords,
+            )
+        else:
+            hits = self._store.search_kb(
+                col,
+                "",
+                top_k=k,
+                # keywords 已经是 QueryProcessor 分好的词条，不要再过一遍分词器
+                query_tokens=keywords,
+            )
         return _to_results(hits)
 
 
@@ -76,12 +104,16 @@ class OpenSearchDenseRetriever:
         store: Any,
         embedding_client: Any,
         default_top_k: int = 10,
+        org_id: Optional[str] = None,
+        owner_user_id: Optional[str] = None,
     ):
         self.collection = collection
         self.default_collection = collection
         self._store = store
         self._embedding = embedding_client
         self.default_top_k = default_top_k
+        self.org_id = org_id
+        self.owner_user_id = owner_user_id
 
     def retrieve(
         self,
@@ -104,9 +136,16 @@ class OpenSearchDenseRetriever:
             return []
         col = self.default_collection
         vector = self._embedding.embed([query])[0]
-        hits = self._store.knn_kb(
-            col, vector, top_k=top_k or self.default_top_k, filters=filters
-        )
+        k = top_k or self.default_top_k
+        if col.startswith("conv_"):
+            assert self.org_id and self.owner_user_id, (
+                "conv_ 检索缺 org_id/owner_user_id —— 这会导致越权"
+            )
+            hits = self._store.knn_conv(
+                self.org_id, col[len("conv_"):], self.owner_user_id, vector, top_k=k
+            )
+        else:
+            hits = self._store.knn_kb(col, vector, top_k=k, filters=filters)
         return _to_results(hits)
 
 
@@ -132,7 +171,11 @@ def _to_results(hits: List[Dict[str, Any]]) -> List[RetrievalResult]:
                 chunk_id=cid,
                 score=float(h.get("score", 0.0)),
                 text=h.get("content", ""),
-                metadata={"source_path": h.get("source_path", "")},
+                # ⚠️ 用 store 给的完整 metadata，**不要在这里另挑字段**。
+                # HybridSearch 的 metadata_filter_post 会在融合后按 metadata
+                # 再过滤一次；少一个字段（比如层次化收窄用的 source_ref）
+                # 就会让结果被整片丢掉，而检索层看起来完全正常。
+                metadata=h.get("metadata") or {"source_path": h.get("source_path", "")},
             )
         )
     return out

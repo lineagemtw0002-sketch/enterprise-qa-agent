@@ -141,6 +141,13 @@ def tokenize_for_query(text: str) -> List[str]:
     return list(getattr(result, "keywords", result))
 
 
+def _term_clause(field: str, value: Any) -> Dict[str, Any]:
+    """单值用 `term`，多值用 `terms` —— 用错会静默匹配不到任何东西。"""
+    if isinstance(value, (list, tuple, set)):
+        return {"terms": {field: list(value)}}
+    return {"term": {field: value}}
+
+
 def _as_query_text(query: str, tokens: Optional[Sequence[str]]) -> str:
     return " ".join(tokens if tokens is not None else tokenize_for_query(query))
 
@@ -153,6 +160,7 @@ def build_chunk_doc(
     chunk_index: int,
     chunk_id: str,
     doc_hash: Optional[str] = None,
+    source_ref: Optional[str] = None,
     conversation_id: Optional[str] = None,
     owner_user_id: Optional[str] = None,
     embedding: Optional[Sequence[float]] = None,
@@ -171,6 +179,8 @@ def build_chunk_doc(
     }
     if doc_hash:
         doc["doc_hash"] = doc_hash
+    if source_ref:
+        doc["source_ref"] = source_ref
     if conversation_id:
         doc["conversation_id"] = conversation_id
     if owner_user_id:
@@ -200,6 +210,13 @@ def _mapping(dense_dims: Optional[int]) -> Dict[str, Any]:
         # 原文只存不索引 —— 检索走 content，展示走这里。
         "content_raw": {"type": "text", "index": False},
         "source_path": {"type": "keyword"},
+        # ⚠️ 层次化检索的文档级收窄靠它过滤 —— `query_knowledge_hub` 的
+        # `_narrow_by_document_summary` 先在摘要层定位到几份文档，
+        # 再用 `{"source_ref": [doc_id, ...]}` 把正文检索收窄到这几份里。
+        # **第一版 mapping 漏了这个字段**，term 过滤匹配不到任何东西 ->
+        # 检索返回空 -> 用户看到"未检索到相关内容"。
+        # 端到端黄金测试从 15/17 掉到 4/17 才发现，单测和直连查询都测不出来。
+        "source_ref": {"type": "keyword"},
         "chunk_index": {"type": "integer"},
         "doc_hash": {"type": "keyword"},
         "chunk_id": {"type": "keyword"},      # 与 Chroma 向量 id 对齐，迁移期需要
@@ -292,7 +309,7 @@ class OpenSearchStore:
         index: str,
         chunks: Sequence[Dict[str, Any]],
         *,
-        refresh: bool = False,
+        refresh: Any = False,
     ) -> int:
         """批量写入。每条 chunk 需要 `source_path` / `chunk_index` / `content`。
 
@@ -321,7 +338,7 @@ class OpenSearchStore:
             )
         return len(chunks)
 
-    def delete_by_source(self, index: str, source_path: str, *, refresh: bool = False) -> int:
+    def delete_by_source(self, index: str, source_path: str, *, refresh: Any = False) -> int:
         """按源文档删除它的全部 chunk。
 
         这是 `BM25Indexer.remove_document` 那条 P0 的正解 —— 不再拿 chunk_id
@@ -364,7 +381,7 @@ class OpenSearchStore:
         return int(resp.get("deleted", 0))
 
     def delete_by_conversation(
-        self, index: str, conversation_id: str, *, refresh: bool = False
+        self, index: str, conversation_id: str, *, refresh: Any = False
     ) -> int:
         """对话被删除时清掉它的全部私有文档。
 
@@ -391,6 +408,7 @@ class OpenSearchStore:
         top_k: int = 10,
         *,
         query_tokens: Optional[Sequence[str]] = None,
+        filters: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """业务知识库检索。企业边界由调用方的 `_org_owned_collections()` 收敛。
 
@@ -402,13 +420,17 @@ class OpenSearchStore:
         index = kb_index_name(collection)
         if not self._client.indices.exists(index=index):
             return []
-        resp = self._client.search(
-            index=index,
-            body={
-                "size": top_k,
-                "query": {"match": {"content": _as_query_text(query, query_tokens)}},
-            },
-        )
+        match = {"match": {"content": _as_query_text(query, query_tokens)}}
+        if filters:
+            q: Dict[str, Any] = {
+                "bool": {
+                    "must": [match],
+                    "filter": [_term_clause(k, v) for k, v in filters.items()],
+                }
+            }
+        else:
+            q = match
+        resp = self._client.search(index=index, body={"size": top_k, "query": q})
         return self._hits(resp)
 
     def search_conv(
@@ -473,10 +495,16 @@ class OpenSearchStore:
         if filters:
             # 元数据过滤必须真的下推，不能接受后忽略 —— 忽略掉的话调用方以为
             # 过滤生效了，实际拿到的是全库结果，属"能跑但结果错"。
+            #
+            # ⚠️ 值是列表时必须用 `terms` 而不是 `term`。
+            # 收窄传的就是 `{"source_ref": [doc_id, ...]}`（多份文档），
+            # 用 `term` 去匹配一个列表**匹配不到任何东西**，静默返回空。
+            # Chroma 侧有同样的处理（chroma_store.py 用 `$in`），
+            # 它的注释里也记着这个真实案例。
             body["query"] = {
                 "bool": {
                     "must": [{"knn": {"embedding": knn}}],
-                    "filter": [{"term": {k: v}} for k, v in filters.items()],
+                    "filter": [_term_clause(k, v) for k, v in filters.items()],
                 }
             }
         else:
@@ -484,18 +512,73 @@ class OpenSearchStore:
         resp = self._client.search(index=index, body=body)
         return self._hits(resp)
 
+    def knn_conv(
+        self,
+        org_id: str,
+        conversation_id: str,
+        owner_user_id: str,
+        vector: Sequence[float],
+        top_k: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """对话私有库的向量检索。
+
+        ⚠️ `owner_user_id` 同样是**位置参数**，理由见 `search_conv`：
+        企业内隔离从物理降级成字段过滤之后，漏了过滤条件就是越权返回。
+        """
+        index = conv_index_name(org_id)
+        if not self._client.indices.exists(index=index):
+            return []
+        resp = self._client.search(
+            index=index,
+            routing=conversation_id,
+            body={
+                "size": top_k,
+                "query": {
+                    "bool": {
+                        "must": [
+                            {"knn": {"embedding": {"vector": list(vector), "k": top_k}}}
+                        ],
+                        "filter": [
+                            {"term": {"conversation_id": conversation_id}},
+                            {"term": {"owner_user_id": owner_user_id}},
+                        ],
+                    }
+                },
+            },
+        )
+        return self._hits(resp)
+
     @staticmethod
     def _hits(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
-        return [
-            {
-                "chunk_id": h["_source"].get("chunk_id", h["_id"]),
-                "score": h["_score"],
-                # 返回原文而不是分词后的 content —— 后者是给检索用的，不能给人看
-                "content": h["_source"].get("content_raw", h["_source"].get("content", "")),
-                "source_path": h["_source"].get("source_path", ""),
-            }
-            for h in resp["hits"]["hits"]
-        ]
+        """把命中转成统一结构。
+
+        ⚠️ **`metadata` 要带上全部字段，不能只挑几个。**
+        `HybridSearch` 的 `metadata_filter_post=True` 会在 RRF 融合之后**再做
+        一次按 metadata 的过滤**。第一版只放了 `source_path`，于是层次化检索
+        收窄传下来的 `{"source_ref": [...]}` 在后置过滤时匹配不到任何东西，
+        **融合后的结果被整片丢掉**，表现为"未检索到相关内容"。
+
+        这个 bug 只有端到端才暴露：`store.search_kb` 带 filters 直接查返回 2 条，
+        经过 HybridSearch 变成 0 条 —— 检索层、单测、直连查询全是绿的。
+        """
+        out = []
+        for h in resp["hits"]["hits"]:
+            src = dict(h["_source"])
+            # 分词后的 content 是给检索用的，不该出现在给人看/给模型看的地方；
+            # 原文在 content_raw。两者都不进 metadata，避免把正文重复一遍。
+            text = src.pop("content_raw", src.get("content", ""))
+            src.pop("content", None)
+            src.pop("embedding", None)   # 768 维向量不该塞进 metadata
+            out.append(
+                {
+                    "chunk_id": src.get("chunk_id", h["_id"]),
+                    "score": h["_score"],
+                    "content": text,
+                    "source_path": src.get("source_path", ""),
+                    "metadata": src,
+                }
+            )
+        return out
 
     # ────────────────────────── 自检 ──────────────────────────
 
@@ -582,7 +665,19 @@ def mirror_ingestion_to_opensearch(
             )
             for i, (chunk, stat) in enumerate(zip(chunks, sparse_stats))
         ]
-        store.index_chunks(index, docs, refresh=False)
+        # ⚠️ `refresh="wait_for"` 而不是 False。
+        #
+        # OpenSearch 是**近实时**的：默认 1 秒刷新间隔，写完不立即可查。
+        # 实测写入后立即查 0 条、+0.5s 仍 0 条、+1.5s 才查到。
+        # 而旧链路（Chroma/BM25）是写完立即可查。
+        #
+        # 这个差异对本项目是实打实的体验回退：用户往对话里传一份文档，
+        # 紧接着问它，**会得到"没找到"**。摄入本来就是后台任务、耗时以秒计，
+        # 多等一次刷新（约 1s）在这里可以忽略，但"传完立刻查不到"很难解释。
+        #
+        # 不用 refresh=True：那会强制立即刷新整个 index，高频摄入时代价很大
+        # （每次都新建 segment）。`wait_for` 是等下一次自然刷新，不额外触发。
+        store.index_chunks(index, docs, refresh="wait_for")
 
         # ⚠️ 这一步不能省：文档被编辑后**变短**时，前 N 个 chunk 会被确定性
         # _id 覆盖，但原来更长的那部分不会被任何新 chunk 覆盖。

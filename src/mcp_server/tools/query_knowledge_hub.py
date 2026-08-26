@@ -357,7 +357,12 @@ class QueryKnowledgeHubTool:
             except Exception as e:
                 logger.warning(f"[Preload] reranker warm-up call failed (non-fatal): {e}")
 
-    def _build_hybrid_search_for(self, collection: str) -> "HybridSearch":
+    def _build_hybrid_search_for(
+        self,
+        collection: str,
+        user_id: Optional[str] = None,
+        org_id: Optional[str] = None,
+    ) -> "HybridSearch":
         """为单个 collection 现建一个独立的 HybridSearch 实例，不读也不写
         self._hybrid_search/self._current_collection——"全库混合召回"
         （_execute_local_multi）要在多个 collection 上并发跑检索，如果沿用
@@ -409,22 +414,46 @@ class QueryKnowledgeHubTool:
                 OpenSearchSparseRetriever,
             )
 
-            os_store = OpenSearchStore()
-            sparse_retriever = OpenSearchSparseRetriever(collection, os_store)
-            dense_retriever = OpenSearchDenseRetriever(
-                collection, os_store, self._embedding_client
-            )
-            logger.info(
-                "检索走 OpenSearch collection=%s", collection,
-                extra={"event": "search.backend.opensearch", "collection": collection},
-            )
-            query_processor = QueryProcessor()
-            return create_hybrid_search(
-                settings=self.settings,
-                query_processor=query_processor,
-                dense_retriever=dense_retriever,
-                sparse_retriever=sparse_retriever,
-            )
+            # 对话私有库在 OpenSearch 侧是"每企业一个 index + 按所有者过滤"
+            # （见 opensearch_store 顶部说明），少了 org_id/user_id 就无法
+            # 定位到正确的 index、也无法做企业内隔离。
+            #
+            # ⚠️ **缺任一个就拒绝走 OpenSearch，回退旧链路** —— 不是"不过滤地查"。
+            # 不过滤地查会把同企业其他用户的对话文档一起返回，是越权；
+            # 回退最多是"这次没享受到新后端"，代价小得多。
+            is_conv = collection.startswith("conv_")
+            if is_conv and not (org_id and user_id):
+                logger.warning(
+                    "对话私有库缺 org_id/user_id，回退旧链路 collection=%s",
+                    collection,
+                    extra={
+                        "event": "search.backend.conv_fallback",
+                        "collection": collection,
+                    },
+                )
+            else:
+                os_store = OpenSearchStore()
+                sparse_retriever = OpenSearchSparseRetriever(
+                    collection, os_store, org_id=org_id, owner_user_id=user_id
+                )
+                dense_retriever = OpenSearchDenseRetriever(
+                    collection, os_store, self._embedding_client,
+                    org_id=org_id, owner_user_id=user_id,
+                )
+                logger.info(
+                    "检索走 OpenSearch collection=%s conv=%s",
+                    collection, is_conv,
+                    extra={
+                        "event": "search.backend.opensearch",
+                        "collection": collection,
+                    },
+                )
+                return create_hybrid_search(
+                    settings=self.settings,
+                    query_processor=QueryProcessor(),
+                    dense_retriever=dense_retriever,
+                    sparse_retriever=sparse_retriever,
+                )
 
         bm25_indexer = BM25Indexer(index_dir=str(resolve_path(f"data/db/bm25/{collection}")))
         sparse_retriever = create_sparse_retriever(
@@ -442,12 +471,19 @@ class QueryKnowledgeHubTool:
             sparse_retriever=sparse_retriever,
         )
 
-    def _ensure_initialized(self, collection: str) -> None:
+    def _ensure_initialized(
+        self,
+        collection: str,
+        user_id: Optional[str] = None,
+        org_id: Optional[str] = None,
+    ) -> None:
         """单 collection 场景（调用方显式指定了 collection，或者委托远程结果
         解析等老路径）用的缓存包装——只有 collection 变了才重建，行为跟改造
         前一致。"全库混合召回"的新路径（_execute_local_multi）不走这个方法，
         直接调 _build_hybrid_search_for，原因见该方法的说明。"""
-        self._hybrid_search = self._build_hybrid_search_for(collection)
+        self._hybrid_search = self._build_hybrid_search_for(
+            collection, user_id=user_id, org_id=org_id
+        )
         self._current_collection = collection
         self._initialized = True
         logger.info(f"Query components initialized for collection: {collection}")
@@ -613,7 +649,9 @@ class QueryKnowledgeHubTool:
             trace.metadata["collection"] = effective_collection
             trace.metadata["source"] = "mcp"
             trace.metadata["connector_type"] = "internal_chroma"
-            return await self._execute_local_single(query, effective_top_k, effective_collection, trace)
+            return await self._execute_local_single(query, effective_top_k, effective_collection, trace,
+                user_id=user_id, org_id=(org.org_id if org else None),
+            )
 
         # 本地 internal_chroma、调用方没指定 collection（绝大多数场景——LLM 从
         # 不主动填这个参数，见模块顶部 DEPARTMENT_KB_COLLECTIONS 旁的说明）：
@@ -649,7 +687,11 @@ class QueryKnowledgeHubTool:
         trace.metadata["source"] = "mcp"
         trace.metadata["connector_type"] = "internal_chroma"
         try:
-            response = await self._execute_local_multi(query, effective_top_k, candidate_collections, trace)
+            response = await self._execute_local_multi(
+                query, effective_top_k, candidate_collections, trace,
+                user_id=user_id,
+                org_id=(org.org_id if org else None),
+            )
             TraceCollector().collect(trace)
             return response
         except Exception as e:
@@ -716,7 +758,11 @@ class QueryKnowledgeHubTool:
         trace.metadata["source"] = "admin_test_bypass"
         trace.metadata["connector_type"] = "internal_chroma"
         try:
-            response = await self._execute_local_multi(query, effective_top_k, candidate_collections, trace)
+            response = await self._execute_local_multi(
+                query, effective_top_k, candidate_collections, trace,
+                user_id=user_id,
+                org_id=(org.org_id if org else None),
+            )
             TraceCollector().collect(trace)
             return response
         except Exception as e:
@@ -933,6 +979,7 @@ class QueryKnowledgeHubTool:
 
     async def _execute_local_single(
         self, query: str, effective_top_k: int, effective_collection: str, trace: TraceContext,
+        user_id: Optional[str] = None, org_id: Optional[str] = None,
     ) -> MCPToolResponse:
         """单 collection 本地检索——调用方显式指定 collection 时的老路径，从
         execute() 里搬出来，逻辑不变。"""
@@ -942,7 +989,12 @@ class QueryKnowledgeHubTool:
             # to avoid blocking the async event loop / MCP stdio transport
             import time as _time
             _init_t0 = _time.monotonic()
-            await asyncio.to_thread(self._ensure_initialized, effective_collection)
+            await asyncio.to_thread(
+                self._ensure_initialized,
+                effective_collection,
+                user_id,
+                org_id,
+            )
             _init_elapsed = (_time.monotonic() - _init_t0) * 1000.0
             trace.record_stage("initialization", {
                 "collection": effective_collection,
@@ -1250,6 +1302,8 @@ class QueryKnowledgeHubTool:
         top_k: int,
         candidate_collections: List[str],
         trace: TraceContext,
+        user_id: Optional[str] = None,
+        org_id: Optional[str] = None,
     ) -> MCPToolResponse:
         """"全库混合召回 + 重排"：调用方没有显式指定 collection 时的默认路径
         （见 execute() 里的分支、以及模块顶部 DEPARTMENT_KB_COLLECTIONS 旁的
@@ -1290,7 +1344,10 @@ class QueryKnowledgeHubTool:
         }, elapsed_ms=_t_narrow_total)
 
         def _build_all_sync() -> Dict[str, "HybridSearch"]:
-            return {c: self._build_hybrid_search_for(c) for c in search_collections}
+            return {
+                c: self._build_hybrid_search_for(c, user_id=user_id, org_id=org_id)
+                for c in search_collections
+            }
 
         _t0 = time.monotonic()
         hybrid_searches = await asyncio.to_thread(_build_all_sync)

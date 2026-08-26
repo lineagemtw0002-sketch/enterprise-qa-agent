@@ -1124,8 +1124,7 @@ class RAGWorkflow:
             retrieval_result = await self._retrieval_tool.execute(
                 query=query,
                 collection=collection,
-                top_k=top_k,
-            )
+                top_k=top_k, user_id=state.get("user_id"))
             
             # retrieval_result 是 MCPToolResponse 对象
             context_text = retrieval_result.content
@@ -1205,7 +1204,15 @@ class RAGWorkflow:
 
         async def _run_one(q: str) -> tuple[str, Optional[str], int, Optional[str]]:
             try:
-                result = await self._retrieval_tool.execute(query=q, collection=collection, top_k=top_k)
+                result = await self._retrieval_tool.execute(
+                    query=q,
+                    collection=collection,
+                    top_k=top_k,
+                    # user_id 来自 app.py 放进 state 的、已校验的 token 身份
+                    # （不是请求体声明）。对话私有库切到 OpenSearch 后，
+                    # 它是企业内隔离过滤的依据 —— 不传就查不到自己的文档。
+                    user_id=state.get("user_id"),
+                )
                 count = result.metadata.get("result_count", 0) if hasattr(result, "metadata") else 0
                 return q, result.content, count, None
             except Exception as e:

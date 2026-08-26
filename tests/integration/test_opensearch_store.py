@@ -443,3 +443,90 @@ class TestIngestionMirror:
             )
         finally:
             store.drop_index(conv_index_name(org))
+
+
+class TestConversationReadPath:
+    """`conv_*` 的**读**路径 —— 写入路由已在 TestIngestionMirror 覆盖。
+
+    这组守的是隔离降级后最危险的那条缝：企业内隔离从"一对话一物理存储"
+    变成"一企业一 index + owner_user_id 过滤"，**漏了过滤条件就是越权返回**。
+    """
+
+    @pytest.fixture()
+    def seeded(self, store):
+        from src.libs.search.opensearch_store import mirror_ingestion_to_opensearch
+        from src.core.types import Chunk, Document
+
+        org = f"pytest_org_{uuid.uuid4().hex[:8]}"
+        doc = Document(id="d" * 64, text="x", metadata={"source_path": "/up/x.pdf"})
+
+        def chunks(tag: str):
+            return [
+                Chunk(
+                    id=f"{tag}_0",
+                    text=f"{tag}的机密文档 次年 顺延",
+                    metadata={"source_path": f"/up/{tag}.pdf", "chunk_index": 0},
+                )
+            ]
+
+        for conv, user, tag in [("conv_aaa", "alice", "爱丽丝"), ("conv_bbb", "bob", "鲍勃")]:
+            mirror_ingestion_to_opensearch(
+                collection=conv,
+                chunks=chunks(tag),
+                sparse_stats=[{"chunk_id": f"{tag}_vec"}],
+                document=doc,
+                dense_vectors=[[0.1] * 8],
+                org_id=org,
+                owner_user_id=user,
+            )
+        yield org
+        store.drop_index(conv_index_name(org))
+
+    def test_sparse_retriever_isolates_by_owner(self, seeded, store):
+        from src.core.query_engine.opensearch_retrievers import (
+            OpenSearchSparseRetriever,
+        )
+
+        mine = OpenSearchSparseRetriever(
+            "conv_aaa", store, org_id=seeded, owner_user_id="alice"
+        ).retrieve(["次年", "顺延"], top_k=9)
+        assert len(mine) == 1
+        assert "爱丽丝" in mine[0].text
+
+        # 鲍勃知道爱丽丝的 conversation_id，但不是所有者
+        stolen = OpenSearchSparseRetriever(
+            "conv_aaa", store, org_id=seeded, owner_user_id="bob"
+        ).retrieve(["次年", "顺延"], top_k=9)
+        assert stolen == [], "拿到别人的 conversation_id 就读到了内容 —— 越权"
+
+    def test_dense_retriever_isolates_by_owner(self, seeded, store):
+        from src.core.query_engine.opensearch_retrievers import OpenSearchDenseRetriever
+
+        class FakeEmbedding:
+            def embed(self, texts):
+                return [[0.1] * 8 for _ in texts]
+
+        mine = OpenSearchDenseRetriever(
+            "conv_aaa", store, FakeEmbedding(), org_id=seeded, owner_user_id="alice"
+        ).retrieve("机密")
+        assert len(mine) == 1 and "爱丽丝" in mine[0].text
+
+        stolen = OpenSearchDenseRetriever(
+            "conv_aaa", store, FakeEmbedding(), org_id=seeded, owner_user_id="bob"
+        ).retrieve("机密")
+        assert stolen == [], "向量检索侧越权"
+
+    def test_missing_identity_raises_not_silently_unfiltered(self, seeded, store):
+        """缺身份时必须炸，**不能不过滤地查**。
+
+        不过滤地查会返回同企业其他用户的对话文档 —— 越权。
+        炸掉最多是"这次检索失败"，代价小得多。
+        调用方（`_build_hybrid_search_for`）在缺身份时已经回退旧链路了，
+        所以正常不会走到这里；这条断言是最后一道。
+        """
+        from src.core.query_engine.opensearch_retrievers import (
+            OpenSearchSparseRetriever,
+        )
+
+        with pytest.raises(AssertionError, match="越权"):
+            OpenSearchSparseRetriever("conv_aaa", store).retrieve(["次年"])

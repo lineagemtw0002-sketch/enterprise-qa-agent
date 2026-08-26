@@ -219,6 +219,10 @@ def migrate_one(
                         chunk_index=int(meta.get("chunk_index", 0)),
                         chunk_id=cid,
                         doc_hash=meta.get("doc_hash"),
+                        # ⚠️ 不能漏：层次化检索的文档级收窄靠它过滤
+                        # （`{"source_ref": [doc_id, ...]}`），漏了会让收窄
+                        # 匹配不到任何东西、检索静默返回空。
+                        source_ref=meta.get("source_ref"),
                         embedding=emb,
                     )
                 )
