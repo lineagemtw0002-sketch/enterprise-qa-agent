@@ -213,3 +213,67 @@ class TestMarkResultOnlyAcceptsCompletedOrFailed:
         store = OpsStore()
         with pytest.raises(IllegalStatusTransition):
             await store.mark_result("remact_1", STATUS_APPROVED, result={})
+
+
+class TestExpireStalePendingApprovals:
+    """`expire_stale_pending_approvals`（2026-08-26 新增，`docs/aiops_module_
+    design.md` §10.4 的定时超时扫描第一次真正接上）。不碰真实 Postgres——
+    这里只验证扫描到的每个候选 id 都被正确转移/跳过，SQL 本身的
+    "按各自连接器 approval_timeout_minutes 算截止时间"由真实 Postgres
+    集成测试覆盖（见 tests/integration）。
+    """
+
+    @pytest.mark.asyncio
+    async def test_advances_each_candidate_to_expired(self, monkeypatch):
+        store = OpsStore()
+        rows = [{"id": "remact_1"}, {"id": "remact_2"}]
+        fake_conn = AsyncMock()
+        fake_conn.fetch = AsyncMock(return_value=rows)
+        monkeypatch.setattr(store, "_get_pool", AsyncMock(return_value=_FakePool(fake_conn)))
+
+        advanced = []
+
+        async def fake_advance_status(action_id, target_status):
+            advanced.append((action_id, target_status))
+            return _action(action_id=action_id, status=target_status)
+
+        monkeypatch.setattr(store, "advance_status", fake_advance_status)
+
+        result = await store.expire_stale_pending_approvals()
+
+        assert result == ["remact_1", "remact_2"]
+        assert advanced == [("remact_1", STATUS_EXPIRED), ("remact_2", STATUS_EXPIRED)]
+
+    @pytest.mark.asyncio
+    async def test_skips_candidate_that_changed_status_concurrently(self, monkeypatch):
+        """扫描到的动作在真正转移之前已经被别的路径（比如审批人刚好点了批准）
+        改变了状态——`IllegalStatusTransition` 必须被吞掉当成正常竞态结果，
+        不能让整次扫描因为一条冲突就崩掉，也不能把它算进"成功过期"的返回值里。
+        判别力：把 `except IllegalStatusTransition: continue` 删掉，这条测试
+        会因为未捕获异常传播而变红。
+        """
+        store = OpsStore()
+        rows = [{"id": "remact_1"}, {"id": "remact_2"}]
+        fake_conn = AsyncMock()
+        fake_conn.fetch = AsyncMock(return_value=rows)
+        monkeypatch.setattr(store, "_get_pool", AsyncMock(return_value=_FakePool(fake_conn)))
+
+        async def fake_advance_status(action_id, target_status):
+            if action_id == "remact_1":
+                raise IllegalStatusTransition("已经被审批，状态已不是 pending_approval")
+            return _action(action_id=action_id, status=target_status)
+
+        monkeypatch.setattr(store, "advance_status", fake_advance_status)
+
+        result = await store.expire_stale_pending_approvals()
+
+        assert result == ["remact_2"]
+
+    @pytest.mark.asyncio
+    async def test_no_candidates_returns_empty_list(self, monkeypatch):
+        store = OpsStore()
+        fake_conn = AsyncMock()
+        fake_conn.fetch = AsyncMock(return_value=[])
+        monkeypatch.setattr(store, "_get_pool", AsyncMock(return_value=_FakePool(fake_conn)))
+
+        assert await store.expire_stale_pending_approvals() == []

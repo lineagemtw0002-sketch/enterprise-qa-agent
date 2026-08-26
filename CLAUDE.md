@@ -985,10 +985,10 @@ flowchart TB
     §10.6 设想的"审批权限比查看权限更窄"这层还没有落地，**任何本企业
     org_admin 都能批准，不是只有被指定的审批人**，这条差距已如实记录在
     `admin_approve_remediation_action` 的函数注释里
-  - LangGraph 接入（`intent_type=ops`/`ops_subgraph`，§10.2）、
-    前端"运维塔台"UI 全部未实现
-  - 审批超时扫描任务未实现（`list_pending_approval_older_than` 只提供
-    查询方法，没有定时调用它的后台任务）
+  - ~~LangGraph 接入（`intent_type=ops`/`ops_subgraph`，§10.2）~~ ✅
+    **已确认不需要新增结构，见 §5 下方对应条目**；前端"运维塔台"UI 进行中
+    （刘德华在做，见 §5 下方）
+  - ~~审批超时扫描任务未实现~~ ✅ **已接线，见 §5 下方对应条目**
   - 真实的 BYOC 连接器进程（客户环境里响应 `query_request`/`exec_request`
     帧的那一端）不在本项目范围内，本阶段只做平台侧协议
   - `CLAUDE.md` §3 权限模型正文**没有**回填 §10.6 的 `role_ops_systems`
@@ -1105,6 +1105,58 @@ flowchart TB
   **本次未覆盖**：仍未跑一次真实的"用户在对话里问运维问题 → LLM 决定调
   `query_ops_system` → 工具真正查到数据"完整链路（需要真实 LLM 决策，
   当前验证止于"handler 收到 user_id 后能不能转发正确的 org_id"这一层）。
+
+- ✅ **2026-08-26　智能运维审批超时扫描任务接线 + 修复一个 `aiops_module_enabled`
+  从未在任何 GET 响应里出现的阻塞问题**（前者本会话「张学友」按 §5 上面
+  记录的"未做"清单主动补上；后者由「刘德华」摸底运维塔台前端时发现并报告，
+  本会话修复）
+
+  **审批超时扫描**：`OpsStore` 原来只有一个从未被调用过的占位查询方法
+  `list_pending_approval_older_than(cutoff_ts)`——接口设计本身就有问题：
+  `approval_timeout_minutes` 是按连接器配置的（§10.4，5～1440 分钟），
+  接收单个全局 `cutoff_ts` 没法表达"不同连接器超时长度不同"，即使接上定时
+  任务也会算错。改为 `expire_stale_pending_approvals()`：`JOIN
+  ops_system_connections` 用各自连接器的超时值算截止时间，过期的走既有
+  `advance_status`（TOCTOU 修复的同一套条件 UPDATE）转成 `expired`，跟扫描
+  同时发生的真实审批不会被覆盖（`IllegalStatusTransition` 说明"扫描到之后、
+  转移之前已经被别的路径改变状态"，捕获后跳过即可，不算错误）。
+  `app.py::lifespan` 新增 `_scan_expired_ops_approvals` 后台任务，5 分钟一轮，
+  跟既有 `_keep_models_warm` 同一个"`asyncio.create_task` + `CancelledError`
+  优雅退出"模式，单次扫描异常只记日志不影响下一轮。
+  验证：`tests/unit/test_ops_store_status_machine.py` 新增
+  `TestExpireStalePendingApprovals`（3 条，假 pool，判别力核心是"扫到的动作
+  已被并发改变状态时必须跳过而不是让异常传播炸穿整个扫描"）+
+  `tests/integration/test_ops_store_expiry_and_batch_flags.py`（新增，连真实
+  Postgres，判别力核心：同一时刻创建的两条动作分别挂在超时 5 分钟和 1440
+  分钟的连接器下，只有前者该被判定过期——如果实现退化成套一个全局 cutoff，
+  这条断言会失败）。
+
+  **`aiops_module_enabled` 阻塞问题**：`OrganizationSummary`（`/auth/me`）、
+  `AdminOrganizationResponse`（`/admin/organizations` 列表 + 单企业详情 +
+  `PUT .../aiops-module-enabled` 自己的响应）三处原来都没有这个字段——
+  前端**没有任何合规的方式知道模块开没开**，只能去调一个业务端点吃 403 来
+  试探，这正是"导航入口该按开关显示，不能只在点击时才发现被拒"这条要求
+  想避免的；`PUT` 端点的响应甚至不回显自己刚写入的新值，管理员点了开关
+  之后无法确认是否真的生效。
+  修法：两个 schema 各加 `aiops_module_enabled: bool = False`；
+  `_org_summary_for_user`（单用户）和 `admin_set_seat_limit`（单企业详情）
+  直接 `await ops_store.is_module_enabled(org_id)`；企业列表页
+  （`admin_list_organizations`）和用户列表页（`admin_list_users`，每个用户
+  带的 `organization` 摘要）走新增的批量方法 `is_module_enabled_batch`
+  （按去重后的 org_id 一次查完，不随列表长度线性增长，跟 P1-14 那一路的
+  纪律一致）；`admin_set_aiops_module_enabled` 直接用刚写入的 `request.enabled`
+  回填，不再读一次数据库。
+  验证：`scripts/verify_aiops_endpoints.py` 新增 3 项（PUT 响应自带新值、
+  `/auth/me` 能看到、管理员企业列表能看到），连同原有 24 项复跑全过（共 27
+  项，真实 Postgres + 真实 HTTP）；`tests/integration/
+  test_ops_store_expiry_and_batch_flags.py::TestIsModuleEnabledBatch`（2 条，
+  含"一个企业显式开、一个从未设置过走列默认值、一个不存在的 org_id 不出现在
+  返回值里"混合场景）。全量 `tests/unit` 2317 通过。
+  **本次未覆盖**：`is_module_enabled_batch`/新字段没有补对应的纯 mock 单测
+  （现有 `test_ops_store_status_machine.py` 走假 pool 的风格对这条"要验证
+  真实 SQL JOIN/ANY 是否正确"的场景价值不大，直接用集成测试覆盖，权衡后
+  判断不需要再补一份假 pool 版本）；前端消费这个字段做导航门禁的部分是
+  刘德华在做，不在本条范围内。
 
 - ✅ **2026-08-26　P1-14 扩展审计：逐个核对全部管理端点，修复 2 处同类问题**
   `/admin/users` 本身的 N+1 早前已修（同一条 P1-14），但 CLAUDE.md 一直如实
@@ -1660,7 +1712,7 @@ flowchart TB
 | **`docs/architecture.md`** | **架构图 · 核心链路 · 双模型 · 性能测试**（与本文同属当前状态正本） | **活文档** |
 | `docs/scale_slo_and_priorities.md` | 容量测算 · 最小 SLO · 27+3 条发现重新分级（12 条 P0） | 活文档 |
 | `docs/orchestration_design.md` | 编排层设计：并行防护 + 记忆异步化 | **部分实施**：A 部分 D4/D5（08-25 第二批）、**D1/D2（08-25 第三批，见 §4.5）** 已落地；D3/D6 未实施；**B 部分整体未实施**（阻塞项 B-R1 已实测查清） |
-| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **部分实施**：2026-08-26 用户明确要求插队开工（覆盖了文档自己"排期维持在 12 条 P0 之后"的原始决定）。阶段一～四全部落地并合并：数据模型/越界判定/审批状态机/管理面端点/审批工作流端点/BYOC 连接器协议（`ConnectorTransport` 实现）+ 联邦查询层/工具注册（两条并行分支已合并，三个运维工具真正注册进 ReAct 工具子图），粗粒度 org_admin/super_admin 门禁；6 处越界判定漏洞 + 审批状态机 TOCTOU 竞态 + 运维工具 `org_id` 从未被注入过的阻塞 bug 均已修复，见 §5。**LangGraph 接入已确认不需要新增 `intent_type`/`ops_subgraph`**（§10.2 已更正）——既有 `tool_subgraph` 的 `general_agent` 路由天然覆盖。`role_ops_systems` 细粒度权限、前端、真实 BYOC 连接器进程（客户环境那一端）、审批超时扫描任务均未实施 |
+| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **部分实施**：2026-08-26 用户明确要求插队开工（覆盖了文档自己"排期维持在 12 条 P0 之后"的原始决定）。阶段一～四全部落地并合并：数据模型/越界判定/审批状态机/管理面端点/审批工作流端点/BYOC 连接器协议（`ConnectorTransport` 实现）+ 联邦查询层/工具注册（两条并行分支已合并，三个运维工具真正注册进 ReAct 工具子图），粗粒度 org_admin/super_admin 门禁；6 处越界判定漏洞 + 审批状态机 TOCTOU 竞态 + 运维工具 `org_id` 从未被注入过的阻塞 bug 均已修复，见 §5。**LangGraph 接入已确认不需要新增 `intent_type`/`ops_subgraph`**（§10.2 已更正）——既有 `tool_subgraph` 的 `general_agent` 路由天然覆盖。审批超时扫描任务已接线（5 分钟一轮，按各自连接器超时算截止时间）；前端"运维塔台"UI 开发中（刘德华）。`role_ops_systems` 细粒度权限、真实 BYOC 连接器进程（客户环境那一端）未实施 |
 | `docs/collaboration_retrospective.md` | 协作复盘与开发流程指南（**每周自查只需读 §1**） | 活文档 |
 | `docs/review_2026-08-24/review_codebase_findings.md` | 代码审计，带行号证据 | 时点快照 |
 | `docs/review_2026-08-24/review_process_retro.md` | 过程复盘量化分析 | 时点快照 |

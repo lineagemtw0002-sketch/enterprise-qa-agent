@@ -46,6 +46,12 @@ class OrganizationSummary(BaseModel):
     org_id: str
     name: str
     is_platform: bool = False
+    # 2026-08-26 补：智能运维模块是否已对本企业开通（`organizations.
+    # aiops_module_enabled`）。原来只有 PUT 端点、没有任何 GET 会回这个字段，
+    # 前端没有任何合规的方式知道"导航入口该不该显示"，只能靠调业务端点吃
+    # 403 来试探——那正是"入口按开关显示，不能只在点击时才发现被拒"这条
+    # 要求想避免的。见 CLAUDE.md §5。
+    aiops_module_enabled: bool = False
 
 
 class MeResponse(BaseModel):
@@ -167,6 +173,9 @@ class AdminOrganizationResponse(BaseModel):
     # 只给上限的话，把 5 改成 3 会不会当场锁死一家企业，他不知道。
     seat_limit: Optional[int] = None
     seats_used: Optional[int] = None
+    # 同 OrganizationSummary 那条注释——super_admin 的企业列表/开关控件需要
+    # 这个字段才能渲染出"当前是开是关"，而不是两个盲按钮。
+    aiops_module_enabled: bool = False
 
 
 class AdminCreateOrganizationRequest(BaseModel):

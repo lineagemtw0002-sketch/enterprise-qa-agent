@@ -657,6 +657,39 @@ def create_app() -> FastAPI:
             except asyncio.CancelledError:
                 break
 
+    async def _scan_expired_ops_approvals():
+        """智能运维审批超时扫描（`docs/aiops_module_design.md` §10.4）——
+        `pending_approval` 状态的修复动作如果超过连接器配置的
+        `approval_timeout_minutes`（5～1440 分钟，见 `aiops_scope.
+        validate_approval_timeout_minutes`）还没人处理，转成 `expired`，
+        不能永远挂在待审批队列里。之前 `OpsStore` 只有查询方法
+        `list_pending_approval_older_than`（且接口设计本身有问题——接收单个
+        全局 cutoff，没法表达"不同连接器超时长度不同"），从未接过任何调用方，
+        这里是第一次真正接上定时任务，见 `CLAUDE.md` §5。
+
+        5 分钟扫一次：这是一个"最长可能多等 5 分钟才被标记过期"的宽限，不是
+        审批本身的时限——跟 `_keep_models_warm` 的保活扫描同一个数量级，
+        没有理由扫得比这更勤（`approval_timeout_minutes` 下限是 5 分钟，
+        扫描间隔跟下限相近很正常，不是巧合也不是问题：即使一次超时窗口只
+        5 分钟的连接器，最坏情况也只是多等一个扫描周期才被标记，不影响
+        "过期动作不能再被执行"这条硬约束本身——`STATUS_EXPIRED` 是终态，
+        审批/执行两个专用方法都会在状态机层面拒绝对一个已经不在
+        `pending_approval` 的动作起作用）。单次扫描异常只记日志，不影响下一轮。
+        """
+        while True:
+            try:
+                await asyncio.sleep(300)
+                expired_ids = await ops_store.expire_stale_pending_approvals()
+                if expired_ids:
+                    logger.info(
+                        "expired stale pending ops approvals",
+                        extra={"expired_count": len(expired_ids)},
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("ops approval timeout scan failed")
+
     async def _preload_retrieval_models() -> None:
         """启动阶段预热知识库检索用到的 reranker/embedding client（
         docs/optimization_tracking.md 耗时优化任务，"知识库检索为什么要
@@ -687,6 +720,7 @@ def create_app() -> FastAPI:
         await _preload_retrieval_models()
         await _warm_llms_at_startup()
         keep_warm_task = asyncio.create_task(_keep_models_warm())
+        ops_timeout_scan_task = asyncio.create_task(_scan_expired_ops_approvals())
 
         # 启动时连接配置的 MCP Servers
         if settings.mcp_servers:
@@ -722,6 +756,12 @@ def create_app() -> FastAPI:
         keep_warm_task.cancel()
         try:
             await keep_warm_task
+        except asyncio.CancelledError:
+            pass
+
+        ops_timeout_scan_task.cancel()
+        try:
+            await ops_timeout_scan_task
         except asyncio.CancelledError:
             pass
 
@@ -842,7 +882,10 @@ def create_app() -> FastAPI:
         org = await org_store.get_org_for_user(user_id)
         if org is None:
             return None
-        return OrganizationSummary(org_id=org.org_id, name=org.name, is_platform=org.is_platform)
+        return OrganizationSummary(
+            org_id=org.org_id, name=org.name, is_platform=org.is_platform,
+            aiops_module_enabled=await ops_store.is_module_enabled(org.org_id),
+        )
 
     @app.get("/api/v1/auth/me", response_model=MeResponse)
     async def get_me(current_user: AuthenticatedUser = Depends(get_current_user)) -> MeResponse:
@@ -1004,6 +1047,12 @@ def create_app() -> FastAPI:
 
         roles_by_user = await role_store.get_user_roles_batch(user_ids)
         collections_by_user = await role_store.get_allowed_collections_for_users_batch(user_ids)
+        # OrganizationSummary 加了 aiops_module_enabled 字段后这里也得跟着填
+        # （见下面 organization= 那行旁边"加字段时两处必须一起改"的既有教训）——
+        # 按去重后的 org_id 批量查一次，不随 user 数线性增长。
+        aiops_enabled_by_org = await ops_store.is_module_enabled_batch(
+            list({org.org_id for org in orgs_by_user.values()})
+        )
 
         return [
             AdminUserResponse(
@@ -1015,7 +1064,10 @@ def create_app() -> FastAPI:
                 ],
                 allowed_collections=collections_by_user.get(u.user_id, []),
                 organization=(
-                    OrganizationSummary(org_id=org.org_id, name=org.name, is_platform=org.is_platform)
+                    OrganizationSummary(
+                        org_id=org.org_id, name=org.name, is_platform=org.is_platform,
+                        aiops_module_enabled=aiops_enabled_by_org.get(org.org_id, False),
+                    )
                     if (org := orgs_by_user.get(u.user_id)) is not None else None
                 ),
                 created_at=u.created_at,
@@ -1144,6 +1196,7 @@ def create_app() -> FastAPI:
             org_id=org.org_id, name=org.name, is_platform=org.is_platform,
             created_at=org.created_at, seat_limit=org.seat_limit,
             seats_used=await user_store.count_active_users(org_id),
+            aiops_module_enabled=await ops_store.is_module_enabled(org_id),
         )
 
     @app.post("/api/v1/admin/users/bulk-import", response_model=BulkImportResponse)
@@ -1421,7 +1474,7 @@ def create_app() -> FastAPI:
 
     # ==================== 组织管理 API（仅平台管理员） ====================
 
-    def _org_response(org) -> AdminOrganizationResponse:
+    def _org_response(org, aiops_module_enabled: bool = False) -> AdminOrganizationResponse:
         """⚠️ **刻意不填 `seats_used`。**
 
         它要 `await user_store.count_active_users(org_id)`，而这个函数被企业
@@ -1429,10 +1482,17 @@ def create_app() -> FastAPI:
         `admin_list_users` 上修掉的那类问题（P1-14，约 300 次串行查询）。
         列表页只给上限，用量在单个企业的详情/改上限响应里给。
         真要在列表上显示用量，得先写一个 `count_active_users_batch`。
+
+        `aiops_module_enabled` 反过来——**特意作为参数传入，不在这里查**，
+        因为调用方有的是"批量列表"场景（`admin_list_organizations`，需要
+        批量查询避免 N+1）、有的是"我刚写完这个值，不需要再读一次"场景
+        （`admin_set_aiops_module_enabled`），两种取值方式不一样，硬塞进
+        这个纯同步的映射函数里反而两头都不讨好。
         """
         return AdminOrganizationResponse(
             org_id=org.org_id, name=org.name, is_platform=org.is_platform,
             created_at=org.created_at, seat_limit=org.seat_limit,
+            aiops_module_enabled=aiops_module_enabled,
         )
 
     @app.get("/api/v1/admin/organizations", response_model=List[AdminOrganizationResponse])
@@ -1450,7 +1510,8 @@ def create_app() -> FastAPI:
         else:
             own_org = await org_store.get_org_for_user(current_user.user_id)
             orgs = [own_org] if own_org else []
-        return [_org_response(o) for o in orgs]
+        aiops_enabled_by_org = await ops_store.is_module_enabled_batch([o.org_id for o in orgs])
+        return [_org_response(o, aiops_enabled_by_org.get(o.org_id, False)) for o in orgs]
 
     @app.post("/api/v1/admin/organizations", response_model=AdminOrganizationResponse)
     async def admin_create_organization(
@@ -1852,7 +1913,12 @@ def create_app() -> FastAPI:
             current_user.user_id, "set_aiops_module_enabled", "organization", org_id,
             {"enabled": request.enabled},
         )
-        return _org_response(org)
+        # 用刚写入的值直接回，不用再读一次数据库——我们本来就知道自己刚设的是
+        # 什么，读回反而多一次可以省掉的查询（也顺带避免了理论上的"写后读到
+        # 旧值"疑虑，虽然同一个连接内不会真的发生）。这是「刘德华」摸底运维
+        # 塔台时发现的真实阻塞：这个端点原来的响应里压根没有这个字段，
+        # PUT 之后前端没有任何办法确认这次点击是否真的生效。
+        return _org_response(org, request.enabled)
 
     def _remediation_scope_response(s) -> RemediationScopeResponse:
         return RemediationScopeResponse(

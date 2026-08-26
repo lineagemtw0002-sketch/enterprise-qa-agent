@@ -255,6 +255,18 @@ async def main() -> None:
         )
         print("3) super_admin enables module:", resp.status_code)
         assert resp.status_code == 200
+        # 「刘德华」摸底运维塔台时发现的阻塞：这个字段原来任何 GET/PUT 响应里
+        # 都没有，前端没有合规的方式知道模块开没开。三处都要能看到最新值。
+        assert resp.json()["aiops_module_enabled"] is True, resp.json()
+
+        resp = await client.get("/api/v1/auth/me", headers=headers)
+        assert resp.json()["organization"]["aiops_module_enabled"] is True, resp.json()
+        print("3b) /auth/me reflects module state: OK")
+
+        resp = await client.get("/api/v1/admin/organizations", headers=platform_headers)
+        target = next(o for o in resp.json() if o["org_id"] == org.org_id)
+        assert target["aiops_module_enabled"] is True, target
+        print("3c) admin org list reflects module state: OK")
 
         resp = await client.post(
             "/api/v1/admin/ops/connectors", headers=headers,

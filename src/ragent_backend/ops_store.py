@@ -298,6 +298,23 @@ class OpsStore:
             )
         return bool(row["aiops_module_enabled"]) if row else False
 
+    async def is_module_enabled_batch(self, org_ids: List[str]) -> Dict[str, bool]:
+        """给企业列表页用的批量版——同一个 N+1 教训（P1-14 等一路踩过）：
+        列表页逐个企业调 `is_module_enabled` 就是又一次"读同一类数据 N 次"。
+        缺失的 org_id（表里没有该企业，理论上不该发生）在返回的 dict 里同样
+        不出现，调用方须用 `.get(org_id, False)` 兜底，跟 `organizations.
+        aiops_module_enabled` 列本身 `NOT NULL DEFAULT FALSE` 的语义一致。
+        """
+        if not org_ids:
+            return {}
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, aiops_module_enabled FROM organizations WHERE id = ANY($1::text[])",
+                list(org_ids),
+            )
+        return {row["id"]: bool(row["aiops_module_enabled"]) for row in rows}
+
     async def set_module_enabled(self, org_id: str, enabled: bool) -> None:
         """权限检查（只有 super_admin 能调）在 app.py 端点层，这里不重复判断——
         跟其它 Store 的既有分工一致（Store 只管数据，端点管权限）。"""
@@ -812,14 +829,40 @@ class OpsStore:
                 )
         return [self._row_to_action(r) for r in rows]
 
-    async def list_pending_approval_older_than(self, cutoff_ts: float) -> List[RemediationAction]:
-        """给超时扫描用（§3.3 的 `expired` 状态）——本阶段只提供查询方法，
-        实际的定时扫描任务是后续阶段（LangGraph 接入 / 后台任务）的工作，
-        见 `CLAUDE.md` §5 该条"什么没做"。"""
+    async def expire_stale_pending_approvals(self) -> List[str]:
+        """给超时扫描用（§3.3 的 `expired` 状态）——扫描全部 `pending_approval`
+        动作，用**各自连接器**的 `approval_timeout_minutes` 算出过期时间点，
+        过期的转成 `expired`。返回本次真正转移成功的 `action_id` 列表。
+
+        ⚠️ **不能用一个全局 `cutoff_ts` 套所有动作**——`approval_timeout_minutes`
+        是按连接器配置的（§10.4，5～1440 分钟范围），不同连接器的超时长度不同，
+        必须 JOIN `ops_system_connections` 用各自的值算 `created_at + timeout`，
+        不能假装全平台一个超时时长。这是本方法取代早前占位版
+        `list_pending_approval_older_than`（只接收一个全局 `cutoff_ts`，从未被
+        任何调用方使用过）的原因，不是简单改名。
+
+        转移复用 `advance_status` 已有的条件 UPDATE（TOCTOU 修复的同一套机制）——
+        扫描任务和"审批人这一刻刚好点了批准"是天然的并发场景，`advance_status`
+        内部按 `WHERE status = 当前状态` 做原子转移，谁先谁赢，扫描到的动作如果
+        已经在别处被改变状态，这里会拿到 `IllegalStatusTransition` 并跳过，
+        不会覆盖真实的审批结果。
+        """
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM remediation_actions WHERE status = $1 AND created_at < $2",
-                STATUS_PENDING_APPROVAL, cutoff_ts,
+                "SELECT ra.id FROM remediation_actions ra "
+                "JOIN ops_system_connections c ON c.id = ra.connection_id "
+                "WHERE ra.status = $1 "
+                "AND ra.created_at + (c.approval_timeout_minutes * 60) < $2",
+                STATUS_PENDING_APPROVAL, time.time(),
             )
-        return [self._row_to_action(r) for r in rows]
+        expired_ids: List[str] = []
+        for row in rows:
+            try:
+                await self.advance_status(row["id"], STATUS_EXPIRED)
+                expired_ids.append(row["id"])
+            except IllegalStatusTransition:
+                # 扫描到之后、真正转移之前，这条动作已经被别的路径改变了状态
+                # （比如刚好被批准/拒绝）——正常竞态结果，不是错误，跳过即可。
+                continue
+        return expired_ids
