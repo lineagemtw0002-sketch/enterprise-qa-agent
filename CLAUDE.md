@@ -519,7 +519,8 @@ flowchart TB
    **删的是误伤，不是覆盖面**——但这是一次"让红转绿"的断言改动，
    如不认同请直接退回。
 
-9. 🔄 **检索层正在迁移到 OpenSearch**（2026-08-26 起，阶段 0–2 已落地，**读仍走旧链路**）
+9. 🔄 **检索层正在迁移到 OpenSearch**（2026-08-26，阶段 0–3 已落地，
+   **切读默认关闭，按 collection 灰度**）
    设计与实施记录 `docs/opensearch_migration_design.md`（§12 是实施记录）。
    **`docs/bm25_storage_design.md` 及其 SQLite 产物将被本方案取代**，
    但阶段 4 未做，现在两套并存。
@@ -541,7 +542,25 @@ flowchart TB
    变成"一企业一 index（`conv_{org}`）+ 按 `owner_user_id` 过滤"。
    **跨企业隔离强度不变，企业内下降一档**（物理 → 逻辑）。
    `search_conv()` 把 `owner_user_id` 设计成必传位置参数，漏传直接 TypeError。
-   §3.3 待阶段 3 切读后更新。
+   §3.3 待灰度验证完成后更新。
+
+   **切读开关**：`RAGENT_OPENSEARCH_READ` = 不设/`off`（默认，全走旧链路，
+   **这是回滚开关**）/ `*`（全切）/ 逗号分隔的 collection 白名单（**精确匹配**）。
+
+   **切读前三项验证已通过**（`scripts/verify_opensearch_parity.py`）：
+   dense kNN 与 Chroma 平均重叠 **88%** · `__summary` 层 **91%** ·
+   黄金测试集 recall@10 **旧 83.0% vs 新 83.0%，未回退**（100 条人工标注）。
+
+   ⚠️ **实施中踩到一个静默降级，值得记住这个形态**：
+   `OpenSearchDenseRetriever.retrieve` 第一版漏了 `filters` 参数，
+   而 `HybridSearch._dense_search` 捕获所有异常后**退化成只有稀疏检索**——
+   检索照常返回结果，只少了一半召回，日志只有一行 warning。
+   **"跑起来没报错"和"测试通过"都抓不到它**，是端到端对照才发现的。
+   已用 `inspect.signature` 逐字比对新旧签名钉死。
+
+   **阶段 4（删 BM25/Chroma）未做，且不该现在做**——旧存储是唯一回滚路径。
+   还差：端到端答案质量未验、未在真实流量灰度、`conv_*` 读路径未接、
+   OpenSearch 侧并发未测。详见 `docs/opensearch_migration_design.md` §14。
 
 9b. 🔴 **顺带发现的既有缺陷：索引侧与查询侧分词器不一致**（未修）
    `sparse_encoder.py::_tokenize` 注释声称"必须与 `QueryProcessor` 一致"，

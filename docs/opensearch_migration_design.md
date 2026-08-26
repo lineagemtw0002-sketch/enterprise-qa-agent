@@ -1,8 +1,8 @@
 # 检索层迁移 OpenSearch · 设计方案
 
-> **状态：阶段 0 / 1 / 2 已实施，2026-08-26。读仍走现有 BM25 + Chroma 链路。**
-> 阶段 3（切读）/ 4（清理旧存储）未实施。四条待拍板项已全部确认，见 §11。
-> 实施记录见 §12。
+> **状态：阶段 0–3 已实施，2026-08-26。切读默认关闭，按 collection 灰度。**
+> 阶段 4（清理旧存储）未实施，**且不该在灰度验证完成前做**。
+> 四条待拍板项已全部确认，见 §11。实施记录见 §12、§13。
 > **日期**：2026-08-26
 > **死期**：2026-11-30。到期未实施则本文作废（`CLAUDE.md` §7.4）。
 > **取代**：`docs/bm25_storage_design.md`（方案 C / SQLite）。那份的阶段 1–3 已实施，
@@ -441,3 +441,93 @@ Lucene 把字段长度**有损量化成一个字节**，长度归一化项与精
 - **什么没做**：阶段 3（切读）/ 4（清理）未做；`__summary` 层未经验证；
   dense 侧只验证了"写进去了"，**没有验证 kNN 召回质量**；
   security plugin 关闭；单分片；未做端到端 TTFT 与黄金测试集对照。
+
+
+---
+
+## 13. 阶段 3 实施记录：切读（2026-08-26）
+
+> **状态：已实施。默认关闭 —— `RAGENT_OPENSEARCH_READ` 不设或 `off` 时全部走旧链路。**
+
+### 灰度开关
+
+| `RAGENT_OPENSEARCH_READ` | 行为 |
+|---|---|
+| 不设 / `off`（默认） | 全部走旧链路。**这是回滚开关**，出问题改回 `off` 即可，不必回滚部署 |
+| `*` | 全切 |
+| 逗号分隔的 collection 名 | 只有列出的走 OpenSearch |
+
+**默认关闭且支持白名单是刻意的。** 切读是本次迁移唯一改变生产检索行为的步骤，
+一次全切意味着出问题时所有库一起受影响。按库灰度可以先拿一个不重要的库跑几天。
+
+⚠️ 白名单是**精确匹配**，不做前缀或通配。模糊匹配在这种开关上危险：
+写错一个字符就可能把一批本不该切的库带进去，而症状（检索结果变了）
+不会立刻被发现。有测试钉住 `mmarc` 不匹配 `mmarco`。
+
+### 接缝在 retriever，不在 vector store
+
+新增 `OpenSearchSparseRetriever` / `OpenSearchDenseRetriever`，
+在 `_build_hybrid_search_for` 处分流。`HybridSearch`、RRF 融合、
+cross-encoder 重排**全部复用**，符合 §4 定的收窄范围。
+
+这不违反 §1 那条"不做适配层"：对齐的是**返回契约**（`RetrievalResult`），
+不是把 OpenSearch 塞进 `BaseVectorStore` 那种会掩盖它原生能力的抽象。
+
+### 🔴 踩到一个静默降级，值得单独记
+
+第一版 `OpenSearchDenseRetriever.retrieve` **漏了 `filters` 参数**。
+
+后果不是报错——`HybridSearch._dense_search` 捕获所有异常，打一行
+`Dense retrieval failed, using sparse only`，然后**退化成只有稀疏检索**。
+检索照常返回结果，只是少了一半召回。**跑起来没报错，日志也只有一行 warning。**
+
+是端到端对照（旧链路 vs 新链路走完整 `HybridSearch`）发现结果对不上才查出来的。
+**单靠"测试通过"和"手工试一下"都抓不到它。**
+
+修完之后同样三条查询，含 RRF 融合与重排，**逐位完全一致**。
+
+回归保护：`test_opensearch_read_switch.py::TestRetrieverSignaturesMatchLegacy`
+用 `inspect.signature` 逐字比对新旧 retriever 的参数列表。
+另有一条测 `filters` 真的下推到查询里——**只接受不实现同样是"能跑但结果错"**。
+
+### 切读前的三项验证（`scripts/verify_opensearch_parity.py`）
+
+| 项 | 结果 |
+|---|---|
+| dense kNN 召回一致性 | 平均 **88%**（90/82/90），3/3 达标 |
+| `__summary` 摘要层 | 平均 **91%**（95/88），2/2 达标 |
+| 黄金测试集 recall@10 | 旧 **83.0%** vs 新 **83.0%**（+0.0%），100 条人工标注 |
+| 黄金测试集（无标注部分） | 17 条命中集合重叠 **100%** |
+
+⚠️ 黄金那项**量的是召回率，不是两边有多像**。重叠率只能说明"没变"，
+而如果原来就召回得差，"没变"不是好消息。用例里的 `expected_chunk_ids`
+是人工标注的正确答案，对着它算 recall@10 才回答得了"质量有没有回退"。
+
+⚠️ 第一版 `report()` 在样本为空时 `return True`，于是黄金测试集一条用例都没
+解析出来（字段名猜错）时仍打印"三项均达标"——**没测被报成通过**，已修。
+
+### 三句话
+
+- **验收怎么做**：`RAGENT_OPENSEARCH_READ=off`（默认）时行为与迁移前完全一致；
+  设成某个 collection 名后，该库走 OpenSearch，其余不变；
+  `python scripts/verify_opensearch_parity.py` 三项应全部达标。
+- **回归怎么保**：`test_opensearch_read_switch.py` 14 条（开关语义 + 签名对齐 +
+  filters 下推）；`test_opensearch_store.py` 15 条行为级；`tests/unit` 全绿。
+- **什么没做**：见 §14。
+
+---
+
+## 14. 现在还差什么（阶段 4 之前）
+
+1. **端到端答案质量未验**——`verify_opensearch_parity.py` 只到检索层。
+   答案质量要跑 `run_tenant_kb_golden_tests.py`（需真实 LLM），未跑。
+2. **没有在真实流量上灰度过**——开关做好了，但一天都没跑过。
+3. **`conv_*` 的读路径未接**——写入已按 `conv_{org}` 路由，但
+   `_build_hybrid_search_for` 的分流只处理业务库。对话私有库切读要单独做，
+   因为它需要 `owner_user_id` 过滤，而那个值当前不在检索调用链上。
+4. **并发未测**——`benchmark_bm25_backends.py` 的 GIL convoy 对照没在
+   OpenSearch 读路径上重跑过（只在裸 HTTP 上测过 6 线程 109ms）。
+5. **security plugin 关闭、单分片、目标规模均未验**。
+6. **分词器不一致（`CLAUDE.md` §4 第 9b 条）仍未修**，如实复刻中。
+
+**阶段 4（删 BM25/Chroma）在 1–3 有答案之前不该做**——旧存储是唯一回滚路径。

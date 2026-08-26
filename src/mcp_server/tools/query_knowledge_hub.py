@@ -394,6 +394,38 @@ class QueryKnowledgeHubTool:
             vector_store=vector_store,
         )
 
+        # ── 读后端分流（docs/opensearch_migration_design.md 阶段 3）──
+        # 默认走旧链路；RAGENT_OPENSEARCH_READ 是灰度开关，见
+        # opensearch_store.opensearch_read_enabled 的说明。
+        # **这是本次迁移唯一改变生产检索行为的地方。**
+        from src.libs.search.opensearch_store import (
+            OpenSearchStore,
+            opensearch_read_enabled,
+        )
+
+        if opensearch_read_enabled(collection):
+            from src.core.query_engine.opensearch_retrievers import (
+                OpenSearchDenseRetriever,
+                OpenSearchSparseRetriever,
+            )
+
+            os_store = OpenSearchStore()
+            sparse_retriever = OpenSearchSparseRetriever(collection, os_store)
+            dense_retriever = OpenSearchDenseRetriever(
+                collection, os_store, self._embedding_client
+            )
+            logger.info(
+                "检索走 OpenSearch collection=%s", collection,
+                extra={"event": "search.backend.opensearch", "collection": collection},
+            )
+            query_processor = QueryProcessor()
+            return create_hybrid_search(
+                settings=self.settings,
+                query_processor=query_processor,
+                dense_retriever=dense_retriever,
+                sparse_retriever=sparse_retriever,
+            )
+
         bm25_indexer = BM25Indexer(index_dir=str(resolve_path(f"data/db/bm25/{collection}")))
         sparse_retriever = create_sparse_retriever(
             settings=self.settings,

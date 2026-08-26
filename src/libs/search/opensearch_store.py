@@ -453,6 +453,37 @@ class OpenSearchStore:
         )
         return self._hits(resp)
 
+    def knn_kb(
+        self,
+        collection: str,
+        vector: Sequence[float],
+        top_k: int = 10,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """业务知识库的向量检索。
+
+        与 Chroma 的召回不会完全一致（实测平均重叠 88%）——两边是不同的 ANN
+        实现，且都是**近似**最近邻，本来就不保证返回同一批。这不是缺陷。
+        """
+        index = kb_index_name(collection)
+        if not self._client.indices.exists(index=index):
+            return []
+        knn: Dict[str, Any] = {"vector": list(vector), "k": top_k}
+        body: Dict[str, Any] = {"size": top_k}
+        if filters:
+            # 元数据过滤必须真的下推，不能接受后忽略 —— 忽略掉的话调用方以为
+            # 过滤生效了，实际拿到的是全库结果，属"能跑但结果错"。
+            body["query"] = {
+                "bool": {
+                    "must": [{"knn": {"embedding": knn}}],
+                    "filter": [{"term": {k: v}} for k, v in filters.items()],
+                }
+            }
+        else:
+            body["query"] = {"knn": {"embedding": knn}}
+        resp = self._client.search(index=index, body=body)
+        return self._hits(resp)
+
     @staticmethod
     def _hits(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
         return [
@@ -575,3 +606,31 @@ def mirror_ingestion_to_opensearch(
                 "collection": collection,
             },
         )
+
+
+# ────────────────────────── 读切换（阶段 3）──────────────────────────
+
+
+def opensearch_read_enabled(collection: str) -> bool:
+    """这个 collection 的**读请求**该不该走 OpenSearch。
+
+    `RAGENT_OPENSEARCH_READ` 取值：
+      - 不设或 `off`（默认）—— 全部走旧链路。**这是回滚开关**，
+        出问题时不必改代码、不必回滚部署。
+      - `*` —— 全部走 OpenSearch。
+      - 逗号分隔的 collection 白名单 —— 只有列出的走 OpenSearch。
+
+    **默认关闭且支持白名单，是刻意的。** 切读是这次迁移里第一个改变生产
+    检索行为的步骤，一次全切意味着出问题时所有库一起受影响。
+    按库灰度可以先拿一个不重要的库跑几天，再逐步放开。
+
+    ⚠️ 白名单匹配的是**精确名字**，不做前缀/通配。模糊匹配在这种开关上是
+    危险的：写错一个字符就可能把一批本不该切的库带进去，而症状（检索结果
+    变了）不会立刻被发现。
+    """
+    raw = os.getenv("RAGENT_OPENSEARCH_READ", "").strip()
+    if not raw or raw.lower() == "off":
+        return False
+    if raw == "*":
+        return True
+    return collection in {c.strip() for c in raw.split(",") if c.strip()}
