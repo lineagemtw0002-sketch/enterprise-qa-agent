@@ -229,7 +229,8 @@ flowchart TB
 flowchart TB
     Q["查询"] --> ACL{"ACL 收敛<br/>_org_owned_collections(org)<br/>∩ 角色 allowed_collections"}
     ACL -->|为空| DENY["直接拒绝"]
-    ACL -->|候选库列表| FAN["并行扇出<br/>每库一路<br/>━━━━━━━━<br/>子查询扇出上限 <b>3</b><br/>（intent.MAX_SUB_QUERY_FANOUT）<br/>唯一截断点在 _retrieve_multi"]
+    ACL -->|候选库列表| NAR["文档级粗筛<br/>{collection}__summary<br/>━━━━━━━━<br/><b>默认关闭</b>（narrow.enabled）<br/>只在库内收窄，<b>不减少候选库</b>"]
+    NAR --> FAN["并行扇出<br/>每库一路<br/>━━━━━━━━<br/>子查询扇出上限 <b>3</b><br/>（intent.MAX_SUB_QUERY_FANOUT）<br/>唯一截断点在 _retrieve_multi"]
 
     FAN --> D["Dense<br/>Chroma 向量"]
     FAN --> S["Sparse<br/>BM25"]
@@ -242,8 +243,21 @@ flowchart TB
     TH -->|通过| OUT["带来源标注的上下文"]
 
     style ACL fill:#ffe8e8
+    style NAR fill:#eef2ff
     style TH fill:#fff8e0
 ```
+
+**文档级粗筛（层次化检索的第一级）默认是关的**（`ingestion.doc_summary.narrow.enabled`，
+2026-08-26）。它只能把**单个库内部**的 chunk 检索收窄到几篇文档，
+**不能改变"要检索哪几个库"**——后者恒等于 ACL 收敛出来的候选库列表。
+这条不变量是 2026-08-26 修的：此前粗筛取「跨全部候选库的全局前 5 篇」，
+再拿命中结果的 keys 当"要查的库"，于是候选库越多（= 用户权限越大）被误伤越重
+（6 库企业管理员 30 条问题里 11 条返回"未找到"，且全部是"问题所属的库压根没被检索"）。
+默认关闭的理由不是"层次化检索没用"，而是**它的前提在当前全部语料上从未成立**：
+32 个非空 collection 的「块/文档」比全是 1.00，而 `use_llm: false` 时摘要就是
+"标题 + 正文前 600 字"，摘要向量≈正文向量。
+完整实测、四个设计问题的回答、以及**重新评估的触发条件**见
+`docs/hierarchical_narrowing_redesign.md`。
 
 **阈值说明**：`MIN_RELEVANCE_SCORE = 0.1` 打在 **cross-encoder 重排分**上，**不是 RRF 融合分**。
 依据是实测（`query_knowledge_hub.py:56-65`）：不相关问题的噪音稳定在 0.03 以下、
@@ -375,6 +389,13 @@ flowchart LR
 3. **当前数据量下检索不是瓶颈，6 库并行与单库基本持平**——同一个问题，
    单库 tool_subgraph 0.28s vs 6 库 0.39s。检索链路从优化前的 8.65s
    降到零点几秒（启动预加载 reranker/embedding 的效果）。
+
+   ⚠️ **2026-08-26 补注：这一条已经不能照字面用了。** 当时"6 库并行 0.39s"是在
+   文档级粗筛**开着**的前提下测的——粗筛会把 6 个库砍到实际只查 1~2 个，
+   所以"6 库并行与单库持平"其实是"6 库并行根本没在查 6 个库"。粗筛默认关闭后，
+   同一批问题的检索段实测 p50 **1678ms**（每库 121 篇、空载）。
+   拆开看：每库各 embed 一次 query（76ms × 6 ≈ 460ms，可优化）+ 重排候选池
+   60 条 566ms + BM25 各库加载。见 `docs/hierarchical_narrowing_redesign.md` §3.4。
    ⚠️ **但这仍然是在测试数据量（每库约 20 块）下测的**，与优化前那次的前提完全相同；
    `CLAUDE.md` §4 P0 第 2 条推算真实数据量（几个 G 文档 → 143K–716K 块）下
    BM25 索引全量加载会变成主要瓶颈。**两者不矛盾，是不同数据量下的两个结论；
