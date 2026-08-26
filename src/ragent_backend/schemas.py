@@ -61,6 +61,12 @@ class MeResponse(BaseModel):
     allowed_collections: List[str]    # 保留：后端按角色关联算好的知识库并集，前端不用二次拼接
     organization: Optional[OrganizationSummary] = None
     created_at: float
+    # 2026-08-26 补：role_ops_systems 落地后，"能不能看到运维审批入口"不再
+    # 等价于"是不是 org_admin"——一个被授予 can_approve 的普通员工也该看到。
+    # 跟 allowed_collections 同一个思路：后端把"该用户在任意连接器上是否有
+    # 权限"这个并集算好，前端不用重复实现 org_admin 通配符这层判断逻辑。
+    ops_can_view: bool = False
+    ops_can_approve: bool = False
 
 
 class ChangePasswordRequest(BaseModel):

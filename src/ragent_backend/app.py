@@ -901,6 +901,7 @@ def create_app() -> FastAPI:
         if user is None:
             raise HTTPException(status_code=404, detail="用户不存在")
         roles = await role_store.get_user_roles(user.user_id)
+        ops_perm = await ops_store.get_ops_permission_summary(user.user_id)
         return MeResponse(
             user_id=user.user_id,
             username=user.username,
@@ -908,6 +909,8 @@ def create_app() -> FastAPI:
             allowed_collections=await role_store.get_allowed_collections_for_user(user.user_id),
             organization=await _org_summary_for_user(user.user_id),
             created_at=user.created_at,
+            ops_can_view=ops_perm["can_view"],
+            ops_can_approve=ops_perm["can_approve"],
         )
 
     @app.post("/api/v1/auth/change-password")

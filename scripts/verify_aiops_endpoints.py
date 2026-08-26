@@ -409,6 +409,14 @@ async def main() -> None:
         print("16d) reviewer with no grant tries to approve:", resp.status_code)
         assert resp.status_code == 403
 
+        # 16d2) 「刘德华」发现的真实阻塞：/auth/me 原来没有任何字段能让前端
+        # 知道"这个用户有没有运维权限"，导航门禁只能按角色名判断，被授权的
+        # 非 org_admin 用户永远进不了运维塔台。补的聚合字段先验证"没有任何
+        # 授权时确实是 False"这一侧。
+        resp = await client.get("/api/v1/auth/me", headers=reviewer_headers)
+        print("16d2) reviewer /auth/me before grant:", resp.json()["ops_can_view"], resp.json()["ops_can_approve"])
+        assert resp.json()["ops_can_view"] is False and resp.json()["ops_can_approve"] is False
+
         # 16e) 系统内置角色（org_admin/super_admin）不允许配置 role_ops_systems
         resp = await client.put(
             f"/api/v1/admin/roles/{org_admin_role.role_id}/ops-permissions/{connection_id}",
@@ -425,6 +433,10 @@ async def main() -> None:
         print("16f) grant can_approve to reviewer role:", resp.status_code, resp.json())
         assert resp.status_code == 200
         assert resp.json()["can_view"] is True, "can_approve=True 必须隐含 can_view=True"
+
+        resp = await client.get("/api/v1/auth/me", headers=reviewer_headers)
+        print("16f2) reviewer /auth/me after grant:", resp.json()["ops_can_view"], resp.json()["ops_can_approve"])
+        assert resp.json()["ops_can_view"] is True and resp.json()["ops_can_approve"] is True
 
         resp = await client.get("/api/v1/admin/ops/remediation-actions", headers=reviewer_headers)
         print("16g) reviewer after grant sees:", resp.status_code, len(resp.json()))

@@ -1270,6 +1270,26 @@ flowchart TB
   刻意没有跟着放宽，因为"谁能提议"和"谁能批准"是两件事，提议本身还没有
   在设计里被要求下放）。
 
+  ⚠️ **落地当天即由「刘德华」发现一个真实阻塞，已修复**：后端放宽了，
+  前端的门还锁着——`TopNav` 的"智能运维"入口门禁是纯按角色名判断
+  `isAdmin`（`ADMIN_ROLE_NAMES`），被授予 `can_approve` 的非 org_admin
+  用户角色名不在这个集合里，永远看不到入口，等于这套权限刚落地就只有
+  org_admin 自己能用——跟 `aiops_module_enabled` 那次同一个根因："/auth/me
+  没有任何字段能让前端知道这件事"。
+  修法：`MeResponse` 加 `ops_can_view`/`ops_can_approve` 两个聚合布尔字段
+  （`ops_store.py::get_ops_permission_summary`），语义是"该用户在**任意**
+  连接器上有没有这个权限"，不是某一个连接器——跟 `allowed_collections`
+  同一个思路，后端把并集算好，前端不用遍历连接器自己拼。
+  ⚠️ **org_admin 通配符在这里不要求企业名下已经有连接器**——通配符是身份
+  性质，不该因为企业还没注册任何连接器就退化成 False，那是运营状态不是
+  权限声明；判别式测试专门换一个零连接器的新企业验证这条。
+  验证：`tests/integration/test_ops_store_role_permissions.py` 新增
+  `TestGetOpsPermissionSummary`（3 条，含上面那条判别式）+
+  `scripts/verify_aiops_endpoints.py` 新增 2 项（授权前 `/auth/me` 两个
+  字段为 False，授权后为 True），全量复跑 14+33 项、`tests/unit` 2346 通过。
+  前端接这两个字段做门禁（`isAdmin || ops_can_view`）由刘德华跟进，
+  同时在做"授权管理"界面（PUT/DELETE 那两个端点目前只能直接调 API）。
+
 - ✅ **2026-08-26　P1-14 扩展审计：逐个核对全部管理端点，修复 2 处同类问题**
   `/admin/users` 本身的 N+1 早前已修（同一条 P1-14），但 CLAUDE.md 一直如实
   标注"其余管理端点未逐个排查"。这次过了一遍全部 GET 列表端点：

@@ -232,3 +232,47 @@ class TestViewableConnectionIdsForUser:
         async with _fixture() as fixture:
             result = await fixture.ops.viewable_connection_ids_for_user(fixture.nobody.user_id, fixture.org_a.org_id)
             assert result == []
+
+
+class TestGetOpsPermissionSummary:
+    """给 `/auth/me` 用的聚合视图——「刘德华」摸底运维塔台前端时发现的真实
+    阻塞：导航门禁原来只按角色名判断 `isAdmin`，被授予 `can_approve` 的
+    非 org_admin 用户在角色名判断下永远进不了运维塔台，即使后端权限已经
+    放开。这组测试对应的正是补上的这个聚合字段。"""
+
+    async def test_org_admin_gets_true_even_with_zero_connectors_in_org(self):
+        # 判别式：通配符是身份性质，不该因为企业还没注册任何连接器就变成
+        # False——如果实现依赖"至少存在一个已授权的连接器"才返回 True，
+        # 这条会失败（fixture 建的连接器属于 org_a，这里刻意换一个全新的
+        # 、没有任何连接器的企业）。
+        async with _fixture() as fixture:
+            empty_org = await fixture.org_store.create_organization("role-perm-summary-empty-org")
+            admin = await fixture.user_store.create_user("role_perm_summary_admin", "pw12345678")
+            pool = await fixture.user_store._get_pool()
+            try:
+                async with pool.acquire() as conn:
+                    await conn.execute("UPDATE users SET org_id = $1 WHERE id = $2", empty_org.org_id, admin.user_id)
+                org_admin_role = await fixture.role_store.get_role_by_name(ROLE_ORG_ADMIN, org_id=None)
+                await fixture.role_store.add_user_role(admin.user_id, org_admin_role.role_id)
+
+                summary = await fixture.ops.get_ops_permission_summary(admin.user_id)
+                assert summary == {"can_view": True, "can_approve": True}
+            finally:
+                async with pool.acquire() as conn:
+                    await conn.execute("DELETE FROM user_roles WHERE user_id = $1", admin.user_id)
+                    await conn.execute("DELETE FROM users WHERE id = $1", admin.user_id)
+                    await conn.execute("DELETE FROM organizations WHERE id = $1", empty_org.org_id)
+
+    async def test_explicit_grant_on_any_connector_aggregates_to_true(self):
+        async with _fixture() as fixture:
+            await fixture.ops.set_role_ops_permission(
+                fixture.reviewer_role.role_id, fixture.connector.connection_id,
+                can_view=True, can_approve=False,
+            )
+            summary = await fixture.ops.get_ops_permission_summary(fixture.reviewer.user_id)
+            assert summary == {"can_view": True, "can_approve": False}
+
+    async def test_no_role_no_grant_is_false(self):
+        async with _fixture() as fixture:
+            summary = await fixture.ops.get_ops_permission_summary(fixture.nobody.user_id)
+            assert summary == {"can_view": False, "can_approve": False}

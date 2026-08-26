@@ -675,6 +675,43 @@ class OpsStore:
             "can_approve": any(r["can_approve"] for r in perm_rows),
         }
 
+    async def get_ops_permission_summary(self, user_id: str) -> Dict[str, bool]:
+        """给 `/auth/me` 用的**聚合**视图——不是"某个连接器上有没有权限"，是
+        "这个用户在**任意**连接器上有没有 can_view/can_approve"，前端用它
+        决定导航入口显示与否，不需要遍历每个连接器再自己取并集。
+
+        ⚠️ org_admin 通配符在这里**不要求企业名下已经有连接器**——通配符
+        本身是"企业管理员=企业内全部运维系统"这条身份性质，不该因为企业
+        还没注册任何连接器就变成 False，那是运营状态，不是权限声明。"""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            user_row = await conn.fetchrow("SELECT org_id FROM users WHERE id = $1", user_id)
+            if user_row is None or user_row["org_id"] is None:
+                return {"can_view": False, "can_approve": False}
+
+            role_rows = await conn.fetch(
+                "SELECT r.id, r.name FROM roles r JOIN user_roles ur ON ur.role_id = r.id "
+                "WHERE ur.user_id = $1",
+                user_id,
+            )
+            role_ids = [r["id"] for r in role_rows]
+            role_names = {r["name"] for r in role_rows}
+
+            if ROLE_ORG_ADMIN in role_names:
+                return {"can_view": True, "can_approve": True}
+
+            if not role_ids:
+                return {"can_view": False, "can_approve": False}
+
+            perm_rows = await conn.fetch(
+                "SELECT can_view, can_approve FROM role_ops_systems WHERE role_id = ANY($1::text[])",
+                role_ids,
+            )
+        return {
+            "can_view": any(r["can_view"] for r in perm_rows),
+            "can_approve": any(r["can_approve"] for r in perm_rows),
+        }
+
     async def viewable_connection_ids_for_user(self, user_id: str, org_id: str) -> Optional[List[str]]:
         """给"列出本企业修复动作"这类端点按 can_view 过滤用。
 
