@@ -62,7 +62,11 @@ const ACTION_LABEL = Object.fromEntries(ACTION_TYPES.map((a) => [a.value, a.labe
 const STATUS_META = {
   proposed: { color: 'default', label: '已提议' },
   pending_approval: { color: 'processing', label: '待审批' },
-  approved: { color: 'blue', label: '已批准' },
+  // 「已批准」不等于「已执行」——批准端点只把状态推到 approved，真正下发是另一条
+  // 链路（execute_approved_remediation 工具，由智能运维在对话里发起，见设计 §10.2
+  // 「触发链路」与「审批/执行链路」分离）。标签直接把这层说破，省得管理员看到
+  // 「已批准」就以为事情办完了。
+  approved: { color: 'blue', label: '已批准 · 待执行' },
   rejected: { color: 'red', label: '已拒绝' },
   rejected_pre: { color: 'red', label: '越界拒绝' },
   executing: { color: 'gold', label: '执行中' },
@@ -471,7 +475,7 @@ function ApprovalsSection({ onModuleDisabled }) {
           <Space>
             <Popconfirm
               title="确认批准这个修复动作？"
-              description="批准后会真的在你的环境里执行，请先确认上面的动作参数。"
+              description="批准 = 授予执行资格，本身不会立刻下发；真正执行由智能运维在对话里另行发起。请先确认上面的动作参数。"
               okText="确认批准"
               cancelText="再想想"
               onConfirm={() => act(row.action_id, 'approve')}
@@ -501,7 +505,7 @@ function ApprovalsSection({ onModuleDisabled }) {
         showIcon
         className="ops-console-alert"
         message="当前本企业任何管理员都可以审批"
-        description="精细的审批权限（区分「能查看」和「能审批」）尚未实现，因此这里没有指定审批人的概念。批准会立即触发执行。"
+        description="精细的审批权限（区分「能查看」和「能审批」）尚未实现，因此这里没有指定审批人的概念。另外注意：批准只是授予执行资格，动作不会因为你点了批准就自动跑起来——真正下发是独立的一步。"
       />
       <Table
         rowKey="action_id"
