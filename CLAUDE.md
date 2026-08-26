@@ -559,8 +559,17 @@ flowchart TB
    已用 `inspect.signature` 逐字比对新旧签名钉死。
 
    **阶段 4（删 BM25/Chroma）未做，且不该现在做**——旧存储是唯一回滚路径。
-   还差：端到端答案质量未验、未在真实流量灰度、`conv_*` 读路径未接、
-   OpenSearch 侧并发未测。详见 `docs/opensearch_migration_design.md` §14。
+   **模拟流量已跑**（`scripts/simulate_search_traffic.py`，120 请求/6 并发）：
+   零失败、零静默降级、结果重叠率 **92%**；
+   **p50 慢 2 倍但 p95 快 4 倍**（295ms vs 1236ms，旧链路尾巴很长）；
+   6 线程挂钟膨胀 **旧 2.96x / 新 3.01x，两边几乎相同、都没有 convoy**。
+   ⚠️ 但现网最大的库只有 604 条，**数据量不足以触发 convoy**——
+   目标规模下完整链路的并发行为**仍是未知数**。
+   小数据量下 OpenSearch 更慢属预期（HTTP 固定开销），
+   **不要拿"现在更快"当切读理由**。
+
+   还差：端到端答案质量未验、`conv_*` 读路径未接、目标规模并发未测。
+   详见 `docs/opensearch_migration_design.md` §14 §15。
 
 9b. 🔴 **顺带发现的既有缺陷：索引侧与查询侧分词器不一致**（未修）
    `sparse_encoder.py::_tokenize` 注释声称"必须与 `QueryProcessor` 一致"，
@@ -845,6 +854,7 @@ flowchart TB
 | **`docs/architecture.md`** | **架构图 · 核心链路 · 双模型 · 性能测试**（与本文同属当前状态正本） | **活文档** |
 | `docs/scale_slo_and_priorities.md` | 容量测算 · 最小 SLO · 27+3 条发现重新分级（12 条 P0） | 活文档 |
 | `docs/orchestration_design.md` | 编排层设计：并行防护 + 记忆异步化 | **部分实施**：A 部分 D4/D5（08-25 第二批）、**D1/D2（08-25 第三批，见 §4.5）** 已落地；D3/D6 未实施；**B 部分整体未实施**（阻塞项 B-R1 已实测查清） |
+| `docs/aiops_module_design.md` | **新功能提案**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复），BYOC 架构 | **提案，未实施**，死期 2026-09-25。⚠️ 与 §30秒必读"停止新增功能"矛盾，用户已明确要求立项，但排期顺序（是否插队于 12 条 P0 之前）待用户另行确认 |
 | `docs/collaboration_retrospective.md` | 协作复盘与开发流程指南（**每周自查只需读 §1**） | 活文档 |
 | `docs/review_2026-08-24/review_codebase_findings.md` | 代码审计，带行号证据 | 时点快照 |
 | `docs/review_2026-08-24/review_process_retro.md` | 过程复盘量化分析 | 时点快照 |
