@@ -64,6 +64,8 @@ from src.ragent_backend.schemas import (
     AdminKbChunkPreview,
     AdminCreatedUserCredential, SetSeatLimitRequest, SetUserDisabledRequest,
     ActivateAccountRequest, BulkImportRowResult, BulkImportResponse,
+    OpsConnectorResponse, RegisterOpsConnectorRequest, SetAiopsModuleEnabledRequest,
+    RemediationScopeResponse, UpsertRemediationScopeRequest,
 )
 from src.ragent_backend import account_import as _acct_import
 from src.ragent_backend import activation as _activation
@@ -83,6 +85,8 @@ from src.ragent_backend.collection_store import OrgCollectionStore
 from src.ragent_backend.dashboard_stats import DashboardStatsService
 from src.ragent_backend.tenant_identity_store import TenantIdentityStore
 from src.ragent_backend.audit_store import AuditStore
+from src.ragent_backend.ops_store import OpsStore
+from src.ragent_backend import aiops_scope
 from src.ragent_backend.auth import (
     AuthenticatedUser, create_access_token, get_current_user, require_role,
     require_same_org_or_platform, require_platform_admin, get_jwt_secret,
@@ -372,6 +376,10 @@ def create_app() -> FastAPI:
     # audit_store：治理与合规——管理后台变更操作 + 工具调用的审计记录（见
     # audit_store.py）
     audit_store: AuditStore = AuditStore()
+    # ops_store：智能运维模块（docs/aiops_module_design.md）——连接器/修复范围
+    # 白名单/审批状态机，阶段一存储层。BYOC 连接器的实际运行时（心跳/联邦查询/
+    # AI 分析）尚未实现，这里接的只是管理面的 CRUD 端点。
+    ops_store: OpsStore = OpsStore()
     # 知识库管理工具：统计/查看/清空一家企业名下知识库的数据。
     # 企业管理员在「知识库权限」页面自助删除知识库/分页查看数据（见下面
     # admin_delete_collection / admin_list_collection_chunks，只传调用方自己的
@@ -1552,6 +1560,142 @@ def create_app() -> FastAPI:
             for c, health in zip(connectors, health_statuses)
         ]
         return results
+
+    # ==================== 智能运维模块 API（docs/aiops_module_design.md） ====================
+    # 阶段二：管理面 CRUD 端点，接的是 ops_store.py 的存储层（阶段一）。
+    # BYOC 连接器的实际运行时（WebSocket 心跳/联邦查询/AI 分析）、审批工作流、
+    # LangGraph 接入均未实现——这里注册的连接器目前只是"元数据存在"，还不会
+    # 真的连上任何客户系统。见 CLAUDE.md §5 该条"什么没做"。
+
+    async def _require_aiops_enabled_org(current_user: AuthenticatedUser):
+        """模块开关叠加在角色/ACL 校验之前的新一层（§4.1），不是替代——
+        `_require_org_admin` 这层 Depends 已经先过了，这里再加一道"这家企业
+        开没开通"的业务闸。跟 `_require_local_retrieval_org` 是同一个模式：
+        返回调用方所属的 Organization，避免调用方再查一次。"""
+        org = await org_store.get_org_for_user(current_user.user_id)
+        if org is None:
+            raise HTTPException(status_code=403, detail="账号未关联任何企业")
+        if not await ops_store.is_module_enabled(org.org_id):
+            raise HTTPException(status_code=403, detail="智能运维模块未对本企业开通，请联系平台管理员")
+        return org
+
+    async def _get_owned_connector(org_id: str, connection_id: str):
+        """404 不是 403——不能让"这个连接器存在但不是你的"这个信息泄露给
+        跨企业的调用方，跟 admin_delete_collection 的既有约定一致。"""
+        connector = await ops_store.get_connector(connection_id)
+        if connector is None or connector.org_id != org_id:
+            raise HTTPException(status_code=404, detail="连接器不存在")
+        return connector
+
+    def _ops_connector_response(c) -> OpsConnectorResponse:
+        return OpsConnectorResponse(
+            connection_id=c.connection_id, org_id=c.org_id, name=c.name,
+            system_type=c.system_type, connector_status=c.connector_status,
+            last_heartbeat_at=c.last_heartbeat_at, created_by=c.created_by,
+            approval_timeout_minutes=c.approval_timeout_minutes, created_at=c.created_at,
+        )
+
+    @app.post("/api/v1/admin/ops/connectors", response_model=OpsConnectorResponse)
+    async def admin_register_ops_connector(
+        request: RegisterOpsConnectorRequest,
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> OpsConnectorResponse:
+        org = await _require_aiops_enabled_org(current_user)
+        try:
+            timeout_minutes = aiops_scope.validate_approval_timeout_minutes(
+                request.approval_timeout_minutes
+            )
+        except aiops_scope.InvalidApprovalTimeout as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        connector = await ops_store.register_connector(
+            org.org_id, request.name, request.system_type, current_user.user_id,
+            approval_timeout_minutes=timeout_minutes,
+        )
+        await _audit_log(
+            current_user.user_id, "register_ops_connector", "ops_connector", connector.connection_id,
+            {"org_id": org.org_id, "name": request.name, "system_type": request.system_type},
+        )
+        return _ops_connector_response(connector)
+
+    @app.get("/api/v1/admin/ops/connectors", response_model=List[OpsConnectorResponse])
+    async def admin_list_ops_connectors(
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> List[OpsConnectorResponse]:
+        org = await _require_aiops_enabled_org(current_user)
+        connectors = await ops_store.list_connectors_for_org(org.org_id)
+        return [_ops_connector_response(c) for c in connectors]
+
+    @app.put(
+        "/api/v1/admin/organizations/{org_id}/aiops-module-enabled",
+        response_model=AdminOrganizationResponse,
+    )
+    async def admin_set_aiops_module_enabled(
+        org_id: str,
+        request: SetAiopsModuleEnabledRequest,
+        current_user: AuthenticatedUser = Depends(_require_super_admin),
+        __: AuthenticatedUser = Depends(require_platform_admin),
+    ) -> AdminOrganizationResponse:
+        """§4.1：只有 super_admin 能切换，企业管理员看不到、改不了——跟连接器
+        配置（§4 那张对照表）同一套边界，双重网关（超级管理员 + 平台管理员）
+        跟 `admin_upsert_tenant_connector` 一致。"""
+        org = await org_store.get_organization(org_id)
+        if org is None:
+            raise HTTPException(status_code=404, detail="组织不存在")
+        await ops_store.set_module_enabled(org_id, request.enabled)
+        await _audit_log(
+            current_user.user_id, "set_aiops_module_enabled", "organization", org_id,
+            {"enabled": request.enabled},
+        )
+        return _org_response(org)
+
+    def _remediation_scope_response(s) -> RemediationScopeResponse:
+        return RemediationScopeResponse(
+            scope_id=s.scope_id, org_id=s.org_id, connection_id=s.connection_id,
+            action_type=s.action_type, scope_config=s.scope_config,
+            configured_by=s.configured_by, updated_at=s.updated_at,
+        )
+
+    @app.put(
+        "/api/v1/admin/ops/connectors/{connection_id}/remediation-scopes/{action_type}",
+        response_model=RemediationScopeResponse,
+    )
+    async def admin_upsert_remediation_scope(
+        connection_id: str,
+        action_type: str,
+        request: UpsertRemediationScopeRequest,
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> RemediationScopeResponse:
+        """§3.3.1："谁能配置这份白名单——收紧为 org 管理员专属权限"。
+        这是高风险操作（一份错误的白名单会持续影响此后所有次执行），
+        `_require_org_admin` 已经是这条边界，不额外放宽给 role_ops_systems
+        的 can_approve 持有者。"""
+        org = await _require_aiops_enabled_org(current_user)
+        try:
+            aiops_scope.validate_action_type(action_type)
+        except aiops_scope.InvalidActionType as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        await _get_owned_connector(org.org_id, connection_id)  # 404 若不属于本企业
+        scope = await ops_store.upsert_remediation_scope(
+            org.org_id, connection_id, action_type, request.scope_config, current_user.user_id,
+        )
+        await _audit_log(
+            current_user.user_id, "upsert_remediation_scope", "ops_remediation_scope", scope.scope_id,
+            {"connection_id": connection_id, "action_type": action_type},
+        )
+        return _remediation_scope_response(scope)
+
+    @app.get(
+        "/api/v1/admin/ops/connectors/{connection_id}/remediation-scopes",
+        response_model=List[RemediationScopeResponse],
+    )
+    async def admin_list_remediation_scopes(
+        connection_id: str,
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> List[RemediationScopeResponse]:
+        org = await _require_aiops_enabled_org(current_user)
+        await _get_owned_connector(org.org_id, connection_id)
+        scopes = await ops_store.list_remediation_scopes(connection_id)
+        return [_remediation_scope_response(s) for s in scopes]
 
     # ==================== 运营仪表盘 API（仅平台管理员，见 dashboard_stats.py） ====================
     # _require_platform_tier 目前只剩 super_admin 一档（2026-08-24 起平台侧

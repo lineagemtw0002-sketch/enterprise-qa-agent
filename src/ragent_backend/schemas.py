@@ -220,6 +220,50 @@ class GatewayConnectorResponse(BaseModel):
     last_error: Optional[str]
 
 
+# ============== 智能运维模块 API（docs/aiops_module_design.md，阶段一存储层
+# 已实施；这里是阶段二——端点接线用的 schema）==============
+# 只有 org_admin 能注册连接器/配置修复范围白名单（§3.3.1）；只有 super_admin
+# 能切换 aiops_module_enabled 开关（§4.1）；两条边界跟角色管理/连接器管理是
+# 同一套既有分工，不是这次新发明的。
+
+class OpsConnectorResponse(BaseModel):
+    connection_id: str
+    org_id: str
+    name: str
+    system_type: str
+    connector_status: str
+    last_heartbeat_at: Optional[float]
+    created_by: str
+    approval_timeout_minutes: int
+    created_at: float
+
+
+class RegisterOpsConnectorRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=128)
+    system_type: str = Field(..., min_length=1, max_length=64)
+    approval_timeout_minutes: int = Field(
+        default=30, description="[5, 1440] 分钟，越界会被拒绝，不静默夹紧（见 aiops_scope.py）"
+    )
+
+
+class SetAiopsModuleEnabledRequest(BaseModel):
+    enabled: bool
+
+
+class RemediationScopeResponse(BaseModel):
+    scope_id: str
+    org_id: str
+    connection_id: str
+    action_type: str
+    scope_config: Dict[str, Any]
+    configured_by: str
+    updated_at: float
+
+
+class UpsertRemediationScopeRequest(BaseModel):
+    scope_config: Dict[str, Any]
+
+
 # 2026-08-26 已删除：这里原有 AdminTestKBQueryRequest/Response、
 # AdminKbCollectionStat 三个类，专供已删除的【测试专用】知识库超权测试端点使用，
 # 随端点一并删除，见 `CLAUDE.md` §5「已修复」。AdminKbChunkPreview 继续保留，
