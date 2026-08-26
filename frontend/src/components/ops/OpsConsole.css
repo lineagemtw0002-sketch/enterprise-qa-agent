@@ -197,3 +197,32 @@
 .metric-value .good { color: var(--good); }
 .metric-value .bad { color: var(--critical); }
 .metric-sample { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-faint); margin-top: 3px; }
+
+/* ---------- 事后复盘 ---------- */
+.pm-card {
+  background: var(--surface-inset);
+  border: 1px solid var(--ops-border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+.pm-card:last-child { margin-bottom: 0; }
+.pm-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.pm-time { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-faint); }
+.pm-section-label { font-size: 10.5px; color: var(--ink-faint); margin-bottom: 3px; letter-spacing: 0.03em; }
+.pm-result { margin: 8px 0; }
+.pm-result code {
+  display: block; font-family: var(--font-mono); font-size: 11px;
+  color: var(--ink-muted); background: var(--surface); border-radius: 6px;
+  padding: 6px 8px; word-break: break-all;
+}
+.pm-analysis { margin: 8px 0; }
+.pm-summary { font-size: 12px; color: var(--ink-muted); margin: 0; white-space: pre-wrap; }
+/* 「没有关联分析」不是一句轻描淡写的"暂无"——它本身是复盘线索，要看得见 */
+.pm-none {
+  font-size: 12px; color: var(--ink-faint); margin: 0;
+  background: var(--pending-dim); border-radius: 6px; padding: 7px 9px;
+}
+.pm-none b { color: var(--ink-muted); }
+.pm-outcome { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-soft); }
+.pm-ask { font-size: 11.5px; color: var(--ink-muted); margin-right: 4px; }

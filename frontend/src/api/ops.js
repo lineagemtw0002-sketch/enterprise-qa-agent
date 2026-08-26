@@ -180,3 +180,16 @@ export function setActionOutcome(actionId, effective) {
     .post(`${BASE}/ops/remediation-actions/${encodeURIComponent(actionId)}/outcome`, { effective })
     .then((res) => res.data)
 }
+
+// ==================== 事后复盘（§9.2 最小可行版） ====================
+//
+// 设计文档原话："没有这个视图，本模块的自动修复到底有没有用将无法被回顾评估，
+// 是一条真实的遗留风险"。
+//
+// ⚠️ 返回项里的 `linked_summary` 是 `string | null`：**null 表示这条动作压根没有
+// 关联 AI 分析（人工直接提议的），跟"关联了但摘要是空串"是两件事**。渲染时必须
+// 分开表达——把 null 显示成"暂无"会让人以为分析跑过但没结论，而实际上是根本
+// 没跑过分析就动手了，那是复盘时完全不同的一条线索。
+export function listPostmortems(limit = 100) {
+  return axios.get(`${BASE}/ops/postmortems`, { params: { limit } }).then((res) => res.data)
+}

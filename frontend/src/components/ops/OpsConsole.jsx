@@ -3,8 +3,9 @@ import {
   Alert, Button, Card, Checkbox, ConfigProvider, Empty, Form, Input, InputNumber,
   Modal, Popconfirm, Segmented, Select, Space, Spin, Table, Tag, Typography, message, theme,
 } from 'antd'
-import { Plug, KeyRound, ShieldCheck, ClipboardCheck, RefreshCw, Copy, Users, Trash2, LayoutDashboard } from 'lucide-react'
+import { Plug, KeyRound, ShieldCheck, ClipboardCheck, RefreshCw, Copy, Users, Trash2, LayoutDashboard, History } from 'lucide-react'
 import OpsOverview from './OpsOverview.jsx'
+import OpsPostmortems from './OpsPostmortems.jsx'
 import * as adminApi from '../../api/admin.js'
 import * as opsApi from '../../api/ops.js'
 import './OpsConsole.css'
@@ -754,6 +755,10 @@ function PermissionsSection({ connectors, onModuleDisabled }) {
 const SECTIONS = [
   { value: 'overview', label: '总览', icon: LayoutDashboard, everyone: true },
   { value: 'approvals', label: '审批队列', icon: ClipboardCheck, everyone: true },
+  // 「事后复盘」给所有能看的人，不只管理员：后端那个端点走的是
+  // viewable_connection_ids_for_user（跟审批队列同一套 can_view），
+  // 被授权的普通员工本来就能看到自己权限内的动作，复盘同理。
+  { value: 'postmortems', label: '事后复盘', icon: History, everyone: true },
   { value: 'scopes', label: '白名单配置', icon: ShieldCheck },
   { value: 'connectors', label: '连接器管理', icon: Plug },
   { value: 'permissions', label: '授权管理', icon: Users },
@@ -849,6 +854,7 @@ export default function OpsConsole({ canManage = true }) {
         booting ? <Spin /> : <ScopesSection connectors={connectors} onModuleDisabled={onModuleDisabled} />
       )}
       {section === 'approvals' && <ApprovalsSection onModuleDisabled={onModuleDisabled} />}
+      {section === 'postmortems' && <OpsPostmortems onModuleDisabled={onModuleDisabled} />}
       {section === 'permissions' && canManage && (
         booting ? <Spin /> : <PermissionsSection connectors={connectors} onModuleDisabled={onModuleDisabled} />
       )}
