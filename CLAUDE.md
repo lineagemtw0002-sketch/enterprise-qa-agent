@@ -979,12 +979,12 @@ flowchart TB
   会在 org 归属校验那一步被拒），但体验不完美，留作后续细化。
 
   ⚠️ **未做的（阶段四之后）**：
-  - `role_ops_systems`（can_view/can_approve 精细权限位）、
-    `ops_analysis_summaries` 只建了表，**CRUD 方法未实现**——当前的权限
+  - `role_ops_systems`（can_view/can_approve 精细权限位）——当前的权限
     粒度只有"org_admin 能管自己企业的一切 / super_admin 管开关"两档，
     §10.6 设想的"审批权限比查看权限更窄"这层还没有落地，**任何本企业
     org_admin 都能批准，不是只有被指定的审批人**，这条差距已如实记录在
-    `admin_approve_remediation_action` 的函数注释里
+    `admin_approve_remediation_action` 的函数注释里。~~`ops_analysis_summaries`
+    只建了表，CRUD 方法未实现~~ ✅ **已实现，见 §5 下方 CRUD 条目**
   - ~~LangGraph 接入（`intent_type=ops`/`ops_subgraph`，§10.2）~~ ✅
     **已确认不需要新增结构，见 §5 下方对应条目**；前端"运维塔台"UI 进行中
     （刘德华在做，见 §5 下方）
@@ -1157,6 +1157,44 @@ flowchart TB
   真实 SQL JOIN/ANY 是否正确"的场景价值不大，直接用集成测试覆盖，权衡后
   判断不需要再补一份假 pool 版本）；前端消费这个字段做导航门禁的部分是
   刘德华在做，不在本条范围内。
+
+- ✅ **2026-08-26　智能运维前端"运维塔台"（连接器/允许范围/审批队列）+
+  `ops_analysis_summaries` CRUD**（前者「刘德华」开发，本会话合并 + 真机
+  联调验收；后者本会话实现，为「刘德华」正在写的 `src/ops/analysis/`
+  AI 分析层解锁存储依赖）
+
+  **前端**：接在既有的 `TopNav` 占位入口上（`OpsPlaceholder` →
+  `OpsConsole.jsx`），门禁读 `organization.aiops_module_enabled`（上面那条
+  刚补的字段）决定导航是否显示，平台管理员也看不到（`hideForPlatform`——
+  运维审批不该暴露给平台运营方）。三个分段：连接器登记/握手凭证、修复范围
+  白名单（有类型的表单，不是裸 JSON 文本框）、审批队列（10 秒轮询）。
+  真机联调走查 5 项写路径（握手凭证只显示一次的强制确认弹窗、允许范围
+  切换动作类型后正确回填、clean_disk 帮助文案与路径穿越防护对得上、409
+  并发冲突走 `message.warning` 而不是刺眼的错误提示）全部确认正常。
+  联调过程中刘德华自己发现并修复了一处**文案而非代码的错误**：批准端点
+  （`admin_approve_remediation_action`）只推进状态到 `approved`，不触发
+  任何下发，但原文案"批准后会立即执行"暗示了错误的系统行为——三处文案已
+  改为如实区分"授予执行资格"和"真正下发是独立一步"。这类错配（代码对、
+  渲染对，但文案描述的系统行为和后端实际行为不一致）只有读过后端链路的人
+  联调时才能发现，是本次真机验收的主要价值所在。
+
+  **`ops_analysis_summaries` CRUD**：`save_analysis_summary`/
+  `get_analysis_summary`/`list_analysis_summaries` 三个方法（`ops_store.py`），
+  只落库"分析结论摘要 + 依据引用"，不解析 `evidence_refs` 内部结构（分析层
+  自己定义字段格式，Store 层当不透明 JSON 存取），呼应 §3.1 BYOC 原则
+  "不落库原始运维数据"。回归：`tests/integration/
+  test_ops_store_analysis_summaries.py`（4 条，真实 Postgres，含 JSONB
+  存取一圈后逐项相同的判别式）。
+
+  ⚠️ **已知缺口，讨论后判定暂不做**：工具注册（三个运维工具）没有按
+  `aiops_module_enabled` 过滤——查证后确认 `register_builtin_tools` 只在
+  `create_app()` 跑一次、建的是全局工具列表，`workflow.py` 拿工具列表时
+  没有 org 上下文，要修必须让工具列表按调用者动态生成，这是横切核心对话
+  链路的改动（影响所有工具，不只运维三个），判定不适合两人并行、单独排期，
+  谁做都行但只能一个人做。**低成本中间方案已批准去做**：`query_ops_system`
+  在企业未开通模块时，从"静默返回空结果"（LLM 会自己编一个"未查到数据"的
+  解释，误导用户）改成明确返回"本企业未开通智能运维模块"，把"体验不完美"
+  降级成"体验一般但不骗人"，同一个文件内可独立完成。
 
 - ✅ **2026-08-26　P1-14 扩展审计：逐个核对全部管理端点，修复 2 处同类问题**
   `/admin/users` 本身的 N+1 早前已修（同一条 P1-14），但 CLAUDE.md 一直如实
@@ -1712,7 +1750,7 @@ flowchart TB
 | **`docs/architecture.md`** | **架构图 · 核心链路 · 双模型 · 性能测试**（与本文同属当前状态正本） | **活文档** |
 | `docs/scale_slo_and_priorities.md` | 容量测算 · 最小 SLO · 27+3 条发现重新分级（12 条 P0） | 活文档 |
 | `docs/orchestration_design.md` | 编排层设计：并行防护 + 记忆异步化 | **部分实施**：A 部分 D4/D5（08-25 第二批）、**D1/D2（08-25 第三批，见 §4.5）** 已落地；D3/D6 未实施；**B 部分整体未实施**（阻塞项 B-R1 已实测查清） |
-| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **部分实施**：2026-08-26 用户明确要求插队开工（覆盖了文档自己"排期维持在 12 条 P0 之后"的原始决定）。阶段一～四全部落地并合并：数据模型/越界判定/审批状态机/管理面端点/审批工作流端点/BYOC 连接器协议（`ConnectorTransport` 实现）+ 联邦查询层/工具注册（两条并行分支已合并，三个运维工具真正注册进 ReAct 工具子图），粗粒度 org_admin/super_admin 门禁；6 处越界判定漏洞 + 审批状态机 TOCTOU 竞态 + 运维工具 `org_id` 从未被注入过的阻塞 bug 均已修复，见 §5。**LangGraph 接入已确认不需要新增 `intent_type`/`ops_subgraph`**（§10.2 已更正）——既有 `tool_subgraph` 的 `general_agent` 路由天然覆盖。审批超时扫描任务已接线（5 分钟一轮，按各自连接器超时算截止时间）；前端"运维塔台"UI 开发中（刘德华）。`role_ops_systems` 细粒度权限、真实 BYOC 连接器进程（客户环境那一端）未实施 |
+| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **部分实施**：2026-08-26 用户明确要求插队开工（覆盖了文档自己"排期维持在 12 条 P0 之后"的原始决定）。阶段一～四全部落地并合并：数据模型/越界判定/审批状态机/管理面端点/审批工作流端点/BYOC 连接器协议（`ConnectorTransport` 实现）+ 联邦查询层/工具注册（两条并行分支已合并，三个运维工具真正注册进 ReAct 工具子图），粗粒度 org_admin/super_admin 门禁；6 处越界判定漏洞 + 审批状态机 TOCTOU 竞态 + 运维工具 `org_id` 从未被注入过的阻塞 bug 均已修复，见 §5。**LangGraph 接入已确认不需要新增 `intent_type`/`ops_subgraph`**（§10.2 已更正）——既有 `tool_subgraph` 的 `general_agent` 路由天然覆盖。审批超时扫描任务已接线（5 分钟一轮，按各自连接器超时算截止时间）；前端"运维塔台"UI 已完成并真机联调验收（刘德华开发）；`ops_analysis_summaries` CRUD 已实现。**AI 分析层（异常检测/告警关联降噪/RCA 辅助，§2 三项 V1 已确认能力）开发中（刘德华）**：异常检测/告警关联走统计+规则（不用 LLM），RCA 复用既有生成用 7b LLM 并强制带依据引用，整合点是 `tool_registration.py` 新增 `analyze_ops_incident` 工具，走既有 `intent_type="tool"` 路由，不新增结构。`role_ops_systems` 细粒度权限、真实 BYOC 连接器进程（客户环境那一端）、工具列表按 org 动态生成未实施 |
 | `docs/collaboration_retrospective.md` | 协作复盘与开发流程指南（**每周自查只需读 §1**） | 活文档 |
 | `docs/review_2026-08-24/review_codebase_findings.md` | 代码审计，带行号证据 | 时点快照 |
 | `docs/review_2026-08-24/review_process_retro.md` | 过程复盘量化分析 | 时点快照 |
