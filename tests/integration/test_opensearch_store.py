@@ -27,9 +27,11 @@ import pytest
 
 from src.libs.search.opensearch_store import (
     OpenSearchStore,
+    build_chunk_doc,
     chunk_doc_id,
     conv_index_name,
     kb_index_name,
+    tokenize_for_index,
 )
 
 pytestmark = pytest.mark.integration
@@ -60,13 +62,19 @@ def kb(store):
 
 
 def _chunk(source: str, idx: int, text: str, **extra):
-    return {
-        "content": text,
-        "source_path": source,
-        "chunk_index": idx,
-        "chunk_id": f"{source}#{idx}",
+    """走真实的 build_chunk_doc + 索引侧分词器，不要在测试里另拼一份文档结构。
+
+    `content` 字段用的是 whitespace 分析器，写入前必须先分词；测试里绕过这一步
+    会让测试通过而生产检索不到 —— 那正是最坏的一类假绿。
+    """
+    return build_chunk_doc(
+        text=text,
+        tokens=tokenize_for_index(text),
+        source_path=source,
+        chunk_index=idx,
+        chunk_id=f"{source}#{idx}",
         **extra,
-    }
+    )
 
 
 # ───────────────── T-1：重摄入后旧版本片段必须消失 ─────────────────
@@ -86,7 +94,12 @@ class TestStaleChunksDisappear:
         store.index_chunks(index, [_chunk(src, 0, "年假可以顺延到次年六月")], refresh=True)
 
         assert store.count(index) == 1, "旧版本没被覆盖，库里现在有两版"
-        hits = store.search_kb(name, "年假 顺延")
+        # ⚠️ 查询词要选**两侧分词器产出一致**的。索引侧切出 `顺延到`、
+        # 查询 "顺延" 切出 `顺延`，whitespace 分析器下二者不等 —— 匹配不上。
+        # 这不是本模块的 bug，是现有 SparseEncoder / QueryProcessor 分词不一致
+        # 的直接后果（见 tokenize_for_query 的说明），现有 BM25 同样中招，
+        # 只是从来没人测过。本次刻意不修，如实复刻。
+        hits = store.search_kb(name, "次年")
         assert len(hits) == 1
         assert "六月" in hits[0]["content"]
         assert "三月" not in hits[0]["content"], "旧版本内容仍可被检索到"
@@ -120,7 +133,7 @@ class TestStaleChunksDisappear:
         # 默认 standard 分析器把中文切成**单字**，"关键词4" 会匹配上 "关键词0"
         # （共享 关/键/词）—— 第一版这条测试就是这么写错的，红了才发现分析器
         # 这个设计缺口。见 opensearch_migration_design.md §4 第 4 条。
-        remaining = store.search_kb(name, "段", top_k=99)
+        remaining = store.search_kb(name, "关键词", top_k=99)
         contents = {h["content"] for h in remaining}
         assert contents == {"新第0段 关键词0", "新第1段 关键词1"}
         assert not any("第4段" in c for c in contents), "被删掉那段仍可检索到"
@@ -261,3 +274,57 @@ class TestFailureIsLoud:
                   "chunk_index": 0, "ingested_at": "这不是日期"}],
                 refresh=True,
             )
+
+
+# ───────────────── 分词一致性：如实记录现状，不是修复 ─────────────────
+
+
+class TestTokenizerMismatchIsFaithfullyReproduced:
+    """⚠️ **这组断言的是"现状是坏的"，不是"我们修好了"。**
+
+    索引侧（`SparseEncoder`，分词器）与查询侧（`QueryProcessor`，关键词抽取器）
+    产出不一致，是现有系统的既有状态。对同一批 22 条真实 chunk 实测：
+    两侧都产出 132 词（69%）、只有索引侧 41 词（21%）、只有查询侧 29 词（15%）。
+
+    而 `sparse_encoder.py::_tokenize` 的注释声称"必须与查询侧一致" ——
+    **那个声称与实现不符**，属注释里的未证实断言（`CLAUDE.md` §7.2 明令
+    这类断言要么验证要么标为假设）。
+
+    本次迁移**刻意不修**：修分词会同时改变检索结果，与"换存储引擎"两个变量
+    一起动就无法归因。这里如实复刻，切读时的新旧比对才有意义。
+
+    **修好之后这组测试会变红，那正是提醒删掉它的信号** ——
+    不要在修分词之前把它改绿。
+    """
+
+    def test_index_and_query_tokenizers_currently_disagree(self):
+        from src.libs.search.opensearch_store import (
+            tokenize_for_index,
+            tokenize_for_query,
+        )
+
+        text = "年假可以顺延到次年三月"
+        idx = set(tokenize_for_index(text))
+        qry = set(tokenize_for_query(text))
+
+        assert idx != qry, (
+            "两侧分词已经一致了 —— 说明分词问题被修好了。"
+            "这是好事，但请连同这整组测试一起删掉，别改绿它。"
+        )
+        assert qry - idx, "查询侧独有的词（单字/数字）消失了"
+        assert idx - qry, "索引侧独有的词消失了"
+
+    def test_mismatched_term_cannot_be_retrieved(self, store, kb):
+        """具体后果：索引里是 `顺延到`，用户搜 `顺延` 搜不到。
+
+        现有 BM25 有完全相同的问题（词条级精确匹配），只是从来没被测过。
+        """
+        name, index = kb
+        store.index_chunks(
+            index, [_chunk("/docs/x.pdf", 0, "年假可以顺延到次年三月")], refresh=True
+        )
+
+        assert store.search_kb(name, "顺延") == [], (
+            "如果这条通过了，说明分词已对齐 —— 请同上，删掉这组测试"
+        )
+        assert store.search_kb(name, "次年"), "两侧一致的词应该能检索到"

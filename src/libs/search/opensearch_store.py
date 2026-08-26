@@ -74,6 +74,11 @@ _CONV_PREFIX = "conv_"
 
 _DEFAULT_URL = "http://localhost:9200"
 
+# 分词器实例复用：jieba 首次加载词典要几百毫秒，不该每次查询都付。
+# ⚠️ 索引侧与查询侧是**两个不同的分词器**，见 tokenize_for_query 的说明。
+_INDEX_TOKENIZER: Any = None
+_QUERY_TOKENIZER: Any = None
+
 
 def kb_index_name(collection: str) -> str:
     return f"{_KB_PREFIX}{collection}"
@@ -92,9 +97,108 @@ def chunk_doc_id(source_path: str, chunk_index: int) -> str:
     return hashlib.sha256(f"{source_path}:{chunk_index}".encode()).hexdigest()[:32]
 
 
+def tokenize_for_index(text: str) -> List[str]:
+    """**索引侧**分词 —— 复用 `SparseEncoder` 的 jieba 实现。
+
+    不要在这里另写一份：迁移的判据是"检索结果与现状一致"，而现状的索引
+    就是 `SparseEncoder._tokenize` 建的。换个分词器会让比对失去意义。
+    """
+    from src.ingestion.embedding.sparse_encoder import SparseEncoder
+
+    global _INDEX_TOKENIZER
+    if _INDEX_TOKENIZER is None:
+        _INDEX_TOKENIZER = SparseEncoder()
+    return _INDEX_TOKENIZER._tokenize(text)
+
+
+def tokenize_for_query(text: str) -> List[str]:
+    """**查询侧**分词 —— 复用 `QueryProcessor`。
+
+    ⚠️ **索引侧和查询侧用的是两个不同的东西，而且产出确实不一致。**
+    这是现有系统的既有状态，不是本次引入的。对同一批 22 条真实 chunk 实测：
+
+        两侧都产出      132 词 (69%)
+        只有索引侧       41 词 (21%)   hr / it / 主管 / 丢失 / 为期 …
+        只有查询侧       29 词 (15%)   3 / 5 / b / 不 / 为 / 假 …
+
+    根因是两者定位不同：`SparseEncoder` 是分词器（过滤单字），
+    `QueryProcessor` 是关键词抽取器（保留单字、丢弃部分实词）。
+    而 `sparse_encoder.py::_tokenize` 的注释声称"必须与查询侧一致"——
+    **那个声称与实现不符**，属注释里的未证实断言（`CLAUDE.md` §7.2）。
+
+    **本次刻意不修。** 迁移要回答的是"换存储引擎会不会出问题"，
+    修分词一致性会同时改变检索结果，两个变量一起动就无法归因。
+    这里如实复刻现状：索引走 SparseEncoder，查询走 QueryProcessor，
+    连同这个缺陷一起搬过去，切读时的比对才有意义。
+    修它是独立课题，判据应该是黄金测试集通过率。
+    """
+    from src.core.query_engine.query_processor import QueryProcessor
+
+    global _QUERY_TOKENIZER
+    if _QUERY_TOKENIZER is None:
+        _QUERY_TOKENIZER = QueryProcessor()
+    result = _QUERY_TOKENIZER.process(text)
+    return list(getattr(result, "keywords", result))
+
+
+def _as_query_text(query: str, tokens: Optional[Sequence[str]]) -> str:
+    return " ".join(tokens if tokens is not None else tokenize_for_query(query))
+
+
+def build_chunk_doc(
+    *,
+    text: str,
+    tokens: Sequence[str],
+    source_path: str,
+    chunk_index: int,
+    chunk_id: str,
+    doc_hash: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    owner_user_id: Optional[str] = None,
+    embedding: Optional[Sequence[float]] = None,
+) -> Dict[str, Any]:
+    """把一个 chunk 组装成 OpenSearch 文档。
+
+    `tokens` 必须来自 `tokenize_for_index()`（即 `SparseEncoder._tokenize`）—— **不要在这里自己分词**，
+    与摄入侧用不同的分词器会让 BM25 匹配不上，而且这种错误在小语料上测不出来。
+    """
+    doc: Dict[str, Any] = {
+        "content": " ".join(tokens),
+        "content_raw": text,
+        "source_path": source_path,
+        "chunk_index": int(chunk_index),
+        "chunk_id": chunk_id,
+    }
+    if doc_hash:
+        doc["doc_hash"] = doc_hash
+    if conversation_id:
+        doc["conversation_id"] = conversation_id
+    if owner_user_id:
+        doc["owner_user_id"] = owner_user_id
+    if embedding is not None:
+        doc["embedding"] = list(embedding)
+    return doc
+
+
 def _mapping(dense_dims: Optional[int]) -> Dict[str, Any]:
     props: Dict[str, Any] = {
-        "content": {"type": "text"},
+        # ⚠️ `whitespace` 分析器 + 索引侧写入**项目自己 jieba 分好的文本**。
+        #
+        # 不用 OpenSearch 内置分析器是刻意的。实测同一句话三种切法：
+        #   standard（默认）    年 假 可 以 顺 延 到 次 年 三 月   ← 逐字切
+        #   cjk（内置）         年假 假可 可以 以顺 顺延 …          ← 二元组
+        #   项目 SparseEncoder  年 假 顺延到 次年 三月              ← jieba 真分词
+        # 默认分析器会让「关键词4」匹配上「关键词0」（共享 关/键/词）。
+        #
+        # 更重要的是**隔离变量**：这次迁移要回答"换存储引擎会不会出问题"，
+        # 不是"换分词器好不好"。tokenization 保持完全不变，任何检索质量变化
+        # 都能归因到存储层。analysis-ik 作为迁移后的独立课题，判据是黄金测试集。
+        #
+        # 这意味着写入方必须先分词（见 `build_chunk_doc`），且
+        # `SparseEncoder._tokenize` / `QueryProcessor` 都不能删。
+        "content": {"type": "text", "analyzer": "whitespace"},
+        # 原文只存不索引 —— 检索走 content，展示走这里。
+        "content_raw": {"type": "text", "index": False},
         "source_path": {"type": "keyword"},
         "chunk_index": {"type": "integer"},
         "doc_hash": {"type": "keyword"},
@@ -259,14 +363,30 @@ class OpenSearchStore:
 
     # ────────────────────────── 读取（阶段 1 仅供比对与测试）──────────────────────────
 
-    def search_kb(self, collection: str, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
-        """业务知识库检索。企业边界由调用方的 `_org_owned_collections()` 收敛。"""
+    def search_kb(
+        self,
+        collection: str,
+        query: str,
+        top_k: int = 10,
+        *,
+        query_tokens: Optional[Sequence[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """业务知识库检索。企业边界由调用方的 `_org_owned_collections()` 收敛。
+
+        ⚠️ `content` 用的是 `whitespace` 分析器，所以**查询串必须先用同一个
+        jieba 分词器切好**，否则整句会被当成一个 token，什么都匹配不上。
+        生产调用方应传 `query_tokens`（来自 `QueryProcessor`）；
+        不传时这里兜底调 `SparseEncoder._tokenize`，行为一致但多一次分词。
+        """
         index = kb_index_name(collection)
         if not self._client.indices.exists(index=index):
             return []
         resp = self._client.search(
             index=index,
-            body={"size": top_k, "query": {"match": {"content": query}}},
+            body={
+                "size": top_k,
+                "query": {"match": {"content": _as_query_text(query, query_tokens)}},
+            },
         )
         return self._hits(resp)
 
@@ -277,6 +397,8 @@ class OpenSearchStore:
         owner_user_id: str,
         query: str,
         top_k: int = 10,
+        *,
+        query_tokens: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """对话私有库检索。
 
@@ -299,7 +421,7 @@ class OpenSearchStore:
                 "size": top_k,
                 "query": {
                     "bool": {
-                        "must": [{"match": {"content": query}}],
+                        "must": [{"match": {"content": _as_query_text(query, query_tokens)}}],
                         "filter": [
                             {"term": {"conversation_id": conversation_id}},
                             {"term": {"owner_user_id": owner_user_id}},
@@ -316,7 +438,8 @@ class OpenSearchStore:
             {
                 "chunk_id": h["_source"].get("chunk_id", h["_id"]),
                 "score": h["_score"],
-                "content": h["_source"].get("content", ""),
+                # 返回原文而不是分词后的 content —— 后者是给检索用的，不能给人看
+                "content": h["_source"].get("content_raw", h["_source"].get("content", "")),
                 "source_path": h["_source"].get("source_path", ""),
             }
             for h in resp["hits"]["hits"]
