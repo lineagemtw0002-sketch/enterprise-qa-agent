@@ -111,7 +111,12 @@ const MODULES = [
   // 在那之前前端无从提前知道，只能等点进去才发现）。
   // OpsConsole 内部那层 403 探测保留当兜底：开关是别人（平台管理员）在改的，
   // 用户这一侧的 meProfile 可能是开关变更之前拉的，入口藏不藏得住不能只靠它。
-  { key: 'ops', label: '智能运维', icon: Activity, adminOnly: true, hideForPlatform: true, needsAiops: true },
+  // ⚠️ 门禁**不是** adminOnly：`role_ops_systems` 落地后，审批人可以是被授权的普通
+  // 员工（那正是这套权限的核心场景——审批范围应该比管理员更窄/不同）。用角色名判断
+  // 的 isAdmin 会把他们全挡在外面，等于后端放宽了、前端的门还锁着。
+  // 依据 /auth/me 的 ops_can_view（后端已把 org_admin 通配符和显式授权算成并集，
+  // 前端不重复实现权限逻辑——跟 allowed_collections 是同一个思路）。
+  { key: 'ops', label: '智能运维', icon: Activity, hideForPlatform: true, needsAiops: true, needsOpsView: true },
 ]
 
 // 顶部导航：登录后所有界面共用的壳——模块切换 + 通知 + 个人信息，替代原来
@@ -210,7 +215,8 @@ export default function TopNav({
       <div className="nav-modules">
         {MODULES.filter((m) => (!m.adminOnly || isAdmin) && (!m.platformOnly || isPlatformAdmin)
           && (!m.hideForPlatform || !isPlatformAdmin)
-          && (!m.needsAiops || !!meProfile?.organization?.aiops_module_enabled)).map((m) => (
+          && (!m.needsAiops || !!meProfile?.organization?.aiops_module_enabled)
+          && (!m.needsOpsView || isAdmin || !!meProfile?.ops_can_view)).map((m) => (
           <div
             key={m.key}
             className={[

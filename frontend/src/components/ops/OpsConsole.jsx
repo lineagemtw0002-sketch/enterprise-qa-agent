@@ -3,7 +3,7 @@ import {
   Alert, Button, Card, Empty, Form, Input, InputNumber, Modal, Popconfirm,
   Checkbox, Segmented, Select, Space, Spin, Table, Tag, Typography, message,
 } from 'antd'
-import { Plug, KeyRound, ShieldCheck, ClipboardCheck, RefreshCw, Copy, Users } from 'lucide-react'
+import { Plug, KeyRound, ShieldCheck, ClipboardCheck, RefreshCw, Copy, Users, Trash2 } from 'lucide-react'
 import * as adminApi from '../../api/admin.js'
 import * as opsApi from '../../api/ops.js'
 import './OpsConsole.css'
@@ -115,6 +115,7 @@ function ConnectorsSection({ onModuleDisabled, onConnectorsLoaded }) {
   const [creating, setCreating] = useState(false)
   const [form] = Form.useForm()
   const [tokenInfo, setTokenInfo] = useState(null)
+  const [deleting, setDeleting] = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -153,6 +154,19 @@ function ConnectorsSection({ onModuleDisabled, onConnectorsLoaded }) {
     }
   }
 
+  async function handleDelete(row) {
+    setDeleting(row.connection_id)
+    try {
+      await opsApi.deleteConnector(row.connection_id)
+      message.success(`已删除连接器「${row.name}」及其名下全部数据`)
+      load()
+    } catch (error) {
+      message.error(opsApi.errorText(error))
+    } finally {
+      setDeleting('')
+    }
+  }
+
   async function handleToken(row) {
     try {
       const data = await opsApi.generateRegisterToken(row.connection_id)
@@ -182,9 +196,35 @@ function ConnectorsSection({ onModuleDisabled, onConnectorsLoaded }) {
     {
       title: '操作',
       render: (_, row) => (
-        <Button size="small" icon={<KeyRound size={14} />} onClick={() => handleToken(row)}>
-          生成握手凭证
-        </Button>
+        <Space>
+          <Button size="small" icon={<KeyRound size={14} />} onClick={() => handleToken(row)}>
+            生成握手凭证
+          </Button>
+          {/* 删除是硬删除且级联——把"会一起消失什么"逐条列出来再让人点。
+              只写"确定删除吗"的话，管理员不会意识到审批历史也跟着没了。 */}
+          <Popconfirm
+            title="删除这个连接器？"
+            description={
+              <div style={{ maxWidth: 320 }}>
+                会<b>一并永久删除</b>它名下的全部数据：
+                <ul style={{ margin: '6px 0 0 16px', padding: 0 }}>
+                  <li>修复范围白名单</li>
+                  <li>角色授权（谁能看 / 谁能批）</li>
+                  <li><b>全部修复动作记录</b>——谁在什么时候批准了什么，会一起消失</li>
+                  <li><b>全部分析摘要与依据引用</b></li>
+                  <li>握手/会话令牌</li>
+                </ul>
+                这些属于审计材料，删了无法恢复。
+              </div>
+            }
+            okText="确认删除" cancelText="取消" okButtonProps={{ danger: true }}
+            onConfirm={() => handleDelete(row)}
+          >
+            <Button size="small" danger icon={<Trash2 size={14} />} loading={deleting === row.connection_id}>
+              删除
+            </Button>
+          </Popconfirm>
+        </Space>
       ),
     },
   ]
@@ -672,8 +712,12 @@ const SECTIONS = [
   { value: 'permissions', label: '授权管理', icon: Users },
 ]
 
-export default function OpsConsole() {
-  const [section, setSection] = useState('connectors')
+export default function OpsConsole({ canManage = true }) {
+  // 连接器 / 允许范围 / 授权管理 三个分段都是 org_admin 专属（后端也只对 org_admin
+  // 开放）。被授予 can_view/can_approve 的普通员工只该看到审批队列——给他看三个
+  // 点进去必然 403 的分段，跟"导航入口本身要按权限藏起来"是同一个道理。
+  const sections = canManage ? SECTIONS : SECTIONS.filter((s) => s.value === 'approvals')
+  const [section, setSection] = useState(canManage ? 'connectors' : 'approvals')
   const [moduleDisabled, setModuleDisabled] = useState(false)
   const [connectors, setConnectors] = useState([])
   const [booting, setBooting] = useState(true)
@@ -701,7 +745,7 @@ export default function OpsConsole() {
         className="ops-console-nav"
         value={section}
         onChange={setSection}
-        options={SECTIONS.map((s) => ({
+        options={sections.map((s) => ({
           value: s.value,
           label: (
             <Space size={6}>
@@ -712,14 +756,14 @@ export default function OpsConsole() {
         }))}
       />
 
-      {section === 'connectors' && (
+      {section === 'connectors' && canManage && (
         <ConnectorsSection onModuleDisabled={onModuleDisabled} onConnectorsLoaded={onConnectorsLoaded} />
       )}
-      {section === 'scopes' && (
+      {section === 'scopes' && canManage && (
         booting ? <Spin /> : <ScopesSection connectors={connectors} onModuleDisabled={onModuleDisabled} />
       )}
       {section === 'approvals' && <ApprovalsSection onModuleDisabled={onModuleDisabled} />}
-      {section === 'permissions' && (
+      {section === 'permissions' && canManage && (
         booting ? <Spin /> : <PermissionsSection connectors={connectors} onModuleDisabled={onModuleDisabled} />
       )}
     </div>

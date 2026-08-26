@@ -52,6 +52,19 @@ export function generateRegisterToken(connectionId) {
     .then((res) => res.data)
 }
 
+/** 硬删除一个连接器。
+ *
+ * ⚠️ **级联清掉这个连接器下的全部数据**：权限授权、两张令牌表、修复动作、
+ * 白名单配置、分析摘要。其中**修复动作和分析摘要是审计性质的**——
+ * "谁在什么时候批准了什么、依据是什么"会跟着一起消失。
+ * 所以 UI 上必须把这一点说清楚再让人点，不能只问一句"确定删除吗"。
+ */
+export function deleteConnector(connectionId) {
+  return axios
+    .delete(`${BASE}/ops/connectors/${encodeURIComponent(connectionId)}`)
+    .then((res) => res.data)
+}
+
 // ==================== 修复范围白名单 ====================
 
 export function listRemediationScopes(connectionId) {
