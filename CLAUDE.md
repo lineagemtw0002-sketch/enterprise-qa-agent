@@ -822,15 +822,57 @@ flowchart TB
   （2026-08-26，见 §5），BM25 磁盘反序列化那一侧仍未解决**：`_build_hybrid_search_for`
   仍然每次查询、每个 collection 都重建 `HybridSearch`/`BM25Indexer`，且建各 collection
   store 的步骤仍按 workaround 强制串行（现在已不是必须的，但没有拆除，见 §5 该条"未做的"）
-- ~~管理端普遍 N+1（`/admin/users` 约 300 次串行查询）~~ ✅ **`/admin/users` 已修复（2026-08-26），见 §5**——
-  注意是"`/admin/users` 已修复"，不是"管理端普遍 N+1 已解决"：这条只覆盖了这一个端点，
-  其余管理端点是否有同类问题**未逐个排查**
+- ~~管理端普遍 N+1（`/admin/users` 约 300 次串行查询）~~ 🟢 **已逐个排查全部管理端点
+  （2026-08-26），见 §5**——`/admin/users` 本身早前已修（P1-14）；这次核对了其余全部
+  GET 列表端点（roles/organizations/audit-logs/collections/workflow-templates/
+  workflow-approvers/gateway connectors/dashboard），发现并修复 2 处同类问题
+  （`admin_list_workflow_approvers` 的角色查询、连接器健康检查的串行 HTTP 探活），
+  其余端点核对后确认干净（批量查询 + 内存 join，或已有意识地避免了 N+1，如
+  `_org_response` 的 `seats_used` 注释）
 - `create_app()` 3038 行 / 72 端点，无路由分层、无依赖注入
 - 无 Dockerfile / CI / 依赖锁定
 
 ---
 
 ## 5. 已修复（防止重新引入）
+
+- ✅ **2026-08-26　P1-14 扩展审计：逐个核对全部管理端点，修复 2 处同类问题**
+  `/admin/users` 本身的 N+1 早前已修（同一条 P1-14），但 CLAUDE.md 一直如实
+  标注"其余管理端点未逐个排查"。这次过了一遍全部 GET 列表端点：
+
+  | 端点 | 结果 |
+  |---|---|
+  | `/admin/roles`、`/admin/organizations`、`/admin/audit-logs`、`/admin/collections`、`/admin/workflow-templates` | ✅ 核对干净，批量查询 + 内存 join |
+  | `/admin/organizations/{org_id}/connectors` | 🔴 发现问题，已修（下方） |
+  | `/admin/gateway/connectors` | 🔴 发现问题，已修（下方） |
+  | `/admin/workflow-approvers` | 🔴 发现问题，已修（下方） |
+  | `/admin/dashboard/*` | ✅ 核对干净，聚合 SQL，无逐行循环 |
+
+  **发现 1（两个端点同一个根因）**：`_connector_response`/
+  `admin_gateway_connectors` 对每个连接器串行 `await _check_connector_health(c)`
+  ——不是 SQL 查询，是**对外 HTTP 探活**（每个最多 2s 超时），但同一个"N 次
+  串行 await 本可以并发"的浪费模式。改成 `asyncio.gather` 并发发起。
+  `/admin/organizations/{org_id}/connectors` 按 org 数量小（早期客户 1-3 家、
+  每家几个能力），`/admin/gateway/connectors` 是全平台汇总，随连接器总数增长。
+
+  **发现 2**：`admin_list_workflow_approvers` 对每个不重复的
+  `approver_role_id` 单独调 `role_store.get_role_by_id`。绝对数量目前很小
+  （受限于工作流模板数，通常个位数），跟 `/admin/users` 那次 300 次量级不是
+  一个规模，但补批量版 `get_roles_by_ids_batch` 是同样的常数成本。
+  回归：`tests/unit/test_role_store_batch_lookup.py`（3 条，判别力核心：
+  查询次数不随 role_id 数量增长）。
+
+  ⚠️ **未验证的部分**：连接器健康检查那两处改动**已实现但未验证**——本仓库
+  `create_app()` 3038 行 / 无路由分层，`conftest.py` 无 DB fixture，测这两个
+  端点要起完整 app + 真实/mock 的 HTTP 目标，现有测试基础设施搭不了这个场景
+  （跟 trace WebSocket 鉴权那次是同一个已知限制）。已确认：`app.py` 能正常
+  import、语法检查通过、改动本身是纯粹的"串行改并发"（`_check_connector_health`
+  自带 try/except 不会往外抛异常），逻辑上风险很低，但没有跑过真实请求。
+
+  **未覆盖的范围**：POST/PUT/DELETE 类端点（如批量导入用户的
+  `admin_bulk_import_users`）没有纳入这次排查——那类端点是"必须对 N 行分别
+  做写入"，跟"读同一类数据 N 次"性质不同，不算严格意义的 N+1，且是低频管理
+  操作（CSV 上传）不是页面加载路径，本次判断为不同类问题，未处理。
 
 - ✅ **2026-08-26　P1-2：14 个 Store 各建连接池 → 合并为一个按 DSN 缓存的共享池**
   `attendance_store` / `audit_store` / `dashboard_stats` / `conversation_store` /

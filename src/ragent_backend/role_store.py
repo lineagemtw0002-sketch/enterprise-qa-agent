@@ -255,6 +255,29 @@ class RoleStore:
             )
         return self._row_to_role(row) if row else None
 
+    async def get_roles_by_ids_batch(self, role_ids: List[str]) -> "dict[str, Role]":
+        """`get_role_by_id` 的批量版——1 次查询覆盖任意多个 role_id，不是 N 次。
+
+        N+1 审计发现（2026-08-26，P1-14 修复后的排查，见 CLAUDE.md §5）：
+        `admin_list_workflow_approvers` 对每个不重复的 `approver_role_id`
+        单独调 `get_role_by_id`。这条的绝对数量目前很小（受限于工作流模板
+        数量，通常个位数），跟 `/admin/users` 那次 300 次量级不是一个规模，
+        但补上批量版是同样的常数成本，不用为了"反正数量小"就留一个已知模式。
+        """
+        result: "dict[str, Role]" = {}
+        if not role_ids:
+            return result
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, name, display_name, is_system, org_id, created_at "
+                "FROM roles WHERE id = ANY($1::text[])",
+                role_ids,
+            )
+        for row in rows:
+            result[row["id"]] = self._row_to_role(row)
+        return result
+
     async def update_role(self, role_id: str, display_name: str) -> Optional[Role]:
         """改 display_name；is_system 角色的 name 从不允许改（这个方法压根不接受改 name）。"""
         pool = await self._get_pool()

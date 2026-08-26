@@ -1456,7 +1456,10 @@ def create_app() -> FastAPI:
         if await org_store.get_organization(org_id) is None:
             raise HTTPException(status_code=404, detail="组织不存在")
         connectors = await tenant_connector_store.list_for_org(org_id)
-        return [await _connector_response(c) for c in connectors]
+        # P1-14 同类问题（N 次串行 await，这里是 HTTP 探活不是 SQL 查询）：
+        # 逐个 await _connector_response 会让每个连接器的 2s 超时探活排队
+        # 累加，改成并发发起。
+        return list(await asyncio.gather(*[_connector_response(c) for c in connectors]))
 
     @app.put(
         "/api/v1/admin/organizations/{org_id}/connectors/{capability}",
@@ -1534,16 +1537,20 @@ def create_app() -> FastAPI:
         connectors = [c for c in connectors if not c.connector_type.startswith("internal")]
         org_names = {o.org_id: o.name for o in await org_store.list_organizations()}
 
-        results = []
-        for c in connectors:
-            results.append(GatewayConnectorResponse(
+        # P1-14 同类问题：这是全平台所有外部连接器一起探活，逐个串行 await
+        # 会让总耗时随连接器数量线性叠加（每个最多 2s 超时）。并发发起。
+        health_statuses = await asyncio.gather(*[_check_connector_health(c) for c in connectors])
+        results = [
+            GatewayConnectorResponse(
                 connector_id=c.connector_id, org_id=c.org_id,
                 org_name=org_names.get(c.org_id, c.org_id),
                 capability=c.capability, connector_type=c.connector_type, endpoint=c.endpoint,
-                is_active=c.is_active, health_status=await _check_connector_health(c),
+                is_active=c.is_active, health_status=health,
                 call_count=c.call_count, failure_count=c.failure_count,
                 last_called_at=c.last_called_at, last_latency_ms=c.last_latency_ms, last_error=c.last_error,
-            ))
+            )
+            for c, health in zip(connectors, health_statuses)
+        ]
         return results
 
     # ==================== 运营仪表盘 API（仅平台管理员，见 dashboard_stats.py） ====================
@@ -2372,12 +2379,9 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=403, detail="账号未关联任何企业")
         templates = await workflow_store.list_templates()
         assignments = await workflow_store.list_org_approver_roles(org.org_id)
-        role_ids = {rid for rid in assignments.values() if rid}
-        roles_by_id = {}
-        for rid in role_ids:
-            role = await role_store.get_role_by_id(rid)
-            if role is not None:
-                roles_by_id[rid] = role
+        role_ids = list({rid for rid in assignments.values() if rid})
+        # N+1 审计发现（P1-14 同类问题）：原来对每个不重复 role_id 单独查一次。
+        roles_by_id = await role_store.get_roles_by_ids_batch(role_ids)
         result = []
         for t in templates:
             approver_role_id = assignments.get(t.workflow_type)
