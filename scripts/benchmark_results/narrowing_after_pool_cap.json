@@ -1,0 +1,397 @@
+{
+  "generated_at": "2026-08-26T21:14:07",
+  "code_state": {
+    "commit": "5efed46b26b1460d1dba6094e40a27ba84329c6f",
+    "dirty_files": "M config/settings.yaml\n M src/core/settings.py\n M src/mcp_server/tools/query_knowledge_hub.py\n M tests/integration/test_hierarchy_narrowing_recall.py\n?? src/core/query_engine/rerank_pool.py\n?? tests/unit/test_rerank_pool.py"
+  },
+  "tenant": "acme",
+  "top_k": 5,
+  "default_top_docs": 5,
+  "strategies": {
+    "shipped": {
+      "budget": null,
+      "summary": {
+        "gold_hit": 25,
+        "kw_hit": 30,
+        "empty": 0,
+        "total": 30,
+        "p50_ms": 803.35,
+        "p95_ms": 1582.0,
+        "max_ms": 15120.8
+      },
+      "rows": [
+        {
+          "collection": "acme_hr_admin_kb",
+          "query": "入职满一年后每年有多少天年假？",
+          "gold": "ACME-HR-001",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 15120.8,
+          "searched_collections": [
+            "acme_hr_admin_kb"
+          ]
+        },
+        {
+          "collection": "acme_hr_admin_kb",
+          "query": "当年没休完的年假可以顺延到什么时候？",
+          "gold": "ACME-HR-001",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 1582.0,
+          "searched_collections": [
+            "acme_hr_admin_kb"
+          ]
+        },
+        {
+          "collection": "acme_hr_admin_kb",
+          "query": "每个月最多可以远程办公几天？",
+          "gold": "ACME-HR-006",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 913.7,
+          "searched_collections": [
+            "acme_hr_admin_kb"
+          ]
+        },
+        {
+          "collection": "acme_hr_admin_kb",
+          "query": "正式员工和试用期员工的离职通知期分别是多少天？",
+          "gold": "ACME-HR-008",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 795.1,
+          "searched_collections": [
+            "acme_hr_admin_kb"
+          ]
+        },
+        {
+          "collection": "acme_hr_admin_kb",
+          "query": "公司的核心工作时间是几点到几点？",
+          "gold": "ACME-HR-005",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 880.2,
+          "searched_collections": [
+            "acme_hr_admin_kb"
+          ]
+        },
+        {
+          "collection": "acme_finance_kb",
+          "query": "报销单笔超过多少金额需要 CFO 审批？",
+          "gold": "ACME-FIN-001",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 599.8,
+          "searched_collections": [
+            "acme_customer_success_kb",
+            "acme_finance_kb"
+          ]
+        },
+        {
+          "collection": "acme_finance_kb",
+          "query": "去一线城市出差，住宿费每晚上限是多少？",
+          "gold": "ACME-FIN-003",
+          "gold_hit": false,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 536.0,
+          "searched_collections": [
+            "acme_finance_kb"
+          ]
+        },
+        {
+          "collection": "acme_finance_kb",
+          "query": "出差期间伙食补贴每天多少钱？",
+          "gold": "ACME-FIN-005",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 461.7,
+          "searched_collections": [
+            "acme_finance_kb"
+          ]
+        },
+        {
+          "collection": "acme_finance_kb",
+          "query": "采购金额超过多少必须三家比价？",
+          "gold": "ACME-FIN-007",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 502.5,
+          "searched_collections": [
+            "acme_finance_kb"
+          ]
+        },
+        {
+          "collection": "acme_finance_kb",
+          "query": "员工因公借款单次上限是多少？",
+          "gold": "ACME-FIN-011",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 1016.7,
+          "searched_collections": [
+            "acme_finance_kb",
+            "acme_hr_admin_kb"
+          ]
+        },
+        {
+          "collection": "acme_it_support_kb",
+          "query": "域账号密码多久强制更换一次？",
+          "gold": "ACME-IT-001",
+          "gold_hit": false,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 5027.2,
+          "searched_collections": [
+            "acme_it_support_kb"
+          ]
+        },
+        {
+          "collection": "acme_it_support_kb",
+          "query": "密码连续输错几次会锁定账号，锁多久？",
+          "gold": "ACME-IT-001",
+          "gold_hit": false,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 502.5,
+          "searched_collections": [
+            "acme_it_support_kb"
+          ]
+        },
+        {
+          "collection": "acme_it_support_kb",
+          "query": "堡垒机会话录像保留多少天？",
+          "gold": "ACME-IT-004",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 447.2,
+          "searched_collections": [
+            "acme_it_support_kb",
+            "acme_rd_product_kb"
+          ]
+        },
+        {
+          "collection": "acme_it_support_kb",
+          "query": "P1 级 IT 工单要求多久内响应？",
+          "gold": "ACME-IT-005",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 1030.5,
+          "searched_collections": [
+            "acme_it_support_kb",
+            "acme_rd_product_kb"
+          ]
+        },
+        {
+          "collection": "acme_it_support_kb",
+          "query": "收到钓鱼邮件应该转发到哪个邮箱？",
+          "gold": "ACME-IT-007",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 723.8,
+          "searched_collections": [
+            "acme_it_support_kb"
+          ]
+        },
+        {
+          "collection": "acme_rd_product_kb",
+          "query": "代码合并到主分支需要几名评审人通过？",
+          "gold": "ACME-RD-001",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 746.1,
+          "searched_collections": [
+            "acme_rd_product_kb"
+          ]
+        },
+        {
+          "collection": "acme_rd_product_kb",
+          "query": "常规发布窗口是什么时候？",
+          "gold": "ACME-RD-003",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 944.8,
+          "searched_collections": [
+            "acme_it_support_kb",
+            "acme_rd_product_kb"
+          ]
+        },
+        {
+          "collection": "acme_rd_product_kb",
+          "query": "P0 级线上故障要求多久内止血？",
+          "gold": "ACME-RD-004",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 930.0,
+          "searched_collections": [
+            "acme_it_support_kb",
+            "acme_rd_product_kb"
+          ]
+        },
+        {
+          "collection": "acme_rd_product_kb",
+          "query": "企业版客户的 API 限流阈值是多少？",
+          "gold": "ACME-RD-008",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 606.8,
+          "searched_collections": [
+            "acme_it_support_kb",
+            "acme_rd_product_kb"
+          ]
+        },
+        {
+          "collection": "acme_rd_product_kb",
+          "query": "弃用对外接口需要提前多久公告？",
+          "gold": "ACME-RD-007",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 811.6,
+          "searched_collections": [
+            "acme_hr_admin_kb",
+            "acme_it_support_kb",
+            "acme_rd_product_kb"
+          ]
+        },
+        {
+          "collection": "acme_sales_marketing_kb",
+          "query": "销售代表最高能给客户多少折扣？",
+          "gold": "ACME-SM-001",
+          "gold_hit": false,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 572.7,
+          "searched_collections": [
+            "acme_sales_marketing_kb"
+          ]
+        },
+        {
+          "collection": "acme_sales_marketing_kb",
+          "query": "专业版每个用户每月多少钱？",
+          "gold": "ACME-SM-002",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 844.1,
+          "searched_collections": [
+            "acme_sales_marketing_kb"
+          ]
+        },
+        {
+          "collection": "acme_sales_marketing_kb",
+          "query": "官网线索需要多久内完成首次联系？",
+          "gold": "ACME-SM-004",
+          "gold_hit": false,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 336.8,
+          "searched_collections": [
+            "acme_customer_success_kb",
+            "acme_sales_marketing_kb"
+          ]
+        },
+        {
+          "collection": "acme_sales_marketing_kb",
+          "query": "标准 POC 试用期是多久，可以延长几次？",
+          "gold": "ACME-SM-006",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 842.3,
+          "searched_collections": [
+            "acme_sales_marketing_kb"
+          ]
+        },
+        {
+          "collection": "acme_sales_marketing_kb",
+          "query": "渠道代理商的标准返点是多少？",
+          "gold": "ACME-SM-012",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 899.7,
+          "searched_collections": [
+            "acme_sales_marketing_kb"
+          ]
+        },
+        {
+          "collection": "acme_customer_success_kb",
+          "query": "黄金套餐客户的工单多久内首次响应？",
+          "gold": "ACME-CS-001",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 510.1,
+          "searched_collections": [
+            "acme_customer_success_kb"
+          ]
+        },
+        {
+          "collection": "acme_customer_success_kb",
+          "query": "公司承诺的月度服务可用性是多少？",
+          "gold": "ACME-CS-002",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 825.6,
+          "searched_collections": [
+            "acme_customer_success_kb",
+            "acme_rd_product_kb"
+          ]
+        },
+        {
+          "collection": "acme_customer_success_kb",
+          "query": "发生重大故障后多久内要主动外呼客户？",
+          "gold": "ACME-CS-004",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 566.1,
+          "searched_collections": [
+            "acme_customer_success_kb"
+          ]
+        },
+        {
+          "collection": "acme_customer_success_kb",
+          "query": "NPS 低于几分要标记为重点关注客户？",
+          "gold": "ACME-CS-006",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 883.2,
+          "searched_collections": [
+            "acme_customer_success_kb"
+          ]
+        },
+        {
+          "collection": "acme_customer_success_kb",
+          "query": "新客户的标准上手周期是多长？",
+          "gold": "ACME-CS-009",
+          "gold_hit": true,
+          "kw_hit": true,
+          "empty": false,
+          "latency_ms": 506.0,
+          "searched_collections": [
+            "acme_customer_success_kb"
+          ]
+        }
+      ]
+    }
+  }
+}

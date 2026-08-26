@@ -12,6 +12,13 @@
   percoll-N  每个候选库各取前 N 篇（改分配方式）
   off        完全不做粗筛（层次化检索上线前的平铺行为，作为基线）
   shipped    不打桩，跑 config/settings.yaml 当前配置下的真实链路（改动验收用这一档）
+  shipped+capN  在 shipped 基础上，把进 cross-encoder 的候选池按融合分先截到 N 条（**全局**上限）
+  shipped+perlibN 在 shipped 基础上，每个库只贡献前 N 条候选（**按库**分配，库多也饿不死谁）
+
+`shipped+capN` 是用来回答"重排候选池设上限值不值"的：检索段 87% 的耗时是
+cross-encoder 给合并后的候选池逐条打分（每库 top_k×2 条，6 库=60 条），
+而"多查几个库"变慢的真实机制就是池子变大，不是查库本身（6 库并行召回墙钟只有 ~32ms）。
+截池子能线性省下重排时间，但它**直接决定谁能进最终排序**，所以必须连召回一起量。
 
 判据两条，都对着 `scripts/demo_kb_content/questions.py` 的正向问题：
   gold_hit  最终结果里有没有出现问题标注的那篇金标文档（检索层的真实召回）
@@ -127,11 +134,37 @@ async def run(tenant: str, strategies: List[str], top_k: int, json_path: str) ->
     }
 
     for strategy in strategies:
-        if strategy == "shipped":
+        cap = perlib = None
+        if strategy.startswith("shipped+cap"):
+            cap = int(strategy.split("cap", 1)[1])
+        elif strategy.startswith("shipped+perlib"):
+            perlib = int(strategy.split("perlib", 1)[1])
+        if strategy == "shipped" or cap is not None or perlib is not None:
             # 不打桩：跑 config/settings.yaml 当前配置下的真实链路（含收窄开关、
             # 置信门控、空结果兜底）。改动落地后的验收就用这一档。
             budget = None
             tool = QueryKnowledgeHubTool(settings=settings)
+            if cap is not None:
+                # 就地模拟"重排前按融合分截断"：包住 _apply_rerank，进 cross-encoder
+                # 之前先排序取前 cap 条。故意包在这一层而不是改生产代码——探针要能
+                # 在同一次运行里对比多个 cap 值，改代码做不到。
+                _orig_rerank = tool._apply_rerank
+
+                def _capped(query_, results, top_k_, trace_=None, _cap=cap, _orig=_orig_rerank):
+                    if len(results) > _cap:
+                        results = sorted(results, key=lambda r: r.score, reverse=True)[:_cap]
+                    return _orig(query_, results, top_k_, trace_)
+
+                tool._apply_rerank = _capped  # type: ignore[assignment]
+            if perlib is not None:
+                # 每个库只贡献前 N 条（库内已排好序）。跟全局 cap 的区别是
+                # **没有库会被别的库挤掉**——正是粗筛那个 bug 教的教训。
+                _orig_search = tool._search_with
+
+                def _perlib(*a, _n=perlib, _orig=_orig_search, **kw):
+                    return _orig(*a, **kw)[:_n]
+
+                tool._search_with = _perlib  # type: ignore[assignment]
         else:
             kind, n = _parse(strategy)
             budget = n if n is not None else default_budget

@@ -58,6 +58,18 @@ rerank:
   model: "BAAI/bge-reranker-base"  # local, no API key, supports zh/en
   top_k: 5
 
+  # 进 cross-encoder 的候选池上限（只作用于多库并行召回，见
+  # src/core/query_engine/rerank_pool.py）。上限 =
+  #   max(pool_per_collection × 候选库数, pool_min, top_k × 2)
+  # 6 库 = 30 条，12 库 = 60 条。**必须随库数增长**，写成常数会退化成
+  # "全局预算饿死库"——实测截到 20 条时只剩 4~5 个库有代表，召回从 25/30 掉到 19/30。
+  # 实测（30 条正向问题、6 库）：不截 60 条 = 25/30 召回 / 1669ms；
+  # 截到 30 条 = 25/30 召回 / ~700ms，关键事实还从 29/30 涨到 30/30
+  # （截掉低分噪音后不再有弱候选被 cross-encoder 抬上来挤掉正确答案）。
+  # pool_per_collection 设为 0 关闭截断，退回"全部候选都进重排"。
+  pool_per_collection: 5
+  pool_min: 20
+
 # =============================================================================
 # Evaluation Configuration
 # =============================================================================
