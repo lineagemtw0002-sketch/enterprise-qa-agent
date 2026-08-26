@@ -1,0 +1,914 @@
+{
+  "generated_at": "2026-08-26T11:35:52.228754",
+  "script": "/Users/david/Documents/enterprise-qa-agent/scripts/benchmark_bm25_backends.py",
+  "code_state": {
+    "commit": "253654a",
+    "commit_full": "253654ad9b182daafcb5fe863f8ff62d0f9703ce",
+    "branch": "fix/p0-security-and-project-conventions",
+    "dirty_paths": [
+      "?? scripts/benchmark_bm25_backends.py",
+      "?? scripts/benchmark_results/bm25_backends_20260826_112806.json",
+      "?? scripts/benchmark_results/bm25_backends_20260826_113429.json",
+      "?? scripts/benchmark_results/bm25_seed_20260826_112414.json",
+      "?? scripts/benchmark_results/bm25_seed_20260826_112712.json",
+      "?? scripts/seed_large_bm25_corpus.py"
+    ],
+    "is_clean": false,
+    "warning": "工作区有未提交改动，这批数字对应「含未提交改动的工作区状态」，不能只靠 commit hash 复现"
+  },
+  "platform": {
+    "sys_platform": "darwin",
+    "python": "3.12.13"
+  },
+  "args": {
+    "sizes": "1000,10000,50000",
+    "crossover_sizes": "10,20,50,100,200,500,1000,2000",
+    "parallel_size": 10000,
+    "parallel_libs": 6,
+    "repeat": 3,
+    "query_kind": "hot",
+    "only": "",
+    "out": ""
+  },
+  "corpus_kind": "synthetic",
+  "corpus_caveat": "语料由 scripts/seed_large_bm25_corpus.py 合成（Zipf 词频 + Heaps 词表增长）。结论覆盖体积/延迟/内存/打分一致性/并行行为；不可用于评价检索质量、召回率或答案正确性。",
+  "results": {
+    "crossover": {
+      "rows": [
+        {
+          "chunks": 10,
+          "collection": "synthetic_bm25_10",
+          "json_bytes": 89117,
+          "sqlite_bytes": 81920,
+          "json": {
+            "load_ms": 0.496,
+            "query_ms": 0.007,
+            "total_ms": 0.504,
+            "load_ms_all": [
+              0.503,
+              0.496,
+              0.49
+            ],
+            "query_ms_all": [
+              0.008,
+              0.007,
+              0.007
+            ],
+            "hits": 6
+          },
+          "sqlite": {
+            "load_ms": 0.393,
+            "query_ms": 0.387,
+            "total_ms": 0.78,
+            "load_ms_all": [
+              0.402,
+              0.393,
+              0.328
+            ],
+            "query_ms_all": [
+              0.478,
+              0.387,
+              0.356
+            ],
+            "hits": 6
+          },
+          "sqlite_speedup_x": 0.646,
+          "winner": "json"
+        },
+        {
+          "chunks": 20,
+          "collection": "synthetic_bm25_20",
+          "json_bytes": 159553,
+          "sqlite_bytes": 122880,
+          "json": {
+            "load_ms": 0.837,
+            "query_ms": 0.016,
+            "total_ms": 0.852,
+            "load_ms_all": [
+              0.839,
+              0.837,
+              0.835
+            ],
+            "query_ms_all": [
+              0.016,
+              0.016,
+              0.015
+            ],
+            "hits": 10
+          },
+          "sqlite": {
+            "load_ms": 0.344,
+            "query_ms": 0.418,
+            "total_ms": 0.762,
+            "load_ms_all": [
+              0.363,
+              0.325,
+              0.344
+            ],
+            "query_ms_all": [
+              0.456,
+              0.418,
+              0.375
+            ],
+            "hits": 10
+          },
+          "sqlite_speedup_x": 1.118,
+          "winner": "sqlite"
+        },
+        {
+          "chunks": 50,
+          "collection": "synthetic_bm25_50",
+          "json_bytes": 352986,
+          "sqlite_bytes": 253952,
+          "json": {
+            "load_ms": 1.775,
+            "query_ms": 0.04,
+            "total_ms": 1.816,
+            "load_ms_all": [
+              1.906,
+              1.775,
+              1.731
+            ],
+            "query_ms_all": [
+              0.041,
+              0.04,
+              0.04
+            ],
+            "hits": 10
+          },
+          "sqlite": {
+            "load_ms": 0.341,
+            "query_ms": 0.452,
+            "total_ms": 0.793,
+            "load_ms_all": [
+              0.336,
+              0.341,
+              0.357
+            ],
+            "query_ms_all": [
+              0.445,
+              0.535,
+              0.452
+            ],
+            "hits": 10
+          },
+          "sqlite_speedup_x": 2.29,
+          "winner": "sqlite"
+        },
+        {
+          "chunks": 100,
+          "collection": "synthetic_bm25_100",
+          "json_bytes": 647429,
+          "sqlite_bytes": 450560,
+          "json": {
+            "load_ms": 3.119,
+            "query_ms": 0.084,
+            "total_ms": 3.203,
+            "load_ms_all": [
+              3.099,
+              3.119,
+              3.193
+            ],
+            "query_ms_all": [
+              0.081,
+              0.084,
+              0.09
+            ],
+            "hits": 10
+          },
+          "sqlite": {
+            "load_ms": 0.343,
+            "query_ms": 0.557,
+            "total_ms": 0.9,
+            "load_ms_all": [
+              0.343,
+              0.381,
+              0.328
+            ],
+            "query_ms_all": [
+              0.603,
+              0.557,
+              0.546
+            ],
+            "hits": 10
+          },
+          "sqlite_speedup_x": 3.559,
+          "winner": "sqlite"
+        },
+        {
+          "chunks": 200,
+          "collection": "synthetic_bm25_200",
+          "json_bytes": 1210250,
+          "sqlite_bytes": 831488,
+          "json": {
+            "load_ms": 5.762,
+            "query_ms": 0.173,
+            "total_ms": 5.936,
+            "load_ms_all": [
+              5.766,
+              5.762,
+              5.747
+            ],
+            "query_ms_all": [
+              0.176,
+              0.173,
+              0.17
+            ],
+            "hits": 10
+          },
+          "sqlite": {
+            "load_ms": 0.343,
+            "query_ms": 0.772,
+            "total_ms": 1.115,
+            "load_ms_all": [
+              0.403,
+              0.32,
+              0.343
+            ],
+            "query_ms_all": [
+              0.776,
+              0.746,
+              0.772
+            ],
+            "hits": 10
+          },
+          "sqlite_speedup_x": 5.324,
+          "winner": "sqlite"
+        },
+        {
+          "chunks": 500,
+          "collection": "synthetic_bm25_500",
+          "json_bytes": 2828709,
+          "sqlite_bytes": 1949696,
+          "json": {
+            "load_ms": 13.525,
+            "query_ms": 0.454,
+            "total_ms": 13.979,
+            "load_ms_all": [
+              13.591,
+              13.495,
+              13.525
+            ],
+            "query_ms_all": [
+              0.455,
+              0.454,
+              0.454
+            ],
+            "hits": 10
+          },
+          "sqlite": {
+            "load_ms": 0.332,
+            "query_ms": 1.419,
+            "total_ms": 1.751,
+            "load_ms_all": [
+              0.332,
+              0.384,
+              0.315
+            ],
+            "query_ms_all": [
+              1.511,
+              1.419,
+              1.394
+            ],
+            "hits": 10
+          },
+          "sqlite_speedup_x": 7.983,
+          "winner": "sqlite"
+        },
+        {
+          "chunks": 1000,
+          "collection": "synthetic_bm25_1000",
+          "json_bytes": 5495776,
+          "sqlite_bytes": 3862528,
+          "json": {
+            "load_ms": 25.49,
+            "query_ms": 0.932,
+            "total_ms": 26.422,
+            "load_ms_all": [
+              25.475,
+              25.595,
+              25.49
+            ],
+            "query_ms_all": [
+              0.932,
+              1.43,
+              0.926
+            ],
+            "hits": 10
+          },
+          "sqlite": {
+            "load_ms": 0.362,
+            "query_ms": 2.777,
+            "total_ms": 3.139,
+            "load_ms_all": [
+              0.362,
+              0.378,
+              0.333
+            ],
+            "query_ms_all": [
+              2.744,
+              2.807,
+              2.777
+            ],
+            "hits": 10
+          },
+          "sqlite_speedup_x": 8.417,
+          "winner": "sqlite"
+        },
+        {
+          "chunks": 2000,
+          "collection": "synthetic_bm25_2000",
+          "json_bytes": 10693001,
+          "sqlite_bytes": 7614464,
+          "json": {
+            "load_ms": 50.001,
+            "query_ms": 1.979,
+            "total_ms": 51.981,
+            "load_ms_all": [
+              50.35,
+              50.001,
+              49.921
+            ],
+            "query_ms_all": [
+              1.979,
+              1.979,
+              1.982
+            ],
+            "hits": 10
+          },
+          "sqlite": {
+            "load_ms": 0.353,
+            "query_ms": 5.223,
+            "total_ms": 5.576,
+            "load_ms_all": [
+              0.353,
+              0.453,
+              0.325
+            ],
+            "query_ms_all": [
+              12.786,
+              5.206,
+              5.223
+            ],
+            "hits": 10
+          },
+          "sqlite_speedup_x": 9.322,
+          "winner": "sqlite"
+        }
+      ],
+      "crossover": {
+        "between_chunks": [
+          10,
+          20
+        ],
+        "between_json_bytes": [
+          89117,
+          159553
+        ]
+      },
+      "query_kind": "hot"
+    },
+    "scale": {
+      "rows": [
+        {
+          "chunks": 1000,
+          "collection": "synthetic_bm25_1000",
+          "terms": [
+            "一一",
+            "一丁",
+            "一丂",
+            "一七",
+            "一丄"
+          ],
+          "json_bytes": 5495776,
+          "sqlite_bytes": 3862528,
+          "size_ratio_sqlite_over_json": 0.703,
+          "json": {
+            "load_ms": 25.024,
+            "query_ms": 0.925,
+            "total_ms": 25.949,
+            "load_ms_all": [
+              25.135,
+              25.024,
+              24.917
+            ],
+            "query_ms_all": [
+              0.924,
+              1.43,
+              0.925
+            ],
+            "hits": 10
+          },
+          "sqlite": {
+            "load_ms": 0.335,
+            "query_ms": 2.806,
+            "total_ms": 3.141,
+            "load_ms_all": [
+              0.368,
+              0.333,
+              0.335
+            ],
+            "query_ms_all": [
+              2.795,
+              2.824,
+              2.806
+            ],
+            "hits": 10
+          },
+          "sqlite_speedup_x": 8.26
+        },
+        {
+          "chunks": 10000,
+          "collection": "synthetic_bm25_10000",
+          "terms": [
+            "一一",
+            "一丁",
+            "一丂",
+            "一七",
+            "一丄"
+          ],
+          "json_bytes": 51198626,
+          "sqlite_bytes": 37003264,
+          "size_ratio_sqlite_over_json": 0.723,
+          "json": {
+            "load_ms": 243.171,
+            "query_ms": 17.984,
+            "total_ms": 261.155,
+            "load_ms_all": [
+              241.84,
+              243.171,
+              253.116
+            ],
+            "query_ms_all": [
+              18.694,
+              17.984,
+              10.348
+            ],
+            "hits": 10
+          },
+          "sqlite": {
+            "load_ms": 0.4,
+            "query_ms": 26.087,
+            "total_ms": 26.486,
+            "load_ms_all": [
+              0.4,
+              0.403,
+              0.371
+            ],
+            "query_ms_all": [
+              26.087,
+              25.978,
+              26.38
+            ],
+            "hits": 10
+          },
+          "sqlite_speedup_x": 9.86
+        },
+        {
+          "chunks": 50000,
+          "collection": "synthetic_bm25_50000",
+          "terms": [
+            "一一",
+            "一丁",
+            "一丂",
+            "一七",
+            "一丄"
+          ],
+          "json_bytes": 249962238,
+          "sqlite_bytes": 183513088,
+          "size_ratio_sqlite_over_json": 0.734,
+          "json": {
+            "load_ms": 1171.93,
+            "query_ms": 158.334,
+            "total_ms": 1330.264,
+            "load_ms_all": [
+              1196.885,
+              1156.819,
+              1171.93
+            ],
+            "query_ms_all": [
+              158.282,
+              158.95,
+              158.334
+            ],
+            "hits": 10
+          },
+          "sqlite": {
+            "load_ms": 0.385,
+            "query_ms": 128.992,
+            "total_ms": 129.377,
+            "load_ms_all": [
+              0.402,
+              0.385,
+              0.372
+            ],
+            "query_ms_all": [
+              128.587,
+              128.992,
+              131.178
+            ],
+            "hits": 10
+          },
+          "sqlite_speedup_x": 10.28
+        }
+      ],
+      "query_kind": "hot"
+    },
+    "parity": {
+      "rows": [
+        {
+          "chunks": 1000,
+          "collection": "synthetic_bm25_1000",
+          "checks": [
+            {
+              "query_kind": "hot",
+              "terms": [
+                "一一",
+                "一丁",
+                "一丂",
+                "一七",
+                "一丄"
+              ],
+              "n_results_json": 992,
+              "n_results_sqlite": 992,
+              "same_length": true,
+              "identical_ordered": true,
+              "identical_score_map": true,
+              "first_diff": null
+            },
+            {
+              "query_kind": "mixed",
+              "terms": [
+                "一凑",
+                "丁儉",
+                "七京",
+                "七亣",
+                "丅乄"
+              ],
+              "n_results_json": 12,
+              "n_results_sqlite": 12,
+              "same_length": true,
+              "identical_ordered": true,
+              "identical_score_map": true,
+              "first_diff": null
+            }
+          ]
+        },
+        {
+          "chunks": 10000,
+          "collection": "synthetic_bm25_10000",
+          "checks": [
+            {
+              "query_kind": "hot",
+              "terms": [
+                "一一",
+                "一丁",
+                "一丂",
+                "一七",
+                "一丄"
+              ],
+              "n_results_json": 9983,
+              "n_results_sqlite": 9983,
+              "same_length": true,
+              "identical_ordered": true,
+              "identical_score_map": true,
+              "first_diff": null
+            },
+            {
+              "query_kind": "mixed",
+              "terms": [
+                "丅凹",
+                "不乎",
+                "上修",
+                "丐免",
+                "专傁"
+              ],
+              "n_results_json": 24,
+              "n_results_sqlite": 24,
+              "same_length": true,
+              "identical_ordered": true,
+              "identical_score_map": true,
+              "first_diff": null
+            }
+          ]
+        },
+        {
+          "chunks": 50000,
+          "collection": "synthetic_bm25_50000",
+          "checks": [
+            {
+              "query_kind": "hot",
+              "terms": [
+                "一一",
+                "一丁",
+                "一丂",
+                "一七",
+                "一丄"
+              ],
+              "n_results_json": 49936,
+              "n_results_sqlite": 49936,
+              "same_length": true,
+              "identical_ordered": true,
+              "identical_score_map": true,
+              "first_diff": null
+            },
+            {
+              "query_kind": "mixed",
+              "terms": [
+                "不军",
+                "丝仠",
+                "丣偔",
+                "丯儌",
+                "乁儴"
+              ],
+              "n_results_json": 38,
+              "n_results_sqlite": 38,
+              "same_length": true,
+              "identical_ordered": true,
+              "identical_score_map": true,
+              "first_diff": null
+            }
+          ]
+        }
+      ],
+      "all_bit_identical": true
+    },
+    "rss": {
+      "baseline": {
+        "peak_rss_bytes": 78184448,
+        "rss_after_import_bytes": 78184448,
+        "hits": 0
+      },
+      "rows": [
+        {
+          "chunks": 1000,
+          "collection": "synthetic_bm25_1000",
+          "json_peak_mb": 113.9,
+          "sqlite_peak_mb": 76.6,
+          "json_over_baseline_mb": 39.4,
+          "sqlite_over_baseline_mb": 2.0,
+          "raw_json": {
+            "peak_rss_bytes": 119472128,
+            "rss_after_import_bytes": 78462976,
+            "hits": 10
+          },
+          "raw_sqlite": {
+            "peak_rss_bytes": 80314368,
+            "rss_after_import_bytes": 78544896,
+            "hits": 10
+          }
+        },
+        {
+          "chunks": 10000,
+          "collection": "synthetic_bm25_10000",
+          "json_peak_mb": 440.5,
+          "sqlite_peak_mb": 87.4,
+          "json_over_baseline_mb": 365.9,
+          "sqlite_over_baseline_mb": 12.9,
+          "raw_json": {
+            "peak_rss_bytes": 461864960,
+            "rss_after_import_bytes": 78577664,
+            "hits": 10
+          },
+          "raw_sqlite": {
+            "peak_rss_bytes": 91668480,
+            "rss_after_import_bytes": 78594048,
+            "hits": 10
+          }
+        },
+        {
+          "chunks": 50000,
+          "collection": "synthetic_bm25_50000",
+          "json_peak_mb": 1429.2,
+          "sqlite_peak_mb": 138.1,
+          "json_over_baseline_mb": 1354.6,
+          "sqlite_over_baseline_mb": 63.6,
+          "raw_json": {
+            "peak_rss_bytes": 1498628096,
+            "rss_after_import_bytes": 78462976,
+            "hits": 10
+          },
+          "raw_sqlite": {
+            "peak_rss_bytes": 144850944,
+            "rss_after_import_bytes": 78430208,
+            "hits": 10
+          }
+        }
+      ],
+      "note": "每个数字来自一个全新子进程的 ru_maxrss（峰值），不是主进程前后取差值"
+    },
+    "parallel": {
+      "chunks": 10000,
+      "n_libs": 6,
+      "thread_counts": [
+        1,
+        2,
+        3,
+        6
+      ],
+      "by_query_kind": {
+        "hot": {
+          "terms": [
+            "一一",
+            "一丁",
+            "一丂",
+            "一七",
+            "一丄"
+          ],
+          "sqlite_boundary_rows_per_query": 39237,
+          "backends": {
+            "json": {
+              "serial_ms": 1695.32,
+              "parallel_ms": 2086.6,
+              "speedup_x": 0.812,
+              "ideal_speedup_x": 6,
+              "parallel_efficiency": 0.135,
+              "thread_sweep_ms": {
+                "1": 286.83,
+                "2": 597.75,
+                "3": 905.42,
+                "6": 2086.6
+              },
+              "wall_ratio_vs_1_thread": 7.27,
+              "serial_ms_all": [
+                1710.0,
+                1693.85,
+                1695.32
+              ]
+            },
+            "sqlite": {
+              "serial_ms": 156.86,
+              "parallel_ms": 2808.63,
+              "speedup_x": 0.056,
+              "ideal_speedup_x": 6,
+              "parallel_efficiency": 0.009,
+              "thread_sweep_ms": {
+                "1": 26.33,
+                "2": 101.83,
+                "3": 355.7,
+                "6": 2808.63
+              },
+              "wall_ratio_vs_1_thread": 106.67,
+              "serial_ms_all": [
+                166.91,
+                156.86,
+                155.74
+              ]
+            }
+          },
+          "process_parallel_ms": {
+            "json": 1195.45,
+            "sqlite": 546.25
+          },
+          "sqlite_sql_side_agg_sweep_ms": {
+            "1": 11.67,
+            "2": 14.28,
+            "3": 14.52,
+            "6": 23.87
+          },
+          "sqlite_sql_side_agg_note": "诊断变体，非生产实现：打分下推进 SQL 后跨边界行数降到 top_k。它与 BM25Indexer.query 的语义不完全等价（IN 去重了重复查询词），只用于验证「跨边界行数 → GIL convoy」这一因果。"
+        },
+        "mixed": {
+          "terms": [
+            "丅凹",
+            "不乎",
+            "上修",
+            "丐免",
+            "专傁"
+          ],
+          "sqlite_boundary_rows_per_query": 24,
+          "backends": {
+            "json": {
+              "serial_ms": 1538.74,
+              "parallel_ms": 1731.78,
+              "speedup_x": 0.889,
+              "ideal_speedup_x": 6,
+              "parallel_efficiency": 0.148,
+              "thread_sweep_ms": {
+                "1": 251.18,
+                "2": 509.57,
+                "3": 760.05,
+                "6": 1731.78
+              },
+              "wall_ratio_vs_1_thread": 6.89,
+              "serial_ms_all": [
+                1582.33,
+                1529.9,
+                1538.74
+              ]
+            },
+            "sqlite": {
+              "serial_ms": 4.35,
+              "parallel_ms": 3.99,
+              "speedup_x": 1.091,
+              "ideal_speedup_x": 6,
+              "parallel_efficiency": 0.182,
+              "thread_sweep_ms": {
+                "1": 0.81,
+                "2": 1.27,
+                "3": 1.81,
+                "6": 3.99
+              },
+              "wall_ratio_vs_1_thread": 4.93,
+              "serial_ms_all": [
+                4.88,
+                4.35,
+                4.11
+              ]
+            }
+          },
+          "process_parallel_ms": {
+            "json": 1425.7,
+            "sqlite": 487.78
+          },
+          "sqlite_sql_side_agg_sweep_ms": {
+            "1": 0.63,
+            "2": 0.56,
+            "3": 0.86,
+            "6": 1.7
+          },
+          "sqlite_sql_side_agg_note": "诊断变体，非生产实现：打分下推进 SQL 后跨边界行数降到 top_k。它与 BM25Indexer.query 的语义不完全等价（IN 去重了重复查询词），只用于验证「跨边界行数 → GIL convoy」这一因果。"
+        }
+      }
+    },
+    "threshold": {
+      "threshold_bytes": 262144,
+      "rows": [
+        {
+          "chunks": 10,
+          "collection": "synthetic_bm25_10",
+          "json_bytes": 89117,
+          "auto_picks_sqlite": false
+        },
+        {
+          "chunks": 20,
+          "collection": "synthetic_bm25_20",
+          "json_bytes": 159553,
+          "auto_picks_sqlite": false
+        },
+        {
+          "chunks": 50,
+          "collection": "synthetic_bm25_50",
+          "json_bytes": 352986,
+          "auto_picks_sqlite": true
+        },
+        {
+          "chunks": 100,
+          "collection": "synthetic_bm25_100",
+          "json_bytes": 647429,
+          "auto_picks_sqlite": true
+        },
+        {
+          "chunks": 200,
+          "collection": "synthetic_bm25_200",
+          "json_bytes": 1210250,
+          "auto_picks_sqlite": true
+        },
+        {
+          "chunks": 500,
+          "collection": "synthetic_bm25_500",
+          "json_bytes": 2828709,
+          "auto_picks_sqlite": true
+        },
+        {
+          "chunks": 1000,
+          "collection": "synthetic_bm25_1000",
+          "json_bytes": 5495776,
+          "auto_picks_sqlite": true
+        },
+        {
+          "chunks": 2000,
+          "collection": "synthetic_bm25_2000",
+          "json_bytes": 10693001,
+          "auto_picks_sqlite": true
+        },
+        {
+          "chunks": 1000,
+          "collection": "synthetic_bm25_1000",
+          "json_bytes": 5495776,
+          "auto_picks_sqlite": true
+        },
+        {
+          "chunks": 10000,
+          "collection": "synthetic_bm25_10000",
+          "json_bytes": 51198626,
+          "auto_picks_sqlite": true
+        },
+        {
+          "chunks": 50000,
+          "collection": "synthetic_bm25_50000",
+          "json_bytes": 249962238,
+          "auto_picks_sqlite": true
+        }
+      ]
+    }
+  },
+  "not_covered": [
+    "合成语料，非真实文档；不涉及检索质量/召回率",
+    "只测 BM25 这一层，不含 dense 检索、rerank、端到端 TTFT",
+    "只测单进程内的并发；未测多进程/多 worker 部署形态",
+    "未测写路径（add_documents / remove_document）在大规模下的耗时",
+    "未测索引更新与查询并发时的读写竞争",
+    "只在本机 macOS + APFS 上跑过；生产硬件与文件系统不同"
+  ]
+}
