@@ -16,8 +16,14 @@ collection 各自开自己的 client，互不干扰**）"——这句话暗示"�
 在单线程事件循环里假并发——那样测不出真正的线程安全问题
 （`CLAUDE.md` §7.2："并发缺陷必须用并发方式验证"）。
 
-**这份测试本身不改任何生产代码**，只回答"共享 client 安不安全"这一个问题，
-结论决定 P1-8 那条优化要不要做、怎么做。
+**结论（2026-08-26）**：共享 client 在本文件前四个测试类下全部安全；
+`TestOldPatternMultipleClientsSamePathWasUnsafe` 那组对照实验则把"旧写法
+在并发下可能有问题"从猜测坐实成**稳定复现的真实 bug**（5/5 复现 chromadb
+底层竞态）。据此已经把 `src/libs/vector_store/chroma_store.py::ChromaStore`
+改成从一个按 `persist_directory` 缓存的共享 client 取实例，不再每次构造都
+新建 `PersistentClient`——**这份测试文件现在既是验证依据，也覆盖了这处
+生产代码改动本身**（见 `TestChromaStoreFixUsesSharedClient`），不再是
+"不改生产代码,只回答要不要做"的纯前置调研。
 """
 
 from __future__ import annotations
@@ -177,14 +183,33 @@ class TestSharedClientOnSameCollectionUnderLoad:
         assert col.count() == write_count, f"写入数量对不上，可能存在丢写/竞态: {col.count()}"
 
 
-class TestCurrentPatternMultipleClientsSamePath:
-    """对照组：现在的实现是"每次查询都新建一个 `PersistentClient`，但都指向
-    同一个 `persist_directory`"——这不是共享 client 的对照，是**当前生产代码
-    正在做的事**。chromadb 对"同一路径被多个 `PersistentClient` 实例并发持有"
-    是有名的已知限制（底层 sqlite 连接/文件锁），这组测试反过来验证：现在的
-    写法在并发下是不是已经有问题——如果是，切成共享 client 就不是「新引入
-    风险」，是**顺带修掉一个现有风险**。"""
+class TestOldPatternMultipleClientsSamePathWasUnsafe:
+    """对照组：修复前的实现是"每次查询都新建一个 `PersistentClient`，但都指向
+    同一个 `persist_directory`"。chromadb 对"同一路径被多个 `PersistentClient`
+    实例并发持有"是有名的已知限制（底层 sqlite 连接/文件锁），这组测试反过来
+    验证：那种写法在并发下是不是已经有问题。
 
+    ⚠️ **结论已经从"理论风险"变成"稳定复现的真实 bug"**（2026-08-26）：
+    独立跑 5 次，**5 次全部失败**，报错为 chromadb 底层竞态（
+    `ValueError: Could not connect to tenant default_tenant`、
+    `AttributeError: 'RustBindingsAPI' object has no attribute 'bindings'`、
+    `KeyError` 命中 tmp 路径）。这不是"新引入风险"，是发现并顺带修掉一个
+    **已经在生产代码里的真实并发 bug**——`src/libs/vector_store/chroma_store.py`
+    的 `ChromaStore.__init__` 正是这个模式，而 `query_knowledge_hub.py` 每次
+    查询都会重新构造 `ChromaStore`，多用户并发提问时天然触发这条路径。
+
+    这个类本身**保留下来当回归证据**，不修（它就是在模拟"如果退回旧写法会
+    怎样"），标 `xfail(strict=False)` 而不是删除或改断言方向——删掉等于抹掉
+    "旧写法不安全"这个曾经真实发生过的证据；`strict=False` 是因为竞态本身
+    不保证每次都触发，万一某次环境巧合躲过去也不该让测试套件变红。
+    真正的回归保护在下面 `TestChromaStoreFixUsesSharedClient`，它测的是
+    **修复后的 `ChromaStore` 本身**。"""
+
+    @pytest.mark.xfail(
+        strict=False,
+        reason="记录已修复的真实 bug：旧写法（并发同路径新建多个 PersistentClient）"
+        "在本机 5/5 复现竞态错误，不代表环境保证每次都触发",
+    )
     @pytest.mark.asyncio
     async def test_concurrent_new_clients_to_same_path_different_collections(self, tmp_path):
         path = str(tmp_path)
@@ -213,3 +238,72 @@ class TestCurrentPatternMultipleClientsSamePath:
             f"现有写法（每次新建 client，同路径并发）在 {len(exceptions)} 个线程里抛了异常: "
             f"{exceptions[:3]}"
         )
+
+
+class TestChromaStoreFixUsesSharedClient:
+    """验证 P1-8 的实际修复：`ChromaStore.__init__` 改成从 `_get_or_create_client`
+    缓存里取共享 client 之后，`TestOldPatternMultipleClientsSamePathWasUnsafe`
+    复现的竞态不再出现，且构造多个指向同一路径的 `ChromaStore` 实例确实拿到的是
+    同一个底层 `chromadb.ClientAPI` 对象（不是"恰好没触发"，是"从根上就没有并发
+    构造多个 client"）。"""
+
+    def test_same_persist_directory_shares_one_client_object(self, tmp_path):
+        from src.libs.vector_store.chroma_store import ChromaStore
+
+        class _Cfg:
+            collection_name = "col_a"
+            persist_directory = str(tmp_path)
+
+        class _Settings:
+            vector_store = _Cfg()
+
+        store1 = ChromaStore(settings=_Settings())
+        store2 = ChromaStore(settings=_Settings())
+        assert store1.client is store2.client, (
+            "两个指向同一 persist_directory 的 ChromaStore 实例应共享同一个 "
+            "PersistentClient 对象，而不是各自新建"
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_chromastore_construction_same_path_different_collections(
+        self, tmp_path
+    ):
+        """把上面对照组的场景原样复刻一遍，但这次构造的是真实 ChromaStore
+        （生产代码路径），而不是直接调 chromadb.PersistentClient。"""
+        from src.libs.vector_store.chroma_store import ChromaStore
+
+        path = str(tmp_path)
+
+        def build_store_write_and_read(name: str, n: int) -> list[str]:
+            class _Cfg:
+                collection_name = name
+                persist_directory = path
+
+            class _Settings:
+                vector_store = _Cfg()
+
+            store = ChromaStore(settings=_Settings())
+            records = [
+                {
+                    "id": f"{name}_doc_{j}",
+                    "vector": _vector(hash((name, j))),
+                    "metadata": {"collection": name},
+                }
+                for j in range(n)
+            ]
+            store.upsert(records)
+            return [r["id"] for r in store.get_by_ids([f"{name}_doc_{j}" for j in range(n)])]
+
+        names = [f"store_col_{i}" for i in range(6)]
+        results = await asyncio.gather(
+            *[asyncio.to_thread(build_store_write_and_read, name, 20) for name in names],
+            return_exceptions=True,
+        )
+
+        exceptions = [r for r in results if isinstance(r, Exception)]
+        assert not exceptions, (
+            f"修复后的 ChromaStore 在 {len(exceptions)} 个线程里仍然抛了异常: "
+            f"{exceptions[:3]}"
+        )
+        for name, ids in zip(names, results):
+            assert ids == [f"{name}_doc_{j}" for j in range(20)]

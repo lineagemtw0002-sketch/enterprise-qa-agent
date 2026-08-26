@@ -753,7 +753,10 @@ flowchart TB
   这条描述本身也是过时的：结构化日志基础设施（`src/observability/logger.py` 等）早在
   2026-08-25 就已实施（`docs/observability_design.md` 阶段一），只是没写进本文件，
   且 `app.py`/`workflow.py`/`intent.py` 的 print 一直没接上。现已全部接上并转完
-- 检索链路每查询重建全套组件、全链路无缓存
+- 检索链路每查询重建全套组件、全链路无缓存 —— 🟡 **Chroma client 这一侧已部分修复
+  （2026-08-26，见 §5），BM25 磁盘反序列化那一侧仍未解决**：`_build_hybrid_search_for`
+  仍然每次查询、每个 collection 都重建 `HybridSearch`/`BM25Indexer`，且建各 collection
+  store 的步骤仍按 workaround 强制串行（现在已不是必须的，但没有拆除，见 §5 该条"未做的"）
 - ~~管理端普遍 N+1（`/admin/users` 约 300 次串行查询）~~ ✅ **`/admin/users` 已修复（2026-08-26），见 §5**——
   注意是"`/admin/users` 已修复"，不是"管理端普遍 N+1 已解决"：这条只覆盖了这一个端点，
   其余管理端点是否有同类问题**未逐个排查**
@@ -763,6 +766,40 @@ flowchart TB
 ---
 
 ## 5. 已修复（防止重新引入）
+
+- ✅ **2026-08-26　P1-8（部分）：`ChromaStore` 改成共享 client，顺带修掉一个
+  真实存在的并发 bug**
+  `ChromaStore.__init__` 原来每次构造都无条件新建一个
+  `chromadb.PersistentClient`，即使指向同一个 `persist_directory`——而
+  `query_knowledge_hub.py` 的 `_build_hybrid_search_for` 对每次查询、每个
+  candidate collection 都会重新构造一次，6 库企业每次提问 = 6 次 Chroma
+  bootstrap。`tests/unit/test_chroma_shared_client_concurrency.py` 先验证
+  "共享 client 在多线程并发读写下是否安全"（5 条全过，含跨 collection/同
+  collection 两类场景），随后加了一组对照实验直接复刻"旧写法在并发下会不会
+  已经有问题"——**结果不是理论风险，是稳定复现的真实 bug**：连续 5 次独立
+  跑，5 次全部触发 chromadb 底层竞态（`Could not connect to tenant
+  default_tenant` / `RustBindingsAPI object has no attribute bindings` 等）。
+  这正是 `query_knowledge_hub.py:1245-1255` 那段"先串行建 client 再并行查询"
+  workaround 注释里描述的同一个坑——workaround 本身没动（见下方"未做的"），
+  但根因现在被修了。
+  改法：`chroma_store.py` 新增按 `persist_directory` 分桶、`threading.Lock`
+  保护的进程级 client 缓存 `_get_or_create_client`，`__init__` 从缓存取
+  client 而不是每次新建。全量 `tests/unit`（1864 条）与
+  `tests/integration/test_chroma_store_roundtrip.py` 跑过均通过；
+  `tests/integration` 里另外 33 个失败经 `git stash` 验证是修复前就已存在
+  （缺 Azure 凭证 / 缺演示语料等环境问题），与本次改动无关。
+  回归保护：`test_chroma_shared_client_concurrency.py` 新增
+  `TestChromaStoreFixUsesSharedClient`（验证同路径两个 `ChromaStore` 实例
+  确实共享同一个 client 对象、且并发构造 6 个不同 collection 的 `ChromaStore`
+  不再报错）；原来的对照组测试保留作为"旧写法不安全"的证据，标
+  `xfail(strict=False)`（竞态不保证每次触发，不该让套件偶尔变红）。
+  ⚠️ **未做的**：`query_knowledge_hub.py` 里那段"先串行建 client 再并行查询"
+  的 workaround **本次没有拆除**——它只序列化"建 client"这一步，理论上现在
+  已经不需要了（client 缓存本身线程安全），但 `_build_hybrid_search_for`
+  一次调用建的不只是 vector_store，还有 `BM25Indexer`/reranker/embedding
+  client 等其它部分，要不要连带一起改成并行构造需要单独验证这些部分的并发
+  安全性，本次没有做，留作 P1-8 的下一步。BM25 磁盘反序列化那一半（P1-8 的
+  另一个侧面）由 #2/#2c/#9（SQLite/OpenSearch 迁移）覆盖，不是本次范围。
 
 - ✅ **2026-08-26　账号体系阶段一落地（批量导入 / 激活码 / 停用 / 席位）**
   设计 `docs/account_lifecycle_design.md`（四档演进，本次只做第一档；
