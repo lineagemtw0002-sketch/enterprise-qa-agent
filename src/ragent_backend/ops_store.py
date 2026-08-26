@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional
 import asyncpg
 
 from src.ragent_backend.db_pool import get_shared_pool
+from src.ragent_backend.role_store import ROLE_ORG_ADMIN
 
 # 状态机（docs/aiops_module_design.md §3.3）：
 #   proposed -> pending_approval -> approved -> executing -> completed
@@ -123,6 +124,14 @@ class RemediationAction:
     rollback_plan: Optional[Dict[str, Any]]
     outcome_effective: Optional[bool]
     created_at: float
+
+
+@dataclass(frozen=True)
+class RoleOpsPermission:
+    role_id: str
+    connection_id: str
+    can_view: bool
+    can_approve: bool
 
 
 @dataclass(frozen=True)
@@ -607,6 +616,145 @@ class OpsStore:
                 connection_id,
             )
         return [self._row_to_scope(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # role_ops_systems（§10.6：细粒度审批权限，can_view/can_approve）
+    # ------------------------------------------------------------------
+    #
+    # ⚠️ 范围边界（跟 role_collections 刻意保持同一套语义，不是各判各的）：
+    # - `org_admin` 是通配符——本企业名下**全部**连接器自动 can_view=True、
+    #   can_approve=True，不看这张表；这条不能被这张表的显式行覆盖或收窄，
+    #   跟 `role_store.get_allowed_collections_for_user` 的 org_admin 通配符
+    #   处理是同一条业务规则（"企业管理员=企业内全部资源"）。
+    # - `super_admin`（平台运营方）从不自动获得任何连接器的权限——没有入口
+    #   配置，不是遗漏，对齐"role_collections 从来不会给 super_admin 挂
+    #   关联"这条既有铁律，运维审批涉及"批准执行动作"，比知识库查看的
+    #   爆炸半径更大，更不该放开。
+    # - **只管 can_view/can_approve，不管连接器登记/白名单配置写权限**——
+    #   那两个仍然是 org_admin 专属、判定依据是 `ROLE_ORG_ADMIN in 角色集合`，
+    #   不进入这张表、不可通过自定义角色委托（§10.6 明确要求，避免跟日常
+    #   审批权限混淆）。
+
+    async def get_ops_permission(self, user_id: str, connection_id: str) -> Dict[str, bool]:
+        """返回 `{"can_view": bool, "can_approve": bool}`。org_admin 通配符 +
+        super_admin 零权限的规则见上方类注释。连接器不存在时两者皆 False
+        （由调用方决定是否要转成 404——这里不对"连接器不存在"和"没权限"
+        做区分，保持这个方法只回答权限问题）。"""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            conn_row = await conn.fetchrow(
+                "SELECT org_id FROM ops_system_connections WHERE id = $1", connection_id,
+            )
+            if conn_row is None:
+                return {"can_view": False, "can_approve": False}
+
+            user_row = await conn.fetchrow("SELECT org_id FROM users WHERE id = $1", user_id)
+            user_org_id = user_row["org_id"] if user_row else None
+
+            role_rows = await conn.fetch(
+                "SELECT r.id, r.name FROM roles r JOIN user_roles ur ON ur.role_id = r.id "
+                "WHERE ur.user_id = $1",
+                user_id,
+            )
+            role_ids = [r["id"] for r in role_rows]
+            role_names = {r["name"] for r in role_rows}
+
+            if ROLE_ORG_ADMIN in role_names and user_org_id == conn_row["org_id"]:
+                return {"can_view": True, "can_approve": True}
+
+            if not role_ids:
+                return {"can_view": False, "can_approve": False}
+
+            perm_rows = await conn.fetch(
+                "SELECT can_view, can_approve FROM role_ops_systems "
+                "WHERE role_id = ANY($1::text[]) AND connection_id = $2",
+                role_ids, connection_id,
+            )
+        return {
+            "can_view": any(r["can_view"] for r in perm_rows),
+            "can_approve": any(r["can_approve"] for r in perm_rows),
+        }
+
+    async def viewable_connection_ids_for_user(self, user_id: str, org_id: str) -> Optional[List[str]]:
+        """给"列出本企业修复动作"这类端点按 can_view 过滤用。
+
+        返回 `None` 表示**不需要过滤**（该用户是这家企业的 org_admin，
+        通配符覆盖全部连接器，调用方不用再拿到一份显式列表逐条比对）；
+        返回列表（可能为空）表示"只有这些 connection_id 可见"。
+        """
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            user_row = await conn.fetchrow("SELECT org_id FROM users WHERE id = $1", user_id)
+            user_org_id = user_row["org_id"] if user_row else None
+
+            role_rows = await conn.fetch(
+                "SELECT r.id, r.name FROM roles r JOIN user_roles ur ON ur.role_id = r.id "
+                "WHERE ur.user_id = $1",
+                user_id,
+            )
+            role_ids = [r["id"] for r in role_rows]
+            role_names = {r["name"] for r in role_rows}
+
+            if ROLE_ORG_ADMIN in role_names and user_org_id == org_id:
+                return None
+
+            if not role_ids:
+                return []
+
+            rows = await conn.fetch(
+                "SELECT DISTINCT ros.connection_id FROM role_ops_systems ros "
+                "JOIN ops_system_connections c ON c.id = ros.connection_id "
+                "WHERE ros.role_id = ANY($1::text[]) AND ros.can_view = TRUE AND c.org_id = $2",
+                role_ids, org_id,
+            )
+        return [r["connection_id"] for r in rows]
+
+    async def set_role_ops_permission(
+        self, role_id: str, connection_id: str, can_view: bool, can_approve: bool,
+    ) -> RoleOpsPermission:
+        """`can_approve=True` 隐含 `can_view=True`——审批权限比查看权限更窄
+        是设计要求的方向（§10.6），反过来（能批但看不见）没有意义，这里直接
+        在写入前拉齐，不指望调用方（管理员点选界面）自己保证这条不变量。"""
+        if can_approve:
+            can_view = True
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO role_ops_systems (role_id, connection_id, can_view, can_approve)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (role_id, connection_id) DO UPDATE SET
+                    can_view = EXCLUDED.can_view, can_approve = EXCLUDED.can_approve
+                """,
+                role_id, connection_id, can_view, can_approve,
+            )
+        return RoleOpsPermission(
+            role_id=role_id, connection_id=connection_id, can_view=can_view, can_approve=can_approve,
+        )
+
+    async def revoke_role_ops_permission(self, role_id: str, connection_id: str) -> None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM role_ops_systems WHERE role_id = $1 AND connection_id = $2",
+                role_id, connection_id,
+            )
+
+    async def list_role_ops_permissions(self, connection_id: str) -> List[RoleOpsPermission]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT role_id, connection_id, can_view, can_approve FROM role_ops_systems "
+                "WHERE connection_id = $1 ORDER BY role_id",
+                connection_id,
+            )
+        return [
+            RoleOpsPermission(
+                role_id=r["role_id"], connection_id=r["connection_id"],
+                can_view=r["can_view"], can_approve=r["can_approve"],
+            )
+            for r in rows
+        ]
 
     # ------------------------------------------------------------------
     # AI 分析结论摘要（§3.1：只落库摘要 + 依据引用，不落库原始运维数据）

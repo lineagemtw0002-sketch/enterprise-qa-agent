@@ -604,6 +604,12 @@ stateDiagram-v2
 
 ### 10.6 权限模型回填 `CLAUDE.md` §3 —— 草稿（2026-08-26 修订，对齐既有角色机制）
 
+> ✅ **本节草稿已于 2026-08-26 实施**，内容与实际代码一致，见 `CLAUDE.md` §5
+> 对应条目（`ops_store.py::get_ops_permission`/`viewable_connection_ids_for_user`/
+> `set_role_ops_permission` + `app.py` 的 `/api/v1/admin/roles/{role_id}/
+> ops-permissions/{connection_id}` 端点）。下面这份草稿的内容原样成立，
+> 不再是"待确认"状态。
+
 ⚠️ **第一版草稿有问题，已修正**：原草稿用"org 管理员"这个模糊说法，
 没有落到系统里已经存在的具体机制上。查代码（`role_store.py`）后确认两件事：
 

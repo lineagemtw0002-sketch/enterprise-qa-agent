@@ -979,22 +979,22 @@ flowchart TB
   会在 org 归属校验那一步被拒），但体验不完美，留作后续细化。
 
   ⚠️ **未做的（阶段四之后）**：
-  - `role_ops_systems`（can_view/can_approve 精细权限位）——当前的权限
-    粒度只有"org_admin 能管自己企业的一切 / super_admin 管开关"两档，
-    §10.6 设想的"审批权限比查看权限更窄"这层还没有落地，**任何本企业
-    org_admin 都能批准，不是只有被指定的审批人**，这条差距已如实记录在
-    `admin_approve_remediation_action` 的函数注释里。~~`ops_analysis_summaries`
-    只建了表，CRUD 方法未实现~~ ✅ **已实现，见 §5 下方 CRUD 条目**
+  - ~~`role_ops_systems`（can_view/can_approve 精细权限位）~~ ✅ **已实现，
+    见 §5 下方对应条目**。~~`ops_analysis_summaries` 只建了表，CRUD 方法
+    未实现~~ ✅ **已实现，见 §5 下方 CRUD 条目**
   - ~~LangGraph 接入（`intent_type=ops`/`ops_subgraph`，§10.2）~~ ✅
-    **已确认不需要新增结构，见 §5 下方对应条目**；前端"运维塔台"UI 进行中
-    （刘德华在做，见 §5 下方）
+    **已确认不需要新增结构，见 §5 下方对应条目**；前端"运维塔台"UI 已完成
+    （刘德华开发，见 §5 下方）；**AI 分析层（异常检测/告警关联降噪/RCA）
+    已实现**（刘德华开发，见 §5 下方对应条目）
   - ~~审批超时扫描任务未实现~~ ✅ **已接线，见 §5 下方对应条目**
   - 真实的 BYOC 连接器进程（客户环境里响应 `query_request`/`exec_request`
     帧的那一端）不在本项目范围内，本阶段只做平台侧协议
-  - `CLAUDE.md` §3 权限模型正文**没有**回填 §10.6 的 `role_ops_systems`
-    草稿——按 §7.4"§3 只描述已经实现的现状"，`role_ops_systems` 实际还没
-    接线，现在写进去就是"文档说了算但代码不算数"，等真正接细粒度权限那一步
-    再回填
+  - `CLAUDE.md` §3 权限模型正文仍**没有**回填 `role_ops_systems`——§7.4
+    "§3 只描述已经实现的现状"这条现在满足了（`role_ops_systems` 已接线），
+    但本次判断暂缓回填：§3.1 的篇幅和结构是围绕"知识库权限"组织的，运维
+    权限的通配符/零权限规则虽然复用同一套语义，直接插进去会打断那节的
+    叙事，值得单独起一段而不是塞进现有段落，留到下次专门整理 §3 时一并做，
+    不是遗忘
   - `scripts/verify_aiops_endpoints.py` 只覆盖了粗粒度的 org_admin/
     super_admin 门禁；`reject` 端点没有单独测（跟 `approve` 共用同一段状态机
     校验，判别力已经在 `approve` 的 409 用例里验过）。
@@ -1195,6 +1195,47 @@ flowchart TB
   在企业未开通模块时，从"静默返回空结果"（LLM 会自己编一个"未查到数据"的
   解释，误导用户）改成明确返回"本企业未开通智能运维模块"，把"体验不完美"
   降级成"体验一般但不骗人"，同一个文件内可独立完成。
+
+- ✅ **2026-08-26　`role_ops_systems` 细粒度审批权限落地（§10.6 设计已实施）**
+  ——本会话「张学友」实现，闭环了 §5 上面多处"任何本企业 org_admin 都能
+  批准，不是只有被指定的审批人"这条反复记录的已知差距。
+
+  **语义跟 `role_collections` 刻意保持一致**（`ops_store.py::get_ops_permission`/
+  `viewable_connection_ids_for_user` 类注释里逐条写明，避免两张表各判各的）：
+  `org_admin` 是通配符——本企业名下全部连接器自动 `can_view=True` +
+  `can_approve=True`，不查表；`super_admin` 从不自动获得任何客户连接器的
+  权限，没有入口配置；`can_approve=True` 写入时自动拉齐 `can_view=True`
+  （能批准但看不到是矛盾状态，不指望调用方自己保证）。**只管审批权限，
+  不管连接器登记/白名单配置写权限**——那两个仍是 `org_admin` 专属，判定
+  依据是 `ROLE_ORG_ADMIN in 角色集合`，不进入这张表，避免跟日常审批混淆。
+
+  **端点**：`PUT/DELETE /api/v1/admin/roles/{role_id}/ops-permissions/
+  {connection_id}`（授权/撤销，org_admin 专属，系统内置角色
+  `super_admin`/`org_admin` 拒绝配置——配了也不生效，一并挡掉避免误导）、
+  `GET /api/v1/admin/ops/connectors/{connection_id}/permissions`（列出某
+  连接器的全部授权）。`admin_list_remediation_actions`/
+  `admin_approve_remediation_action`/`admin_reject_remediation_action`
+  三个端点的网关从 `_require_org_admin` 放宽到"任意登录用户"，收窄逻辑
+  挪进 handler 内部：列表按 `viewable_connection_ids_for_user` 返回值过滤
+  （`None`=org_admin 不过滤，`[]`=空授权必须真的返回空，不能被误当成"不
+  过滤"）；批准/拒绝统一走 `_require_can_approve`（拒绝跟批准同一档权限，
+  不是 `can_view`——能看不代表能拍板）。
+
+  **验证**：`tests/integration/test_ops_store_role_permissions.py`（11 条，
+  真实 Postgres，含三条判别式：org_admin 通配符仅限本企业不是全局、
+  super_admin 显式塞一行权限 Store 层依然如实执行——防线只在 app.py 写
+  路径一层，不在 Store 层重复拦截、can_approve 隐含 can_view 的自动拉齐）+
+  `scripts/verify_aiops_endpoints.py` 新增 9 项真实端到端场景（16b～16k：
+  无授权用户列表为空/批准 403 → 授权给系统角色被拒 → 授权给自定义角色后
+  能看到 4 条能批准第 4 条 → 撤销后恢复 403 → org_admin 通配符全程不受
+  影响），连同原有全部复跑（共 33 项）。全量 `tests/unit` 2317 通过。
+  `docs/aiops_module_design.md` §10.6 标注已实施。
+
+  **本次未覆盖**：只做了后端，`role_ops_systems` 的管理界面（给哪个角色
+  授权哪个连接器的 UI）未实现，目前只能靠 API 直接调；`admin_propose_
+  remediation_action` 仍是 org_admin 专属（跟连接器登记/白名单配置同一档，
+  刻意没有跟着放宽，因为"谁能提议"和"谁能批准"是两件事，提议本身还没有
+  在设计里被要求下放）。
 
 - ✅ **2026-08-26　P1-14 扩展审计：逐个核对全部管理端点，修复 2 处同类问题**
   `/admin/users` 本身的 N+1 早前已修（同一条 P1-14），但 CLAUDE.md 一直如实

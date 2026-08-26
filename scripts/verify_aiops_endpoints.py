@@ -74,7 +74,7 @@ def _reset_pool_caches() -> None:
 
 _TEST_ORG_NAME = "AIOps-smoke-test-org"
 _TEST_ORG_NAME_2 = "AIOps-smoke-test-org-2"
-_TEST_USERNAMES = ["aiops_smoke_admin", "aiops_smoke_platform", "aiops_smoke_admin_2"]
+_TEST_USERNAMES = ["aiops_smoke_admin", "aiops_smoke_platform", "aiops_smoke_admin_2", "aiops_smoke_reviewer"]
 
 
 async def _cleanup(user_store: UserStore) -> None:
@@ -103,6 +103,9 @@ async def _cleanup(user_store: UserStore) -> None:
             ]
             if conn_ids:
                 await conn.execute(
+                    "DELETE FROM role_ops_systems WHERE connection_id = ANY($1::text[])", conn_ids,
+                )
+                await conn.execute(
                     "DELETE FROM ops_connector_refresh_tokens WHERE connection_id = ANY($1::text[])", conn_ids,
                 )
                 await conn.execute(
@@ -121,6 +124,9 @@ async def _cleanup(user_store: UserStore) -> None:
             await conn.execute("DELETE FROM user_roles WHERE user_id = ANY($1::text[])", user_ids)
             await conn.execute("DELETE FROM users WHERE id = ANY($1::text[])", user_ids)
         if org_ids:
+            # 自定义角色（16b 那条创建的 reviewer 角色）挂在测试企业名下，
+            # 企业删除前先清角色，否则留下孤儿角色。
+            await conn.execute("DELETE FROM roles WHERE org_id = ANY($1::text[]) AND is_system = FALSE", org_ids)
             await conn.execute("DELETE FROM organizations WHERE id = ANY($1::text[])", org_ids)
 
 
@@ -370,6 +376,98 @@ async def main() -> None:
         )
         print("16) approve an already-rejected action:", resp.status_code)
         assert resp.status_code == 409
+
+        # 16b) §10.6 细粒度审批权限：一个没有 org_admin、也没被显式授权的
+        # 普通用户既不能批准，列表接口也应该收窄成空（不是继续看到全部）。
+        reviewer = await user_store.create_user("aiops_smoke_reviewer", "pw12345678")
+        pool = await user_store._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE users SET org_id = $1 WHERE id = $2", org.org_id, reviewer.user_id)
+        reviewer_role = await role_store.create_role(org.org_id, "aiops_smoke_reviewer_role", "运维审批员（冒烟测试）")
+        await role_store.add_user_role(reviewer.user_id, reviewer_role.role_id)
+        reviewer_token = create_access_token(reviewer.user_id, reviewer.username)
+        reviewer_headers = {"Authorization": f"Bearer {reviewer_token}"}
+
+        resp = await client.post(
+            f"/api/v1/admin/ops/connectors/{connection_id}/remediation-actions", headers=headers,
+            json={
+                "action_type": "restart_service", "intent": "给细粒度权限测试用的第四条",
+                "plan": {"target": "order-service"},
+            },
+        )
+        assert resp.status_code == 200 and resp.json()["status"] == "pending_approval"
+        fourth_action = resp.json()
+
+        resp = await client.get("/api/v1/admin/ops/remediation-actions", headers=reviewer_headers)
+        print("16c) reviewer with no grant sees:", resp.status_code, len(resp.json()))
+        assert resp.status_code == 200 and resp.json() == []
+
+        resp = await client.post(
+            f"/api/v1/admin/ops/remediation-actions/{fourth_action['action_id']}/approve",
+            headers=reviewer_headers,
+        )
+        print("16d) reviewer with no grant tries to approve:", resp.status_code)
+        assert resp.status_code == 403
+
+        # 16e) 系统内置角色（org_admin/super_admin）不允许配置 role_ops_systems
+        resp = await client.put(
+            f"/api/v1/admin/roles/{org_admin_role.role_id}/ops-permissions/{connection_id}",
+            headers=headers, json={"can_view": True, "can_approve": True},
+        )
+        print("16e) grant to system role rejected:", resp.status_code)
+        assert resp.status_code == 403
+
+        # 16f) 授权给自定义角色后，reviewer 应该既能看到、也能批准
+        resp = await client.put(
+            f"/api/v1/admin/roles/{reviewer_role.role_id}/ops-permissions/{connection_id}",
+            headers=headers, json={"can_approve": True},  # 故意不传 can_view，验证服务端会自动拉齐
+        )
+        print("16f) grant can_approve to reviewer role:", resp.status_code, resp.json())
+        assert resp.status_code == 200
+        assert resp.json()["can_view"] is True, "can_approve=True 必须隐含 can_view=True"
+
+        resp = await client.get("/api/v1/admin/ops/remediation-actions", headers=reviewer_headers)
+        print("16g) reviewer after grant sees:", resp.status_code, len(resp.json()))
+        assert resp.status_code == 200 and len(resp.json()) == 4
+
+        resp = await client.post(
+            f"/api/v1/admin/ops/remediation-actions/{fourth_action['action_id']}/approve",
+            headers=reviewer_headers,
+        )
+        print("16h) reviewer after grant approves:", resp.status_code, resp.json().get("status"))
+        assert resp.status_code == 200 and resp.json()["status"] == "approved"
+        assert resp.json()["approver_user_id"] == reviewer.user_id
+
+        # 16i) 撤销权限后恢复原状——拿一条新的 pending 动作验证 403 恢复
+        resp = await client.delete(
+            f"/api/v1/admin/roles/{reviewer_role.role_id}/ops-permissions/{connection_id}",
+            headers=headers,
+        )
+        print("16i) revoke grant:", resp.status_code)
+        assert resp.status_code == 200
+
+        resp = await client.post(
+            f"/api/v1/admin/ops/connectors/{connection_id}/remediation-actions", headers=headers,
+            json={
+                "action_type": "restart_service", "intent": "撤销权限之后的第五条",
+                "plan": {"target": "order-service"},
+            },
+        )
+        fifth_action = resp.json()
+        resp = await client.post(
+            f"/api/v1/admin/ops/remediation-actions/{fifth_action['action_id']}/approve",
+            headers=reviewer_headers,
+        )
+        print("16j) reviewer after revoke is rejected again:", resp.status_code)
+        assert resp.status_code == 403
+
+        # org_admin 的通配符必须完全不受这张表影响——从头到尾都还能批
+        resp = await client.post(
+            f"/api/v1/admin/ops/remediation-actions/{fifth_action['action_id']}/approve",
+            headers=headers,
+        )
+        print("16k) org_admin wildcard unaffected:", resp.status_code, resp.json().get("status"))
+        assert resp.status_code == 200 and resp.json()["status"] == "approved"
 
         other_org = await org_store.create_organization(_TEST_ORG_NAME_2)
         other_user = await user_store.create_user("aiops_smoke_admin_2", "pw12345678")

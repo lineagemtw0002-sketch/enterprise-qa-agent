@@ -68,6 +68,7 @@ from src.ragent_backend.schemas import (
     OpsConnectorRegisterTokenResponse,
     RemediationScopeResponse, UpsertRemediationScopeRequest,
     RemediationActionResponse, ProposeRemediationActionRequest,
+    RoleOpsPermissionResponse, SetRoleOpsPermissionRequest,
 )
 from src.ragent_backend import account_import as _acct_import
 from src.ragent_backend import activation as _activation
@@ -1969,6 +1970,80 @@ def create_app() -> FastAPI:
         scopes = await ops_store.list_remediation_scopes(connection_id)
         return [_remediation_scope_response(s) for s in scopes]
 
+    def _role_ops_permission_response(p) -> RoleOpsPermissionResponse:
+        return RoleOpsPermissionResponse(
+            role_id=p.role_id, connection_id=p.connection_id,
+            can_view=p.can_view, can_approve=p.can_approve,
+        )
+
+    async def _require_grantable_role(actor_org_id: str, role_id: str):
+        """§10.6：`role_ops_systems` 只能配给企业自建角色，两个内置系统角色
+        （`super_admin`/`org_admin`）不允许配置——`org_admin` 已经是通配符，
+        配了也不生效，一并挡掉避免误导；`super_admin` 是"从不自动获得任何
+        连接器权限"这条铁律本身，允许给它配置就是打开一个后门。
+        跟 `admin_set_role_collections` 校验角色归属的方式完全一致。"""
+        role = await role_store.get_role_by_id(role_id)
+        if role is None:
+            raise HTTPException(status_code=404, detail="角色不存在")
+        if role.is_system:
+            raise HTTPException(status_code=403, detail="系统内置角色（super_admin/org_admin）不支持配置运维权限")
+        if role.org_id is not None and role.org_id != actor_org_id:
+            raise HTTPException(status_code=403, detail="只能给本企业的角色配置运维权限")
+        return role
+
+    @app.put(
+        "/api/v1/admin/roles/{role_id}/ops-permissions/{connection_id}",
+        response_model=RoleOpsPermissionResponse,
+    )
+    async def admin_set_role_ops_permission(
+        role_id: str,
+        connection_id: str,
+        request: SetRoleOpsPermissionRequest,
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> RoleOpsPermissionResponse:
+        """把"能查看/能批准哪个连接器"授权给一个自定义角色——§10.6 细粒度
+        审批权限的写入口，只有 org_admin 能配（跟白名单配置同一档权限）。"""
+        org = await _require_aiops_enabled_org(current_user)
+        await _require_grantable_role(org.org_id, role_id)
+        await _get_owned_connector(org.org_id, connection_id)
+        perm = await ops_store.set_role_ops_permission(
+            role_id, connection_id, can_view=request.can_view, can_approve=request.can_approve,
+        )
+        await _audit_log(
+            current_user.user_id, "set_role_ops_permission", "role_ops_systems", role_id,
+            {"connection_id": connection_id, "can_view": perm.can_view, "can_approve": perm.can_approve},
+        )
+        return _role_ops_permission_response(perm)
+
+    @app.delete("/api/v1/admin/roles/{role_id}/ops-permissions/{connection_id}")
+    async def admin_revoke_role_ops_permission(
+        role_id: str,
+        connection_id: str,
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> dict:
+        org = await _require_aiops_enabled_org(current_user)
+        await _require_grantable_role(org.org_id, role_id)
+        await _get_owned_connector(org.org_id, connection_id)
+        await ops_store.revoke_role_ops_permission(role_id, connection_id)
+        await _audit_log(
+            current_user.user_id, "revoke_role_ops_permission", "role_ops_systems", role_id,
+            {"connection_id": connection_id},
+        )
+        return {"success": True}
+
+    @app.get(
+        "/api/v1/admin/ops/connectors/{connection_id}/permissions",
+        response_model=List[RoleOpsPermissionResponse],
+    )
+    async def admin_list_role_ops_permissions(
+        connection_id: str,
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> List[RoleOpsPermissionResponse]:
+        org = await _require_aiops_enabled_org(current_user)
+        await _get_owned_connector(org.org_id, connection_id)
+        perms = await ops_store.list_role_ops_permissions(connection_id)
+        return [_role_ops_permission_response(p) for p in perms]
+
     def _remediation_action_response(a, scope_check_reason: Optional[str] = None) -> RemediationActionResponse:
         return RemediationActionResponse(
             action_id=a.action_id, org_id=a.org_id, connection_id=a.connection_id,
@@ -2058,11 +2133,29 @@ def create_app() -> FastAPI:
     @app.get("/api/v1/admin/ops/remediation-actions", response_model=List[RemediationActionResponse])
     async def admin_list_remediation_actions(
         status: Optional[str] = None,
-        current_user: AuthenticatedUser = Depends(_require_org_admin),
+        current_user: AuthenticatedUser = Depends(get_current_user),
     ) -> List[RemediationActionResponse]:
+        """网关从 `_require_org_admin` 放宽到"任意登录用户"——§10.6 细粒度
+        权限落地后，持有 `role_ops_systems.can_view` 的非 org_admin 角色也该
+        看得到（比如被指定为审批人但本身不是企业管理员）。真正的收窄发生在
+        下面：org_admin 走 `viewable_connection_ids_for_user` 返回的 `None`
+        （不过滤），其余角色按显式授权的 connection_id 集合过滤——没有任何
+        授权时那个集合是空列表，`list_actions_for_org` 传空的
+        `connection_ids` 必须返回空结果，不能被误当成"没传参数=不过滤"。"""
         org = await _require_aiops_enabled_org(current_user)
+        viewable = await ops_store.viewable_connection_ids_for_user(current_user.user_id, org.org_id)
+        if viewable is not None and not viewable:
+            return []
         actions = await ops_store.list_actions_for_org(org.org_id, status=status)
+        if viewable is not None:
+            viewable_set = set(viewable)
+            actions = [a for a in actions if a.connection_id in viewable_set]
         return [_remediation_action_response(a) for a in actions]
+
+    async def _require_can_approve(user_id: str, connection_id: str) -> None:
+        perm = await ops_store.get_ops_permission(user_id, connection_id)
+        if not perm["can_approve"]:
+            raise HTTPException(status_code=403, detail="没有这个连接器的审批权限")
 
     @app.post(
         "/api/v1/admin/ops/remediation-actions/{action_id}/approve",
@@ -2070,15 +2163,15 @@ def create_app() -> FastAPI:
     )
     async def admin_approve_remediation_action(
         action_id: str,
-        current_user: AuthenticatedUser = Depends(_require_org_admin),
+        current_user: AuthenticatedUser = Depends(get_current_user),
     ) -> RemediationActionResponse:
-        """⚠️ **权限粒度是已知的临时状态**：§3.3.1 设想的审批权限应该是
-        `role_ops_systems.can_approve`（比查看权限更窄），但那张表的 CRUD
-        还没实现（见 CLAUDE.md §5），这里暂时用 `_require_org_admin` 这个
-        粗粒度门禁占位——任何本企业的 org_admin 都能批，不是只有被指定的
-        审批人。**这条差距已经如实记录，不是遗漏。**"""
+        """§10.6 细粒度审批权限已接线：`org_admin` 仍是通配符（企业内全部
+        连接器自动 can_approve），非 org_admin 角色必须先被显式授予
+        `role_ops_systems.can_approve` 才能批准这个连接器上的动作——不再是
+        "任何 org_admin 都能批"这一档粗粒度门禁。"""
         org = await _require_aiops_enabled_org(current_user)
         action = await _get_owned_action(org.org_id, action_id)
+        await _require_can_approve(current_user.user_id, action.connection_id)
         try:
             action = await ops_store.approve_action(action.action_id, approver_user_id=current_user.user_id)
         except IllegalStatusTransition as e:
@@ -2094,10 +2187,13 @@ def create_app() -> FastAPI:
     )
     async def admin_reject_remediation_action(
         action_id: str,
-        current_user: AuthenticatedUser = Depends(_require_org_admin),
+        current_user: AuthenticatedUser = Depends(get_current_user),
     ) -> RemediationActionResponse:
+        """拒绝跟批准走同一档权限（`can_approve`），不是 `can_view`——能看不
+        代表能拍板，"只能看不能定"的用户不该有否决权，这条跟批准对称。"""
         org = await _require_aiops_enabled_org(current_user)
         action = await _get_owned_action(org.org_id, action_id)
+        await _require_can_approve(current_user.user_id, action.connection_id)
         try:
             action = await ops_store.advance_status(action.action_id, STATUS_REJECTED)
         except IllegalStatusTransition as e:

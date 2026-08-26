@@ -279,6 +279,18 @@ class UpsertRemediationScopeRequest(BaseModel):
     scope_config: Dict[str, Any]
 
 
+class RoleOpsPermissionResponse(BaseModel):
+    role_id: str
+    connection_id: str
+    can_view: bool
+    can_approve: bool
+
+
+class SetRoleOpsPermissionRequest(BaseModel):
+    can_view: bool = False
+    can_approve: bool = False
+
+
 class RemediationActionResponse(BaseModel):
     action_id: str
     org_id: str
