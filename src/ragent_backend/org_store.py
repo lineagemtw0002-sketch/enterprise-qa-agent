@@ -39,6 +39,9 @@ class Organization:
     name: str
     is_platform: bool
     created_at: float
+    # 2026-08-26 席位上限（docs/account_lifecycle_design.md §4.4）。
+    # None = 不限。有默认值放最后，不破坏既有的位置构造调用。
+    seat_limit: Optional[int] = None
 
 
 class OrgStore:
@@ -82,6 +85,12 @@ class OrgStore:
             await conn.execute(
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS org_id TEXT REFERENCES organizations(id)"
             )
+            # 2026-08-26 席位（docs/account_lifecycle_design.md §4.4）。
+            # NULL = 不限。存量企业迁移过来时就是 NULL——**不能默认成某个数字**，
+            # 那会在升级的瞬间把已经超过该数字的企业全部锁死。
+            await conn.execute(
+                "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS seat_limit INTEGER"
+            )
             await conn.execute(
                 """
                 INSERT INTO organizations (id, name, is_platform, created_at)
@@ -98,12 +107,44 @@ class OrgStore:
 
     @staticmethod
     def _row_to_org(row: asyncpg.Record) -> Organization:
+        # 库里多数查询只 SELECT 前四列（含 `get_orgs_for_users_batch` 那条
+        # JOIN），而 asyncpg 的 Record 对缺失 key 抛 KeyError 不返回 None，
+        # 所以这里按 key 是否存在取值。
         return Organization(
             org_id=row["id"],
             name=row["name"],
             is_platform=row["is_platform"],
             created_at=row["created_at"],
+            seat_limit=row["seat_limit"] if "seat_limit" in row.keys() else None,
         )
+
+    async def get_seat_limit(self, org_id: str) -> Optional[int]:
+        """企业的席位上限。NULL / 查不到都返回 None（= 不限）。
+
+        查不到也返回 None 而不是抛异常：`org_id` 来自已鉴权用户的归属，
+        走到这里说明这个企业刚被删掉——此时挡住建号没有意义，
+        真正该报的错在别处。
+        """
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT seat_limit FROM organizations WHERE id = $1", org_id)
+        return row["seat_limit"] if row else None
+
+    async def set_seat_limit(self, org_id: str, seat_limit: Optional[int]) -> bool:
+        """改席位上限。**调用方必须已经确认操作者是平台管理员。**
+
+        席位是合同条款不是配置项——企业管理员能改自己企业的上限，
+        这个功能就等于不存在。守卫在端点上（`require_platform_admin`），
+        这里只做数据校验：负数没有意义，0 是合法的（暂停一家企业的新建号）。
+        """
+        if seat_limit is not None and seat_limit < 0:
+            raise ValueError("seat_limit 不能为负数")
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE organizations SET seat_limit = $1 WHERE id = $2", seat_limit, org_id,
+            )
+        return result.split()[-1] != "0"
 
     async def list_organizations(self) -> List[Organization]:
         pool = await self._get_pool()

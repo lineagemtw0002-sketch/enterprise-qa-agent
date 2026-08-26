@@ -152,6 +152,41 @@ async def get_current_user(authorization: Optional[str] = Header(default=None)) 
     return _decode_token(token)
 
 
+async def reject_if_disabled(user_id: str) -> None:
+    """已停用的账号一律 403。**只挂在本来就查库的那几个守卫上。**
+
+    2026-08-26 账号生命周期（`docs/account_lifecycle_design.md` §4.2，
+    `CLAUDE.md` §3.2 那张不对称表）。
+
+    ## 为什么不加在 `get_current_user` 里
+
+    `get_current_user` 是纯 JWT 解码、不碰数据库，35 个端点（问答、会话历史等）
+    只挂它。在那里加检查等于给**每一个请求**加一次 DB 查询，用户已明确拍板
+    不付这个代价（O-2）。代价是那些端点上停用最长 24 小时才生效——
+    token 24 小时不过期且没有黑名单，彻底关闭要等第四档的 token 吊销。
+
+    ## 为什么加在角色守卫上
+
+    `require_role` / `require_platform_admin` / `require_same_org_or_platform`
+    这三个本来就每次实时查库（它们刻意不信 token 里的角色声明），
+    覆盖 19 个管理端端点。**这里确实多了一次查询**——一次主键查找，
+    而这些端点本来就要查角色和企业归属，多这一次在管理端的量级上可以忽略。
+    O-2 拒绝的是"为停用给全部请求加查库"，不是"一次都不许加"。
+
+    ## 这个不对称是对的风险排序
+
+    高权限面（改角色、建账号、看审计日志）立刻关闭；低权限面（继续提问）
+    留一个有界窗口。**窗口不会因为对方反复登录而延长**——`authenticate` 里
+    挡着，停用账号拿不到新 token。反过来才是问题。
+    """
+    from src.ragent_backend.user_store import UserStore
+
+    if await UserStore().is_disabled(user_id):
+        # 措辞跟 403 权限不足区分开：管理员看到"权限不足"会去查角色配置，
+        # 查半天发现角色是对的。直接说账号被停用，省掉这一轮。
+        raise HTTPException(status_code=403, detail="账号已被停用，请联系管理员")
+
+
 def require_role(*allowed_roles: str):
     """依赖工厂：要求当前用户的（实时查库的）角色集合与 allowed_roles 有交集，否则 403。
 
@@ -171,6 +206,8 @@ def require_role(*allowed_roles: str):
         # FastAPI 依赖每次请求都会重新调用这个闭包，但 RoleStore 内部的连接池是
         # 懒创建且跨调用复用的单例（见 role_store.py 的 _pool 缓存），所以这里
         # 每次 new 一个 RoleStore() 不会重复建池，可以放心用。
+        await reject_if_disabled(current_user.user_id)
+
         store = RoleStore()
         role_names = {r.name for r in await store.get_user_roles(current_user.user_id)}
         if not role_names & set(allowed_roles):
@@ -199,6 +236,8 @@ async def require_same_org_or_platform(
     # role_store 的处理方式一致）
     from src.ragent_backend.org_store import OrgStore
 
+    await reject_if_disabled(current_user.user_id)
+
     store = OrgStore()
     if await store.is_platform_admin(current_user.user_id):
         return current_user
@@ -217,6 +256,8 @@ async def require_platform_admin(
     否则 403。给"建组织"、"改派用户所属企业"这类跨企业操作用——这两件事不能交给
     某家客户企业自己的管理员做，只有我们自己（平台组织）能做。"""
     from src.ragent_backend.org_store import OrgStore
+
+    await reject_if_disabled(current_user.user_id)
 
     if not await OrgStore().is_platform_admin(current_user.user_id):
         raise HTTPException(status_code=403, detail="仅平台管理员可操作")
