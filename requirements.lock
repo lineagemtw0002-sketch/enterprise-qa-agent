@@ -10,8 +10,6 @@
 #
 # ⚠️ 这是 pip freeze 的产物，只对本平台（darwin/arm64）成立，且不含哈希校验。
 #    更好的长期方案是 uv 或 pip-tools（跨平台解析 + 哈希），
-#    但那要引入新工具链，本次刻意不做——先要能复现，再要复现得优雅。
-#
 aiohappyeyeballs==2.7.1
 aiohttp==3.14.3
 aiosignal==1.4.0
@@ -44,6 +42,7 @@ distro==1.9.0
 docstring_parser==0.18.0
 durationpy==0.10
 et_xmlfile==2.0.0
+Events==0.5
 fastapi==0.141.1
 filelock==3.32.2
 flatbuffers==25.12.19
@@ -118,6 +117,7 @@ oauthlib==3.3.1
 onnxruntime==1.28.0
 openai==2.54.0
 openpyxl==3.1.5
+opensearch-py==2.8.0
 opentelemetry-api==1.44.0
 opentelemetry-exporter-otlp-proto-common==1.44.0
 opentelemetry-exporter-otlp-proto-grpc==1.44.0
