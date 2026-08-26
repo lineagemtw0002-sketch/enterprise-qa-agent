@@ -149,3 +149,14 @@ export function revokeRoleOpsPermission(roleId, connectionId) {
     .delete(`${BASE}/roles/${encodeURIComponent(roleId)}/ops-permissions/${encodeURIComponent(connectionId)}`)
     .then((res) => res.data)
 }
+
+// ==================== 分析摘要（告警关联时间线的数据源） ====================
+//
+// 只有真正调用过 analyze_ops_incident 才会有记录——没触发过分析的企业这里就是
+// 空列表。**空列表要如实显示成空**，不要拿示例数据顶上（设计稿里那几条时间线是
+// 示例数字，实现时按 mockup 头部注释的要求换成了这个真实接口）。
+export function listAnalysisSummaries(limit = 20) {
+  return axios
+    .get(`${BASE}/ops/analysis-summaries`, { params: { limit } })
+    .then((res) => res.data)
+}
