@@ -33,6 +33,7 @@ from typing import Any, Dict, Optional, Protocol
 
 from src.ops.federation.engine import FederatedQueryEngine, describe_unavailable
 from src.ops.types import (
+    QUERY_KIND_ALERT,
     QUERY_KIND_METRIC,
     ExecutionOutcome,
     QueryRequest,
@@ -56,6 +57,11 @@ class RemediationStore(Protocol):
     它的签名是这个协议的超集。
     """
 
+    async def is_module_enabled(self, org_id: str) -> bool: ...
+    async def save_analysis_summary(
+        self, org_id: str, connection_id: Optional[str], summary: str,
+        evidence_refs: list,
+    ) -> Any: ...
     async def get_action(self, action_id: str) -> Optional[Any]: ...
     async def get_remediation_scope(self, connection_id: str, action_type: str) -> Optional[Any]: ...
     async def create_proposed_action(
@@ -97,11 +103,37 @@ class OpsToolset:
         store: RemediationStore,
         dispatcher: Optional[RemediationDispatcher] = None,
         exec_timeout_s: float = DEFAULT_EXEC_TIMEOUT_SECONDS,
+        llm: Optional[Any] = None,
     ) -> None:
         self._engine = engine
         self._store = store
         self._dispatcher = dispatcher
         self._exec_timeout_s = exec_timeout_s
+        # 复用主链路那个生成模型（app.py::_build_llm 建的实例），不新建、不引入
+        # 另一套工厂——只有根因分析那一层用得到它，见 analysis/rca.py 顶部。
+        self._llm = llm
+
+    async def _module_disabled_outcome(self, org_id: str) -> Optional[ToolOutcome]:
+        """企业没开通智能运维模块时，**明确说出来**。
+
+        改这一处之前的行为是：工具照常执行、拿到空结果，LLM 看到空结果会自己编一个
+        解释（"未查询到相关数据"），用户以为是真没数据。工具列表本身还没有按 org
+        过滤（那要改成"工具列表按调用者动态生成"，是横切核心对话链路的改动，
+        见 CLAUDE.md §5 该条已知缺口），但至少不能让它产生误导性回答。
+
+        查询失败时**不拦**：宁可放行也不要因为一次数据库抖动就把可用的功能说成
+        "未开通"——那会让管理员去找平台管理员开一个本来就是开着的开关。
+        """
+        try:
+            if await self._store.is_module_enabled(org_id):
+                return None
+        except Exception as e:  # noqa: BLE001
+            logger.warning("读取智能运维模块开关失败，按已开通放行: %s", e, exc_info=True)
+            return None
+        return ToolOutcome(
+            ok=False, refused=True,
+            message="本企业尚未开通智能运维模块，无法使用运维相关能力。请联系平台管理员开通。",
+        )
 
     # ------------------------------------------------------------------ 只读
     async def query_ops_system(
@@ -111,6 +143,10 @@ class OpsToolset:
     ) -> ToolOutcome:
         """查客户自己的运维系统。只读，不改变任何状态。"""
         import time as _time
+
+        disabled = await self._module_disabled_outcome(org_id)
+        if disabled is not None:
+            return disabled
 
         end = now_ts if now_ts is not None else _time.time()
         request = QueryRequest(
@@ -303,3 +339,104 @@ class OpsToolset:
                 data={"scope_reason": check.reason},
             )
         return None
+
+    # ------------------------------------------------------------------ 分析
+    async def analyze_ops_incident(
+        self, org_id: str, target: str, metric: str = "error_rate",
+        window_minutes: int = 60, now_ts: Optional[float] = None,
+        connection_ids: Optional[list] = None, persist: bool = True,
+    ) -> ToolOutcome:
+        """异常检测 + 告警关联 + 根因分析辅助，一次跑完（设计 §2 的三项 V1 能力）。
+
+        编排顺序是刻意的：**先算出事实，再让模型解释事实**。
+        指标和告警都来自联邦查询（数据始终留在客户自己的系统里），
+        统计层把"哪里不对"算出来，模型只负责把这些事实串成可能的因果链。
+
+        ⚠️ 落库的只有"结论摘要 + 依据引用"，**没有原始运维数据**——
+        §3.1 的 BYOC 原则：平台不保存客户运维数据的副本。
+        """
+        import time as _time
+
+        disabled = await self._module_disabled_outcome(org_id)
+        if disabled is not None:
+            return disabled
+
+        from src.ops.analysis import Alert, analyze_root_cause, correlate_alerts, detect_anomalies
+
+        end = now_ts if now_ts is not None else _time.time()
+        window = TimeRange(end - window_minutes * 60, end)
+
+        metric_result = await self._engine.query(
+            org_id,
+            QueryRequest(kind=QUERY_KIND_METRIC, target=target, metric=metric, time_range=window),
+            connection_ids=connection_ids,
+        )
+        alert_result = await self._engine.query(
+            org_id,
+            QueryRequest(kind=QUERY_KIND_ALERT, target=target, time_range=window),
+            connection_ids=connection_ids,
+        )
+
+        reports = [
+            detect_anomalies(r.points, target=f"{target}@{r.system_name}", metric=metric)
+            for r in metric_result.results
+        ]
+
+        alerts = [
+            Alert(
+                alert_id=f"{r.connection_id}:{idx}", ts=p.ts,
+                target=p.labels.get("target") or target,
+                labels=dict(p.labels), text=p.text or "",
+                severity=p.labels.get("severity", "warning"),
+            )
+            for r in alert_result.results
+            for idx, p in enumerate(r.points)
+        ]
+        correlation = correlate_alerts(alerts)
+        incident = correlation.incidents[0] if correlation.incidents else None
+
+        rca = await analyze_root_cause(incident=incident, anomaly_reports=reports, llm=self._llm)
+
+        # 部分失败要显式带上——分析结论建立在残缺数据上时，用户必须知道
+        # （§3.5 第 4 条），否则"没发现异常"会被当成"一切正常"。
+        unavailable = [
+            *describe_unavailable(metric_result),
+            *describe_unavailable(alert_result),
+        ]
+        lines = [rca.to_text()]
+        if unavailable:
+            lines.append("⚠️ 以下数据源本次不可用，结论建立在残缺数据上：")
+            lines += [f"  - {u}" for u in unavailable]
+
+        summary_id = None
+        if persist and not rca.degraded:
+            # 降级结果（模型没参与）不落库：`ops_analysis_summaries` 是给审批人看
+            # 数据血缘用的，存一条"其实只是数据复述"的记录会稀释它的意义。
+            try:
+                saved = await self._store.save_analysis_summary(
+                    org_id=org_id,
+                    connection_id=(metric_result.results[0].connection_id if metric_result.results else None),
+                    summary=rca.summary,
+                    evidence_refs=[e.to_dict() for e in rca.evidence],
+                )
+                summary_id = getattr(saved, "summary_id", None)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("保存分析摘要失败（不影响本次分析结果）: %s", e, exc_info=True)
+
+        return ToolOutcome(
+            ok=True,
+            message="\n".join(lines),
+            data={
+                "summary_id": summary_id,
+                "degraded": rca.degraded,
+                "anomaly_targets": [r.target for r in reports if r.has_anomaly],
+                "unevaluated_targets": [r.target for r in reports if not r.evaluated],
+                "alert_count": correlation.original_count,
+                "incident_count": len(correlation.incidents),
+                "noise_reduction": round(correlation.noise_reduction, 4),
+                "unavailable": [
+                    {"system": e.system_name, "reason": e.reason}
+                    for e in [*metric_result.errors, *alert_result.errors]
+                ],
+            },
+        )

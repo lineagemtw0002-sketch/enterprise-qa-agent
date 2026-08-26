@@ -302,3 +302,129 @@ class TestQueryTool:
         out = await _toolset(FakeStore(), transport=FakeTransport(points=5)).query_ops_system(
             ORG, "order-service")
         assert out.ok is True and out.data["point_count"] == 5
+
+
+class _AnalysisStore(FakeStore):
+    """在 FakeStore 上补出分析/开关这两条能力。"""
+
+    def __init__(self, enabled=True, enabled_raises=None, save_raises=None):
+        super().__init__()
+        self._enabled, self._enabled_raises, self._save_raises = enabled, enabled_raises, save_raises
+        self.saved = []
+
+    async def is_module_enabled(self, org_id):
+        if self._enabled_raises:
+            raise self._enabled_raises
+        return self._enabled
+
+    async def save_analysis_summary(self, org_id, connection_id, summary, evidence_refs):
+        if self._save_raises:
+            raise self._save_raises
+        self.saved.append({"org_id": org_id, "connection_id": connection_id,
+                           "summary": summary, "evidence_refs": evidence_refs})
+        return type("S", (), {"summary_id": "opssum_test"})()
+
+
+class _MetricAlertTransport:
+    """按查询类别返回不同数据：metric 给一条带尖峰的序列，alert 给一串同源告警。"""
+
+    def __init__(self, metric_values=None, alert_count=5, raises=None):
+        self._metric_values = metric_values if metric_values is not None else [10.0] * 20 + [900.0]
+        self._alert_count = alert_count
+        self._raises = raises
+        self.kinds = []
+
+    async def query(self, connection_id, org_id, request, timeout_s):
+        self.kinds.append(request.kind)
+        if self._raises:
+            raise self._raises
+        if request.kind == "metric":
+            pts = [DataPoint(ts=float(i), value=v) for i, v in enumerate(self._metric_values)]
+        else:
+            pts = [DataPoint(ts=1000.0 + i * 10, text="5xx 比例升高",
+                             labels={"env": "prod", "severity": "error"})
+                   for i in range(self._alert_count)]
+        return QueryResult(connection_id, "Prometheus", pts)
+
+    async def online_status(self, connection_ids):
+        return {c: True for c in connection_ids}
+
+
+class TestModuleSwitchIsHonest:
+    """未开通模块时要**明说**，不能静默返回空结果让 LLM 自己编解释。"""
+
+    @pytest.mark.asyncio
+    async def test_disabled_module_is_refused_with_a_clear_message(self):
+        store = _AnalysisStore(enabled=False)
+        transport = _MetricAlertTransport()
+        out = await _toolset(store, transport=transport).query_ops_system(ORG, "order-service")
+
+        assert out.refused is True
+        assert "未开通" in out.message
+        assert transport.kinds == [], "未开通时不该发出任何查询"
+
+    @pytest.mark.asyncio
+    async def test_switch_lookup_failure_fails_open(self):
+        """读开关失败时放行——宁可放行也不要因为一次数据库抖动，就让管理员
+        去找平台管理员开一个本来就开着的开关。"""
+        store = _AnalysisStore(enabled_raises=RuntimeError("db down"))
+        transport = _MetricAlertTransport()
+        out = await _toolset(store, transport=transport).query_ops_system(ORG, "order-service")
+        assert out.refused is False and transport.kinds != []
+
+
+class _JsonLLM:
+    def __init__(self, reply):
+        self._reply = reply
+
+    async def ainvoke(self, prompt):
+        return self._reply
+
+
+class TestAnalyzeOpsIncident:
+    @pytest.mark.asyncio
+    async def test_runs_the_whole_chain_and_persists_summary(self):
+        store = _AnalysisStore()
+        toolset = OpsToolset(
+            FederatedQueryEngine(_MetricAlertTransport(), FakeDirectory()), store,
+            llm=_JsonLLM('{"summary":"错误率突增","likely_causes":["上游超时"],"next_steps":["查连接池"]}'))
+        out = await toolset.analyze_ops_incident(ORG, "order-service")
+
+        assert out.ok is True
+        assert out.data["incident_count"] == 1 and out.data["alert_count"] == 5
+        assert out.data["anomaly_targets"], "带尖峰的指标应该被检出异常"
+        assert store.saved, "非降级结果应当落库"
+        # ⚠️ 落库的只有摘要 + 依据，没有原始运维数据（§3.1 BYOC）
+        assert set(store.saved[0]) == {"org_id", "connection_id", "summary", "evidence_refs"}
+
+    @pytest.mark.asyncio
+    async def test_degraded_result_is_not_persisted(self):
+        """ops_analysis_summaries 是给审批人看数据血缘的。存一条"其实只是数据复述"
+        的记录会稀释它的意义。"""
+        store = _AnalysisStore()
+        toolset = OpsToolset(
+            FederatedQueryEngine(_MetricAlertTransport(), FakeDirectory()), store, llm=None)
+        out = await toolset.analyze_ops_incident(ORG, "order-service")
+        assert out.data["degraded"] is True and store.saved == []
+
+    @pytest.mark.asyncio
+    async def test_partial_data_failure_is_surfaced_in_the_conclusion(self):
+        """结论建立在残缺数据上时用户必须知道——否则"没发现异常"会被当成"一切正常"。"""
+        store = _AnalysisStore()
+        toolset = OpsToolset(
+            FederatedQueryEngine(
+                _MetricAlertTransport(raises=ConnectorUnavailable(ERROR_OFFLINE, "心跳超时")),
+                FakeDirectory()),
+            store, llm=None)
+        out = await toolset.analyze_ops_incident(ORG, "order-service")
+        assert "不可用" in out.message and out.data["unavailable"]
+
+    @pytest.mark.asyncio
+    async def test_save_failure_does_not_lose_the_analysis(self):
+        """落库失败不该把已经算出来的结论一起丢掉。"""
+        store = _AnalysisStore(save_raises=RuntimeError("db down"))
+        toolset = OpsToolset(
+            FederatedQueryEngine(_MetricAlertTransport(), FakeDirectory()), store,
+            llm=_JsonLLM('{"summary":"s"}'))
+        out = await toolset.analyze_ops_incident(ORG, "order-service")
+        assert out.ok is True and out.data["summary_id"] is None and out.message
