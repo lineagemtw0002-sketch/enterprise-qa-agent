@@ -297,6 +297,15 @@ class SetRoleOpsPermissionRequest(BaseModel):
     can_approve: bool = False
 
 
+class AnalysisSummaryResponse(BaseModel):
+    summary_id: str
+    org_id: str
+    connection_id: str
+    summary: str
+    evidence_refs: List[Dict[str, Any]]
+    created_at: float
+
+
 class RemediationActionResponse(BaseModel):
     action_id: str
     org_id: str

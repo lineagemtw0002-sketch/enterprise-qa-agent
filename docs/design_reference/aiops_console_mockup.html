@@ -1,0 +1,1119 @@
+<!--
+  状态：视觉设计参考稿（2026-08-26 制作），静态 HTML，示例数据，未接真实后端。
+  2026-08-27 用户已确认要真正实现"总览"这个大屏，作为视觉/布局参考——照抄这份
+  CSS（深色 NOC 主题、KPI 卡片、面板结构）+ 布局，但**数据来源要按下面这份清单
+  改**，不能原样照抄示例数字：
+
+  - KPI 条只保留 3 张真实可算的：待审批修复数 / 连接器在线数(X/Y) / 进行中事件数
+    （`executing` 状态的 remediation_actions，目前大概率恒为 0——因为没有真实
+    BYOC 连接器进程，这是诚实的空，不是 bug）。
+  - **今日告警合并、MTTR 两张 KPI 卡片整个删掉**——用户已确认宁可不显示，也不
+    编示例数字顶上；这两个指标的定义本身还没有，属于 `docs/aiops_module_design.md`
+    §9.3 明确记录的"效果度量指标未定义"空白，不是这次要顺手补的东西。
+  - **服务健康网格（svc-grid 那部分）也整个不做**——同样的"没有真实数据源"问题：
+    系统里没有"这家企业有哪些服务"这个清单概念，画出来的每一项都会是编的。
+  - 告警关联时间线：数据源是 `GET /api/v1/admin/ops/analysis-summaries`（新增，
+    见下方 API 部分），只列出真实调用过 `analyze_ops_incident` 才会有的记录，
+    没触发过分析的企业这里就是空列表，不是缩短的示例数据。
+  - 审批队列（右列卡片）、连接器状态列表：数据源是已有的
+    `GET /api/v1/admin/ops/remediation-actions`（filter status=pending_approval）
+    和 `GET /api/v1/admin/ops/connectors`，跟"审批队列"/"连接器"两个现有 tab
+    读的是同一批真实数据，只是这里换一种更丰富的卡片视觉呈现。
+  - "白名单配置""连接器管理"两个 tab 的视觉可以照抄这份设计，但要接的是已经在
+    `OpsConsole.jsx` 里跑通的真实增删改逻辑，不是这份 mockup 里的静态占位输入框。
+-->
+<title>运维塔台</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Titillium+Web:ital,wght@0,300;0,400;0,600;0,700;0,900;1,400&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+
+<style>
+  /* ---- Deliberate single-theme design ----
+     A NOC / ops control-room screen is canonically dark by convention (24/7
+     viewing rooms, status-light legibility) — this is a domain reason, not a
+     default. Colors are declared explicitly so the page holds regardless of
+     host theme; no prefers-color-scheme branching. */
+
+  :root {
+    --ground: #12131a;
+    --surface: #191b25;
+    --surface-raised: #21232f;
+    --surface-inset: #0d0e13;
+    --border: #2b2e3d;
+    --border-soft: #22242f;
+    --ink: #eef0f6;
+    --ink-muted: #8d90a3;
+    --ink-faint: #5c5f70;
+    --accent: #8b7ffb;
+    --accent-dim: #4a4270;
+    --accent-glow: rgba(139, 127, 251, 0.18);
+    --good: #34d399;
+    --good-dim: #163a2d;
+    --warning: #fbbf24;
+    --warning-dim: #3d3316;
+    --critical: #f8717a;
+    --critical-dim: #3d1e22;
+    --pending: #7c8299;
+    --pending-dim: #24273a;
+
+    --font-display: "Titillium Web", "Segoe UI", system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--font-display);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
+  }
+
+  a { color: inherit; }
+  button { font-family: inherit; }
+
+  .page {
+    max-width: 1440px;
+    margin: 0 auto;
+    padding: 20px 28px 40px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  /* ---------- Header ---------- */
+  .topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+    padding-bottom: 4px;
+  }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .brand-mark {
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+    background: linear-gradient(155deg, var(--accent), #5b4fc4);
+    display: grid;
+    place-items: center;
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.06), 0 8px 20px -6px var(--accent-glow);
+    flex: none;
+  }
+  .brand-mark svg { width: 18px; height: 18px; }
+
+  .brand-text h1 {
+    font-size: 17px;
+    font-weight: 700;
+    margin: 0;
+    letter-spacing: 0.01em;
+  }
+  .brand-text .sub {
+    font-size: 11.5px;
+    color: var(--ink-muted);
+    font-family: var(--font-mono);
+    letter-spacing: 0.02em;
+  }
+
+  .org-switch {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 14px 7px 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 13px;
+    color: var(--ink);
+    cursor: default;
+  }
+  .org-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); box-shadow: 0 0 0 3px var(--good-dim); flex: none; }
+  .org-switch .chev { color: var(--ink-faint); font-size: 10px; margin-left: 2px; }
+
+  .topbar-right {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .live-pill {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--ink-muted);
+    padding: 6px 11px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+  }
+  .live-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--good);
+    animation: pulse 2.2s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.5); }
+    50% { box-shadow: 0 0 0 5px rgba(52, 211, 153, 0); }
+  }
+
+  .clock { font-family: var(--font-mono); font-size: 12.5px; color: var(--ink-muted); font-variant-numeric: tabular-nums; }
+
+  /* ---------- KPI strip ---------- */
+  .kpi-strip {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 12px;
+  }
+
+  .kpi-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .kpi-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--ink-muted);
+    font-weight: 600;
+  }
+
+  .kpi-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .kpi-value {
+    font-family: var(--font-mono);
+    font-size: 26px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+  }
+
+  .kpi-delta {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    font-weight: 500;
+    padding: 2px 6px;
+    border-radius: 5px;
+    white-space: nowrap;
+  }
+  .kpi-delta.good { color: var(--good); background: var(--good-dim); }
+  .kpi-delta.bad { color: var(--critical); background: var(--critical-dim); }
+  .kpi-delta.flat { color: var(--ink-muted); background: var(--surface-raised); }
+
+  .spark { width: 100%; height: 34px; display: block; }
+
+  /* ---------- Main grid ---------- */
+  .main-grid {
+    display: grid;
+    grid-template-columns: 1.72fr 1fr;
+    gap: 16px;
+    align-items: start;
+  }
+
+  .col { display: flex; flex-direction: column; gap: 16px; }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+
+  .panel-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 18px 12px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+
+  .panel-title {
+    font-size: 13.5px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .panel-title .count {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--ink-muted);
+    background: var(--surface-raised);
+    padding: 1px 7px;
+    border-radius: 10px;
+    font-weight: 500;
+  }
+
+  .panel-note {
+    font-size: 11.5px;
+    color: var(--ink-faint);
+  }
+
+  .panel-body { padding: 14px 18px 18px; }
+
+  /* ---------- Service health grid ---------- */
+  .svc-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+  }
+
+  .svc-card {
+    background: var(--surface-inset);
+    border: 1px solid var(--border-soft);
+    border-radius: 10px;
+    padding: 12px 13px;
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+  }
+  .svc-card.critical { border-color: rgba(248, 113, 122, 0.35); }
+  .svc-card.warning { border-color: rgba(251, 191, 36, 0.3); }
+
+  .svc-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .svc-name { font-family: var(--font-mono); font-size: 12.5px; font-weight: 500; }
+
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 10.5px;
+    font-weight: 600;
+    padding: 2.5px 8px 2.5px 6px;
+    border-radius: 20px;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+  }
+  .status-pill .dot { width: 5px; height: 5px; border-radius: 50%; }
+  .status-pill.good { color: var(--good); background: var(--good-dim); }
+  .status-pill.good .dot { background: var(--good); }
+  .status-pill.warning { color: var(--warning); background: var(--warning-dim); }
+  .status-pill.warning .dot { background: var(--warning); }
+  .status-pill.critical { color: var(--critical); background: var(--critical-dim); }
+  .status-pill.critical .dot { background: var(--critical); }
+  .status-pill.pending { color: var(--pending); background: var(--pending-dim); }
+  .status-pill.pending .dot { background: var(--pending); }
+
+  .svc-metrics {
+    display: flex;
+    justify-content: space-between;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--ink-muted);
+  }
+  .svc-metrics b { color: var(--ink); font-weight: 500; }
+
+  /* ---------- Alert timeline ---------- */
+  .timeline { display: flex; flex-direction: column; }
+  .tl-row {
+    display: grid;
+    grid-template-columns: 64px 20px 1fr auto;
+    gap: 12px;
+    align-items: start;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .tl-row:last-child { border-bottom: none; padding-bottom: 0; }
+  .tl-time { font-family: var(--font-mono); font-size: 11px; color: var(--ink-faint); padding-top: 2px; font-variant-numeric: tabular-nums; }
+
+  .tl-marker { display: flex; flex-direction: column; align-items: center; height: 100%; }
+  .tl-dot { width: 9px; height: 9px; border-radius: 50%; margin-top: 3px; flex: none; }
+  .tl-dot.critical { background: var(--critical); box-shadow: 0 0 0 3px var(--critical-dim); }
+  .tl-dot.warning { background: var(--warning); box-shadow: 0 0 0 3px var(--warning-dim); }
+  .tl-dot.good { background: var(--good); box-shadow: 0 0 0 3px var(--good-dim); }
+  .tl-line { width: 1px; flex: 1; background: var(--border); margin-top: 4px; }
+
+  .tl-title { font-size: 13px; font-weight: 500; margin: 0 0 3px; }
+  .tl-desc { font-size: 12px; color: var(--ink-muted); margin: 0; }
+  .tl-tag {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--ink-faint);
+    margin-top: 5px;
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .tl-tag span { background: var(--surface-raised); padding: 1.5px 6px; border-radius: 4px; }
+
+  .tl-count {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--ink-muted);
+    white-space: nowrap;
+    padding-top: 2px;
+  }
+
+  /* ---------- Approval queue ---------- */
+  .approval-list { display: flex; flex-direction: column; gap: 10px; }
+
+  .approval-card {
+    background: var(--surface-inset);
+    border: 1px solid var(--border-soft);
+    border-radius: 10px;
+    padding: 13px 14px 12px;
+  }
+
+  .ap-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+  .ap-type {
+    font-size: 10.5px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--accent);
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .ap-intent { font-size: 12.5px; font-weight: 600; margin: 5px 0 6px; line-height: 1.4; }
+
+  .ap-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 14px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--ink-muted);
+    margin-bottom: 9px;
+  }
+  .ap-meta b { color: var(--ink); font-weight: 500; }
+
+  .ap-radius {
+    display: flex;
+    gap: 7px;
+    background: rgba(251, 191, 36, 0.07);
+    border: 1px dashed rgba(251, 191, 36, 0.28);
+    border-radius: 7px;
+    padding: 7px 9px;
+    font-size: 11px;
+    color: #e8cf8f;
+    line-height: 1.45;
+    margin-bottom: 10px;
+  }
+  .ap-radius svg { flex: none; margin-top: 1px; width: 13px; height: 13px; }
+
+  .ap-actions { display: flex; gap: 8px; }
+  .ap-btn {
+    flex: 1;
+    text-align: center;
+    padding: 7px 0;
+    border-radius: 7px;
+    font-size: 12px;
+    font-weight: 600;
+    border: 1px solid var(--border);
+    background: var(--surface-raised);
+    color: var(--ink-muted);
+  }
+  .ap-btn.approve { background: var(--good-dim); border-color: rgba(52, 211, 153, 0.3); color: var(--good); }
+  .ap-btn.reject { background: transparent; }
+
+  .ap-card.expired { opacity: 0.55; }
+  .ap-card.expired .ap-actions { display: none; }
+  .ap-expired-note { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-faint); padding-top: 2px; }
+
+  /* ---------- Connector status ---------- */
+  .conn-list { display: flex; flex-direction: column; gap: 9px; }
+  .conn-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 10px;
+    background: var(--surface-inset);
+    border: 1px solid var(--border-soft);
+    border-radius: 9px;
+  }
+  .conn-icon {
+    width: 26px; height: 26px; border-radius: 7px;
+    background: var(--surface-raised);
+    display: grid; place-items: center;
+    flex: none;
+    color: var(--ink-muted);
+  }
+  .conn-icon svg { width: 14px; height: 14px; }
+  .conn-info { flex: 1; min-width: 0; }
+  .conn-name { font-size: 12px; font-weight: 500; }
+  .conn-sub { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-faint); }
+  .conn-byoc {
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    color: var(--ink-faint);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+
+  .legend-strip {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    font-size: 11px;
+    color: var(--ink-muted);
+    padding: 2px 4px 0;
+  }
+  .legend-strip .item { display: flex; align-items: center; gap: 6px; }
+  .legend-strip .dot { width: 7px; height: 7px; border-radius: 50%; }
+
+  @media (max-width: 1180px) {
+    .kpi-strip { grid-template-columns: repeat(3, 1fr); }
+    .main-grid { grid-template-columns: 1fr; }
+    .svc-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+  @media (max-width: 700px) {
+    .kpi-strip { grid-template-columns: repeat(2, 1fr); }
+    .svc-grid { grid-template-columns: 1fr; }
+    .page { padding: 16px 14px 32px; }
+  }
+
+  .scrolly { overflow-x: auto; }
+
+  /* ---------- Tab nav ---------- */
+  .tabnav {
+    display: flex;
+    gap: 4px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0;
+  }
+  .tabbtn {
+    appearance: none;
+    background: transparent;
+    border: none;
+    color: var(--ink-muted);
+    font-family: var(--font-display);
+    font-size: 13px;
+    font-weight: 600;
+    padding: 10px 4px;
+    margin-right: 22px;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    position: relative;
+    top: 1px;
+  }
+  .tabbtn:hover { color: var(--ink); }
+  .tabbtn.active { color: var(--ink); border-bottom-color: var(--accent); }
+  .tabbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+
+  .view[hidden] { display: none; }
+  .view { display: flex; flex-direction: column; gap: 20px; }
+
+  /* ---------- Scope config page ---------- */
+  .scope-layout { display: grid; grid-template-columns: 240px 1fr; gap: 16px; align-items: start; }
+
+  .conn-picker { display: flex; flex-direction: column; gap: 6px; }
+  .conn-picker-item {
+    display: flex; align-items: center; gap: 9px;
+    padding: 10px 11px; border-radius: 9px;
+    border: 1px solid transparent;
+    cursor: default;
+    font-size: 12.5px;
+  }
+  .conn-picker-item.active { background: var(--surface-raised); border-color: var(--border); }
+  .conn-picker-item .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--good); flex: none; }
+
+  .admin-note {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 11.5px; color: var(--ink-muted);
+    background: var(--surface-raised);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 12px;
+  }
+  .admin-note svg { width: 14px; height: 14px; flex: none; color: var(--accent); }
+
+  .scope-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .scope-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 13px;
+    padding: 16px 17px;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .scope-card-head { display: flex; align-items: center; justify-content: space-between; }
+  .scope-card-title { font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+  .scope-card-title .tag {
+    font-family: var(--font-mono); font-size: 9.5px; color: var(--accent);
+    background: var(--accent-dim); padding: 2px 7px; border-radius: 10px; font-weight: 600;
+  }
+  .scope-field-label { font-size: 11px; color: var(--ink-muted); font-weight: 600; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 7px; }
+
+  .chip-field { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px; background: var(--surface-inset); border: 1px solid var(--border-soft); border-radius: 9px; min-height: 40px; align-content: flex-start; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 11px; background: var(--surface-raised); border: 1px solid var(--border); color: var(--ink); padding: 4px 6px 4px 10px; border-radius: 6px; }
+  .chip button { background: none; border: none; color: var(--ink-faint); cursor: default; font-size: 13px; line-height: 1; padding: 0 2px; }
+  .chip-add { font-family: var(--font-mono); font-size: 11px; color: var(--ink-faint); border: 1px dashed var(--border); padding: 4px 10px; border-radius: 6px; }
+
+  .bound-field { display: flex; align-items: center; gap: 10px; }
+  .bound-input { display: flex; align-items: center; gap: 8px; background: var(--surface-inset); border: 1px solid var(--border-soft); border-radius: 8px; padding: 8px 12px; flex: 1; }
+  .bound-input label { font-size: 10.5px; color: var(--ink-faint); text-transform: uppercase; letter-spacing: .04em; }
+  .bound-input .val { font-family: var(--font-mono); font-size: 15px; font-weight: 600; margin-left: auto; font-variant-numeric: tabular-nums; }
+
+  .path-list { display: flex; flex-direction: column; gap: 6px; }
+  .path-row { display: flex; align-items: center; gap: 8px; font-family: var(--font-mono); font-size: 11.5px; background: var(--surface-inset); border: 1px solid var(--border-soft); border-radius: 7px; padding: 7px 10px; }
+  .path-row.exclude { color: var(--critical); }
+  .path-row .kind { font-size: 9.5px; text-transform: uppercase; letter-spacing: .05em; padding: 1px 6px; border-radius: 4px; background: var(--good-dim); color: var(--good); }
+  .path-row.exclude .kind { background: var(--critical-dim); color: var(--critical); }
+
+  .scope-meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-faint); display: flex; justify-content: space-between; padding-top: 8px; border-top: 1px solid var(--border-soft); }
+  .save-row { display: flex; justify-content: flex-end; gap: 10px; }
+  .btn { font-family: var(--font-display); font-size: 12.5px; font-weight: 600; padding: 8px 16px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-raised); color: var(--ink-muted); cursor: default; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #0d0b1f; }
+
+  /* ---------- Connector management page ---------- */
+  .conn-page-head { display: flex; align-items: center; justify-content: space-between; }
+  .conn-manage-list { display: flex; flex-direction: column; gap: 10px; }
+  .conn-manage-row {
+    display: grid; grid-template-columns: 30px 1fr auto auto; gap: 14px; align-items: center;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px;
+  }
+  .conn-manage-icon { width: 30px; height: 30px; border-radius: 8px; background: var(--surface-raised); display: grid; place-items: center; color: var(--ink-muted); }
+  .conn-manage-icon svg { width: 16px; height: 16px; }
+  .conn-manage-name { font-size: 13.5px; font-weight: 600; }
+  .conn-manage-sub { font-family: var(--font-mono); font-size: 11px; color: var(--ink-faint); margin-top: 2px; }
+  .conn-manage-actions { display: flex; gap: 8px; }
+  .link-btn { font-size: 12px; color: var(--ink-muted); background: none; border: none; cursor: default; }
+  .link-btn:hover { color: var(--accent); }
+
+  .register-panel { background: var(--surface); border: 1px solid var(--accent-dim); border-radius: 14px; padding: 20px 22px; display: flex; flex-direction: column; gap: 16px; }
+  .register-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .form-field { display: flex; flex-direction: column; gap: 6px; }
+  .form-field label { font-size: 11px; color: var(--ink-muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  .form-field .input { background: var(--surface-inset); border: 1px solid var(--border-soft); border-radius: 8px; padding: 9px 12px; font-size: 12.5px; color: var(--ink); }
+
+  .no-cred-banner {
+    display: flex; gap: 10px; align-items: flex-start;
+    background: rgba(139, 127, 251, 0.08); border: 1px dashed var(--accent-dim); border-radius: 9px;
+    padding: 10px 13px; font-size: 12px; color: var(--ink); line-height: 1.5;
+  }
+  .no-cred-banner svg { flex: none; width: 16px; height: 16px; margin-top: 1px; color: var(--accent); }
+
+  .deploy-block { background: var(--surface-inset); border: 1px solid var(--border-soft); border-radius: 10px; padding: 14px 16px; }
+  .deploy-block .lbl { font-size: 11px; color: var(--ink-muted); font-weight: 600; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 8px; }
+  .deploy-code { font-family: var(--font-mono); font-size: 11.5px; color: var(--good); line-height: 1.8; white-space: pre-wrap; word-break: break-all; }
+  .deploy-code .comment { color: var(--ink-faint); }
+  .deploy-code .token { color: var(--warning); }
+</style>
+
+<div class="page">
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M12 3L4 7v6c0 4.6 3.2 8.4 8 9 4.8-.6 8-4.4 8-9V7l-8-4z" stroke="#0d0b1f" stroke-width="1.6" stroke-linejoin="round"/><path d="M9 12.5l2 2 4-4.5" stroke="#0d0b1f" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="brand-text">
+        <h1>运维塔台</h1>
+        <div class="sub">AIOPS · OPERATIONS TOWER</div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <div class="org-switch"><span class="org-dot"></span>Acme Corp<span class="chev">▾</span></div>
+      <div class="live-pill"><span class="live-dot"></span>实时接入 · 2 个连接器在线</div>
+      <div class="clock">2026-08-26&nbsp; 14:32:07</div>
+    </div>
+  </header>
+
+  <nav class="tabnav" role="tablist" aria-label="模块导航">
+    <button class="tabbtn active" role="tab" aria-selected="true" data-target="overview">总览</button>
+    <button class="tabbtn" role="tab" aria-selected="false" data-target="scopes">白名单配置</button>
+    <button class="tabbtn" role="tab" aria-selected="false" data-target="connectors">连接器管理</button>
+  </nav>
+
+  <div class="view" data-view="overview">
+  <!-- KPI strip -->
+  <section class="kpi-strip" aria-label="核心指标">
+    <div class="kpi-card">
+      <div class="kpi-label">今日告警合并</div>
+      <div class="kpi-row">
+        <span class="kpi-value">1,284<span style="font-size:14px;color:var(--ink-muted);font-weight:500;"> → 47</span></span>
+        <span class="kpi-delta good">↓ 96.3%</span>
+      </div>
+      <svg class="spark" viewBox="0 0 200 34" preserveAspectRatio="none">
+        <polyline points="0,10 30,14 60,9 90,20 120,16 150,26 180,22 200,27" fill="none" stroke="var(--ink-faint)" stroke-width="1" opacity="0.5"/>
+        <path d="M0,10 30,14 60,9 90,20 120,16 150,26 180,22 200,27 200,34 0,34 Z" fill="url(#g1)"/>
+        <polyline points="0,10 30,14 60,9 90,20 120,16 150,26 180,22 200,27" fill="none" stroke="var(--good)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="200" cy="27" r="2.6" fill="var(--good)"/>
+        <defs><linearGradient id="g1" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--good)" stop-opacity="0.25"/><stop offset="100%" stop-color="var(--good)" stop-opacity="0"/></linearGradient></defs>
+      </svg>
+    </div>
+
+    <div class="kpi-card">
+      <div class="kpi-label">MTTR（中位数）</div>
+      <div class="kpi-row">
+        <span class="kpi-value">6.4<span style="font-size:13px;color:var(--ink-muted);"> 分钟</span></span>
+        <span class="kpi-delta good">↓ 41%</span>
+      </div>
+      <svg class="spark" viewBox="0 0 200 34" preserveAspectRatio="none">
+        <path d="M0,26 30,24 60,22 90,18 120,15 150,12 180,11 200,10 200,34 0,34 Z" fill="url(#g2)"/>
+        <polyline points="0,26 30,24 60,22 90,18 120,15 150,12 180,11 200,10" fill="none" stroke="var(--accent)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="200" cy="10" r="2.6" fill="var(--accent)"/>
+        <defs><linearGradient id="g2" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--accent)" stop-opacity="0.28"/><stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs>
+      </svg>
+    </div>
+
+    <div class="kpi-card">
+      <div class="kpi-label">待审批修复</div>
+      <div class="kpi-row">
+        <span class="kpi-value">3</span>
+        <span class="kpi-delta flat">1 项即将超时</span>
+      </div>
+      <svg class="spark" viewBox="0 0 200 34" preserveAspectRatio="none">
+        <path d="M0,30 20,30 20,20 50,20 50,26 80,26 80,14 110,14 110,22 140,22 140,8 170,8 170,18 200,18 200,34 0,34 Z" fill="url(#g3)"/>
+        <polyline points="0,30 20,30 20,20 50,20 50,26 80,26 80,14 110,14 110,22 140,22 140,8 170,8 170,18 200,18" fill="none" stroke="var(--warning)" stroke-width="1.6"/>
+        <defs><linearGradient id="g3" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--warning)" stop-opacity="0.22"/><stop offset="100%" stop-color="var(--warning)" stop-opacity="0"/></linearGradient></defs>
+      </svg>
+    </div>
+
+    <div class="kpi-card">
+      <div class="kpi-label">进行中事件</div>
+      <div class="kpi-row">
+        <span class="kpi-value">2</span>
+        <span class="kpi-delta bad">1 严重</span>
+      </div>
+      <svg class="spark" viewBox="0 0 200 34" preserveAspectRatio="none">
+        <path d="M0,20 30,18 60,24 90,10 120,16 150,6 180,14 200,9 200,34 0,34 Z" fill="url(#g4)"/>
+        <polyline points="0,20 30,18 60,24 90,10 120,16 150,6 180,14 200,9" fill="none" stroke="var(--critical)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="200" cy="9" r="2.6" fill="var(--critical)"/>
+        <defs><linearGradient id="g4" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--critical)" stop-opacity="0.25"/><stop offset="100%" stop-color="var(--critical)" stop-opacity="0"/></linearGradient></defs>
+      </svg>
+    </div>
+
+    <div class="kpi-card">
+      <div class="kpi-label">连接器心跳</div>
+      <div class="kpi-row">
+        <span class="kpi-value">2/2</span>
+        <span class="kpi-delta good">全部在线</span>
+      </div>
+      <svg class="spark" viewBox="0 0 200 34" preserveAspectRatio="none">
+        <polyline points="0,17 15,17 15,8 25,8 25,17 55,17 55,26 65,26 65,17 100,17 100,8 110,8 110,17 150,17 150,26 160,26 160,17 200,17" fill="none" stroke="var(--good)" stroke-width="1.6" opacity="0.85"/>
+      </svg>
+    </div>
+  </section>
+
+  <!-- Main grid -->
+  <div class="main-grid">
+
+    <div class="col">
+      <!-- Service health -->
+      <section class="panel">
+        <div class="panel-head">
+          <div class="panel-title">服务健康 <span class="count">5 个服务 · 本企业接入</span></div>
+          <div class="legend-strip">
+            <span class="item"><span class="dot" style="background:var(--good)"></span>正常</span>
+            <span class="item"><span class="dot" style="background:var(--warning)"></span>观察中</span>
+            <span class="item"><span class="dot" style="background:var(--critical)"></span>异常</span>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="svc-grid">
+
+            <div class="svc-card critical">
+              <div class="svc-top"><span class="svc-name">order-service</span>
+                <span class="status-pill critical"><span class="dot"></span>异常</span>
+              </div>
+              <div class="svc-metrics"><span>P95 延迟 <b>2.4s</b></span><span>错误率 <b>8.1%</b></span></div>
+            </div>
+
+            <div class="svc-card warning">
+              <div class="svc-top"><span class="svc-name">payment-gateway</span>
+                <span class="status-pill warning"><span class="dot"></span>观察中</span>
+              </div>
+              <div class="svc-metrics"><span>P95 延迟 <b>640ms</b></span><span>错误率 <b>1.2%</b></span></div>
+            </div>
+
+            <div class="svc-card">
+              <div class="svc-top"><span class="svc-name">auth-service</span>
+                <span class="status-pill good"><span class="dot"></span>正常</span>
+              </div>
+              <div class="svc-metrics"><span>P95 延迟 <b>88ms</b></span><span>错误率 <b>0.02%</b></span></div>
+            </div>
+
+            <div class="svc-card">
+              <div class="svc-top"><span class="svc-name">inventory-api</span>
+                <span class="status-pill good"><span class="dot"></span>正常</span>
+              </div>
+              <div class="svc-metrics"><span>P95 延迟 <b>121ms</b></span><span>错误率 <b>0.05%</b></span></div>
+            </div>
+
+            <div class="svc-card">
+              <div class="svc-top"><span class="svc-name">notification-worker</span>
+                <span class="status-pill good"><span class="dot"></span>正常</span>
+              </div>
+              <div class="svc-metrics"><span>队列延迟 <b>3s</b></span><span>失败率 <b>0.1%</b></span></div>
+            </div>
+
+            <div class="svc-card">
+              <div class="svc-top"><span class="svc-name">search-index</span>
+                <span class="status-pill pending"><span class="dot"></span>数据中</span>
+              </div>
+              <div class="svc-metrics"><span>P95 延迟 <b>—</b></span><span>连接器 <b>同步中</b></span></div>
+            </div>
+
+          </div>
+        </div>
+      </section>
+
+      <!-- Alert timeline -->
+      <section class="panel">
+        <div class="panel-head">
+          <div class="panel-title">告警关联时间线 <span class="count">近 2 小时</span></div>
+          <div class="panel-note">已从 1,284 条原始告警合并为 6 个事件</div>
+        </div>
+        <div class="panel-body">
+          <div class="timeline">
+
+            <div class="tl-row">
+              <div class="tl-time">14:18</div>
+              <div class="tl-marker"><div class="tl-dot critical"></div><div class="tl-line"></div></div>
+              <div>
+                <p class="tl-title">order-service 错误率突增</p>
+                <p class="tl-desc">根因辅助判断：下游 payment-gateway 超时重试引发级联堆积，建议核查连接池配置</p>
+                <div class="tl-tag"><span>日志 ×312</span><span>链路 ×48</span><span>关联告警 ×19</span></div>
+              </div>
+              <div class="tl-count">19 条 → 1</div>
+            </div>
+
+            <div class="tl-row">
+              <div class="tl-time">13:52</div>
+              <div class="tl-marker"><div class="tl-dot warning"></div><div class="tl-line"></div></div>
+              <div>
+                <p class="tl-title">payment-gateway P95 延迟抬升</p>
+                <p class="tl-desc">已关联到 order-service 事件，判断为同一根因链的先导信号</p>
+                <div class="tl-tag"><span>指标 ×6</span></div>
+              </div>
+              <div class="tl-count">6 条 → 1</div>
+            </div>
+
+            <div class="tl-row">
+              <div class="tl-time">13:30</div>
+              <div class="tl-marker"><div class="tl-dot good"></div><div class="tl-line"></div></div>
+              <div>
+                <p class="tl-title">磁盘空间修复已执行完成</p>
+                <p class="tl-desc">notification-worker 日志目录清理 12.4GB，队列延迟恢复正常</p>
+                <div class="tl-tag"><span>审批人 · 王工</span><span>耗时 41s</span></div>
+              </div>
+              <div class="tl-count">已完成</div>
+            </div>
+
+            <div class="tl-row">
+              <div class="tl-time">12:47</div>
+              <div class="tl-marker"><div class="tl-dot warning"></div></div>
+              <div>
+                <p class="tl-title">inventory-api 部署后错误率短暂上升</p>
+                <p class="tl-desc">观察 6 分钟后自行恢复，未触发修复建议</p>
+                <div class="tl-tag"><span>部署 v2.14.0</span></div>
+              </div>
+              <div class="tl-count">自愈</div>
+            </div>
+
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="col">
+      <!-- Approval queue -->
+      <section class="panel">
+        <div class="panel-head">
+          <div class="panel-title">待审批修复 <span class="count">3 项</span></div>
+        </div>
+        <div class="panel-body">
+          <div class="approval-list">
+
+            <div class="approval-card">
+              <div class="ap-head">
+                <span class="ap-type">扩容实例</span>
+                <span class="status-pill warning"><span class="dot"></span>待审批</span>
+              </div>
+              <p class="ap-intent">order-service 实例数 4 → 6，缓解错误率突增</p>
+              <div class="ap-meta">
+                <span>目标 <b>order-service</b></span>
+                <span>提议 <b>Davis-RCA</b></span>
+                <span>边界 <b>≤ 基线 2 倍</b></span>
+              </div>
+              <div class="ap-radius">
+                <svg viewBox="0 0 24 24" fill="none"><path d="M12 3l9 16H3l9-16z" stroke="#e8cf8f" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 10v4M12 17h.01" stroke="#e8cf8f" stroke-width="1.6" stroke-linecap="round"/></svg>
+                <span>影响半径为 AI 定性推断，非实时拓扑图，实际影响范围可能更大或更小；实际可执行范围以右侧边界约束为准</span>
+              </div>
+              <div class="ap-actions">
+                <button class="ap-btn approve">批准</button>
+                <button class="ap-btn reject">拒绝</button>
+              </div>
+            </div>
+
+            <div class="approval-card">
+              <div class="ap-head">
+                <span class="ap-type">回滚部署</span>
+                <span class="status-pill warning"><span class="dot"></span>待审批 · 12 分钟后超时</span>
+              </div>
+              <p class="ap-intent">inventory-api 回滚至 v2.13.4（上一个已知良好版本）</p>
+              <div class="ap-meta">
+                <span>目标 <b>inventory-api</b></span>
+                <span>当前 <b>v2.14.0</b></span>
+                <span>范围 <b>近 5 个良好版本</b></span>
+              </div>
+              <div class="ap-radius">
+                <svg viewBox="0 0 24 24" fill="none"><path d="M12 3l9 16H3l9-16z" stroke="#e8cf8f" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 10v4M12 17h.01" stroke="#e8cf8f" stroke-width="1.6" stroke-linecap="round"/></svg>
+                <span>影响半径为 AI 定性推断，非实时拓扑图，仅供参考，不作为唯一决策依据</span>
+              </div>
+              <div class="ap-actions">
+                <button class="ap-btn approve">批准</button>
+                <button class="ap-btn reject">拒绝</button>
+              </div>
+            </div>
+
+            <div class="approval-card expired">
+              <div class="ap-head">
+                <span class="ap-type">重启服务</span>
+                <span class="status-pill pending"><span class="dot"></span>已超时</span>
+              </div>
+              <p class="ap-intent">notification-worker 重启以清理僵死连接</p>
+              <div class="ap-meta">
+                <span>目标 <b>notification-worker</b></span>
+                <span>提议于 <b>13:02</b></span>
+              </div>
+              <div class="ap-expired-note">超过 30 分钟无人处理，已自动转为 expired，需重新发起</div>
+            </div>
+
+          </div>
+        </div>
+      </section>
+
+      <!-- BYOC connectors -->
+      <section class="panel">
+        <div class="panel-head">
+          <div class="panel-title">运维系统连接器</div>
+          <div class="panel-note">BYOC · 凭证留在客户环境</div>
+        </div>
+        <div class="panel-body">
+          <div class="conn-list">
+
+            <div class="conn-row">
+              <div class="conn-icon"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="12" rx="2" stroke="currentColor" stroke-width="1.6"/><path d="M8 20h8M12 16v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></div>
+              <div class="conn-info">
+                <div class="conn-name">acme-prod-prometheus</div>
+                <div class="conn-sub">心跳 · 4 秒前</div>
+              </div>
+              <span class="status-pill good"><span class="dot"></span>在线</span>
+            </div>
+
+            <div class="conn-row">
+              <div class="conn-icon"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="12" rx="2" stroke="currentColor" stroke-width="1.6"/><path d="M8 20h8M12 16v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></div>
+              <div class="conn-info">
+                <div class="conn-name">acme-prod-alertlog</div>
+                <div class="conn-sub">心跳 · 11 秒前</div>
+              </div>
+              <span class="status-pill good"><span class="dot"></span>在线</span>
+            </div>
+
+            <div class="conn-row" style="opacity:.6">
+              <div class="conn-icon"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="12" rx="2" stroke="currentColor" stroke-width="1.6"/><path d="M8 20h8M12 16v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></div>
+              <div class="conn-info">
+                <div class="conn-name">acme-staging-search</div>
+                <div class="conn-sub">首次同步中</div>
+              </div>
+              <span class="status-pill pending"><span class="dot"></span>连接中</span>
+            </div>
+
+          </div>
+        </div>
+      </section>
+    </div>
+
+  </div>
+  </div><!-- /view: overview -->
+
+  <!-- ================= 白名单配置 ================= -->
+  <div class="view" data-view="scopes" hidden>
+
+    <div class="admin-note">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M12 2l8 4v6c0 5-3.4 8.7-8 10-4.6-1.3-8-5-8-10V6l8-4z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+      仅 org 管理员可编辑此页——白名单错误配置的影响面覆盖此后所有次自动执行，权限比日常审批更收紧
+    </div>
+
+    <div class="scope-layout">
+      <div class="conn-picker">
+        <div class="conn-picker-item active"><span class="dot"></span>acme-prod-prometheus</div>
+        <div class="conn-picker-item"><span class="dot" style="background:var(--good)"></span>acme-prod-alertlog</div>
+        <div class="conn-picker-item"><span class="dot" style="background:var(--pending)"></span>acme-staging-search</div>
+      </div>
+
+      <div class="scope-cards">
+
+        <div class="scope-card">
+          <div class="scope-card-head">
+            <div class="scope-card-title">重启服务/进程 <span class="tag">枚举白名单</span></div>
+          </div>
+          <div>
+            <div class="scope-field-label">允许被重启的服务（清单外一律拒绝）</div>
+            <div class="chip-field">
+              <span class="chip">order-service<button>×</button></span>
+              <span class="chip">payment-gateway<button>×</button></span>
+              <span class="chip">notification-worker<button>×</button></span>
+              <span class="chip-add">+ 添加服务</span>
+            </div>
+          </div>
+          <div class="scope-meta"><span>上次更新 · 陈工</span><span>2026-08-24 09:12</span></div>
+        </div>
+
+        <div class="scope-card">
+          <div class="scope-card-head">
+            <div class="scope-card-title">扩容/缩容实例数量 <span class="tag">数值边界</span></div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:10px;">
+            <div class="bound-field">
+              <div class="bound-input"><label>上界</label><span class="val">基线 × 2</span></div>
+              <div class="bound-input"><label>下界</label><span class="val">1</span></div>
+            </div>
+            <div class="scope-field-label" style="margin-bottom:0;">超出边界的提议（如"扩容到 10000"）在进入审批前直接拒绝</div>
+          </div>
+          <div class="scope-meta"><span>上次更新 · 陈工</span><span>2026-08-20 16:40</span></div>
+        </div>
+
+        <div class="scope-card">
+          <div class="scope-card-head">
+            <div class="scope-card-title">清理磁盘空间 <span class="tag">路径模式</span></div>
+          </div>
+          <div class="path-list">
+            <div class="path-row"><span class="kind">允许</span>/var/log/app/*.log</div>
+            <div class="path-row"><span class="kind">允许</span>/tmp/app-cache/*</div>
+            <div class="path-row exclude"><span class="kind">排除</span>/var/lib/postgresql/*</div>
+            <div class="path-row exclude"><span class="kind">排除</span>/data/**</div>
+          </div>
+          <div class="scope-meta"><span>上次更新 · 王工</span><span>2026-08-18 11:03</span></div>
+        </div>
+
+        <div class="scope-card">
+          <div class="scope-card-head">
+            <div class="scope-card-title">回滚部署版本 <span class="tag">版本范围</span></div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:10px;">
+            <div class="bound-field">
+              <div class="bound-input"><label>可回滚范围</label><span class="val">最近 5 个良好版本</span></div>
+            </div>
+            <div class="scope-field-label" style="margin-bottom:0;">防止回滚到过老、已知不兼容的版本</div>
+          </div>
+          <div class="scope-meta"><span>上次更新 · 陈工</span><span>2026-08-22 14:55</span></div>
+        </div>
+
+      </div>
+    </div>
+
+    <div class="save-row">
+      <button class="btn">取消</button>
+      <button class="btn primary">保存白名单</button>
+    </div>
+
+  </div><!-- /view: scopes -->
+
+  <!-- ================= 连接器管理 ================= -->
+  <div class="view" data-view="connectors" hidden>
+
+    <div class="conn-page-head">
+      <div class="panel-title" style="font-size:15px;">运维系统连接器</div>
+      <button class="btn primary">+ 新增连接器</button>
+    </div>
+
+    <div class="conn-manage-list">
+      <div class="conn-manage-row">
+        <div class="conn-manage-icon"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="12" rx="2" stroke="currentColor" stroke-width="1.6"/><path d="M8 20h8M12 16v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></div>
+        <div>
+          <div class="conn-manage-name">acme-prod-prometheus</div>
+          <div class="conn-manage-sub">Prometheus · 注册于 2026-07-02 · 心跳 4 秒前</div>
+        </div>
+        <span class="status-pill good"><span class="dot"></span>在线</span>
+        <div class="conn-manage-actions"><button class="link-btn">部署说明</button><button class="link-btn">吊销</button></div>
+      </div>
+
+      <div class="conn-manage-row">
+        <div class="conn-manage-icon"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="12" rx="2" stroke="currentColor" stroke-width="1.6"/><path d="M8 20h8M12 16v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></div>
+        <div>
+          <div class="conn-manage-name">acme-prod-alertlog</div>
+          <div class="conn-manage-sub">自建日志平台 · 注册于 2026-07-02 · 心跳 11 秒前</div>
+        </div>
+        <span class="status-pill good"><span class="dot"></span>在线</span>
+        <div class="conn-manage-actions"><button class="link-btn">部署说明</button><button class="link-btn">吊销</button></div>
+      </div>
+
+      <div class="conn-manage-row">
+        <div class="conn-manage-icon"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="12" rx="2" stroke="currentColor" stroke-width="1.6"/><path d="M8 20h8M12 16v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></div>
+        <div>
+          <div class="conn-manage-name">acme-staging-search</div>
+          <div class="conn-manage-sub">Datadog · 注册于 2026-08-25 · 尚未建立心跳</div>
+        </div>
+        <span class="status-pill pending"><span class="dot"></span>连接中</span>
+        <div class="conn-manage-actions"><button class="link-btn">部署说明</button><button class="link-btn">吊销</button></div>
+      </div>
+    </div>
+
+    <div class="register-panel">
+      <div class="panel-title" style="font-size:13.5px;">新增连接器</div>
+
+      <div class="no-cred-banner">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M12 2l8 4v6c0 5-3.4 8.7-8 10-4.6-1.3-8-5-8-10V6l8-4z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M9 12l2 2 4-4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>这里不需要、也不会要求你填写 Prometheus / Datadog 的账号密码或 API Key。平台只生成一次性注册令牌，凭证只会出现在你自己环境里的连接器配置文件中。</span>
+      </div>
+
+      <div class="register-grid">
+        <div class="form-field"><label>连接器名称</label><div class="input">acme-eu-metrics</div></div>
+        <div class="form-field"><label>系统类型（仅用于分类展示）</label><div class="input">Prometheus ▾</div></div>
+      </div>
+
+      <div class="deploy-block">
+        <div class="lbl">部署说明 · 在你的环境内执行</div>
+        <div class="deploy-code"><span class="comment"># 凭证留在下面这份本地配置里，不会上传</span>
+docker run -d --name aiops-connector \
+  -e REGISTER_TOKEN=<span class="token">rgtk_8f2c...一次性，10 分钟内有效</span> \
+  -v ./connector-local.yaml:/etc/connector.yaml \
+  acme-registry/ops-connector:latest</div>
+      </div>
+
+      <div class="save-row">
+        <button class="btn">取消</button>
+        <button class="btn primary">生成注册令牌</button>
+      </div>
+    </div>
+
+  </div><!-- /view: connectors -->
+
+</div>
+<script>
+  document.querySelectorAll('.tabbtn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      document.querySelectorAll('.tabbtn').forEach(function (b) { b.classList.remove('active'); b.setAttribute('aria-selected', 'false'); });
+      btn.classList.add('active');
+      btn.setAttribute('aria-selected', 'true');
+      var target = btn.getAttribute('data-target');
+      document.querySelectorAll('.view').forEach(function (v) {
+        v.hidden = v.getAttribute('data-view') !== target;
+      });
+    });
+  });
+</script>
+
+</body></html>

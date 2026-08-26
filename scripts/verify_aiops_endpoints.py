@@ -118,6 +118,9 @@ async def _cleanup(user_store: UserStore) -> None:
                     "DELETE FROM ops_remediation_scopes WHERE connection_id = ANY($1::text[])", conn_ids,
                 )
                 await conn.execute(
+                    "DELETE FROM ops_analysis_summaries WHERE connection_id = ANY($1::text[])", conn_ids,
+                )
+                await conn.execute(
                     "DELETE FROM ops_system_connections WHERE id = ANY($1::text[])", conn_ids,
                 )
         if user_ids:
@@ -527,6 +530,28 @@ async def main() -> None:
         assert all(c["connection_id"] != throwaway_conn_id for c in resp.json()), (
             "删除之后不该再出现在列表里"
         )
+
+        # 17e) 告警关联时间线数据源——GET /analysis-summaries。没有任何分析
+        # 发生过时必须是空列表（不是编几条垫底），插一条真实记录后必须能
+        # 读到；reviewer 账号在撤销授权之后应该看不到（同一套 can_view 过滤）。
+        resp = await client.get("/api/v1/admin/ops/analysis-summaries", headers=headers)
+        print("17e) analysis summaries before any analysis ran:", resp.status_code, len(resp.json()))
+        assert resp.status_code == 200 and resp.json() == []
+
+        ops_store_direct = OpsStore()
+        await ops_store_direct._get_pool()
+        await ops_store_direct.save_analysis_summary(
+            org.org_id, connection_id, "order-service 错误率突增，怀疑近期部署回归",
+            [{"source": "alert_correlation", "description": "19 条告警合并为 1 个事件"}],
+        )
+        resp = await client.get("/api/v1/admin/ops/analysis-summaries", headers=headers)
+        print("17f) analysis summaries after one ran:", resp.status_code, len(resp.json()))
+        assert resp.status_code == 200 and len(resp.json()) == 1
+        assert resp.json()[0]["connection_id"] == connection_id
+
+        resp = await client.get("/api/v1/admin/ops/analysis-summaries", headers=reviewer_headers)
+        print("17g) reviewer without grant sees:", resp.status_code, len(resp.json()))
+        assert resp.status_code == 200 and resp.json() == []
 
         # 18) 生成 register_token
         resp = await client.post(

@@ -69,6 +69,7 @@ from src.ragent_backend.schemas import (
     RemediationScopeResponse, UpsertRemediationScopeRequest,
     RemediationActionResponse, ProposeRemediationActionRequest,
     RoleOpsPermissionResponse, SetRoleOpsPermissionRequest,
+    AnalysisSummaryResponse,
 )
 from src.ragent_backend import account_import as _acct_import
 from src.ragent_backend import activation as _activation
@@ -2180,6 +2181,33 @@ def create_app() -> FastAPI:
             viewable_set = set(viewable)
             actions = [a for a in actions if a.connection_id in viewable_set]
         return [_remediation_action_response(a) for a in actions]
+
+    def _analysis_summary_response(s) -> AnalysisSummaryResponse:
+        return AnalysisSummaryResponse(
+            summary_id=s.summary_id, org_id=s.org_id, connection_id=s.connection_id,
+            summary=s.summary, evidence_refs=s.evidence_refs, created_at=s.created_at,
+        )
+
+    @app.get("/api/v1/admin/ops/analysis-summaries", response_model=List[AnalysisSummaryResponse])
+    async def admin_list_analysis_summaries(
+        limit: int = 50,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> List[AnalysisSummaryResponse]:
+        """给"运维塔台·总览"的告警关联时间线用——只列出真实调用过
+        `analyze_ops_incident` 才会产生的记录（`save_analysis_summary`），
+        没有任何一次分析发生过的企业这里就是空列表，不是编几条垫底。
+        权限过滤跟 `admin_list_remediation_actions` 同一套——org_admin 不
+        过滤，其余角色按 `can_view` 显式授权的连接器集合过滤，没有任何
+        授权时直接空列表，不能误当成"没传参数=不过滤"。"""
+        org = await _require_aiops_enabled_org(current_user)
+        viewable = await ops_store.viewable_connection_ids_for_user(current_user.user_id, org.org_id)
+        if viewable is not None and not viewable:
+            return []
+        summaries = await ops_store.list_analysis_summaries(org.org_id, limit=limit)
+        if viewable is not None:
+            viewable_set = set(viewable)
+            summaries = [s for s in summaries if s.connection_id in viewable_set]
+        return [_analysis_summary_response(s) for s in summaries]
 
     async def _require_can_approve(user_id: str, connection_id: str) -> None:
         perm = await ops_store.get_ops_permission(user_id, connection_id)
