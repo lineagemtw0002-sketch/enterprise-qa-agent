@@ -450,6 +450,7 @@ function ApprovalsSection({ onModuleDisabled }) {
   const [rows, setRows] = useState([])
   const [loading, setLoading] = useState(false)
   const [acting, setActing] = useState('')
+  const [marking, setMarking] = useState('')
   const timer = useRef(null)
 
   const load = useCallback(async (silent = false) => {
@@ -471,6 +472,28 @@ function ApprovalsSection({ onModuleDisabled }) {
     timer.current = setInterval(() => load(true), POLL_INTERVAL_MS)
     return () => clearInterval(timer.current)
   }, [load])
+
+  /** 事后标注"这次修复到底有没有解决问题"。
+   *
+   * §10.5 四个指标里唯一需要人工输入的一项——其余三个都能从状态机自己算出来。
+   * 没有它，「执行成功」只代表命令跑通了，不代表问题解决了：服务重启成功、
+   * 错误率照旧，在状态机看来仍然是 completed。
+   *
+   * 允许改主意（后端 set_outcome_effective 对终态之后不做状态限制，是有意的）：
+   * 事后复盘经常会推翻当时的判断。
+   */
+  async function mark(actionId, effective) {
+    setMarking(actionId)
+    try {
+      await opsApi.setActionOutcome(actionId, effective)
+      message.success(effective ? '已标注为有效' : '已标注为无效')
+      load()
+    } catch (error) {
+      message.error(opsApi.errorText(error))
+    } finally {
+      setMarking('')
+    }
+  }
 
   async function act(actionId, kind) {
     setActing(actionId)
@@ -505,6 +528,24 @@ function ApprovalsSection({ onModuleDisabled }) {
     { title: '提议人', dataIndex: 'proposed_by' },
     { title: '状态', dataIndex: 'status', render: (s) => <StatusTag status={s} /> },
     { title: '提议时间', dataIndex: 'created_at', render: fmtTime },
+    {
+      title: '事后有效性',
+      width: 150,
+      render: (_, row) => {
+        // 只有跑完了才谈得上"有没有效"——待审批/执行中的动作还没有结果可评。
+        if (!['completed', 'failed'].includes(row.status)) return <Text type="secondary">—</Text>
+        if (row.outcome_effective === true) return <Tag color="green">已标注有效</Tag>
+        if (row.outcome_effective === false) return <Tag color="red">已标注无效</Tag>
+        return (
+          <Space size={4}>
+            <Button size="small" loading={marking === row.action_id}
+                    onClick={() => mark(row.action_id, true)}>有效</Button>
+            <Button size="small" danger loading={marking === row.action_id}
+                    onClick={() => mark(row.action_id, false)}>无效</Button>
+          </Space>
+        )
+      },
+    },
     {
       title: '审批',
       render: (_, row) => {

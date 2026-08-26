@@ -160,3 +160,23 @@ export function listAnalysisSummaries(limit = 20) {
     .get(`${BASE}/ops/analysis-summaries`, { params: { limit } })
     .then((res) => res.data)
 }
+
+// ==================== V1 效果指标（§10.5） ====================
+//
+// ⚠️ 三个比例字段是 `Optional[float]`：**分母为 0 时后端返回 null，不是 0.0**。
+// "还没有样本"和"比例恰好是 0"是两件不同的事，糊在一起会让"这家企业刚开始用、
+// 数据太少"看起来像"表现很差"。前端必须把 null 显示成"暂无数据"。
+export function getOpsMetrics() {
+  return axios.get(`${BASE}/ops/metrics`).then((res) => res.data)
+}
+
+/** 事后人工标注"这次修复到底有没有解决问题"。
+ *
+ * 这是 §10.5 四个指标里唯一需要人工输入的一项——其余三个都能从状态机自己算出来。
+ * 没有它，"执行成功"只代表命令跑通了，不代表问题解决了。
+ */
+export function setActionOutcome(actionId, effective) {
+  return axios
+    .post(`${BASE}/ops/remediation-actions/${encodeURIComponent(actionId)}/outcome`, { effective })
+    .then((res) => res.data)
+}

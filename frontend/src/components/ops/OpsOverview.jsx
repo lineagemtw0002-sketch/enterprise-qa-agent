@@ -95,8 +95,47 @@ function evidenceTags(summary) {
   return tags
 }
 
+/** 比例指标的一格。
+ *
+ * ⚠️ **`value == null` 显示「暂无数据」，不显示 0%。** 后端在分母为 0 时刻意返回
+ * null 而不是 0.0，前端把它渲染成 0% 等于把这份用心扔掉——"刚开始用、还没样本"
+ * 会看起来像"表现很差"。
+ *
+ * 同时把样本量显示出来：1 个样本算出的 100% 和 200 个样本算出的 100% 在决策上
+ * 完全是两回事，只给百分比等于把这个差别藏起来。
+ */
+/** 样本量。后端给的是分状态计数（approved/rejected/expired/completed/failed/
+ *  alert_count/incident_count），不是按指标聚合好的数——这里按指标把该算进
+ *  分母的那几项加起来。
+ *
+ *  ⚠️ 这些键名是**照着 ops_store.compute_ops_metrics 的返回值抄的**，不是猜的：
+ *  第一版我按语义猜了 `approval_decisions`/`executions`/`correlation_runs`，
+ *  四个全错——而这类错不会让页面报错，只会让样本量默默显示成"—"。
+ */
+function sumSamples(metrics, keys) {
+  const sizes = metrics?.sample_sizes
+  if (!sizes) return undefined
+  return keys.reduce((acc, k) => acc + (sizes[k] || 0), 0)
+}
+
+function MetricCell({ label, value, sample, hint }) {
+  const hasValue = value !== null && value !== undefined
+  return (
+    <div className="metric-cell">
+      <div className="metric-label">{label}</div>
+      <div className={`metric-value ${hasValue ? '' : 'empty'}`}>
+        {hasValue ? `${(value * 100).toFixed(1)}%` : '暂无数据'}
+      </div>
+      <div className="metric-sample">
+        {hasValue ? `样本 ${sample ?? '—'}` : (hint || '还没有可统计的样本')}
+      </div>
+    </div>
+  )
+}
+
 export default function OpsOverview({ canManage, onModuleDisabled }) {
   const [actions, setActions] = useState([])
+  const [metrics, setMetrics] = useState(null)
   const [connectors, setConnectors] = useState([])
   const [summaries, setSummaries] = useState([])
   const [loading, setLoading] = useState(true)
@@ -111,16 +150,20 @@ export default function OpsOverview({ canManage, onModuleDisabled }) {
     try {
       // 三个接口并发拉。任意一个 403 都说明模块没开通（后端是统一的门），
       // 交给外层显示"未开通"，不在这里各自处理。
-      const [actionList, summaryList, connectorList] = await Promise.all([
+      const [actionList, summaryList, connectorList, metricsData] = await Promise.all([
         opsApi.listRemediationActions(),
         opsApi.listAnalysisSummaries(),
         // 非管理员没有连接器列表权限（后端 org_admin 专属），拿不到就当空——
         // 他看到的 KPI 里"连接器在线"那张会显示"—"，不是报错。
         canManage ? opsApi.listConnectors() : Promise.resolve([]),
+        // 指标算不出来不该让整块大屏挂掉——它是"锦上添花"的那一层，
+        // 失败时显示"暂无数据"就够了。
+        opsApi.getOpsMetrics().catch(() => null),
       ])
       setActions(actionList)
       setSummaries(summaryList)
       setConnectors(connectorList)
+      setMetrics(metricsData)
     } catch (error) {
       if (opsApi.isModuleDisabledError(error)) { onModuleDisabled(); return }
       if (!silent) message.error(opsApi.errorText(error))
@@ -232,6 +275,52 @@ export default function OpsOverview({ canManage, onModuleDisabled }) {
                   ))}
                 </div>
               )}
+            </div>
+          </section>
+          <section className="panel">
+            <div className="panel-head">
+              <div className="panel-title">V1 效果指标</div>
+              <div className="panel-note">按 §10.5 定义真实计算，不预设目标值</div>
+            </div>
+            <div className="panel-body">
+              <div className="metric-grid">
+                <MetricCell
+                  label="审批处理及时率"
+                  value={metrics?.approval_timeliness_rate}
+                  sample={sumSamples(metrics, ['approved', 'rejected', 'expired'])}
+                  hint="还没有审批记录"
+                />
+                <MetricCell
+                  label="执行成功率"
+                  value={metrics?.execution_success_rate}
+                  sample={sumSamples(metrics, ['completed', 'failed'])}
+                  hint="还没有执行完成的动作"
+                />
+                <MetricCell
+                  label="告警合并率"
+                  value={metrics?.alert_noise_reduction}
+                  sample={metrics?.sample_sizes?.alert_count}
+                  hint="还没有跑过告警关联"
+                />
+                <div className="metric-cell">
+                  <div className="metric-label">事后有效性</div>
+                  {/* 刻意不折成一个比例：设计文档没给公式，而且"未标注"的数量
+                      本身就是有意义的信息（标注覆盖率）。折成百分比会把
+                      "大部分没人标"和"标了但效果不好"糊成同一个数字。 */}
+                  <div className="metric-value small">
+                    <span className="good">{metrics?.outcome_effective_counts?.effective ?? 0} 有效</span>
+                    {' / '}
+                    <span className="bad">{metrics?.outcome_effective_counts?.ineffective ?? 0} 无效</span>
+                  </div>
+                  <div className="metric-sample">
+                    {metrics?.outcome_effective_counts?.unlabeled ?? 0} 条未标注
+                  </div>
+                </div>
+              </div>
+              <p className="ops-note">
+                这四个指标的目的是<b>能测量</b>，不是达到某个数字。执行成功率和事后有效性
+                在没有真实连接器进程时会长期是空的——那是诚实的空，不是统计出错。
+              </p>
             </div>
           </section>
         </div>
