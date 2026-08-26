@@ -945,8 +945,23 @@ flowchart TB
   ~1072ms，其中 rerank（候选池 60 条）**931.7ms，占 87%**，embedding 93ms，
   6 个库的 dense+sparse 墙钟只有 31.6ms。候选池随候选库数量线性增长
   （每库 `top_k × 2`），cross-encoder 大致按候选数线性收费。
-  **下一步值钱的优化是给进重排的候选池设上限，但它直接动"谁能进最终排序"，
-  必须先用 `scripts/probe_narrowing_strategies.py` 测召回影响——本次未做。**
+  **候选池上限已落地**（`src/core/query_engine/rerank_pool.py`，
+  配置 `rerank.pool_per_collection` / `pool_min`）：上限 =
+  `max(per_collection × 候选库数, pool_min, top_k × 2)`，6 库=30、12 库=60。
+  实测截到 30~40 条**零召回代价**（25/30 不变），关键事实反而从 29/30 涨到 30/30
+  （截掉低分噪音后不再有弱候选被 cross-encoder 抬上来挤掉正确答案），
+  检索段 p50 **1613ms → 803ms**。
+
+  ⚠️ **这里用全局上限、而不是像粗筛层那样按库分配——两处结论相反，理由不同**：
+  同样 30 条池子，全局截取 25/30，按库各取 5 条只有 22/30。
+  区别在信号质量——粗筛层的摘要相似度几乎分不出对错（分差中位 0.0495），
+  全局分配等于随机；而这里的融合分来自各库内部真实的 dense+sparse 命中，排名可信。
+  **信号可信就全局分配，信号不可信就按库保底。**
+
+  ⚠️ **上限绝不能写成常数**：实测截到 30 条时 6 个库都还有代表（最少的剩 1~2 条），
+  截到 20 条就只剩 4~5 个库、金标召回掉到 19/30——跟本条修的那个"全局预算饿死库"
+  是同一个失败模式。`tests/integration/test_hierarchy_narrowing_recall.py::TestRerankPoolCap`
+  拿真实数据守着"截断后每个候选库仍有代表"，改成常数会跑红。
 
 - ✅ **2026-08-26　P1-2：14 个 Store 各建连接池 → 合并为一个按 DSN 缓存的共享池**
   `attendance_store` / `audit_store` / `dashboard_stats` / `conversation_store` /

@@ -1280,6 +1280,7 @@ class QueryKnowledgeHubTool:
         下面的兜底），保证"摘要筛错了"不会表现成"库里没有"。
         """
         from src.core.query_engine.narrow_plan import decisions_to_filters
+        from src.core.query_engine.rerank_pool import RerankPoolConfig, pool_cap, trim_pool
 
         # 整条链路只把 query embed 一次，粗筛和每个 collection 的稠密检索共用。
         # 改这一处之前：粗筛 1 次 + 每个候选库各 1 次 = 6 库 7 次，而 Ollama 默认
@@ -1411,6 +1412,27 @@ class QueryKnowledgeHubTool:
             # 提示词注入防护，见 _filter_injected_chunks 旁的说明——重排之前拦，
             # 不给投毒 chunk 机会拿到一个不低的重排分数、挤掉真正相关的结果。
             results = self._filter_injected_chunks(results, trace)
+
+            # 候选池上限：cross-encoder 要给池子里每个 (query, doc) 对逐一打分，
+            # 占整个检索段 87%（实测 931.7ms / 1072ms），而池子 = 候选库数 × top_k × 2。
+            # "多查几个库变慢"的真实机制就是池子变大——查库本身是并发的，6 库墙钟
+            # 只有 ~32ms。截到 top_k × 库数 实测零召回代价，见 rerank_pool.py 顶部。
+            # 注入过滤之后才截，顺序不能反：先截会让被投毒的高分 chunk 占掉名额。
+            _cap = pool_cap(top_k, len(search_collections), RerankPoolConfig.from_settings(self.settings))
+            if results and 0 < _cap < len(results):
+                _before = len(results)
+                results = trim_pool(results, _cap)
+                trace.record_stage("rerank_pool_trim", {
+                    "pass": pass_label,
+                    "cap": _cap,
+                    "before": _before,
+                    "after": len(results),
+                    # 守着"截断不许饿死库"——库数一多而上限写死时这里会掉下来，
+                    # 集成测试拿真实数据断言它等于候选库数。
+                    "collections_kept": sorted({
+                        r.metadata.get("collection") for r in results if (r.metadata or {}).get("collection")
+                    }),
+                })
 
             if self.config.enable_rerank and results:
                 results, scored = await asyncio.to_thread(self._apply_rerank, query, results, top_k, trace)

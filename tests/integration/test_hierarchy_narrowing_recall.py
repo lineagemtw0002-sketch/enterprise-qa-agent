@@ -15,6 +15,8 @@ keys 当"要检索哪几个库"用——候选库越多（= 用户权限越大�
 | test_same_question_works_for_one_kb_and_six_kb_shapes | ✅ **这条是本缺陷的判别式**：旧实现 1 库对、6 库错 |
 | test_narrowing_never_drops_a_candidate_collection | ✅ 旧实现 search_collections = narrowed.keys() |
 | test_narrowed_pass_falls_back_when_empty | ✅ 旧实现没有兜底 |
+| test_trim_never_starves_a_candidate_collection | 新增能力；把候选池上限改成常数或调小时会跑红 |
+| test_single_collection_query_is_not_trimmed | 回归保护：这笔优化只向多库用户收费 |
 
 依赖真实数据（`scripts/generate_demo_kb_dataset.py` 摄入的 Acme 演示语料）
 与本地 Ollama；任一缺失即 skip，不阻断整体测试套件。
@@ -119,6 +121,34 @@ class TestRecallForMultiKbUsers:
         assert any(k in six_resp.content for k in q.keywords), (
             "单库能答出、6 库答不出——粗筛又在按候选库数量误伤了"
         )
+
+
+class TestRerankPoolCap:
+    """进 cross-encoder 的候选池上限（`rerank_pool.py`）——拿真实数据守两件事。"""
+
+    async def test_trim_never_starves_a_candidate_collection(self, settings, questions):
+        """**截断后每个候选库都还要有代表。**
+
+        这条守的是"上限必须随候选库数增长"：把 `pool_per_collection × 库数`
+        改成常数、或把它调小，这里就会跑红。实测截到 20 条时只剩 4~5 个库有代表，
+        金标召回从 25/30 掉到 19/30——跟粗筛层那个"全局预算饿死库"是同一个失败模式。
+        """
+        tool = _make_tool(settings)
+        _, trace = await _run(tool, questions[IT_KB][0].query, ACME_KBS)
+
+        stage = _stage(trace, "rerank_pool_trim")
+        assert stage is not None, "6 库候选（池子 60 条 > 上限 30）必须发生截断"
+        data = stage.get("data") or stage
+        assert data["after"] == data["cap"] < data["before"]
+        assert sorted(data["collections_kept"]) == sorted(ACME_KBS), (
+            f"截断把这些库整个挤掉了: {sorted(set(ACME_KBS) - set(data['collections_kept']))}"
+        )
+
+    async def test_single_collection_query_is_not_trimmed(self, settings, questions):
+        """单库用户的池子只有 top_k×2=10 条，低于下限，不该被这个机制碰到。"""
+        tool = _make_tool(settings)
+        _, trace = await _run(tool, questions[IT_KB][0].query, [IT_KB])
+        assert _stage(trace, "rerank_pool_trim") is None
 
 
 class TestNarrowingInvariant:
