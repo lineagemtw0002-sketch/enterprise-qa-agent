@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from src.ragent_backend.org_store import OrgStore
     from src.ragent_backend.tenant_connector_store import TenantConnectorStore, TenantConnector
     from src.ragent_backend.collection_store import OrgCollectionStore
+    from src.core.query_engine.narrow_plan import NarrowDecision
 
 logger = logging.getLogger(__name__)
 
@@ -996,11 +997,17 @@ class QueryKnowledgeHubTool:
         top_k: int,
         trace: Optional[Any] = None,
         filters: Optional[Dict[str, Any]] = None,
+        query_vector: Optional[List[float]] = None,
     ) -> List[RetrievalResult]:
         """跟 _perform_search 逻辑一样，但接收显式传入的 HybridSearch 实例，
         不读 self._hybrid_search——"全库混合召回"并发查多个 collection 时，
         每个 collection 自己的 HybridSearch 局部变量互不干扰，靠的就是这个
         方法不碰共享的 self 状态（见 _build_hybrid_search_for 的说明）。
+
+        query_vector 是"这句 query 的向量已经算过了"——全库并行召回时每个
+        collection 各有一个 DenseRetriever，不传的话它们会把同一句话各自
+        重新 embed 一次（实测每次 ~76ms，而 Ollama 默认 OLLAMA_NUM_PARALLEL=1
+        下这些调用完全串行，见 CLAUDE.md §4 第 3 条），6 个库就是 ~460ms 的纯重复。
 
         filters 透传给 HybridSearch.search()——层次化检索粗筛后按
         {"source_ref": [doc_id, ...]} 收窄到摘要层选中的那几份文档时用
@@ -1016,6 +1023,7 @@ class QueryKnowledgeHubTool:
                 filters=filters,
                 trace=trace,
                 return_details=False,
+                query_vector=query_vector,
             )
             return results if isinstance(results, list) else results.results
         except Exception as e:
@@ -1130,31 +1138,50 @@ class QueryKnowledgeHubTool:
 
     async def _narrow_by_document_summary(
         self, query: str, candidate_collections: List[str], trace: Optional["TraceContext"] = None,
-    ) -> Dict[str, List[str]]:
-        """层次化检索的"粗筛"阶段——见 ingestion/hierarchy/doc_summary.py 顶部
-        说明。在每个候选 collection 的 `{collection}__summary` 摘要层各查一次
-        （只做向量相似度，不跑 BM25/rerank，这一层要的是"大致相关"的快速信号，
-        不是精确排序），把全部候选 collection 的摘要命中合并、按分数取整体
-        前 N 份文档，按它们各自所属的 collection 分组返回。
+        query_vector: Optional[List[float]] = None,
+    ) -> List["NarrowDecision"]:
+        """层次化检索的"粗筛"阶段——在每个候选 collection 的 `{collection}__summary`
+        摘要层各查一次（只做向量相似度，不跑 BM25/rerank），**各库各自**决定要不要
+        把接下来的 chunk 检索收窄到几篇文档里。
 
-        返回空 dict 表示"摘要层没有可用信号"（可能是这几个 collection 都还
-        没有任何文档摘要——比如这个功能上线前就已经摄入的老数据），调用方
-        （_execute_local_multi）据此决定要不要整体退回原来的平铺检索，不是
-        把空结果当成"真的查无相关文档"处理。
+        ⚠️ **这个方法不决定"要查哪几个库"。** 2026-08-26 之前它是这么用的：
+        把全部候选库的摘要命中合并、取跨库全局前 `top_docs` 篇，调用方再拿
+        `narrowed.keys()` 当 `search_collections`——于是"某个库一篇都没挤进全局前 5"
+        就等于**这个库整个被从检索里删掉**。实测 30 条正向问题里 11 条返回空结果，
+        无一例外是"问题所属的那个库压根没被检索"，而且候选库越多（= 用户权限越大）
+        越严重。完整证据与设计见 `docs/hierarchical_narrowing_redesign.md`。
 
-        `trace` 是本次诊断"知识库检索为什么要 7 秒"时临时加的分段计时——把
-        "建 6 个摘要 store（当前是串行）""embed 一次查询向量""并行查各 store"
-        这三步拆开各自计时，写进 `trace.record_stage("narrow_detail", ...)`，
-        跟正式的 rerank 计时用同一套机制，方便直接从 logs/traces.jsonl 里
-        对比哪一步才是真正的大头。不影响任何检索结果，只是多记了几条日志。
+        现在返回的是**每个候选 collection 一条** `NarrowDecision`：
+        `doc_ids is None` 表示"这个库整库参与检索"（不是跳过），
+        预算分配与置信门控的纯逻辑在 `src/core/query_engine/narrow_plan.py`，
+        那边有单元测试（`tests/unit/test_hierarchy_narrowing.py`）。
+
+        `ingestion.doc_summary.narrow.enabled` 默认 **false**——当前全部语料
+        每篇文档只切出一个 chunk（实测 32 个非空 collection 里业务库全是 1.00，
+        含 mmarco / product_req_kb），而 `use_llm: false` 下摘要就是"标题 + 正文前
+        600 字"，摘要向量≈正文向量：这一层现在是"拿一份更差的正文副本给真正的
+        检索器当硬门禁"。关掉即退回平铺检索。**这不是说层次化检索的设计错了，
+        是说它的前提（长文档、每篇几十个 chunk）在当前数据上从未成立**——
+        真实客户那种几个 G 的 PDF/Word 到位后要重新评估，判据见设计文档 §6 P2。
+
+        `trace` 记两类信息：`narrow_detail` 是分步计时（诊断"检索为什么要 7 秒"时
+        加的），`hierarchy_narrow` 是每个库的决定与原因，排查"为什么没查到"时
+        第一眼就该看它。
         """
+        from src.core.query_engine.narrow_plan import (
+            NarrowConfig, NarrowDecision, budget_for, plan_narrowing,
+        )
         from src.ingestion.hierarchy.doc_summary import summary_collection_name
         from src.libs.vector_store.vector_store_factory import VectorStoreFactory
 
-        self._ensure_shared_clients()
+        cfg = NarrowConfig.from_settings(self.settings)
+        if not cfg.enabled:
+            # 关掉时**完全不碰摘要层**：省掉建 N 个 store、一次 query embedding
+            # 和 N 次向量查询——没有这一步的短路，"默认关闭"反而要为一层用不上的
+            # 索引付延迟。
+            return [NarrowDecision(c, None, "disabled", 0, 0.0) for c in candidate_collections]
 
-        top_docs = getattr(getattr(self.settings, "ingestion", None), "doc_summary", None) or {}
-        top_docs = top_docs.get("top_docs", 5)
+        self._ensure_shared_clients()
 
         # 跟 _execute_local_multi 建 HybridSearch 时同一个坑：并发 new 多个
         # PersistentClient 指向同一个 persist_directory 不是线程安全的，必须
@@ -1176,23 +1203,37 @@ class QueryKnowledgeHubTool:
                 "step": "build_summary_stores", "collection_count": len(candidate_collections),
             }, elapsed_ms=_t_build)
         if not summary_stores:
-            return {}
+            # 一个摘要 store 都打不开：全部整库参检，不是全部跳过。
+            return [NarrowDecision(c, None, "no_summary_store", 0, 0.0) for c in candidate_collections]
 
+        # 调用方（_execute_local_multi）通常已经算过这个向量了，直接复用；
+        # 只有单独调用这个方法时才自己算一次。
         _t0 = time.monotonic()
-        query_vector = (await asyncio.to_thread(self._embedding_client.embed, [query]))[0]
+        if query_vector is None:
+            query_vector = (await asyncio.to_thread(self._embedding_client.embed, [query]))[0]
         _t_embed = (time.monotonic() - _t0) * 1000.0
         if trace is not None:
-            trace.record_stage("narrow_detail", {"step": "embed_query"}, elapsed_ms=_t_embed)
+            trace.record_stage("narrow_detail", {
+                "step": "embed_query", "reused": _t_embed < 1.0,
+            }, elapsed_ms=_t_embed)
+
+        def _doc_count_sync(collection: str) -> int:
+            try:
+                return int(summary_stores[collection].get_collection_stats().get("count", 0))
+            except Exception as e:
+                logger.warning(f"Failed to read summary count for '{collection}': {e}")
+                return 0
+
+        doc_counts = {c: _doc_count_sync(c) for c in summary_stores}
 
         def _query_one_sync(collection: str) -> List[Dict[str, Any]]:
+            # 每个库按**自己**的预算取候选，不再跟别的库抢一个全局名额。
+            budget = budget_for(doc_counts.get(collection, 0), cfg)
             try:
-                hits = summary_stores[collection].query(vector=query_vector, top_k=top_docs)
+                return summary_stores[collection].query(vector=query_vector, top_k=budget)
             except Exception as e:
                 logger.warning(f"Summary query failed for '{collection}': {e}")
                 return []
-            for h in hits:
-                h["_collection"] = collection
-            return hits
 
         _t0 = time.monotonic()
         per_collection_hits = await asyncio.gather(
@@ -1203,18 +1244,13 @@ class QueryKnowledgeHubTool:
             trace.record_stage("narrow_detail", {
                 "step": "query_summary_stores", "store_count": len(summary_stores),
             }, elapsed_ms=_t_query)
-        all_hits = [h for sub in per_collection_hits for h in sub]
-        if not all_hits:
-            return {}
 
-        all_hits.sort(key=lambda h: h.get("score", 0.0), reverse=True)
-        narrowed: Dict[str, List[str]] = {}
-        for h in all_hits[:top_docs]:
-            doc_id = h.get("metadata", {}).get("doc_id") or h.get("id")
-            if not doc_id:
-                continue
-            narrowed.setdefault(h["_collection"], []).append(doc_id)
-        return narrowed
+        hits_by_collection = dict(zip(summary_stores.keys(), per_collection_hits))
+        # 打不开 store 的 collection 也要有一条决定（整库参检），否则调用方
+        # 拿不到它的决定，容易又退回"从 keys 推要查哪些库"那个老错误。
+        for c in candidate_collections:
+            hits_by_collection.setdefault(c, [])
+        return plan_narrowing(hits_by_collection, doc_counts, cfg)
 
     async def _execute_local_multi(
         self,
@@ -1233,18 +1269,71 @@ class QueryKnowledgeHubTool:
         不需要 LLM 参与这个决策。
 
         在真正的全量并行召回之前，先过一遍层次化检索的文档级粗筛（见
-        `_narrow_by_document_summary`）——摘要层有信号时，把接下来的
+        `_narrow_by_document_summary`）——某个库的摘要层有把握时，把这个库的
         hybrid search 收窄到"只在这几份文档范围内"（通过 source_ref 过滤，
-        见下面 _search_one_sync），减少候选池里跟查询没关系的文档稀释精排
-        结果；摘要层没信号（老数据没有摘要）就整体退回原来的行为，不做任何
-        收窄，保证这个功能是纯增量的，不会让还没补摘要的旧数据查不到东西。
+        见下面 _search_one_sync）；没把握、没摘要、或粗筛整体关着（当前默认）
+        时，这个库整库参与检索。
+
+        **粗筛只影响"每个库内部查多少篇"，不影响"查哪几个库"**——后者恒等于
+        `candidate_collections`，理由见下面 search_collections 那段注释。
+        另外收窄这一趟拿到空结果时会不带过滤重跑一趟（见 _recall_and_rank
+        下面的兜底），保证"摘要筛错了"不会表现成"库里没有"。
         """
+        from src.core.query_engine.narrow_plan import decisions_to_filters
+
+        # 整条链路只把 query embed 一次，粗筛和每个 collection 的稠密检索共用。
+        # 改这一处之前：粗筛 1 次 + 每个候选库各 1 次 = 6 库 7 次，而 Ollama 默认
+        # OLLAMA_NUM_PARALLEL=1 下这些调用完全串行（CLAUDE.md §4 第 3 条同日实测），
+        # 每次 ~76ms，也就是 ~460ms 花在把同一句话反复算成同一个向量上。
+        # embedding 失败不该让整次检索失败——退回 None，各 retriever 自己算，
+        # 就是改这一处之前的行为。
+        query_vector: Optional[List[float]] = None
+        try:
+            self._ensure_shared_clients()
+            _t0 = time.monotonic()
+            query_vector = (await asyncio.to_thread(self._embedding_client.embed, [query]))[0]
+            trace.record_stage("embed_query_once", {
+                "reused_by_collections": len(candidate_collections),
+            }, elapsed_ms=(time.monotonic() - _t0) * 1000.0)
+        except Exception as e:
+            logger.warning(f"Shared query embedding failed, each retriever will embed on its own: {e}")
+
         _t0 = time.monotonic()
-        narrowed = await self._narrow_by_document_summary(query, candidate_collections, trace=trace)
+        decisions = await self._narrow_by_document_summary(
+            query, candidate_collections, trace=trace, query_vector=query_vector,
+        )
         _t_narrow_total = (time.monotonic() - _t0) * 1000.0
-        # 先把每个 collection 的 HybridSearch（内部会各自新建一个指向同一个
-        # persist_directory 的 chromadb.PersistentClient）串行建好，再并行跑
-        # 查询——实测踩过坑：6 个 collection 各自在不同线程里并发 new 一个
+        narrowed = decisions_to_filters(decisions)
+
+        # ⚠️ 不变量：**被检索的 collection 集合与粗筛无关**。
+        # 2026-08-26 之前这里写的是 `list(narrowed.keys()) if narrowed else candidate_collections`，
+        # 于是一层弱 embedding 的排名可以把整个知识库从检索里删掉——那是除 ACL 之外
+        # 第二个决定"用户这次能看到哪些库"的地方，却没有日志也没有兜底。
+        # 现在粗筛只提供各库自己的 source_ref 过滤条件（narrowed），
+        # **不参与"查哪几个库"这个决定**。见 narrow_plan.py 顶部与
+        # docs/hierarchical_narrowing_redesign.md。
+        search_collections = list(candidate_collections)
+        # elapsed_ms 用整个 _narrow_by_document_summary() 的墙钟时间（含它
+        # 内部三个子步骤），narrow_detail 那几条已经拆得更细，这里是总览。
+        # 逐库记 reason：排查"为什么没查到"时第一眼看这条——
+        # disabled / no_summary_signal / low_confidence / narrowed。
+        trace.record_stage("hierarchy_narrow", {
+            "search_collections": search_collections,
+            "decisions": [
+                {
+                    "collection": d.collection,
+                    "reason": d.reason,
+                    "budget": d.budget,
+                    "top_score": round(d.top_score, 4),
+                    "doc_count": len(d.doc_ids) if d.doc_ids else None,
+                }
+                for d in decisions
+            ],
+        }, elapsed_ms=_t_narrow_total)
+
+        # 先把每个 collection 的 HybridSearch（内部会各自取一个指向同一个
+        # persist_directory 的 chromadb client）串行建好，再并行跑查询——
+        # 实测踩过坑：6 个 collection 各自在不同线程里并发 new 一个
         # PersistentClient 指向同一个目录时，ChromaDB 的 Rust binding 初始化
         # 不是线程安全的，会报"'RustBindingsAPI' object has no attribute
         # 'bindings'" / "Could not connect to tenant default_tenant" 这类
@@ -1253,16 +1342,6 @@ class QueryKnowledgeHubTool:
         # client 一旦建好之后，用已建好的 client 并发查询是安全的（SQLite
         # WAL 模式支持并发读），所以只把"建 client"这一步收窄成串行，真正
         # 耗时的 embedding + 检索这部分保留并行，不牺牲全库并行召回的速度。
-        # 摘要层有信号就只在命中的那几个 collection 里查（且带 source_ref
-        # 过滤，收窄到具体那几份文档）；没信号（narrowed 为空）就是老行为——
-        # 全部候选 collection、不加文档级过滤。
-        search_collections = list(narrowed.keys()) if narrowed else candidate_collections
-        # elapsed_ms 用整个 _narrow_by_document_summary() 的墙钟时间（含它
-        # 内部三个子步骤），narrow_detail 那几条已经拆得更细，这里是总览。
-        trace.record_stage("hierarchy_narrow", {
-            "narrowed_collections": {c: docs for c, docs in narrowed.items()},
-        }, elapsed_ms=_t_narrow_total)
-
         def _build_all_sync() -> Dict[str, "HybridSearch"]:
             return {
                 c: self._build_hybrid_search_for(c, user_id=user_id, org_id=org_id)
@@ -1276,12 +1355,15 @@ class QueryKnowledgeHubTool:
             "collection_count": len(search_collections),
         }, elapsed_ms=_t_build_hybrid)
 
-        def _search_one_sync(collection: str) -> List[RetrievalResult]:
+        def _search_one_sync(collection: str, doc_filters: Dict[str, List[str]]) -> List[RetrievalResult]:
             _t0_one = time.monotonic()
             hybrid_search = hybrid_searches[collection]
             initial_top_k = top_k * 2 if self.config.enable_rerank else top_k
-            doc_filter = {"source_ref": narrowed[collection]} if collection in narrowed else None
-            results = self._search_with(hybrid_search, query, initial_top_k, trace=None, filters=doc_filter)
+            doc_filter = {"source_ref": doc_filters[collection]} if collection in doc_filters else None
+            results = self._search_with(
+                hybrid_search, query, initial_top_k, trace=None,
+                filters=doc_filter, query_vector=query_vector,
+            )
             # 打上来源标记，供合并后统计"最终结果实际来自哪几个库"（response
             # metadata 的 collections 字段，UI 来源角标用），以及排查问题时
             # 一眼看出某条结果是从哪个库召回的。
@@ -1298,40 +1380,66 @@ class QueryKnowledgeHubTool:
             }, elapsed_ms=(time.monotonic() - _t0_one) * 1000.0)
             return results
 
-        _t0 = time.monotonic()
-        per_collection_results = await asyncio.gather(
-            *[asyncio.to_thread(_search_one_sync, c) for c in search_collections],
-            return_exceptions=True,
-        )
-        _t_gather = (time.monotonic() - _t0) * 1000.0
+        async def _recall_and_rank(doc_filters: Dict[str, List[str]], pass_label: str) -> List[RetrievalResult]:
+            """一趟完整的"并行召回 → 注入过滤 → 重排 → 相关性过滤"。
 
-        merged: List[RetrievalResult] = []
-        for collection, sub_results in zip(search_collections, per_collection_results):
-            if isinstance(sub_results, Exception):
-                logger.warning(f"Search failed for collection '{collection}': {sub_results}")
-                continue
-            merged.extend(sub_results)
+            抽成函数是为了让下面的"收窄兜底"能原样再跑一趟：判断收窄有没有
+            筛错，唯一可信的方式就是用**同一条链路**不带过滤再跑一次，
+            而不是另写一段近似逻辑。
+            """
+            _t0_pass = time.monotonic()
+            per_collection_results = await asyncio.gather(
+                *[asyncio.to_thread(_search_one_sync, c, doc_filters) for c in search_collections],
+                return_exceptions=True,
+            )
+            _t_gather = (time.monotonic() - _t0_pass) * 1000.0
 
-        trace.record_stage("parallel_recall", {
-            "candidate_collections": candidate_collections,
-            "merged_candidate_count": len(merged),
-        }, elapsed_ms=_t_gather)
+            results: List[RetrievalResult] = []
+            for collection, sub_results in zip(search_collections, per_collection_results):
+                if isinstance(sub_results, Exception):
+                    logger.warning(f"Search failed for collection '{collection}': {sub_results}")
+                    continue
+                results.extend(sub_results)
 
-        # 提示词注入防护，见 _filter_injected_chunks 旁的说明——重排之前拦，
-        # 不给投毒 chunk 机会拿到一个不低的重排分数、挤掉真正相关的结果。
-        merged = self._filter_injected_chunks(merged, trace)
+            trace.record_stage("parallel_recall", {
+                "pass": pass_label,
+                "candidate_collections": candidate_collections,
+                "narrowed_collections": sorted(doc_filters.keys()),
+                "merged_candidate_count": len(results),
+            }, elapsed_ms=_t_gather)
 
-        if self.config.enable_rerank and merged:
-            merged, scored = await asyncio.to_thread(self._apply_rerank, query, merged, top_k, trace)
-            if scored:
-                # 全库并行召回对"不相关问题也能凑出候选"格外敏感——每个候选库
-                # 都会各自返回自己"矬子里最高"的几条，6 个库凑在一起，合并候选
-                # 集比单库场景更容易看着"有内容"，实际全是噪音（见
-                # MIN_RELEVANCE_SCORE 旁的真实案例）。重排后过滤跟单库路径
-                # （_execute_local_single）用的是同一个阈值/同一个理由。
-                merged = self._filter_by_relevance(merged)
-        else:
-            merged = sorted(merged, key=lambda r: r.score, reverse=True)[:top_k]
+            # 提示词注入防护，见 _filter_injected_chunks 旁的说明——重排之前拦，
+            # 不给投毒 chunk 机会拿到一个不低的重排分数、挤掉真正相关的结果。
+            results = self._filter_injected_chunks(results, trace)
+
+            if self.config.enable_rerank and results:
+                results, scored = await asyncio.to_thread(self._apply_rerank, query, results, top_k, trace)
+                if scored:
+                    # 全库并行召回对"不相关问题也能凑出候选"格外敏感——每个候选库
+                    # 都会各自返回自己"矬子里最高"的几条，6 个库凑在一起，合并候选
+                    # 集比单库场景更容易看着"有内容"，实际全是噪音（见
+                    # MIN_RELEVANCE_SCORE 旁的真实案例）。重排后过滤跟单库路径
+                    # （_execute_local_single）用的是同一个阈值/同一个理由。
+                    results = self._filter_by_relevance(results)
+            else:
+                results = sorted(results, key=lambda r: r.score, reverse=True)[:top_k]
+            return results
+
+        merged = await _recall_and_rank(narrowed, "narrowed" if narrowed else "flat")
+
+        # 收窄兜底：走了收窄却什么都没查到，最可能的原因是摘要层筛错了文档
+        # （摘要用弱中文 embedding，实测金标文档与榜首分差中位仅 0.0495），
+        # 而不是"库里真的没有"。代价只落在本来就要返回空结果的请求上。
+        if not merged and narrowed:
+            logger.info(
+                f"Hierarchy narrowing produced no results for query='{query[:50]}...', "
+                f"retrying without document filter (collections={sorted(narrowed)})"
+            )
+            trace.record_stage("hierarchy_narrow_fallback", {
+                "reason": "narrowed_pass_empty",
+                "narrowed_collections": sorted(narrowed.keys()),
+            })
+            merged = await _recall_and_rank({}, "fallback_flat")
 
         contributing_collections = sorted({
             r.metadata.get("collection") for r in merged if r.metadata.get("collection")

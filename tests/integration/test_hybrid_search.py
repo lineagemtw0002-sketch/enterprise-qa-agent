@@ -49,6 +49,7 @@ class MockDenseRetriever:
         self.last_query = None
         self.last_top_k = None
         self.last_filters = None
+        self.last_query_vector = None
     
     def retrieve(
         self,
@@ -56,11 +57,14 @@ class MockDenseRetriever:
         top_k: int = 10,
         filters: Optional[Dict[str, Any]] = None,
         trace: Optional[Any] = None,
+        query_vector: Optional[List[float]] = None,
     ) -> List[RetrievalResult]:
         self.call_count += 1
         self.last_query = query
         self.last_top_k = top_k
         self.last_filters = filters
+        # 记下来供断言：调用方有没有把预计算向量透传下来（省掉重复 embedding）
+        self.last_query_vector = query_vector
         
         if self.should_fail:
             raise RuntimeError(self.error_message)

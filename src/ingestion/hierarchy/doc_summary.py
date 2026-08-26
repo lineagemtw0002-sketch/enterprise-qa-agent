@@ -55,7 +55,9 @@ class DocumentSummarizer:
         self._prompt_template: Optional[str] = None
         cfg = getattr(getattr(settings, "ingestion", None), "doc_summary", None) or {}
         self.use_llm: bool = cfg.get("use_llm", False)
-        self.top_docs: int = cfg.get("top_docs", 5)
+        # 这里原来还读了一个 `self.top_docs`——摄入侧从来没有用过它（检索侧的
+        # 粗筛预算现在读 `doc_summary.narrow`，见 core/query_engine/narrow_plan.py），
+        # 留着只会让人以为"摘要生成也受这个数影响"。2026-08-26 删除。
 
     @property
     def llm(self) -> Optional[BaseLLM]:

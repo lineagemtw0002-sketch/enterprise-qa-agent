@@ -103,6 +103,7 @@ class DenseRetriever:
         top_k: Optional[int] = None,
         filters: Optional[Dict[str, Any]] = None,
         trace: Optional[Any] = None,
+        query_vector: Optional[List[float]] = None,
     ) -> List[RetrievalResult]:
         """Retrieve semantically similar chunks for a query.
         
@@ -111,6 +112,16 @@ class DenseRetriever:
             top_k: Maximum number of results to return. If None, uses default_top_k.
             filters: Optional metadata filters (e.g., {"collection": "api-docs"}).
             trace: Optional TraceContext for observability (reserved for Stage F).
+            query_vector: Pre-computed embedding for `query`. When the same query
+                is searched across several collections (the parallel multi-KB recall
+                in query_knowledge_hub.py), each collection has its own
+                DenseRetriever and would otherwise embed the identical string again
+                — with Ollama's default OLLAMA_NUM_PARALLEL=1 those calls are fully
+                serial (measured 2026-08-26: ~76ms each, 6 collections ≈ 460ms of
+                pure repetition). Callers that already hold the vector pass it here.
+                **The caller is responsible for it matching `query`** — this method
+                does not (cannot) verify that, so never pass a vector computed from
+                a different string or a different embedding model.
         
         Returns:
             List of RetrievalResult objects, sorted by similarity (descending).
@@ -135,15 +146,16 @@ class DenseRetriever:
         
         logger.debug(f"Retrieving for query='{query[:50]}...', top_k={effective_top_k}")
         
-        # Step 1: Embed the query
-        try:
-            query_vectors = self.embedding_client.embed([query], trace=trace)
-            query_vector = query_vectors[0]
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to embed query: {e}. "
-                "Check embedding client configuration and connectivity."
-            ) from e
+        # Step 1: Embed the query (skipped when the caller already did it)
+        if query_vector is None:
+            try:
+                query_vectors = self.embedding_client.embed([query], trace=trace)
+                query_vector = query_vectors[0]
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to embed query: {e}. "
+                    "Check embedding client configuration and connectivity."
+                ) from e
         
         # Step 2: Query the vector store
         try:

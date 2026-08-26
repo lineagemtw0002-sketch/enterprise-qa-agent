@@ -207,6 +207,7 @@ class HybridSearch:
         filters: Optional[Dict[str, Any]] = None,
         trace: Optional[Any] = None,
         return_details: bool = False,
+        query_vector: Optional[List[float]] = None,
     ) -> List[RetrievalResult] | HybridSearchResult:
         """执行混合检索，组合稠密检索和稀疏检索的结果。
         
@@ -216,6 +217,10 @@ class HybridSearch:
             filters: 可选的元数据过滤条件，例如 {"collection": "docs"}。
             trace: 可选的 TraceContext，用于可观测性记录。
             return_details: 为 True 时返回带调试信息的 HybridSearchResult。
+            query_vector: `query` 的预计算向量，透传给稠密检索跳过重复 embedding。
+                多个 collection 上跑同一句 query 时用（见 dense_retriever.retrieve
+                的说明）。稀疏检索不受影响——它走关键词，不用向量。
+                **调用方负责保证它确实是这句 query、用同一个模型算出来的。**
         
         Returns:
             return_details=False 时返回按相关度排序的 RetrievalResult 列表。
@@ -259,6 +264,7 @@ class HybridSearch:
             processed_query=processed_query,
             filters=merged_filters,
             trace=trace,
+            query_vector=query_vector,
         )
         
         # 第 3 步：处理各种降级场景。
@@ -364,6 +370,7 @@ class HybridSearch:
         processed_query: ProcessedQuery,
         filters: Optional[Dict[str, Any]],
         trace: Optional[Any],
+        query_vector: Optional[List[float]] = None,
     ) -> Tuple[
         Optional[List[RetrievalResult]],
         Optional[List[RetrievalResult]],
@@ -408,13 +415,13 @@ class HybridSearch:
         if self.config.parallel_retrieval and run_dense and run_sparse:
             # 两路都要跑且允许并行时，尽量利用并发减少等待时间。
             dense_results, sparse_results, dense_error, sparse_error = (
-                self._run_parallel_retrievals(processed_query, filters, trace)
+                self._run_parallel_retrievals(processed_query, filters, trace, query_vector)
             )
         else:
             # 否则按顺序执行，适合单通道或调试场景。
             if run_dense:
                 dense_results, dense_error = self._run_dense_retrieval(
-                    processed_query.original_query, filters, trace
+                    processed_query.original_query, filters, trace, query_vector
                 )
             
             if run_sparse:
@@ -429,6 +436,7 @@ class HybridSearch:
         processed_query: ProcessedQuery,
         filters: Optional[Dict[str, Any]],
         trace: Optional[Any],
+        query_vector: Optional[List[float]] = None,
     ) -> Tuple[
         Optional[List[RetrievalResult]],
         Optional[List[RetrievalResult]],
@@ -460,6 +468,7 @@ class HybridSearch:
                 processed_query.original_query,
                 filters,
                 trace,
+                query_vector,
             )
             
             # 提交稀疏检索任务。
@@ -495,6 +504,7 @@ class HybridSearch:
         query: str,
         filters: Optional[Dict[str, Any]],
         trace: Optional[Any],
+        query_vector: Optional[List[float]] = None,
     ) -> Tuple[Optional[List[RetrievalResult]], Optional[str]]:
         """执行稠密检索，并统一处理异常和 trace 记录。
         
@@ -516,12 +526,15 @@ class HybridSearch:
                 top_k=self.config.dense_top_k,
                 filters=filters,
                 trace=trace,
+                query_vector=query_vector,
             )
             _elapsed = (time.monotonic() - _t0) * 1000.0
             if trace is not None:
                 trace.record_stage("dense_retrieval", {
                     "method": "dense",
                     "provider": getattr(self.dense_retriever, 'provider_name', 'unknown'),
+                    # 复用了上游算好的向量就没有 embedding 往返，看耗时时要知道这点
+                    "reused_query_vector": query_vector is not None,
                     "top_k": self.config.dense_top_k,
                     "result_count": len(results) if results else 0,
                     "chunks": _snapshot_results(results),
