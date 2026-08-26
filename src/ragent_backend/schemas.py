@@ -306,6 +306,20 @@ class AnalysisSummaryResponse(BaseModel):
     created_at: float
 
 
+class SetOutcomeEffectiveRequest(BaseModel):
+    effective: bool
+
+
+class OpsMetricsResponse(BaseModel):
+    # 三个字段用 Optional 而不是缺省 0.0——分母为 0（还没有样本）跟"比例
+    # 恰好是 0"是两件不同的事，见 `ops_store.py::compute_ops_metrics` 的说明。
+    approval_timeliness_rate: Optional[float] = None
+    execution_success_rate: Optional[float] = None
+    alert_noise_reduction: Optional[float] = None
+    outcome_effective_counts: Dict[str, int]
+    sample_sizes: Dict[str, int]
+
+
 class RemediationActionResponse(BaseModel):
     action_id: str
     org_id: str

@@ -1229,7 +1229,7 @@ flowchart TB
   V1 没有拓扑数据源）；RCA 提示词没做过效果调优，只保证了"不编造/不下
   结论"两条约束在提示词里。
 
-- 🔄 **2026-08-27　运维塔台"总览"大屏——用户已确认要真正实现，非纯换皮**
+- ✅ **2026-08-27　运维塔台"总览"大屏——已完成并真机联调（刘德华开发）**
 
   用户翻出一份本会话早前做的设计稿（深色 NOC 监控大屏风格：KPI 指标条 + 服务
   健康网格 + 告警关联时间线 + 审批队列卡片 + 连接器状态，静态 HTML、示例数据），
@@ -1276,10 +1276,75 @@ flowchart TB
      CSS/布局，但数据来源必须按上面那份清单改，不能原样搬示例数字"，防止拿去
      实现时把静态示例数据当成规范照搬。
 
-  **未做（交给刘德华，前端 + 布局迁移）**：把 `docs/design_reference/
-  aiops_console_mockup.html` 的深色 NOC 主题 CSS 移植进 `OpsConsole.jsx`，
-  新增"总览"tab，接入上面列的真实数据源；"白名单配置""连接器管理"两个页面的
-  视觉也可以照抄设计稿，但要接现有真实增删改逻辑，不是设计稿里的静态占位输入框。
+  **刘德华完成了什么**：深色主题走 antd `ConfigProvider` 的 `darkAlgorithm`，
+  不手写覆盖 antd 内部类名（后者版本升级必碎，且弹窗/气泡挂在 portal 上
+  CSS 选择器盖不全）；总览 tab 接入上面的真实数据源；字体只声明字体族 + 系统
+  回退，**没有引入设计稿里的 Google Fonts 外链**——这是企业内网工具，外链
+  字体在隔离网络里会静默失败，且会向 `fonts.googleapis.com` 发请求，跟本模块
+  自己的 BYOC"不向外泄漏客户侧信息"原则冲突。
+  **分段从设计稿的 3 个扩到 5 个**（自行决定，理由记录在案）：多留"审批队列"
+  ——总览卡片只列待审批，历史（已完成/失败/已拒绝）的入口不能丢；多留
+  "授权管理"——设计稿制作时 `role_ops_systems` 还没落地，不是设计上要去掉。
+  时间线的严重度标注从**依据本身推导**（有告警关联事件=critical，有异常
+  检出=warning），不采信模型措辞——跟 `rca.py`"绝不采信模型输出的引用"是
+  同一条原则的延伸。
+  ⚠️ **真机跑出三处 `vite build` 查不出的问题**（构建通过、语法正确，只有
+  点进去才看得见）：重构 import 时删掉了 `Segmented` 但 `ScopesSection`
+  还在用，导致"白名单配置"整页白屏（已修）；提议人显示成裸 UUID；时间线
+  标题和正文渲染了同一段文字两遍。**这条线到目前为止全部 UI 问题都是真机
+  跑出来的，没有一个是读代码发现的**，再次印证真机验证的价值。
+  测试数据（1 连接器+1 待审批动作+1 分析摘要）已用 DELETE 端点级联清理，
+  共用库零残留。
+  **未做**：审批队列表格"提议人"仍是 UUID、"动作"仍是原始 JSON（改造前就
+  这样，未顺手动）；窄屏只做了断点没真机验；总览 15 秒轮询在多人同开时会
+  放大后端读压力，当前数据量无感，真上量要换 SSE/WS。
+
+- ✅ **2026-08-27　§10.5 验收指标公式正式接线 + 补上一处死代码**（回应
+  §9.3"模块从未定义过效果怎么衡量"这条用户今天要求现在就补的空白）
+
+  `docs/aiops_module_design.md` §10.5 早就给了四个指标的公式，但从写下那天
+  到今天，从没有一段代码真的算过。补的是计算本身，不是重新设计公式：
+
+  - **审批处理及时率** = (approved+rejected)/(approved+rejected+expired)，
+    `approved` 计数用 `approver_user_id IS NOT NULL` 而不是"当前状态字段
+    恰好是 approved"——一个动作批准之后会继续流转到
+    executing/completed/failed，用当前状态字段算会把所有已经执行完的都
+    漏掉，`approver_user_id` 是"是否经过审批"这件事本身的忠实记录。
+  - **执行成功率** = completed/(completed+failed)。
+  - **事后有效性**：不折成单一比例，按 `outcome_effective` 三态给计数
+    （effective/ineffective/unlabeled）——未标注的数量本身是有意义的信息
+    （标注覆盖率），折成比例会把它藏起来。**顺手补上一处真实的死代码**：
+    `ops_store.set_outcome_effective` 早就写好了，但从落地到今天零调用方
+    ——`POST /api/v1/admin/ops/remediation-actions/{action_id}/outcome`
+    是它第一次真正接上端点。
+  - **告警合并率** = 1 − Σincident_count/Σalert_count，**跨记录先加总
+    再算比例，不是对每条记录的 noise_reduction 取平均**——加总按信号量
+    加权，避免一次只有 2 条告警的小样本把整体比例拉偏。为了让这条有数据
+    可用，顺带修了一个真实缺口：`src/ops/tools.py::analyze_ops_incident`
+    原来只把 `alert_count`/`noise_reduction` 塞进当次 `ToolOutcome.data`
+    回给调用方看一眼，从来没有持久化，导致这个指标即使写了公式也永远没有
+    历史数据可算——现在跟 RCA 依据引用一起存进 `evidence_refs`（新增一条
+    `source="alert_correlation_stats"` 的条目）。
+  - **分母为 0 时返回 `None`，不是 `0.0`**——"还没有样本"和"比例恰好是 0"
+    是两件不同的事，糊在一起会让刚开始用的企业看起来"表现很差"。
+  - **权限**：`GET /api/v1/admin/ops/metrics` 复用总览类端点同一套
+    `viewable_connection_ids_for_user` 过滤，非 org_admin 只统计自己
+    `can_view` 的连接器范围内的样本，`compute_ops_metrics` 新增
+    `connection_ids` 参数支撑这层隔离。
+
+  **验证**：`tests/integration/test_ops_store_metrics.py`（10 条，真实
+  Postgres，动作真的推过完整状态机产生样本，不是摆一行伪造 status 进库；
+  含三条判别式：分母为 0 时是 `None`、告警合并率加总不取平均、
+  `connection_ids` 过滤真的隔离不同连接器的数据）+
+  `tests/unit/test_ops_tools.py` 新增判别式（把持久化 correlation_stats_ref
+  那行删掉这条会失败）+ `scripts/verify_aiops_endpoints.py` 新增 3 项。
+  全量 `tests/unit` 2346 通过。
+
+  **本次未覆盖**：`outcome_effective_counts` 只统计 completed/failed 状态
+  的动作——当前环境没有真实 BYOC 连接器，动作永远停在 approved，这个指标
+  在实际部署前会一直显示全零，这是诚实的空不是 bug（"有没有效"这个问题
+  对一个还没真正执行过的动作没有答案）；四个指标目前只有 API，没有接进
+  总览大屏的 UI（那是下一步，看要不要现在做）。
 
 - ✅ **2026-08-26　`role_ops_systems` 细粒度审批权限落地（§10.6 设计已实施）**
   ——本会话「张学友」实现，闭环了 §5 上面多处"任何本企业 org_admin 都能

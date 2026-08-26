@@ -412,12 +412,30 @@ class OpsToolset:
         if persist and not rca.degraded:
             # 降级结果（模型没参与）不落库：`ops_analysis_summaries` 是给审批人看
             # 数据血缘用的，存一条"其实只是数据复述"的记录会稀释它的意义。
+            #
+            # ⚠️ 告警关联的统计量（alert_count/incident_count/noise_reduction）
+            # 原来只在这次调用的 ToolOutcome.data 里返回给调用方看一眼，从不落库
+            # ——`docs/aiops_module_design.md` §10.5 定义的"告警合并率"验收指标
+            # 因此从来没有持久化数据可用来算。这里跟 RCA 依据引用一起存进
+            # `evidence_refs`（多一条 `source="alert_correlation_stats"` 的条目），
+            # Store 层仍然不解析 evidence_refs 内部结构，只有度量计算这一层会按
+            # `source` 字段过滤读取，属于建立在"不透明 JSON"契约之上的专用读法，
+            # 不算破坏那条约定。
+            correlation_stats_ref = {
+                "source": "alert_correlation_stats",
+                "description": f"{correlation.original_count} 条告警合并为 {len(correlation.incidents)} 个事件",
+                "detail": {
+                    "alert_count": correlation.original_count,
+                    "incident_count": len(correlation.incidents),
+                    "noise_reduction": round(correlation.noise_reduction, 4),
+                },
+            }
             try:
                 saved = await self._store.save_analysis_summary(
                     org_id=org_id,
                     connection_id=(metric_result.results[0].connection_id if metric_result.results else None),
                     summary=rca.summary,
-                    evidence_refs=[e.to_dict() for e in rca.evidence],
+                    evidence_refs=[*(e.to_dict() for e in rca.evidence), correlation_stats_ref],
                 )
                 summary_id = getattr(saved, "summary_id", None)
             except Exception as e:  # noqa: BLE001

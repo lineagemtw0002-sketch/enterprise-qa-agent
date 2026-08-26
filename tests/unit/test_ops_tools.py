@@ -396,6 +396,12 @@ class TestAnalyzeOpsIncident:
         assert store.saved, "非降级结果应当落库"
         # ⚠️ 落库的只有摘要 + 依据，没有原始运维数据（§3.1 BYOC）
         assert set(store.saved[0]) == {"org_id", "connection_id", "summary", "evidence_refs"}
+        # §10.5 验收指标"告警合并率"要求这份统计量真的落库，不能只在这一次
+        # ToolOutcome.data 里回给调用方看一眼就丢——判别式：把持久化那行的
+        # correlation_stats_ref 删掉，这条会失败。
+        stats_refs = [r for r in store.saved[0]["evidence_refs"] if r.get("source") == "alert_correlation_stats"]
+        assert len(stats_refs) == 1
+        assert stats_refs[0]["detail"] == {"alert_count": 5, "incident_count": 1, "noise_reduction": 0.8}
 
     @pytest.mark.asyncio
     async def test_degraded_result_is_not_persisted(self):

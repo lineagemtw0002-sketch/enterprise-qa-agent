@@ -69,7 +69,7 @@ from src.ragent_backend.schemas import (
     RemediationScopeResponse, UpsertRemediationScopeRequest,
     RemediationActionResponse, ProposeRemediationActionRequest,
     RoleOpsPermissionResponse, SetRoleOpsPermissionRequest,
-    AnalysisSummaryResponse,
+    AnalysisSummaryResponse, SetOutcomeEffectiveRequest, OpsMetricsResponse,
 )
 from src.ragent_backend import account_import as _acct_import
 from src.ragent_backend import activation as _activation
@@ -2209,6 +2209,22 @@ def create_app() -> FastAPI:
             summaries = [s for s in summaries if s.connection_id in viewable_set]
         return [_analysis_summary_response(s) for s in summaries]
 
+    @app.get("/api/v1/admin/ops/metrics", response_model=OpsMetricsResponse)
+    async def admin_get_ops_metrics(
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> OpsMetricsResponse:
+        """§10.5 定义的四个 V1 验收指标——`docs/aiops_module_design.md` §9.3
+        原本标注"这个模块完全没有定义过效果怎么衡量"，§10.5 补了公式，但直到
+        今天为止从来没有一段代码真的算过。这是第一次接线。
+
+        权限跟其余总览类端点同一套：org_admin 看全企业，其余角色只统计自己
+        `can_view` 的连接器范围内的样本，没有任何授权时四个指标全部是"没有
+        样本"（`None`），不是意外算出全企业的数字给一个没权限的人看。"""
+        org = await _require_aiops_enabled_org(current_user)
+        viewable = await ops_store.viewable_connection_ids_for_user(current_user.user_id, org.org_id)
+        metrics = await ops_store.compute_ops_metrics(org.org_id, connection_ids=viewable)
+        return OpsMetricsResponse(**metrics)
+
     async def _require_can_approve(user_id: str, connection_id: str) -> None:
         perm = await ops_store.get_ops_permission(user_id, connection_id)
         if not perm["can_approve"]:
@@ -2257,6 +2273,31 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=409, detail=str(e))
         await _audit_log(
             current_user.user_id, "reject_remediation_action", "remediation_action", action.action_id, {},
+        )
+        return _remediation_action_response(action)
+
+    @app.post(
+        "/api/v1/admin/ops/remediation-actions/{action_id}/outcome",
+        response_model=RemediationActionResponse,
+    )
+    async def admin_set_remediation_outcome(
+        action_id: str,
+        request: SetOutcomeEffectiveRequest,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> RemediationActionResponse:
+        """§10.5"事后有效性"指标的数据来源——人工事后补标"这次修复是否真的
+        解决了问题"，`ops_store.set_outcome_effective` 早就写好了但从来没有
+        端点调用过（真实存在过的死代码，不是这次顺手加的）。权限跟批准/拒绝
+        同一档：能拍板批不批的人，也是自然该来判断"批准的这次到底有没有用"
+        的人。不限制当前状态——`set_outcome_effective` 本身"不做状态限制"是
+        既有的设计决定（见它的类内说明），这里不额外收紧。"""
+        org = await _require_aiops_enabled_org(current_user)
+        action = await _get_owned_action(org.org_id, action_id)
+        await _require_can_approve(current_user.user_id, action.connection_id)
+        action = await ops_store.set_outcome_effective(action.action_id, request.effective)
+        await _audit_log(
+            current_user.user_id, "set_remediation_outcome", "remediation_action", action.action_id,
+            {"effective": request.effective},
         )
         return _remediation_action_response(action)
 

@@ -912,6 +912,118 @@ class OpsStore:
                 )
         return [self._row_to_summary(r) for r in rows]
 
+    async def compute_ops_metrics(
+        self, org_id: str, connection_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """§10.5 定义的四个 V1 验收指标，全部按设计文档给的公式真实计算，
+        不预设目标数字（那份态度本身就是设计的一部分："V1 阶段的目标是能测量，
+        不是达到某个具体数字"）。任一指标分母为 0 时返回 `None`（不是 0.0 也
+        不是省略字段）——"还没有样本"和"比例恰好是 0"是两件不同的事，糊在
+        一起会让"这家企业刚开始用、数据太少"看起来像"表现很差"。
+
+        - **审批处理及时率** = (approved+rejected) / (approved+rejected+expired)。
+          `approved` 计数用 `approver_user_id IS NOT NULL`，不是"当前状态字段
+          恰好等于 approved"——一个动作被批准之后还会继续流转到
+          executing/completed/failed，用当前状态字段算会漏掉所有已经执行完的，
+          `approver_user_id` 是"是否经过审批"这件事本身的忠实记录，不随后续
+          状态推进而改变。
+        - **执行成功率** = completed / (completed+failed)，两者都是终态，
+          不存在这个问题。
+        - **事后有效性**：设计文档没有给单一公式，只说"人工在时间线上补标即可"
+          ——按 `outcome_effective` 三态（true/false/未标注）给计数，不是
+          折成一个比例，未标注的数量本身就是有意义的信息（标注覆盖率）。
+        - **告警合并率** = 1 − Σincident_count / Σalert_count，跨企业全部持久化
+          的 `alert_correlation_stats` 条目**先加总再算比例**，不是对每条记录的
+          `noise_reduction` 取平均——加总能按信号量加权，避免一次只有 2 条告警
+          的小样本把整体比例拉偏。
+
+        `connection_ids`：`None` 表示不按连接器过滤（给 org_admin 用，通配符
+        语义跟 `viewable_connection_ids_for_user` 的既有约定一致）；传一个列表
+        （含空列表）表示只统计这些连接器——空列表会让所有查询条件恒假，四个
+        指标全部落到"没有样本"（`None`/空计数），不是意外聚合出全企业的数字。
+        """
+        import json
+
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            if connection_ids is None:
+                status_rows = await conn.fetch(
+                    "SELECT status, approver_user_id IS NOT NULL AS was_approved, "
+                    "outcome_effective, count(*) AS n "
+                    "FROM remediation_actions WHERE org_id = $1 "
+                    "GROUP BY status, was_approved, outcome_effective",
+                    org_id,
+                )
+                summary_rows = await conn.fetch(
+                    "SELECT evidence_refs FROM ops_analysis_summaries WHERE org_id = $1",
+                    org_id,
+                )
+            else:
+                status_rows = await conn.fetch(
+                    "SELECT status, approver_user_id IS NOT NULL AS was_approved, "
+                    "outcome_effective, count(*) AS n "
+                    "FROM remediation_actions WHERE org_id = $1 AND connection_id = ANY($2::text[]) "
+                    "GROUP BY status, was_approved, outcome_effective",
+                    org_id, connection_ids,
+                )
+                summary_rows = await conn.fetch(
+                    "SELECT evidence_refs FROM ops_analysis_summaries "
+                    "WHERE org_id = $1 AND connection_id = ANY($2::text[])",
+                    org_id, connection_ids,
+                )
+
+        approved_n = rejected_n = expired_n = completed_n = failed_n = 0
+        effective_n = ineffective_n = unlabeled_n = 0
+        for row in status_rows:
+            n = row["n"]
+            if row["was_approved"]:
+                approved_n += n
+            if row["status"] == STATUS_REJECTED:
+                rejected_n += n
+            elif row["status"] == STATUS_EXPIRED:
+                expired_n += n
+            elif row["status"] == STATUS_COMPLETED:
+                completed_n += n
+            elif row["status"] == STATUS_FAILED:
+                failed_n += n
+            if row["status"] in (STATUS_COMPLETED, STATUS_FAILED):
+                if row["outcome_effective"] is True:
+                    effective_n += n
+                elif row["outcome_effective"] is False:
+                    ineffective_n += n
+                else:
+                    unlabeled_n += n
+
+        total_alerts = total_incidents = 0
+        for row in summary_rows:
+            refs = row["evidence_refs"]
+            if isinstance(refs, str):
+                refs = json.loads(refs)
+            for ref in refs:
+                if ref.get("source") == "alert_correlation_stats":
+                    detail = ref.get("detail") or {}
+                    total_alerts += detail.get("alert_count", 0)
+                    total_incidents += detail.get("incident_count", 0)
+
+        def _ratio(numerator: int, denominator: int) -> Optional[float]:
+            return round(numerator / denominator, 4) if denominator > 0 else None
+
+        return {
+            "approval_timeliness_rate": _ratio(approved_n + rejected_n, approved_n + rejected_n + expired_n),
+            "execution_success_rate": _ratio(completed_n, completed_n + failed_n),
+            "alert_noise_reduction": (
+                round(1.0 - total_incidents / total_alerts, 4) if total_alerts > 0 else None
+            ),
+            "outcome_effective_counts": {
+                "effective": effective_n, "ineffective": ineffective_n, "unlabeled": unlabeled_n,
+            },
+            "sample_sizes": {
+                "approved": approved_n, "rejected": rejected_n, "expired": expired_n,
+                "completed": completed_n, "failed": failed_n,
+                "alert_count": total_alerts, "incident_count": total_incidents,
+            },
+        }
+
     # ------------------------------------------------------------------
     # 审批工作流（remediation_actions 状态机）
     # ------------------------------------------------------------------

@@ -553,6 +553,36 @@ async def main() -> None:
         print("17g) reviewer without grant sees:", resp.status_code, len(resp.json()))
         assert resp.status_code == 200 and resp.json() == []
 
+        # 17h) §10.5 验收指标——org_admin 看得到刚才那一整套审批流程留下的
+        # 真实样本（approve pending action 那一条 + 409 那条各贡献一次
+        # approver_user_id 非空/rejected 计数）。
+        resp = await client.get("/api/v1/admin/ops/metrics", headers=headers)
+        print("17h) ops metrics:", resp.status_code, resp.json())
+        assert resp.status_code == 200
+        m = resp.json()
+        # 注意：这条脚本走的都是 rejected_pre（越界/无白名单，进 pending_approval
+        # 之前就被系统拒绝），不是人工在 /reject 端点上真正拒绝——所以这里的
+        # "rejected" 计数恒为 0 是符合脚本实际流程的，不是断言写错。
+        assert m["sample_sizes"]["approved"] >= 1
+        assert m["outcome_effective_counts"] == {"effective": 0, "ineffective": 0, "unlabeled": 0}, (
+            "还没人调用过 /outcome，应该全是 unlabeled"
+        )
+
+        # 17i) 事后有效性标注端点——之前是死代码（写好了方法，零调用方）。
+        # `in_scope_action` 目前停在 approved（没有真实 BYOC 连接器，永远
+        # 走不到 completed/failed），所以这里只验证端点本身能写、写进去的
+        # 值能读出来——**不**断言它会出现在 outcome_effective_counts 里，
+        # 那个聚合刻意只统计 completed/failed 的动作（"有没有效"这个问题
+        # 只对真正执行过的动作有意义，approved 但还没跑的动作问"有没有效"
+        # 本身就没有答案）。
+        resp = await client.post(
+            f"/api/v1/admin/ops/remediation-actions/{in_scope_action['action_id']}/outcome",
+            headers=headers, json={"effective": True},
+        )
+        print("17i) mark outcome effective:", resp.status_code)
+        assert resp.status_code == 200
+        assert resp.json()["outcome_effective"] is True
+
         # 18) 生成 register_token
         resp = await client.post(
             f"/api/v1/admin/ops/connectors/{connection_id}/register-token", headers=headers,

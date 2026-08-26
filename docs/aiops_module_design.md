@@ -585,6 +585,14 @@ stateDiagram-v2
 
 ### 10.5 V1 验收指标（回应 §9.3 的遗留空白）
 
+> ✅ **公式已于 2026-08-27 实装**：`ops_store.py::compute_ops_metrics` +
+> `GET /api/v1/admin/ops/metrics`，四个指标全部按下表公式真实计算，不预设
+> 目标数字。`outcome_effective` 补上了缺失的写入口
+> （`POST .../remediation-actions/{action_id}/outcome`）——这个字段本来
+> 就在 schema 里，但从落地到现在从来没有端点调用过。详见 `CLAUDE.md` §5
+> 对应条目（含"分母为 0 时是 None 不是 0.0""告警合并率是加总再算比例不是
+> 平均"两条判别力细节）。
+
 **态度**：V1 阶段的目标是"能测量"，不是"达到某个具体数字"——不照抄大厂 90–95% 告警降噪、
 40–58% MTTR 改善这两个数字当 V1 目标（那是成熟部署的结果，拿来当早期目标等于自证失败）。
 
