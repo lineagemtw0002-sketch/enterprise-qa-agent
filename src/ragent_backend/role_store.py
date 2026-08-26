@@ -368,6 +368,89 @@ class RoleStore:
     # 读 / 权限并集
     # ------------------------------------------------------------------
 
+    async def get_user_roles_batch(self, user_ids: List[str]) -> "dict[str, List[Role]]":
+        """`get_user_roles` 的批量版——1 次查询覆盖任意多用户，不是 N 次。
+
+        2026-08-26 P1-14 修复：管理端 `/admin/users` 原来对每个用户单独调
+        `get_user_roles`，是"50 用户约 300 次串行查询"里的一部分。
+        """
+        result: "dict[str, List[Role]]" = {uid: [] for uid in user_ids}
+        if not user_ids:
+            return result
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT ur.user_id, r.id, r.name, r.display_name, r.is_system, r.org_id, r.created_at
+                FROM roles r JOIN user_roles ur ON ur.role_id = r.id
+                WHERE ur.user_id = ANY($1::text[])
+                ORDER BY r.created_at ASC
+                """,
+                user_ids,
+            )
+        for row in rows:
+            result.setdefault(row["user_id"], []).append(self._row_to_role(row))
+        return result
+
+    async def get_allowed_collections_for_users_batch(self, user_ids: List[str]) -> "dict[str, List[str]]":
+        """`get_allowed_collections_for_user` 的批量版——3 次查询覆盖任意多
+        用户，不是 3×N 次。`(org_id, role_id)` 双重过滤跟单用户版保持完全
+        一致的语义（不是简化成只按 `role_id` 过滤——即使 role_id 本身已经
+        全局唯一，这里也不改变原有的过滤条件组合，降低行为漂移风险）。
+
+        2026-08-26 P1-14 修复：这是"50 用户约 300 次串行查询"里占比最大的
+        一块——单用户版本本身就是 3 次查询，原来是 3×N。
+        """
+        result: "dict[str, List[str]]" = {uid: [] for uid in user_ids}
+        if not user_ids:
+            return result
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            user_rows = await conn.fetch(
+                "SELECT id, org_id FROM users WHERE id = ANY($1::text[])", user_ids,
+            )
+            user_org = {r["id"]: r["org_id"] for r in user_rows}
+
+            role_rows = await conn.fetch(
+                """
+                SELECT ur.user_id, r.id AS role_id, r.name AS role_name
+                FROM roles r JOIN user_roles ur ON ur.role_id = r.id
+                WHERE ur.user_id = ANY($1::text[])
+                """,
+                user_ids,
+            )
+            user_roles: "dict[str, list]" = {}
+            for r in role_rows:
+                user_roles.setdefault(r["user_id"], []).append({"id": r["role_id"], "name": r["role_name"]})
+
+            all_role_ids = list({r["role_id"] for r in role_rows})
+            collection_rows = []
+            if all_role_ids:
+                collection_rows = await conn.fetch(
+                    "SELECT org_id, role_id, collection_name FROM role_collections WHERE role_id = ANY($1::text[])",
+                    all_role_ids,
+                )
+
+        by_org_role: "dict[tuple, list]" = {}
+        for row in collection_rows:
+            by_org_role.setdefault((row["org_id"], row["role_id"]), []).append(row["collection_name"])
+
+        for uid in user_ids:
+            org_id = user_org.get(uid)
+            roles = user_roles.get(uid, [])
+            role_names = {r["name"] for r in roles}
+            if ROLE_ORG_ADMIN in role_names:
+                result[uid] = [_WILDCARD]
+                continue
+            if not roles or org_id is None:
+                result[uid] = []
+                continue
+            names: set = set()
+            for r in roles:
+                names.update(by_org_role.get((org_id, r["id"]), []))
+            result[uid] = [_WILDCARD] if _WILDCARD in names else sorted(names)
+        return result
+
     async def get_user_roles(self, user_id: str) -> List[Role]:
         pool = await self._get_pool()
         async with pool.acquire() as conn:

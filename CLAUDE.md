@@ -669,13 +669,36 @@ flowchart TB
   2026-08-25 就已实施（`docs/observability_design.md` 阶段一），只是没写进本文件，
   且 `app.py`/`workflow.py`/`intent.py` 的 print 一直没接上。现已全部接上并转完
 - 检索链路每查询重建全套组件、全链路无缓存
-- 管理端普遍 N+1（`/admin/users` 约 300 次串行查询）
+- ~~管理端普遍 N+1（`/admin/users` 约 300 次串行查询）~~ ✅ **`/admin/users` 已修复（2026-08-26），见 §5**——
+  注意是"`/admin/users` 已修复"，不是"管理端普遍 N+1 已解决"：这条只覆盖了这一个端点，
+  其余管理端点是否有同类问题**未逐个排查**
 - `create_app()` 3038 行 / 72 端点，无路由分层、无依赖注入
 - 无 Dockerfile / CI / 依赖锁定
 
 ---
 
 ## 5. 已修复（防止重新引入）
+
+- ✅ **2026-08-26　P1-14：`/admin/users` N+1（约 300 次串行查询 → 固定常数次）**
+  原来 `admin_list_users` 对每个用户单独 await
+  `get_org_for_user`（过滤时 1 次）+ `_build_admin_user_response` 内
+  `get_user_roles`（1 次）+ `get_allowed_collections_for_user`
+  （**自己就是 3 次**：users/roles/role_collections 各查一次）+
+  `get_org_for_user`（又 1 次，经 `_org_summary_for_user`），非平台管理员
+  视角下每个用户最多 6 次查询，50 用户 ≈ 300 次，跟 `CLAUDE.md` 原先记录的
+  数字吻合。
+  新增三个批量方法：`OrgStore.get_orgs_for_users_batch`、
+  `RoleStore.get_user_roles_batch`、
+  `RoleStore.get_allowed_collections_for_users_batch`——后者保留了单用户版
+  `(org_id, role_id)` 双重过滤的完整语义（不是简化成只按 `role_id` 过滤），
+  用一次 `role_collections` 查询 + 内存里按 `(org_id, role_id)` 分组，
+  覆盖任意用户数。`admin_list_users` 改为查询一次批量数据、在内存里拼装，
+  查询数不再随用户数增长（固定几次，不含判断当前登录者身份的 1-2 次）。
+  回归：`tests/unit/test_admin_users_batch_queries.py`（13 条），含判别力
+  核心——固定用户数下查询次数不随输入规模增长的断言。
+  ⚠️ **范围声明**：这次只修了 `/admin/users` 这一个端点，`CLAUDE.md` 原文
+  用词是"管理端普遍 N+1"，其余管理端点（如角色管理、组织管理列表页）
+  是否有同类问题**没有逐个排查**，不代表"管理端 N+1 已全部解决"。
 
 - ✅ **2026-08-26　结构化日志接入 + request id 贯穿链路（阶段二，见 `docs/observability_design.md`）**
   基础设施（`context.py`/`redact.py`/`configure_logging`/`JSONFormatter`）2026-08-25

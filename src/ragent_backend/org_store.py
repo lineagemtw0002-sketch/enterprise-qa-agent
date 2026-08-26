@@ -145,6 +145,26 @@ class OrgStore:
             )
         return self._row_to_org(row) if row else None
 
+    async def get_orgs_for_users_batch(self, user_ids: List[str]) -> "dict[str, Organization]":
+        """`get_org_for_user` 的批量版——1 次查询覆盖任意多用户，不是 N 次。
+
+        2026-08-26 P1-14 修复：管理端 `/admin/users` 原来对每个用户单独调
+        `get_org_for_user`，是"50 用户约 300 次串行查询"里的一部分。
+        """
+        if not user_ids:
+            return {}
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT u.id AS user_id, o.id, o.name, o.is_platform, o.created_at
+                FROM users u JOIN organizations o ON o.id = u.org_id
+                WHERE u.id = ANY($1::text[])
+                """,
+                user_ids,
+            )
+        return {row["user_id"]: self._row_to_org(row) for row in rows}
+
     async def is_platform_admin(self, user_id: str) -> bool:
         org = await self.get_org_for_user(user_id)
         return bool(org and org.is_platform)

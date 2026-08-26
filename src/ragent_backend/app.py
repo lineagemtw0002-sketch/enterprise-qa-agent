@@ -858,19 +858,46 @@ def create_app() -> FastAPI:
     async def admin_list_users(
         current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
     ) -> List[AdminUserResponse]:
+        """2026-08-26 P1-14 修复：原来对每个用户单独查角色/知识库权限/所属企业
+        （`_build_admin_user_response` 逐个 await），50 用户约 300 次串行查询。
+        改为批量查询一次拿齐所有用户的数据，再在内存里拼装——查询数不再随
+        用户数线性增长（固定常数次，不含 `is_platform_admin`/`get_org_for_user`
+        这两次判断当前登录者身份的查询）。"""
         users = await user_store.list_users()
+        user_ids = [u.user_id for u in users]
+        orgs_by_user = await org_store.get_orgs_for_users_batch(user_ids)
+
         # 平台管理员看全部；普通企业管理员只看自己企业的——过滤发生在这里，
         # 不是前端拿到全量再自己藏几行（attendance-tenant-federation.md 图4）。
         if not await org_store.is_platform_admin(current_user.user_id):
             actor_org = await org_store.get_org_for_user(current_user.user_id)
             actor_org_id = actor_org.org_id if actor_org else None
-            filtered = []
-            for u in users:
-                user_org = await org_store.get_org_for_user(u.user_id)
-                if user_org is not None and user_org.org_id == actor_org_id:
-                    filtered.append(u)
-            users = filtered
-        return [await _build_admin_user_response(u) for u in users]
+            users = [
+                u for u in users
+                if (org := orgs_by_user.get(u.user_id)) is not None and org.org_id == actor_org_id
+            ]
+            user_ids = [u.user_id for u in users]
+
+        roles_by_user = await role_store.get_user_roles_batch(user_ids)
+        collections_by_user = await role_store.get_allowed_collections_for_users_batch(user_ids)
+
+        return [
+            AdminUserResponse(
+                user_id=u.user_id,
+                username=u.username,
+                roles=[
+                    RoleSummary(role_id=r.role_id, name=r.name, display_name=r.display_name)
+                    for r in roles_by_user.get(u.user_id, [])
+                ],
+                allowed_collections=collections_by_user.get(u.user_id, []),
+                organization=(
+                    OrganizationSummary(org_id=org.org_id, name=org.name, is_platform=org.is_platform)
+                    if (org := orgs_by_user.get(u.user_id)) is not None else None
+                ),
+                created_at=u.created_at,
+            )
+            for u in users
+        ]
 
     @app.post("/api/v1/admin/users", response_model=AdminUserResponse)
     async def admin_create_user(
