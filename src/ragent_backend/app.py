@@ -210,6 +210,8 @@ async def ingest_file_task(
     file_path: str,
     collection: str,
     settings: Settings,
+    org_id: Optional[str] = None,
+    owner_user_id: Optional[str] = None,
 ) -> None:
     """
     后台任务：将文件 ingest 到对话的 collection
@@ -221,7 +223,15 @@ async def ingest_file_task(
             await file_store.update_file_status(conversation_id, file_id, "ingesting")
             
             # 创建 ingestion pipeline，指定 target collection
-            pipeline = IngestionPipeline(settings, collection=collection)
+            # org_id / owner_user_id 供 OpenSearch 侧的对话私有库做企业内隔离过滤。
+            # 两者都来自端点里已校验的身份（_require_conversation_owner 已确认
+            # 当前用户就是该对话的所有者），不是请求体里的声明。
+            pipeline = IngestionPipeline(
+                settings,
+                collection=collection,
+                org_id=org_id,
+                owner_user_id=owner_user_id,
+            )
             
             # 执行 ingest（在线程池中运行，避免阻塞事件循环）
             result = await asyncio.to_thread(
@@ -2415,6 +2425,8 @@ def create_app() -> FastAPI:
                     file_path=file_info.file_path,
                     collection=collection,
                     settings=settings,
+                    org_id=(actor_org.org_id if (actor_org := await org_store.get_org_for_user(current_user.user_id)) else None),
+                    owner_user_id=current_user.user_id,
                 )
             )
             

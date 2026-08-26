@@ -328,3 +328,118 @@ class TestTokenizerMismatchIsFaithfullyReproduced:
             "如果这条通过了，说明分词已对齐 —— 请同上，删掉这组测试"
         )
         assert store.search_kb(name, "次年"), "两侧一致的词应该能检索到"
+
+
+# ───────────── 摄入侧影子写：dense 向量 + conv_ 路由 ─────────────
+
+
+class TestIngestionMirror:
+    """`mirror_ingestion_to_opensearch` 的行为。
+
+    这是唯一会被生产摄入路径调用的入口（pipeline.py 阶段 7 的 6b-2），
+    所以它的失败模式比查询侧更要紧：写错了要过很久才会在检索时暴露。
+    """
+
+    @staticmethod
+    def _chunks(n: int):
+        from src.core.types import Chunk
+
+        return [
+            Chunk(
+                id=f"c{i}",
+                text=f"年假制度第{i}段 次年 顺延",
+                metadata={"source_path": "/t/a.pdf", "chunk_index": i},
+            )
+            for i in range(n)
+        ]
+
+    @staticmethod
+    def _stats(n: int):
+        return [{"chunk_id": f"vec_{i}"} for i in range(n)]
+
+    @staticmethod
+    def _doc():
+        from src.core.types import Document
+
+        return Document(id="d" * 64, text="x", metadata={"source_path": "/t/a.pdf"})
+
+    def test_business_kb_gets_dense_vectors(self, store):
+        from src.libs.search.opensearch_store import mirror_ingestion_to_opensearch
+
+        col = f"pytest_dense_{uuid.uuid4().hex[:8]}"
+        index = kb_index_name(col)
+        try:
+            mirror_ingestion_to_opensearch(
+                collection=col,
+                chunks=self._chunks(3),
+                sparse_stats=self._stats(3),
+                document=self._doc(),
+                dense_vectors=[[0.01 * i] * 768 for i in range(3)],
+            )
+            assert store.count(index) == 3
+            mapping = store._client.indices.get_mapping(index=index)
+            emb = mapping[index]["mappings"]["properties"]["embedding"]
+            assert emb["type"] == "knn_vector"
+            assert emb["dimension"] == 768
+        finally:
+            store.drop_index(index)
+
+    def test_conversation_kb_routes_to_shared_org_index(self, store):
+        """`conv_*` 必须进 `conv_{org}`，**不能**一对话一 index。
+
+        一对话一 index 是 index explosion 反模式：每个 index 的元数据由 master
+        维护、每个 shard 吃堆内存，而对话私有库只装一两份上传文档。
+        """
+        from src.libs.search.opensearch_store import mirror_ingestion_to_opensearch
+
+        org = f"pytest_org_{uuid.uuid4().hex[:8]}"
+        conv = f"conv_{uuid.uuid4().hex[:8]}"
+        try:
+            mirror_ingestion_to_opensearch(
+                collection=conv,
+                chunks=self._chunks(2),
+                sparse_stats=self._stats(2),
+                document=self._doc(),
+                org_id=org,
+                owner_user_id="u_alice",
+            )
+            assert store.count(conv_index_name(org)) == 2
+            assert store.count(kb_index_name(conv)) == 0, (
+                "给对话单独建了 index —— 这正是要避免的 index explosion"
+            )
+
+            cid = conv[len("conv_"):]
+            assert len(store.search_conv(org, cid, "u_alice", "次年")) == 2
+            assert store.search_conv(org, cid, "u_bob", "次年") == [], "越权可读"
+        finally:
+            store.drop_index(conv_index_name(org))
+            store.drop_index(kb_index_name(conv))
+
+    def test_conversation_kb_without_owner_writes_nothing(self, store, caplog):
+        """缺 `owner_user_id` 时宁可影子写失败，也不能写进无法过滤的数据。
+
+        写进去了但没有 owner 字段 = 查询时的 filter 匹配不到任何东西，
+        表现为"文档上传成功但检索不到"；更糟的是如果将来放宽 filter，
+        这批数据会变成**所有人可读**。失败比脏数据安全。
+        """
+        import logging
+
+        from src.libs.search.opensearch_store import mirror_ingestion_to_opensearch
+
+        org = f"pytest_org_{uuid.uuid4().hex[:8]}"
+        try:
+            with caplog.at_level(logging.ERROR):
+                mirror_ingestion_to_opensearch(
+                    collection=f"conv_{uuid.uuid4().hex[:8]}",
+                    chunks=self._chunks(2),
+                    sparse_stats=self._stats(2),
+                    document=self._doc(),
+                    org_id=org,
+                    # owner_user_id 故意不传
+                )
+            assert store.count(conv_index_name(org)) == 0, "写进了无法过滤的脏数据"
+            assert any("owner_user_id" in r.getMessage() for r in caplog.records), (
+                "失败被静默了 —— 切读时就无从知道哪批数据缺字段"
+            )
+        finally:
+            store.drop_index(conv_index_name(org))

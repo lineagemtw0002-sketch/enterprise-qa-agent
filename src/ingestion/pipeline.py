@@ -129,7 +129,9 @@ class IngestionPipeline:
         self,
         settings: Settings,
         collection: str = "default",
-        force: bool = False
+        force: bool = False,
+        org_id: Optional[str] = None,
+        owner_user_id: Optional[str] = None,
     ):
         """初始化流水线及其所有组件。
 
@@ -137,10 +139,18 @@ class IngestionPipeline:
         - settings: 应用配置对象。
         - collection: 文档集合名，用于逻辑隔离存储。
         - force: 为 True 时强制重跑，忽略增量跳过判断。
+        - org_id / owner_user_id: **仅 `conv_*` 对话私有库需要**。
+          OpenSearch 侧对话私有库是"每企业一个 index + 按所有者过滤"
+          （见 opensearch_store 顶部说明），没有这两个值就无法做企业内隔离，
+          影子写会显式失败而不是写一份查询时过滤不了的数据进去。
+          业务知识库不需要，保持 None。
+          值必须来自已校验的身份（JWT / 已校验的对话归属），**不要从请求体取**。
         """
         self.settings = settings
         self.collection = collection
         self.force = force
+        self.org_id = org_id
+        self.owner_user_id = owner_user_id
         
         # 统一在构造期初始化组件，降低运行期首次调用抖动。
         # 这样做的好处：
@@ -613,6 +623,11 @@ class IngestionPipeline:
                 chunks=chunks,
                 sparse_stats=sparse_stats,
                 document=document,
+                dense_vectors=dense_vectors,
+                # conv_* 私有库需要这两个做企业内隔离过滤；业务库不需要。
+                # 由 IngestionPipeline 的构造方传入（见 app.py::ingest_file_task）。
+                org_id=getattr(self, "org_id", None),
+                owner_user_id=getattr(self, "owner_user_id", None),
             )
 
             # 6c: 图片索引登记

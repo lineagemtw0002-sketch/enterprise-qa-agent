@@ -497,6 +497,9 @@ def mirror_ingestion_to_opensearch(
     chunks: Sequence[Any],
     sparse_stats: Sequence[Dict[str, Any]],
     document: Any,
+    dense_vectors: Optional[Sequence[Sequence[float]]] = None,
+    org_id: Optional[str] = None,
+    owner_user_id: Optional[str] = None,
 ) -> None:
     """把本次摄入的 chunk 镜像进 OpenSearch。**失败不阻断摄入。**
 
@@ -516,8 +519,24 @@ def mirror_ingestion_to_opensearch(
     if not chunks:
         return
     try:
-        store = OpenSearchStore()
-        index = kb_index_name(collection)
+        dims = len(dense_vectors[0]) if dense_vectors else None
+        store = OpenSearchStore(dense_dims=dims)
+
+        # conv_* 是对话私有库，走**每企业一个 index**，不能一对话一 index
+        # （index explosion 反模式，见模块顶部 _CONV_PREFIX 的说明）。
+        conversation_id = None
+        if collection.startswith(_CONV_PREFIX):
+            if not org_id or not owner_user_id:
+                raise ValueError(
+                    f"对话私有库 {collection} 缺少 org_id/owner_user_id。"
+                    f"没有它们就无法做企业内隔离过滤 —— 宁可影子写失败，"
+                    f"也不能写一份查询时无法按所有者过滤的数据进去。"
+                )
+            conversation_id = collection[len(_CONV_PREFIX):]
+            index = conv_index_name(org_id)
+        else:
+            index = kb_index_name(collection)
+
         docs = [
             build_chunk_doc(
                 text=chunk.text,
@@ -526,6 +545,9 @@ def mirror_ingestion_to_opensearch(
                 chunk_index=chunk.metadata.get("chunk_index", i),
                 chunk_id=stat["chunk_id"],
                 doc_hash=getattr(document, "id", None),
+                conversation_id=conversation_id,
+                owner_user_id=owner_user_id,
+                embedding=dense_vectors[i] if dense_vectors else None,
             )
             for i, (chunk, stat) in enumerate(zip(chunks, sparse_stats))
         ]

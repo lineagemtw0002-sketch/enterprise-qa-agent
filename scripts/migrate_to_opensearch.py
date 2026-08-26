@@ -191,20 +191,24 @@ def migrate_one(
         res["status"] = "would-migrate"
         return res
 
-    got = col.get(include=["documents", "metadatas"])
+    # 一并取向量：__summary 层是纯向量的（不建 BM25），不带 embedding 迁过去
+    # 等于那一层完全没迁 —— 而它参与 query_knowledge_hub 的文档级收窄检索。
+    got = col.get(include=["documents", "metadatas", "embeddings"])
     ids, docs, metas = got["ids"], got["documents"], got["metadatas"] or [{}] * n
+    embs = got.get("embeddings")
+    dims = len(embs[0]) if embs is not None and len(embs) else None
 
-    store = OpenSearchStore()
+    store = OpenSearchStore(dense_dims=dims)
     index = kb_index_name(collection)
     t0 = time.perf_counter()
     written = 0
     try:
         for start in range(0, len(ids), _BATCH):
             batch = []
-            for cid, text, meta in zip(
-                ids[start : start + _BATCH],
-                docs[start : start + _BATCH],
-                metas[start : start + _BATCH],
+            sl = slice(start, start + _BATCH)
+            emb_slice = embs[sl] if embs is not None and len(embs) else [None] * len(ids[sl])
+            for cid, text, meta, emb in zip(
+                ids[sl], docs[sl], metas[sl], emb_slice
             ):
                 meta = meta or {}
                 batch.append(
@@ -215,12 +219,14 @@ def migrate_one(
                         chunk_index=int(meta.get("chunk_index", 0)),
                         chunk_id=cid,
                         doc_hash=meta.get("doc_hash"),
+                        embedding=emb,
                     )
                 )
             written += store.index_chunks(index, batch, refresh=False)
         res["write_s"] = round(time.perf_counter() - t0, 2)
         res["written"] = written
         res["os_count"] = store.count(index)
+        res["dims"] = dims
 
         queries = pick_verify_queries(bm25_dir, collection)
         if queries:
@@ -279,8 +285,11 @@ def main() -> int:
         st = r["status"]
         if st == "ok":
             exact = "全部一致" if r["diffs"] == 0 else f"{r['diffs']} 组有截断线换位"
-            print(f"✅ {r['written']} 条 · {r['write_s']}s · "
-                  f"{r['verified']} 组重叠率 {r['overlap']:.0%}（{exact}）")
+            vec = f" · 向量 {r['dims']}维" if r.get("dims") else " · 无向量"
+            print(
+                f"✅ {r['written']} 条 · {r['write_s']}s · "
+                f"{r['verified']} 组重叠率 {r['overlap']:.0%}（{exact}）{vec}"
+            )
         elif st == "ok-unverified":
             print(f"⚠️  {r['written']} 条已写入，但{r['reason']}")
         elif st == "would-migrate":
