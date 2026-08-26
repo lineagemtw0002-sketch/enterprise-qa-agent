@@ -1,42 +1,187 @@
-/* 运维塔台。风格对齐 OperationsDashboard.css / AdminPanel.css，不另起一套。 */
+/* 运维塔台。视觉取自 docs/design_reference/aiops_console_mockup.html（深色 NOC 大屏）。
+ *
+ * ⚠️ **两条实现决定，跟设计稿有意不同：**
+ *
+ * 1. **所有 token 声明在 `.ops-console` 上，不在 `:root`。** 设计稿是一个独立
+ *    HTML 页，直接写 :root 没问题；这里是嵌在一个整体浅色的应用里的一个模块，
+ *    写 :root 会把变量泄漏给全站（`--accent` 这类名字跟 App.css 撞车）。
+ *
+ * 2. **不引 Google Fonts。** 设计稿用 <link> 拉 Titillium Web + JetBrains Mono，
+ *    但这是个企业内网部署的工具：外链字体在隔离网络里会静默失败，而且会向
+ *    fonts.googleapis.com 发请求——这跟本模块自己的 BYOC 原则（平台不向外泄漏
+ *    客户侧信息）是同一类考虑。这里只声明字体族并给足系统回退，装了字体的环境
+ *    自然会用上，没装的退化成系统字体，布局不受影响。
+ *
+ * antd 组件的深色化不靠这里的 CSS 覆盖，走 ConfigProvider 的 darkAlgorithm
+ * （见 OpsConsole.jsx）——手写覆盖 antd 内部类名在版本升级时必然碎掉。
+ */
 
-.ops-console-nav {
-  margin-bottom: 12px;
+.ops-console {
+  --ground: #12131a;
+  --surface: #191b25;
+  --surface-raised: #21232f;
+  --surface-inset: #0d0e13;
+  --ops-border: #2b2e3d;
+  --border-soft: #22242f;
+  --ink: #eef0f6;
+  --ink-muted: #8d90a3;
+  --ink-faint: #5c5f70;
+  --ops-accent: #8b7ffb;
+  --good: #34d399;
+  --good-dim: #163a2d;
+  --warning: #fbbf24;
+  --warning-dim: #3d3316;
+  --critical: #f8717a;
+  --critical-dim: #3d1e22;
+  --pending: #7c8299;
+  --pending-dim: #24273a;
+  --font-display: "Titillium Web", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--font-display);
+  min-height: 100%;
+  padding: 16px;
+  border-radius: 12px;
 }
 
-.ops-console-alert {
-  margin-bottom: 12px;
+/* ---------- 分段导航 ---------- */
+.ops-tabnav {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--ops-border);
+  margin-bottom: 14px;
+}
+.ops-tabbtn {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--ink-muted);
+  font-family: inherit;
+  font-size: 13px;
+  padding: 8px 14px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.ops-tabbtn:hover { color: var(--ink); }
+.ops-tabbtn.active { color: var(--ink); border-bottom-color: var(--ops-accent); }
+
+/* ---------- KPI ---------- */
+.kpi-strip {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);   /* 设计稿是 5 张，我们只做 3 张真实可算的 */
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.kpi-card {
+  background: var(--surface);
+  border: 1px solid var(--ops-border);
+  border-radius: 14px;
+  padding: 14px 16px;
+}
+.kpi-label { font-size: 11.5px; color: var(--ink-muted); margin-bottom: 6px; }
+.kpi-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.kpi-value { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.kpi-value .kpi-unit { font-size: 13px; color: var(--ink-muted); font-weight: 500; }
+.kpi-delta { font-size: 11px; font-weight: 600; }
+.kpi-delta.good { color: var(--good); }
+.kpi-delta.bad { color: var(--critical); }
+.kpi-delta.flat { color: var(--ink-faint); }
+
+/* ---------- 面板 ---------- */
+.ops-grid { display: grid; grid-template-columns: 1.6fr 1fr; gap: 12px; align-items: start; }
+.ops-col { display: flex; flex-direction: column; gap: 12px; }
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--ops-border);
+  border-radius: 14px;
+  overflow: hidden;
+}
+.panel-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; border-bottom: 1px solid var(--border-soft);
+}
+.panel-title { font-size: 13.5px; font-weight: 600; }
+.panel-title .count { font-size: 11px; color: var(--ink-faint); font-weight: 400; margin-left: 6px; }
+.panel-note { font-size: 11px; color: var(--ink-faint); }
+.panel-body { padding: 12px 16px 14px; }
+.panel-empty { color: var(--ink-faint); font-size: 12px; padding: 18px 0; text-align: center; }
+
+/* ---------- 状态药丸 ---------- */
+.status-pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 10.5px; font-weight: 600; padding: 2.5px 8px 2.5px 6px;
+  border-radius: 20px; white-space: nowrap;
+}
+.status-pill .dot { width: 5px; height: 5px; border-radius: 50%; }
+.status-pill.good { color: var(--good); background: var(--good-dim); }
+.status-pill.good .dot { background: var(--good); }
+.status-pill.warning { color: var(--warning); background: var(--warning-dim); }
+.status-pill.warning .dot { background: var(--warning); }
+.status-pill.critical { color: var(--critical); background: var(--critical-dim); }
+.status-pill.critical .dot { background: var(--critical); }
+.status-pill.pending { color: var(--pending); background: var(--pending-dim); }
+.status-pill.pending .dot { background: var(--pending); }
+
+/* ---------- 时间线 ---------- */
+.tl-row {
+  display: grid; grid-template-columns: 64px 20px 1fr auto;
+  gap: 12px; align-items: start; padding: 10px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.tl-row:last-child { border-bottom: none; padding-bottom: 0; }
+.tl-time { font-family: var(--font-mono); font-size: 11px; color: var(--ink-faint); padding-top: 2px; font-variant-numeric: tabular-nums; }
+.tl-marker { display: flex; flex-direction: column; align-items: center; height: 100%; }
+.tl-dot { width: 9px; height: 9px; border-radius: 50%; margin-top: 3px; flex: none; }
+.tl-dot.critical { background: var(--critical); box-shadow: 0 0 0 3px var(--critical-dim); }
+.tl-dot.warning { background: var(--warning); box-shadow: 0 0 0 3px var(--warning-dim); }
+.tl-dot.good { background: var(--good); box-shadow: 0 0 0 3px var(--good-dim); }
+.tl-line { width: 1px; flex: 1; background: var(--ops-border); margin-top: 4px; }
+.tl-title { font-size: 13px; font-weight: 500; margin: 0 0 3px; }
+.tl-desc { font-size: 12px; color: var(--ink-muted); margin: 0; white-space: pre-wrap; }
+.tl-tag { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-faint); margin-top: 5px; display: flex; gap: 6px; flex-wrap: wrap; }
+.tl-count { font-family: var(--font-mono); font-size: 11px; color: var(--ink-faint); white-space: nowrap; }
+
+/* ---------- 审批卡片 ---------- */
+.approval-card {
+  background: var(--surface-inset);
+  border: 1px solid var(--ops-border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+.approval-card:last-child { margin-bottom: 0; }
+.ap-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.ap-type { font-size: 12px; font-weight: 600; color: var(--ops-accent); }
+.ap-intent { font-size: 13px; margin: 0 0 8px; }
+.ap-meta { display: flex; flex-wrap: wrap; gap: 10px; font-size: 11px; color: var(--ink-muted); margin-bottom: 8px; }
+.ap-meta b { color: var(--ink); font-weight: 600; }
+.ap-radius {
+  display: flex; gap: 6px; align-items: flex-start;
+  font-size: 10.5px; color: var(--ink-faint); line-height: 1.5;
+  background: var(--warning-dim); border-radius: 8px; padding: 7px 9px; margin-bottom: 10px;
+}
+.ap-actions { display: flex; gap: 8px; }
+
+/* ---------- 连接器行 ---------- */
+.conn-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 10px 0; border-bottom: 1px solid var(--border-soft);
+}
+.conn-row:last-child { border-bottom: none; padding-bottom: 0; }
+.conn-name { font-size: 13px; font-weight: 500; }
+.conn-meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-faint); margin-top: 2px; }
+
+/* ---------- 说明性提示 ---------- */
+.ops-note {
+  font-size: 11.5px; color: var(--ink-faint); line-height: 1.6;
+  border-left: 2px solid var(--ops-border); padding-left: 10px; margin: 10px 0 0;
 }
 
-.ops-console-toolbar {
-  margin-bottom: 8px;
-}
-
-.ops-console-hint {
-  font-size: 12px;
-  margin-bottom: 8px !important;
-}
-
-.ops-console-form {
-  max-width: 560px;
-}
-
-/* 握手凭证：等宽 + 可换行，长串不撑破弹窗；背景色让人一眼看出"这是要复制的东西"。 */
-.ops-console-token {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  word-break: break-all;
-  background: rgba(0, 0, 0, 0.04);
-  padding: 10px 12px;
-  border-radius: 6px;
-  margin: 12px 0 8px !important;
-}
-
-.ops-console-plan {
-  font-size: 12px;
-  color: rgba(0, 0, 0, 0.55);
-  word-break: break-all;
-}
-
-.ops-console-disabled {
-  margin: 24px 0;
+@media (max-width: 1100px) {
+  .kpi-strip { grid-template-columns: 1fr; }
+  .ops-grid { grid-template-columns: 1fr; }
 }

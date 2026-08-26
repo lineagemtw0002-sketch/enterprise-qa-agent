@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  Alert, Button, Card, Empty, Form, Input, InputNumber, Modal, Popconfirm,
-  Checkbox, Segmented, Select, Space, Spin, Table, Tag, Typography, message,
+  Alert, Button, Card, Checkbox, ConfigProvider, Empty, Form, Input, InputNumber,
+  Modal, Popconfirm, Segmented, Select, Space, Spin, Table, Tag, Typography, message, theme,
 } from 'antd'
-import { Plug, KeyRound, ShieldCheck, ClipboardCheck, RefreshCw, Copy, Users, Trash2 } from 'lucide-react'
+import { Plug, KeyRound, ShieldCheck, ClipboardCheck, RefreshCw, Copy, Users, Trash2, LayoutDashboard } from 'lucide-react'
+import OpsOverview from './OpsOverview.jsx'
 import * as adminApi from '../../api/admin.js'
 import * as opsApi from '../../api/ops.js'
 import './OpsConsole.css'
@@ -705,19 +706,24 @@ function PermissionsSection({ connectors, onModuleDisabled }) {
 
 // ============================================================ 页面
 
+// 设计稿只有三个 tab（总览/白名单配置/连接器管理），这里多留两个：
+// - 「审批队列」：总览上的审批卡片只列**待审批**，历史（已完成/失败/已拒绝）在这里。
+//   总览是大屏、看当下；队列是台账、看过去。砍掉它等于丢掉审批历史的入口。
+// - 「授权管理」：设计稿制作时 role_ops_systems 还没落地，不是设计上不要。
 const SECTIONS = [
-  { value: 'connectors', label: '连接器', icon: Plug },
-  { value: 'scopes', label: '允许范围', icon: ShieldCheck },
-  { value: 'approvals', label: '审批队列', icon: ClipboardCheck },
+  { value: 'overview', label: '总览', icon: LayoutDashboard, everyone: true },
+  { value: 'approvals', label: '审批队列', icon: ClipboardCheck, everyone: true },
+  { value: 'scopes', label: '白名单配置', icon: ShieldCheck },
+  { value: 'connectors', label: '连接器管理', icon: Plug },
   { value: 'permissions', label: '授权管理', icon: Users },
 ]
 
 export default function OpsConsole({ canManage = true }) {
-  // 连接器 / 允许范围 / 授权管理 三个分段都是 org_admin 专属（后端也只对 org_admin
-  // 开放）。被授予 can_view/can_approve 的普通员工只该看到审批队列——给他看三个
-  // 点进去必然 403 的分段，跟"导航入口本身要按权限藏起来"是同一个道理。
-  const sections = canManage ? SECTIONS : SECTIONS.filter((s) => s.value === 'approvals')
-  const [section, setSection] = useState(canManage ? 'connectors' : 'approvals')
+  // 白名单/连接器/授权三个分段是 org_admin 专属（后端也只对 org_admin 开放）。
+  // 被授予 can_view/can_approve 的普通员工只看总览和审批队列——给他看点进去
+  // 必然 403 的分段，跟"导航入口本身要按权限藏起来"是同一个道理。
+  const sections = canManage ? SECTIONS : SECTIONS.filter((s) => s.everyone)
+  const [section, setSection] = useState('overview')
   const [moduleDisabled, setModuleDisabled] = useState(false)
   const [connectors, setConnectors] = useState([])
   const [booting, setBooting] = useState(true)
@@ -725,36 +731,75 @@ export default function OpsConsole({ canManage = true }) {
   const onModuleDisabled = useCallback(() => setModuleDisabled(true), [])
   const onConnectorsLoaded = useCallback((list) => { setConnectors(list); setBooting(false) }, [])
 
+  // 连接器列表在**控制台这一层**拉，不在「连接器管理」分段里拉——默认落在
+  // 「总览」时那个分段根本不会挂载，而「白名单配置」「授权管理」都需要这份列表
+  // 来渲染下拉框。放在分段里拉会让它们误显示"先登记至少一个连接器"，
+  // 而实际上连接器是有的、只是没人去拉过。
   useEffect(() => {
-    // 连接器列表是这个页面的第一个请求，它同时充当"模块开没开"的探测。
+    let cancelled = false
+    if (!canManage) { setBooting(false); return undefined }
+    opsApi.listConnectors()
+      .then((list) => { if (!cancelled) { setConnectors(list); setBooting(false) } })
+      .catch((error) => {
+        if (cancelled) return
+        // 这个请求同时充当"模块开没开"的探测：后端未开通时统一 403。
+        if (opsApi.isModuleDisabledError(error)) setModuleDisabled(true)
+        setBooting(false)
+      })
+    return () => { cancelled = true }
+  }, [canManage])
+
+  useEffect(() => {
+    // 兜底：万一上面的请求既没成功也没失败（网络挂起），别让两个分段永远转圈。
     // ⚠️ 这是权宜之计：真正该做的是让导航入口本身按开关显示/隐藏，而不是让
     // 用户点进来才发现。做不了的原因是 aiops_module_enabled 目前**没有任何
     // GET 接口暴露**（OrganizationSummary / AdminOrganizationResponse 都没有
     // 这个字段），前端无从提前知道。已反馈给后端那条线，字段加上之后：
     // AdminPanel.jsx 里按 meProfile.organization.aiops_module_enabled 决定
     // 要不要 push 这个 tab，这里的探测逻辑可以保留当兜底。
-    const t = setTimeout(() => setBooting(false), 3000)
+    const t = setTimeout(() => setBooting(false), 8000)
     return () => clearTimeout(t)
   }, [])
 
   if (moduleDisabled) return <ModuleDisabled />
 
   return (
+    // antd 组件的深色化走 darkAlgorithm，不手写覆盖 antd 内部类名——那种覆盖
+    // 在版本升级时必然碎掉，而且弹窗/气泡这类挂在 portal 上的组件也盖不全
+    // （ConfigProvider 的 context 能穿透 portal，CSS 选择器不能）。
+    // token 取自 OpsConsole.css 里那套（设计稿的深色 NOC 配色），两边保持一致。
+    <ConfigProvider
+      theme={{
+        algorithm: theme.darkAlgorithm,
+        token: {
+          colorBgBase: '#12131a',
+          colorPrimary: '#8b7ffb',
+          colorSuccess: '#34d399',
+          colorWarning: '#fbbf24',
+          colorError: '#f8717a',
+          borderRadius: 8,
+        },
+      }}
+    >
     <div className="ops-console">
-      <Segmented
-        className="ops-console-nav"
-        value={section}
-        onChange={setSection}
-        options={sections.map((s) => ({
-          value: s.value,
-          label: (
-            <Space size={6}>
-              <s.icon size={14} />
-              {s.label}
-            </Space>
-          ),
-        }))}
-      />
+      <nav className="ops-tabnav" role="tablist" aria-label="运维塔台导航">
+        {sections.map((s) => (
+          <button
+            key={s.value}
+            role="tab"
+            aria-selected={section === s.value}
+            className={`ops-tabbtn ${section === s.value ? 'active' : ''}`}
+            onClick={() => setSection(s.value)}
+          >
+            <s.icon size={14} />
+            {s.label}
+          </button>
+        ))}
+      </nav>
+
+      {section === 'overview' && (
+        <OpsOverview canManage={canManage} onModuleDisabled={onModuleDisabled} />
+      )}
 
       {section === 'connectors' && canManage && (
         <ConnectorsSection onModuleDisabled={onModuleDisabled} onConnectorsLoaded={onConnectorsLoaded} />
@@ -767,5 +812,6 @@ export default function OpsConsole({ canManage = true }) {
         booting ? <Spin /> : <PermissionsSection connectors={connectors} onModuleDisabled={onModuleDisabled} />
       )}
     </div>
+    </ConfigProvider>
   )
 }
