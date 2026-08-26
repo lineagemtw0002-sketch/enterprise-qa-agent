@@ -18,6 +18,7 @@
 """
 
 from pathlib import Path
+import os
 from typing import Callable, List, Optional, Dict, Any, Tuple
 import time
 
@@ -600,7 +601,11 @@ class IngestionPipeline:
                 trace=trace,
             )
             logger.info(f"      Index built for {len(sparse_stats)} documents")
-            
+
+            # 6b-2: OpenSearch 影子写（docs/opensearch_migration_design.md 阶段 2）
+            # 读路径完全不受影响，仍走 BM25 + Chroma。
+            self._mirror_to_opensearch(chunks, sparse_stats, dense_vectors, document)
+
             # 6c: 图片索引登记
             # 注意：PdfLoader 已负责落盘图片文件，这里只登记“可检索索引”。
             logger.info("  6c. Image Storage Index...")
@@ -805,6 +810,74 @@ class IngestionPipeline:
                     logger.info(f"  Rolled back image index {img_id}")
                 except Exception as rollback_e:
                     logger.warning(f"  Failed to rollback image {img_id}: {rollback_e}")
+
+    def _mirror_to_opensearch(
+        self,
+        chunks: List[Any],
+        sparse_stats: List[Dict[str, Any]],
+        dense_vectors: List[Any],
+        document: Any,
+    ) -> None:
+        """把本次摄入的 chunk 镜像进 OpenSearch。**失败不阻断摄入。**
+
+        阶段 2 里 OpenSearch 没有任何生产读者，一次镜像失败不该让整篇文档摄入
+        失败——那是拿"还没人用的新后端"去阻断"正在用的老链路"。
+        但**必须以 ERROR 记下来**：两边静默分歧正是让切读变危险的东西，
+        切读之前要能从日志里查到哪个 collection 什么时候掉过队。
+
+        这个取舍和 SQLite 那一轮一致（bm25_indexer._mirror_to_sqlite），
+        当时的经验是：fail-soft 没问题，静默才是问题。
+        """
+        if os.getenv("RAGENT_OPENSEARCH_DUAL_WRITE", "true").strip().lower() == "false":
+            return
+        try:
+            from src.libs.search.opensearch_store import (
+                OpenSearchStore,
+                build_chunk_doc,
+                kb_index_name,
+                tokenize_for_index,
+            )
+
+            store = OpenSearchStore()
+            index = kb_index_name(self.collection)
+            docs = []
+            for i, (chunk, stat) in enumerate(zip(chunks, sparse_stats)):
+                text = chunk.text
+                docs.append(
+                    build_chunk_doc(
+                        text=text,
+                        tokens=tokenize_for_index(text),
+                        source_path=chunk.metadata["source_path"],
+                        chunk_index=chunk.metadata.get("chunk_index", i),
+                        chunk_id=stat["chunk_id"],
+                        doc_hash=getattr(document, "id", None),
+                    )
+                )
+            store.index_chunks(index, docs, refresh=False)
+
+            # ⚠️ 这一步不能省：文档被编辑后**变短**时，前 N 个 chunk 会被确定性
+            # _id 覆盖，但原来更长的那部分不会被任何新 chunk 覆盖。
+            # 少了它，P0#1 只解决一半。
+            stale = store.delete_stale_chunks(
+                index,
+                chunks[0].metadata["source_path"] if chunks else "",
+                keep_count=len(chunks),
+            )
+            logger.info(
+                f"      OpenSearch 影子写 {len(docs)} 条"
+                + (f"，清理旧残留 {stale} 条" if stale else "")
+            )
+        except Exception as exc:  # noqa: BLE001 —— 见 docstring，刻意不向上抛
+            logger.error(
+                "OpenSearch 影子写失败，该 collection 的副本已与主存储分歧；"
+                "切读前必须重建。collection=%s err=%s",
+                self.collection,
+                exc,
+                extra={
+                    "event": "opensearch.dual_write_failed",
+                    "collection": self.collection,
+                },
+            )
 
     def close(self) -> None:
         """释放外部资源。

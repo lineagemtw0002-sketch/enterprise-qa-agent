@@ -224,11 +224,20 @@ class OpenSearchStore:
     缺陷一起带过去。
     """
 
-    def __init__(self, url: Optional[str] = None, dense_dims: Optional[int] = None):
+    def __init__(
+        self,
+        url: Optional[str] = None,
+        dense_dims: Optional[int] = None,
+        k1: float = 1.5,
+        b: float = 0.75,
+    ):
         from opensearchpy import OpenSearch
 
         self.url = url or os.getenv("RAGENT_OPENSEARCH_URL", _DEFAULT_URL)
         self.dense_dims = dense_dims
+        # 默认值与 BM25Indexer 一致（k1=1.5, b=0.75），不是 Lucene 的默认。
+        self.k1 = k1
+        self.b = b
         self._client = OpenSearch(
             hosts=[self.url],
             http_compress=True,
@@ -253,6 +262,18 @@ class OpenSearchStore:
                         "number_of_replicas": 0,
                         # knn_vector 字段要求打开这个开关，即使暂时不查
                         "knn": bool(self.dense_dims),
+                        # ⚠️ 对齐项目现有 BM25 的参数。**Lucene 默认 k1=1.2，
+                        # 而 BM25Indexer 用的是 k1=1.5** —— 不对齐的话，
+                        # 迁移比对会看到排序差异，却分不清是"换引擎导致的"
+                        # 还是"参数没对齐导致的"。可配置的东西必须先对齐，
+                        # 剩下的差异才归因得到引擎本身。
+                        "similarity": {
+                            "default": {
+                                "type": "BM25",
+                                "k1": self.k1,
+                                "b": self.b,
+                            }
+                        },
                     }
                 },
                 "mappings": _mapping(self.dense_dims),
