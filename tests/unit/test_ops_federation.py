@@ -325,3 +325,42 @@ class TestConnectorHealth:
         t = FakeTransport()
         assert await _engine(t, directory=FakeDirectory({})).connector_health("org_new") == []
         assert t.online_calls == []
+
+
+class TestOpsStoreDirectory:
+    """存储层适配器——只取 id 和名字，不让检索层跟存储 schema 绑死。"""
+
+    @pytest.mark.asyncio
+    async def test_maps_store_rows_to_connection_refs(self):
+        from src.ops.store_adapters import OpsStoreDirectory
+
+        class Row:
+            def __init__(self, cid, name):
+                self.connection_id, self.name = cid, name
+                self.last_heartbeat_at = 123.0      # 存储层的其余字段
+                self.approval_timeout_minutes = 30  # 适配器不该关心它们
+
+        class FakeStore:
+            async def list_connectors_for_org(self, org_id):
+                return [Row("c1", "Prometheus"), Row("c2", "自建日志")]
+
+        refs = await OpsStoreDirectory(FakeStore()).list_for_org(ORG_A)
+        assert [(r.connection_id, r.system_name) for r in refs] == [
+            ("c1", "Prometheus"), ("c2", "自建日志")]
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_id_when_name_is_missing(self):
+        """名字是给用户看的（"来自「XX」的数据不可用"）。缺名字时用 id 兜底，
+        不能让降级提示变成"来自「None」的数据不可用"。"""
+        from src.ops.store_adapters import OpsStoreDirectory
+
+        class Row:
+            connection_id = "c9"
+            name = None
+
+        class FakeStore:
+            async def list_connectors_for_org(self, org_id):
+                return [Row()]
+
+        refs = await OpsStoreDirectory(FakeStore()).list_for_org(ORG_A)
+        assert refs[0].system_name == "c9"
