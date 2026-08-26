@@ -1,0 +1,239 @@
+{
+  "generated_at": "2026-08-26T16:07:30.017564+00:00",
+  "script": "scripts/benchmark_ollama_concurrency.py",
+  "model": "qwen2.5:7b",
+  "num_predict": 200,
+  "num_parallel_label": "1",
+  "code_state": {
+    "commit": "564670d",
+    "commit_full": "564670d028980f1e93550c4476b0adf502ad531b",
+    "branch": "fix/p0-security-and-project-conventions",
+    "dirty_paths": [
+      "?? scripts/benchmark_ollama_concurrency.py"
+    ],
+    "is_clean": false
+  },
+  "concurrency_levels": [
+    {
+      "concurrency": 1,
+      "runs": [
+        {
+          "concurrency": 1,
+          "wall_s": 9.551503082999261,
+          "errors": 0,
+          "error_samples": [],
+          "ok_count": 1,
+          "per_request_latency_s": {
+            "min": 9.551158208021661,
+            "median": 9.551158208021661,
+            "max": 9.551158208021661
+          },
+          "aggregate_tokens_per_s": 20.939112751372125,
+          "total_eval_tokens": 200
+        },
+        {
+          "concurrency": 1,
+          "wall_s": 12.429504291008925,
+          "errors": 0,
+          "error_samples": [],
+          "ok_count": 1,
+          "per_request_latency_s": {
+            "min": 12.429108834010549,
+            "median": 12.429108834010549,
+            "max": 12.429108834010549
+          },
+          "aggregate_tokens_per_s": 16.09074628540682,
+          "total_eval_tokens": 200
+        }
+      ],
+      "representative": {
+        "concurrency": 1,
+        "wall_s": 9.551503082999261,
+        "errors": 0,
+        "error_samples": [],
+        "ok_count": 1,
+        "per_request_latency_s": {
+          "min": 9.551158208021661,
+          "median": 9.551158208021661,
+          "max": 9.551158208021661
+        },
+        "aggregate_tokens_per_s": 20.939112751372125,
+        "total_eval_tokens": 200
+      }
+    },
+    {
+      "concurrency": 2,
+      "runs": [
+        {
+          "concurrency": 2,
+          "wall_s": 22.0375950410089,
+          "errors": 0,
+          "error_samples": [],
+          "ok_count": 2,
+          "per_request_latency_s": {
+            "min": 11.728091666998807,
+            "median": 16.882648603990674,
+            "max": 22.03720554098254
+          },
+          "aggregate_tokens_per_s": 18.15080090434803,
+          "total_eval_tokens": 400
+        },
+        {
+          "concurrency": 2,
+          "wall_s": 19.158367958007148,
+          "errors": 0,
+          "error_samples": [],
+          "ok_count": 2,
+          "per_request_latency_s": {
+            "min": 9.765161834016908,
+            "median": 14.461251063010423,
+            "max": 19.157340292003937
+          },
+          "aggregate_tokens_per_s": 20.878605154507532,
+          "total_eval_tokens": 400
+        }
+      ],
+      "representative": {
+        "concurrency": 2,
+        "wall_s": 19.158367958007148,
+        "errors": 0,
+        "error_samples": [],
+        "ok_count": 2,
+        "per_request_latency_s": {
+          "min": 9.765161834016908,
+          "median": 14.461251063010423,
+          "max": 19.157340292003937
+        },
+        "aggregate_tokens_per_s": 20.878605154507532,
+        "total_eval_tokens": 400
+      }
+    },
+    {
+      "concurrency": 4,
+      "runs": [
+        {
+          "concurrency": 4,
+          "wall_s": 38.863785249996,
+          "errors": 0,
+          "error_samples": [],
+          "ok_count": 4,
+          "per_request_latency_s": {
+            "min": 10.060021624987712,
+            "median": 24.671424020503764,
+            "max": 38.861992209014716
+          },
+          "aggregate_tokens_per_s": 20.58471646171116,
+          "total_eval_tokens": 800
+        },
+        {
+          "concurrency": 4,
+          "wall_s": 38.48045075000846,
+          "errors": 0,
+          "error_samples": [],
+          "ok_count": 4,
+          "per_request_latency_s": {
+            "min": 9.85382912500063,
+            "median": 24.3798848749866,
+            "max": 38.478283125004964
+          },
+          "aggregate_tokens_per_s": 20.789777261115482,
+          "total_eval_tokens": 800
+        }
+      ],
+      "representative": {
+        "concurrency": 4,
+        "wall_s": 38.48045075000846,
+        "errors": 0,
+        "error_samples": [],
+        "ok_count": 4,
+        "per_request_latency_s": {
+          "min": 9.85382912500063,
+          "median": 24.3798848749866,
+          "max": 38.478283125004964
+        },
+        "aggregate_tokens_per_s": 20.789777261115482,
+        "total_eval_tokens": 800
+      }
+    },
+    {
+      "concurrency": 6,
+      "runs": [
+        {
+          "concurrency": 6,
+          "wall_s": 60.563870125013636,
+          "errors": 0,
+          "error_samples": [],
+          "ok_count": 6,
+          "per_request_latency_s": {
+            "min": 12.135102250002092,
+            "median": 36.875944500017795,
+            "max": 60.56276383300428
+          },
+          "aggregate_tokens_per_s": 19.813793232219236,
+          "total_eval_tokens": 1200
+        },
+        {
+          "concurrency": 6,
+          "wall_s": 56.05659329201444,
+          "errors": 0,
+          "error_samples": [],
+          "ok_count": 6,
+          "per_request_latency_s": {
+            "min": 9.582750583998859,
+            "median": 32.72381616650091,
+            "max": 56.054939249996096
+          },
+          "aggregate_tokens_per_s": 21.406937695069427,
+          "total_eval_tokens": 1200
+        }
+      ],
+      "representative": {
+        "concurrency": 6,
+        "wall_s": 56.05659329201444,
+        "errors": 0,
+        "error_samples": [],
+        "ok_count": 6,
+        "per_request_latency_s": {
+          "min": 9.582750583998859,
+          "median": 32.72381616650091,
+          "max": 56.054939249996096
+        },
+        "aggregate_tokens_per_s": 21.406937695069427,
+        "total_eval_tokens": 1200
+      }
+    }
+  ],
+  "scaling_summary": [
+    {
+      "concurrency": 1,
+      "aggregate_tokens_per_s": 20.939112751372125,
+      "speedup_vs_concurrency_1": 1.0,
+      "ideal_speedup": 1
+    },
+    {
+      "concurrency": 2,
+      "aggregate_tokens_per_s": 20.878605154507532,
+      "speedup_vs_concurrency_1": 0.9971103075100148,
+      "ideal_speedup": 2
+    },
+    {
+      "concurrency": 4,
+      "aggregate_tokens_per_s": 20.789777261115482,
+      "speedup_vs_concurrency_1": 0.9928681080220624,
+      "ideal_speedup": 4
+    },
+    {
+      "concurrency": 6,
+      "aggregate_tokens_per_s": 21.406937695069427,
+      "speedup_vs_concurrency_1": 1.0223421569601436,
+      "ideal_speedup": 6
+    }
+  ],
+  "not_covered": [
+    "只测了单个模型（qwen2.5:7b，generate 节点）的并发形态，1.5b router 模型（_intent_node 用）未测，它的调用频率其实更高",
+    "只在本机（单机 Ollama，Apple Silicon）测过，未覆盖目标部署硬件",
+    "prompt 长度固定，未测长 prompt（如命中检索后拼接大段上下文）下的并发形态",
+    "num_predict 固定为 200，真实生成长度分布未覆盖（CLAUDE.md 记录的长回答场景是 354 字）",
+    "没有跑应用全链路（intent+retrieve+generate）的并发，只测了模型服务这一层"
+  ]
+}
