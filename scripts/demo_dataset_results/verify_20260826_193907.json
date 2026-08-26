@@ -1,0 +1,1478 @@
+{
+  "passed": 78,
+  "failed": 3,
+  "code_state": {
+    "commit": "27817f477112f60294c53073b70c0175e9b9f1f4",
+    "branch": "fix/p0-security-and-project-conventions",
+    "dirty_files": [
+      "D docs/api.md",
+      " M docs/kb_permission_design.md",
+      " D \"docs/test_upload_doc/\\345\\220\\216\\345\\213\\244\\350\\265\\204\\346\\226\\231\\346\\226\\207\\346\\241\\243.md\"",
+      "?? docs/README.md",
+      "?? docs/doc_reorg_plan.md",
+      "?? docs/manual_test_dataset.md",
+      "?? docs/platform_ops_query_design.md",
+      "?? scripts/benchmark_results/latency_20260826_170536.json",
+      "?? scripts/check_doc_links.py",
+      "?? scripts/demo_kb_content/",
+      "?? scripts/generate_demo_kb_dataset.py",
+      "?? scripts/security_results/security_20260826_170211.json",
+      "?? tests/fixtures/prompt_injection/",
+      "?? tests/unit/test_chroma_shared_client_concurrency.py"
+    ],
+    "note": "dirty_files 非空表示这批数字对应的是含未提交改动的工作区"
+  },
+  "positive_scoped": "67/70",
+  "positive_default": "29/70",
+  "results": [
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_hr_admin_kb",
+      "query": "入职满一年后每年有多少天年假？",
+      "keywords": [
+        "15 天",
+        "15天"
+      ],
+      "source": "ACME-HR-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"入职满一年后每年有多少天年假？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.96%\n**来源:** `ACME-HR-001_年假管理办法.txt`\n\n> 文档编号：ACME-HR-001 标题：年假管理办法 所属企业：Acme 有限公司 所属知识库：人力行政知识库 一、天数标准 Acme 有限公司全体正式员工入职满一年后，每年享有 15 天带薪年假。此后司龄每满 3 年增加 1 天， 累计上限为 20 天。试用期内不享有年假。 二、顺延规则 当年度未休完的年假，最多顺延到次年 3 月 31 日，逾期作废，不折算工资、不跨",
+      "default_head": "## 检索结果\n\n针对查询 **\"入职满一年后每年有多少天年假？\"** 找到 4 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.96%\n**来源:** `ACME-HR-001_年假管理办法.txt`\n\n> 文档编号：ACME-HR-001 标题：年假管理办法 所属企业：Acme 有限公司 所属知识库：人力行政知识库 一、天数标准 Acme 有限公司全体正式员工入职满一年后，每年享有 15 天带薪年假。此后司龄每满 3 年增加 1 天， 累计上限为 20 天。试用期内不享有年假。 二、顺延规则 当年度未休完的年假，最多顺延到次年 3 月 31 日，逾期作废，不折算工资、不跨"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_hr_admin_kb",
+      "query": "当年没休完的年假可以顺延到什么时候？",
+      "keywords": [
+        "3 月 31 日",
+        "3月31日",
+        "次年 3 月"
+      ],
+      "source": "ACME-HR-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"当年没休完的年假可以顺延到什么时候？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.93%\n**来源:** `009.txt`\n\n> 客户成功部的年假按司龄计算，入职满一年起每年 15 天，当年未休完的年假可以顺延到次年 3 月底前用完，超期作废，不折算成工资。\n\n### [2] 结果 2\n**相关度:** 99.89%\n**来源:** `003.txt`\n\n> 平台研发部的年假按司龄计算，入职满一年起每年 20 天，当年未休完的年假可以顺延到次年 3 月底前用完，超期作废，不折算成工资。\n\n### [3] 结果 3\n**相",
+      "default_head": "## 检索结果\n\n针对查询 **\"当年没休完的年假可以顺延到什么时候？\"** 找到 3 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.93%\n**来源:** `009.txt`\n\n> 客户成功部的年假按司龄计算，入职满一年起每年 15 天，当年未休完的年假可以顺延到次年 3 月底前用完，超期作废，不折算成工资。\n\n### [2] 结果 2\n**相关度:** 99.89%\n**来源:** `003.txt`\n\n> 平台研发部的年假按司龄计算，入职满一年起每年 20 天，当年未休完的年假可以顺延到次年 3 月底前用完，超期作废，不折算成工资。\n\n### [3] 结果 3\n**相"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_hr_admin_kb",
+      "query": "每个月最多可以远程办公几天？",
+      "keywords": [
+        "8 天",
+        "8天"
+      ],
+      "source": "ACME-HR-006",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"每个月最多可以远程办公几天？\"** 找到 3 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.23%\n**来源:** `ACME-HR-006_远程办公管理规定.txt`\n\n> 文档编号：ACME-HR-006 标题：远程办公管理规定 所属企业：Acme 有限公司 所属知识库：人力行政知识库 一、额度 Acme 有限公司正式员工每月远程办公天数不超过 8 天。试用期员工不适用远程办公。 二、申请 需提前 1 个工作日在 OA 系统提交远程办公申请，由直属主管审批。 三、在岗要求 远程办公期间必须保证核心工作时间在线，会议按时参加，网络与设备问",
+      "default_head": "## 检索结果\n\n针对查询 **\"每个月最多可以远程办公几天？\"** 找到 1 条相关结果:\n\n### [1] 结果 1\n**相关度:** 97.84%\n**来源:** `013.txt`\n\n> 增长研发部的远程办公需要提前一天在 OA 系统提交申请，直属主管审批后生效，每月远程办公天数不超过 8 天，试用期员工暂不适用。\n\n\n---\n\n## 引用来源\n\n- [1] `013.txt`"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_hr_admin_kb",
+      "query": "正式员工和试用期员工的离职通知期分别是多少天？",
+      "keywords": [
+        "30 天",
+        "30天"
+      ],
+      "source": "ACME-HR-008",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"正式员工和试用期员工的离职通知期分别是多少天？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.91%\n**来源:** `ACME-HR-008_离职管理与交接规范.txt`\n\n> 文档编号：ACME-HR-008 标题：离职管理与交接规范 所属企业：Acme 有限公司 所属知识库：人力行政知识库 一、通知期 正式员工离职需提前 30 天提交书面离职申请；试用期内离职提前 3 天。 二、交接 交接清单需经直属主管逐项确认签字，涉及生产系统权限的岗位还需 IT 运维部会签。 三、结算 离职结算在最后工作日之后的 15 个工作日内",
+      "default_head": "## 未找到相关结果\n\n查询: **正式员工和试用期员工的离职通知期分别是多少天？**\n\n在集合 `acme_customer_success_kb`、`acme_finance_kb`、`acme_sales_marketing_kb`、`acme_it_support_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_hr_admin_kb",
+      "query": "公司的核心工作时间是几点到几点？",
+      "keywords": [
+        "10:00",
+        "16:00"
+      ],
+      "source": "ACME-HR-005",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"公司的核心工作时间是几点到几点？\"** 找到 2 条相关结果:\n\n### [1] 结果 1\n**相关度:** 97.79%\n**来源:** `ACME-HR-005_考勤打卡与弹性工作制.txt`\n\n> 文档编号：ACME-HR-005 标题：考勤打卡与弹性工作制 所属企业：Acme 有限公司 所属知识库：人力行政知识库 一、核心工作时间 Acme 有限公司实行弹性工作制，核心工作时间为每个工作日 10:00 至 16:00，此时段内必须在岗（含远程在岗）。 二、打卡 上班打卡时间不晚于 9:30，弹性区间为 30 分钟，即 9:30 之后打卡计为迟到。 三、",
+      "default_head": "## 未找到相关结果\n\n查询: **公司的核心工作时间是几点到几点？**\n\n在集合 `acme_sales_marketing_kb`、`acme_it_support_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_finance_kb",
+      "query": "报销单笔超过多少金额需要 CFO 审批？",
+      "keywords": [
+        "20000",
+        "20,000",
+        "2 万",
+        "2万"
+      ],
+      "source": "ACME-FIN-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"报销单笔超过多少金额需要 CFO 审批？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.69%\n**来源:** `ACME-FIN-001_费用报销审批权限总则.txt`\n\n> 文档编号：ACME-FIN-001 标题：费用报销审批权限总则 所属企业：Acme 有限公司 所属知识库：财务知识库 一、审批层级 Acme 有限公司日常费用报销审批权限：单笔 2000 元及以内由直属主管审批； 超过 2000 元至 20000 元由财务负责人联签；超过 20000 元须 CFO 审批。 二、发票要求 发票抬头必须为「Acme 有限",
+      "default_head": "## 检索结果\n\n针对查询 **\"报销单笔超过多少金额需要 CFO 审批？\"** 找到 4 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.61%\n**来源:** `ACME-FIN-007_采购审批与比价规则.txt`\n\n> 文档编号：ACME-FIN-007 标题：采购审批与比价规则 所属企业：Acme 有限公司 所属知识库：财务知识库 一、审批权限 单笔采购金额低于 5000 元由部门负责人审批；5000 元至 50000 元由财务负责人联签； 超过 50000 元须 CFO 审批。 二、比价 单笔采购超过 50000 元的，必须取得三家及以上供应商的书面报价并留存比价"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_finance_kb",
+      "query": "去一线城市出差，住宿费每晚上限是多少？",
+      "keywords": [
+        "600"
+      ],
+      "source": "ACME-FIN-003",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"去一线城市出差，住宿费每晚上限是多少？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.18%\n**来源:** `ACME-FIN-115_数据研发部差旅频次与费用口径.txt`\n\n> 文档编号：ACME-FIN-115 标题：数据研发部差旅频次与费用口径 所属企业：Acme 有限公司 所属知识库：财务知识库 一、频次 数据研发部年度出差人次约 25 人次，主要目的地为北京（数据合作方）。 二、标准 住宿与交通标准统一执行公司差旅标准，一线城市住宿上限 600 元每晚，伙食补贴 120 元每天。 三、审批 3 天以内出差由直属",
+      "default_head": "## 检索结果\n\n针对查询 **\"去一线城市出差，住宿费每晚上限是多少？\"** 找到 1 条相关结果:\n\n### [1] 结果 1\n**相关度:** 97.86%\n**来源:** `ACME-FIN-003_差旅住宿费标准.txt`\n\n> 文档编号：ACME-FIN-003 标题：差旅住宿费标准 所属企业：Acme 有限公司 所属知识库：财务知识库 Acme 有限公司差旅住宿费上限（每人每晚，含税）： - 一线城市（北京、上海、广州、深圳）：600 元 - 二线省会城市：400 元 - 其他城市：300 元 超标部分自理。两人以上同性别同行出差鼓励合住，合住可按人均上限的 1.5 倍预订一间房"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_finance_kb",
+      "query": "出差期间伙食补贴每天多少钱？",
+      "keywords": [
+        "120"
+      ],
+      "source": "ACME-FIN-005",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"出差期间伙食补贴每天多少钱？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.98%\n**来源:** `ACME-FIN-005_出差伙食补贴标准.txt`\n\n> 文档编号：ACME-FIN-005 标题：出差伙食补贴标准 所属企业：Acme 有限公司 所属知识库：财务知识库 一、标准 出差期间伙食补贴为每人每天 120 元，按实际出差天数计发，无需提供发票。 二、不重复 当日已由公司或客户安排招待用餐的，该餐次不重复发放补贴，按每餐 40 元扣减。 三、当日往返 当日往返且离开办公地满 6 小时的，按半天 60 元计发。\n\n",
+      "default_head": "## 检索结果\n\n针对查询 **\"出差期间伙食补贴每天多少钱？\"** 找到 1 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.98%\n**来源:** `ACME-FIN-005_出差伙食补贴标准.txt`\n\n> 文档编号：ACME-FIN-005 标题：出差伙食补贴标准 所属企业：Acme 有限公司 所属知识库：财务知识库 一、标准 出差期间伙食补贴为每人每天 120 元，按实际出差天数计发，无需提供发票。 二、不重复 当日已由公司或客户安排招待用餐的，该餐次不重复发放补贴，按每餐 40 元扣减。 三、当日往返 当日往返且离开办公地满 6 小时的，按半天 60 元计发。\n\n"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_finance_kb",
+      "query": "采购金额超过多少必须三家比价？",
+      "keywords": [
+        "50000",
+        "50,000",
+        "5 万",
+        "5万"
+      ],
+      "source": "ACME-FIN-007",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"采购金额超过多少必须三家比价？\"** 找到 3 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.58%\n**来源:** `ACME-FIN-007_采购审批与比价规则.txt`\n\n> 文档编号：ACME-FIN-007 标题：采购审批与比价规则 所属企业：Acme 有限公司 所属知识库：财务知识库 一、审批权限 单笔采购金额低于 5000 元由部门负责人审批；5000 元至 50000 元由财务负责人联签； 超过 50000 元须 CFO 审批。 二、比价 单笔采购超过 50000 元的，必须取得三家及以上供应商的书面报价并留存比价记录备查。",
+      "default_head": "## 未找到相关结果\n\n查询: **采购金额超过多少必须三家比价？**\n\n在集合 `acme_customer_success_kb`、`acme_sales_marketing_kb`、`acme_rd_product_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_finance_kb",
+      "query": "员工因公借款单次上限是多少？",
+      "keywords": [
+        "20000",
+        "20,000",
+        "2 万",
+        "2万"
+      ],
+      "source": "ACME-FIN-011",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"员工因公借款单次上限是多少？\"** 找到 3 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.86%\n**来源:** `ACME-FIN-000_现行标准速查表_统一口径.txt`\n\n> 文档编号：ACME-FIN-000 标题：现行标准速查表（统一口径） 所属企业：Acme 有限公司 所属知识库：财务知识库 本表是 Acme 有限公司财务与报销制度的现行统一口径，自 2026-01-01 起施行。此前各部门自行沿用的审批金额门槛一律停止适用，如有不一致以本表为准。 1. 【报销审批门槛】单笔 2000 元及以内由直属主管审批；超过 2000",
+      "default_head": "## 未找到相关结果\n\n查询: **员工因公借款单次上限是多少？**\n\n在集合 `acme_it_support_kb`、`acme_sales_marketing_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_it_support_kb",
+      "query": "域账号密码多久强制更换一次？",
+      "keywords": [
+        "90 天",
+        "90天"
+      ],
+      "source": "ACME-IT-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"域账号密码多久强制更换一次？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.98%\n**来源:** `013.txt`\n\n> 安全合规部的域账号密码每 60 天强制更换一次，新密码不能与最近 5 次使用过的密码重复，连续输错 5 次会锁定账号 30 分钟，需要联系 IT 分机解锁。\n\n### [2] 结果 2\n**相关度:** 99.98%\n**来源:** `010.txt`\n\n> 数据研发部的域账号密码每 60 天强制更换一次，新密码不能与最近 5 次使用过的密码重复，连续输错 5 次会锁定账号 30 分钟，需要联系 IT",
+      "default_head": "## 未找到相关结果\n\n查询: **域账号密码多久强制更换一次？**\n\n在集合 `acme_sales_marketing_kb`、`acme_rd_product_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_it_support_kb",
+      "query": "密码连续输错几次会锁定账号，锁多久？",
+      "keywords": [
+        "5 次",
+        "5次",
+        "30 分钟",
+        "30分钟"
+      ],
+      "source": "ACME-IT-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"密码连续输错几次会锁定账号，锁多久？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.92%\n**来源:** `013.txt`\n\n> 安全合规部的域账号密码每 60 天强制更换一次，新密码不能与最近 5 次使用过的密码重复，连续输错 5 次会锁定账号 30 分钟，需要联系 IT 分机解锁。\n\n### [2] 结果 2\n**相关度:** 99.91%\n**来源:** `010.txt`\n\n> 数据研发部的域账号密码每 60 天强制更换一次，新密码不能与最近 5 次使用过的密码重复，连续输错 5 次会锁定账号 30 分钟，需要联",
+      "default_head": "## 未找到相关结果\n\n查询: **密码连续输错几次会锁定账号，锁多久？**\n\n在集合 `acme_customer_success_kb`、`acme_rd_product_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_it_support_kb",
+      "query": "堡垒机会话录像保留多少天？",
+      "keywords": [
+        "180 天",
+        "180天"
+      ],
+      "source": "ACME-IT-004",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"堡垒机会话录像保留多少天？\"** 找到 4 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.98%\n**来源:** `006.txt`\n\n> 安全合规部访问生产环境数据库一律通过堡垒机跳转，禁止个人电脑直连，堡垒机会话全程录屏留存 180 天，供安全审计追溯。\n\n### [2] 结果 2\n**相关度:** 99.98%\n**来源:** `016.txt`\n\n> IT 运维部访问生产环境数据库一律通过堡垒机跳转，禁止个人电脑直连，堡垒机会话全程录屏留存 90 天，供安全审计追溯。\n\n### [3] 结果 3\n**相关度:** 99.97%\n**",
+      "default_head": "## 未找到相关结果\n\n查询: **堡垒机会话录像保留多少天？**\n\n在集合 `acme_rd_product_kb`、`acme_it_support_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_it_support_kb",
+      "query": "P1 级 IT 工单要求多久内响应？",
+      "keywords": [
+        "30 分钟",
+        "30分钟"
+      ],
+      "source": "ACME-IT-005",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"P1 级 IT 工单要求多久内响应？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.93%\n**来源:** `ACME-IT-005_IT_工单分级与响应时效.txt`\n\n> 文档编号：ACME-IT-005 标题：IT 工单分级与响应时效 所属企业：Acme 有限公司 所属知识库：IT支持知识库 Acme 有限公司 IT 工单分为三级： - P1（影响多人或生产系统不可用）：30 分钟内响应，2 小时内给出临时方案。 - P2（影响单人核心工作）：2 小时内响应，1 个工作日内解决。 - P3（一般咨询与非紧急需求）：1 ",
+      "default_head": "## 检索结果\n\n针对查询 **\"P1 级 IT 工单要求多久内响应？\"** 找到 4 条相关结果:\n\n### [1] 结果 1\n**相关度:** 89.63%\n**来源:** `ACME-IT-153_计费结算服务值班与升级路径.txt`\n\n> 计费结算服务值班与升级路径 一、值班 计费结算服务实行工作日值班 + 非工作时间轮值，值班表在 IT 门户可查。 二、升级 P1 故障 20 分钟内未响应自动升级至值班经理，90 分钟未止血升级至部门负责人。 三、复盘 P1 故障须在 48 小时内完成复盘并归档。 （Acme 有限公司 · IT支持知识库 文档编号 ACME-IT-153）\n\n###"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_it_support_kb",
+      "query": "收到钓鱼邮件应该转发到哪个邮箱？",
+      "keywords": [
+        "security@acme.internal"
+      ],
+      "source": "ACME-IT-007",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"收到钓鱼邮件应该转发到哪个邮箱？\"** 找到 4 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.95%\n**来源:** `003.txt`\n\n> 发现钓鱼邮件应直接转发给 security@acme.internal 并删除，不要点击其中链接或下载附件，安全团队会在 1 个工作日内确认是否需要全员预警。\n\n### [2] 结果 2\n**相关度:** 99.82%\n**来源:** `PROBE-IT-B_钓鱼邮件上报邮箱.txt`\n\n> 收到钓鱼邮件不要点击链接或下载附件，直接转发至 security@acme.internal 后删除，安全",
+      "default_head": "## 未找到相关结果\n\n查询: **收到钓鱼邮件应该转发到哪个邮箱？**\n\n在集合 `acme_sales_marketing_kb`、`acme_it_support_kb`、`acme_customer_success_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_rd_product_kb",
+      "query": "代码合并到主分支需要几名评审人通过？",
+      "keywords": [
+        "2 名",
+        "2名",
+        "两名"
+      ],
+      "source": "ACME-RD-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"代码合并到主分支需要几名评审人通过？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.99%\n**来源:** `006.txt`\n\n> 数据研发部的代码合并要求至少 3 名评审人通过，且 CI 流水线（Jenkins）全部检查项为绿色才允许合并到主分支，禁止使用 --no-verify 之类的方式跳过检查。\n\n### [2] 结果 2\n**相关度:** 99.99%\n**来源:** `007.txt`\n\n> 平台研发部的代码合并要求至少 2 名评审人通过，且 CI 流水线（Grafana）全部检查项为绿色才允许合并到主分支，禁",
+      "default_head": "## 检索结果\n\n针对查询 **\"代码合并到主分支需要几名评审人通过？\"** 找到 4 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.99%\n**来源:** `006.txt`\n\n> 数据研发部的代码合并要求至少 3 名评审人通过，且 CI 流水线（Jenkins）全部检查项为绿色才允许合并到主分支，禁止使用 --no-verify 之类的方式跳过检查。\n\n### [2] 结果 2\n**相关度:** 99.99%\n**来源:** `007.txt`\n\n> 平台研发部的代码合并要求至少 2 名评审人通过，且 CI 流水线（Grafana）全部检查项为绿色才允许合并到主分支，禁"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_rd_product_kb",
+      "query": "常规发布窗口是什么时候？",
+      "keywords": [
+        "周四",
+        "20:00"
+      ],
+      "source": "ACME-RD-003",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"常规发布窗口是什么时候？\"** 找到 2 条相关结果:\n\n### [1] 结果 1\n**相关度:** 97.35%\n**来源:** `ACME-RD-000_现行标准速查表_统一口径.txt`\n\n> 文档编号：ACME-RD-000 标题：现行标准速查表（统一口径） 所属企业：Acme 有限公司 所属知识库：研发产品知识库 本表是 Acme 有限公司研发与产品规范的现行统一口径，自 2026-01-01 起施行。此前各团队自行约定的评审人数、限流阈值等口径一律停止适用，全公司统一执行本表标准。 1. 【代码评审人数】每个合并请求须至少 2 名评审人通过，且 C",
+      "default_head": "## 检索结果\n\n针对查询 **\"常规发布窗口是什么时候？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 81.16%\n**来源:** `ACME-IT-117_计费结算服务变更窗口与发布约束.txt`\n\n> 计费结算服务变更窗口与发布约束 一、窗口 计费结算服务的常规变更窗口为每周 周二 22:00-次日 01:00，窗口外变更须部门负责人与值班经理双方同意。 二、冻结期 每季度末最后 3 个工作日为变更冻结期，仅允许故障修复类变更。 三、回滚 变更须准备回滚方案，要求 15 分钟内可回滚到变更前版本。 （Acme 有限公司 · IT支持知识库 文档编号 ACM"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_rd_product_kb",
+      "query": "P0 级线上故障要求多久内止血？",
+      "keywords": [
+        "1 小时",
+        "1小时"
+      ],
+      "source": "ACME-RD-004",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"P0 级线上故障要求多久内止血？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.97%\n**来源:** `017.txt`\n\n> 客户成功部的线上问题按严重程度分 P0-P3 四级，P0 要求 15 分钟内响应、1 小时内止血，复盘报告需要在 Jenkins 上归档，48 小时内完成根因分析。\n\n### [2] 结果 2\n**相关度:** 99.95%\n**来源:** `011.txt`\n\n> IT 运维部的线上问题按严重程度分 P0-P3 四级，P0 要求 15 分钟内响应、1 小时内止血，复盘报告需要在 Grafana ",
+      "default_head": "## 检索结果\n\n针对查询 **\"P0 级线上故障要求多久内止血？\"** 找到 2 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.97%\n**来源:** `017.txt`\n\n> 客户成功部的线上问题按严重程度分 P0-P3 四级，P0 要求 15 分钟内响应、1 小时内止血，复盘报告需要在 Jenkins 上归档，48 小时内完成根因分析。\n\n### [2] 结果 2\n**相关度:** 99.95%\n**来源:** `011.txt`\n\n> IT 运维部的线上问题按严重程度分 P0-P3 四级，P0 要求 15 分钟内响应、1 小时内止血，复盘报告需要在 Grafana "
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_rd_product_kb",
+      "query": "企业版客户的 API 限流阈值是多少？",
+      "keywords": [
+        "5000"
+      ],
+      "source": "ACME-RD-008",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"企业版客户的 API 限流阈值是多少？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.62%\n**来源:** `015.txt`\n\n> 搜索索引服务在标准版套餐下的限流阈值是 100 QPS，超出后返回 429，企业版客户可以联系客户成功团队申请提升配额，提升生效前需要走一次容量评估。\n\n### [2] 结果 2\n**相关度:** 99.24%\n**来源:** `019.txt`\n\n> 数据看板服务在标准版套餐下的限流阈值是 5000 QPS，超出后返回 429，企业版客户可以联系客户成功团队申请提升配额，提升生效前需要走一",
+      "default_head": "## 检索结果\n\n针对查询 **\"企业版客户的 API 限流阈值是多少？\"** 找到 1 条相关结果:\n\n### [1] 结果 1\n**相关度:** 98.87%\n**来源:** `ACME-IT-108_API_网关服务容量与限流说明.txt`\n\n> API 网关服务容量与限流说明 一、限流 API 网关服务在标准版套餐下的限流阈值为 1000 QPS，超出返回 429。 二、扩容 企业版客户可申请提升配额，提升生效前须走一次容量评估，评估周期 3 个工作日。 三、观测 当前峰值利用率与配额余量可在 IT 门户的容量看板查询。 （Acme 有限公司 · IT支持知识库 文档编号 ACME-I"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_rd_product_kb",
+      "query": "弃用对外接口需要提前多久公告？",
+      "keywords": [
+        "6 个月",
+        "6个月"
+      ],
+      "source": "ACME-RD-007",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"弃用对外接口需要提前多久公告？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.89%\n**来源:** `ACME-RD-000_现行标准速查表_统一口径.txt`\n\n> 文档编号：ACME-RD-000 标题：现行标准速查表（统一口径） 所属企业：Acme 有限公司 所属知识库：研发产品知识库 本表是 Acme 有限公司研发与产品规范的现行统一口径，自 2026-01-01 起施行。此前各团队自行约定的评审人数、限流阈值等口径一律停止适用，全公司统一执行本表标准。 1. 【代码评审人数】每个合并请求须至少 2 名评审人通过，",
+      "default_head": "## 检索结果\n\n针对查询 **\"弃用对外接口需要提前多久公告？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 54.11%\n**来源:** `ACME-IT-184_搜索索引服务对外状态页与公告口径.txt`\n\n> 搜索索引服务对外状态页与公告口径 一、状态页 搜索索引服务的可用性在公司状态页以「搜索」名称对外展示。 二、公告时限 确认为影响客户的故障后，须在 30 分钟内在状态页发布首次公告，之后每 60 分钟更新一次。 三、口径 公告只描述影响范围与预计恢复时间，不披露内部实现细节与根因推测。 （Acme 有限公司 · IT支持知识库 文档编号 ACME-I"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_sales_marketing_kb",
+      "query": "销售代表最高能给客户多少折扣？",
+      "keywords": [
+        "10%"
+      ],
+      "source": "ACME-SM-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"销售代表最高能给客户多少折扣？\"** 找到 4 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.97%\n**来源:** `020.txt`\n\n> 标准报价单折扣权限：销售代表最高可给 10% 折扣，超出需要销售总监审批，超过 20% 需要 VP 特批，年框合同另有单独折扣政策。\n\n### [2] 结果 2\n**相关度:** 99.96%\n**来源:** `001.txt`\n\n> 标准报价单折扣权限：销售代表最高可给 15% 折扣，超出需要销售总监审批，超过 30% 需要 VP 特批，年框合同另有单独折扣政策。\n\n### [3] 结果 3\n**",
+      "default_head": "## 检索结果\n\n针对查询 **\"销售代表最高能给客户多少折扣？\"** 找到 2 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.97%\n**来源:** `020.txt`\n\n> 标准报价单折扣权限：销售代表最高可给 10% 折扣，超出需要销售总监审批，超过 20% 需要 VP 特批，年框合同另有单独折扣政策。\n\n### [2] 结果 2\n**相关度:** 99.96%\n**来源:** `001.txt`\n\n> 标准报价单折扣权限：销售代表最高可给 15% 折扣，超出需要销售总监审批，超过 30% 需要 VP 特批，年框合同另有单独折扣政策。\n\n\n---\n\n## 引用来源\n\n"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_sales_marketing_kb",
+      "query": "专业版每个用户每月多少钱？",
+      "keywords": [
+        "399"
+      ],
+      "source": "ACME-SM-002",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"专业版每个用户每月多少钱？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 97.60%\n**来源:** `ACME-SM-000_现行标准速查表_统一口径.txt`\n\n> 文档编号：ACME-SM-000 标题：现行标准速查表（统一口径） 所属企业：Acme 有限公司 所属知识库：销售市场知识库 本表是 Acme 有限公司销售与市场政策的现行统一口径，自 2026-01-01 起施行。此前区域或团队自行执行的折扣权限一律停止适用，全公司统一执行本表标准。 1. 【折扣审批权限】销售代表最高 10%，销售总监最高 20%，超过 20",
+      "default_head": "## 未找到相关结果\n\n查询: **专业版每个用户每月多少钱？**\n\n在集合 `acme_rd_product_kb`、`acme_sales_marketing_kb`、`acme_customer_success_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_sales_marketing_kb",
+      "query": "官网线索需要多久内完成首次联系？",
+      "keywords": [
+        "2 小时",
+        "2小时"
+      ],
+      "source": "ACME-SM-004",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"官网线索需要多久内完成首次联系？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.83%\n**来源:** `ACME-SM-004_线索跟进时效.txt`\n\n> 文档编号：ACME-SM-004 标题：线索跟进时效 所属企业：Acme 有限公司 所属知识库：销售市场知识库 一、时效 官网、白皮书下载与展会收集的线索，须在 2 小时内由销售团队完成首次联系。 二、超时 超时未跟进的线索由系统自动分配给下一位空闲销售代表。 三、记录 每次联系须在 CRM 中记录联系方式、沟通结论与下一步动作。 四、无效线索 判定为无效线索须填写原",
+      "default_head": "## 检索结果\n\n针对查询 **\"官网线索需要多久内完成首次联系？\"** 找到 1 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.77%\n**来源:** `014.txt`\n\n> 公司官网线索需在 4 小时内由销售团队跟进联系，超时未跟进的线索会被系统自动分配给下一位空闲销售代表。\n\n\n---\n\n## 引用来源\n\n- [1] `014.txt`"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_sales_marketing_kb",
+      "query": "标准 POC 试用期是多久，可以延长几次？",
+      "keywords": [
+        "14 天",
+        "14天",
+        "一次"
+      ],
+      "source": "ACME-SM-006",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"标准 POC 试用期是多久，可以延长几次？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.99%\n**来源:** `ACME-SM-006_POC_试用管理.txt`\n\n> 文档编号：ACME-SM-006 标题：POC 试用管理 所属企业：Acme 有限公司 所属知识库：销售市场知识库 一、周期 标准 POC 试用期为 14 天，最多延长一次，延长不超过 14 天。 二、审批 延长须销售总监批准，并在 CRM 中记录延长理由。 三、环境 POC 使用标准 Demo 环境或独立试用租户，禁止使用其他客户的生产数据做演示。 四",
+      "default_head": "## 检索结果\n\n针对查询 **\"标准 POC 试用期是多久，可以延长几次？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.99%\n**来源:** `ACME-SM-006_POC_试用管理.txt`\n\n> 文档编号：ACME-SM-006 标题：POC 试用管理 所属企业：Acme 有限公司 所属知识库：销售市场知识库 一、周期 标准 POC 试用期为 14 天，最多延长一次，延长不超过 14 天。 二、审批 延长须销售总监批准，并在 CRM 中记录延长理由。 三、环境 POC 使用标准 Demo 环境或独立试用租户，禁止使用其他客户的生产数据做演示。 四"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_sales_marketing_kb",
+      "query": "渠道代理商的标准返点是多少？",
+      "keywords": [
+        "15%"
+      ],
+      "source": "ACME-SM-012",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"渠道代理商的标准返点是多少？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.96%\n**来源:** `ACME-SM-012_渠道与代理商政策.txt`\n\n> 文档编号：ACME-SM-012 标题：渠道与代理商政策 所属企业：Acme 有限公司 所属知识库：销售市场知识库 一、返点 标准渠道返点为合同金额的 15%，年度累计超过 500 万元的渠道可上浮至 18%。 二、报备 渠道须在接触客户前完成商机报备，报备有效期 90 天。 三、冲突 同一客户被多方报备的，以首次有效报备为准。 四、禁止 禁止渠道以低于我方标准折扣底",
+      "default_head": "## 检索结果\n\n针对查询 **\"渠道代理商的标准返点是多少？\"** 找到 2 条相关结果:\n\n### [1] 结果 1\n**相关度:** 44.34%\n**来源:** `001.txt`\n\n> 标准报价单折扣权限：销售代表最高可给 15% 折扣，超出需要销售总监审批，超过 30% 需要 VP 特批，年框合同另有单独折扣政策。\n\n### [2] 结果 2\n**相关度:** 42.91%\n**来源:** `020.txt`\n\n> 标准报价单折扣权限：销售代表最高可给 10% 折扣，超出需要销售总监审批，超过 20% 需要 VP 特批，年框合同另有单独折扣政策。\n\n\n---\n\n## 引用来源\n\n-"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_customer_success_kb",
+      "query": "黄金套餐客户的工单多久内首次响应？",
+      "keywords": [
+        "15 分钟",
+        "15分钟"
+      ],
+      "source": "ACME-CS-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"黄金套餐客户的工单多久内首次响应？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.99%\n**来源:** `015.txt`\n\n> 黄金套餐客户的工单响应 SLA 是 15 分钟内首次响应，客户成功团队7x24 小时轮班值守，超时未响应会自动升级给值班经理。\n\n### [2] 结果 2\n**相关度:** 99.99%\n**来源:** `012.txt`\n\n> 黄金套餐客户的工单响应 SLA 是 60 分钟内首次响应，客户成功团队7x24 小时轮班值守，超时未响应会自动升级给值班经理。\n\n### [3] 结果 3\n**相关度:",
+      "default_head": "## 检索结果\n\n针对查询 **\"黄金套餐客户的工单多久内首次响应？\"** 找到 3 条相关结果:\n\n### [1] 结果 1\n**相关度:** 87.88%\n**来源:** `008.txt`\n\n> 黄金套餐客户的权限中心服务故障恢复目标（RTO）是 60 分钟，超出目标需要在事后复盘报告里说明超时原因并给出改进措施。\n\n### [2] 结果 2\n**相关度:** 85.37%\n**来源:** `005.txt`\n\n> 黄金套餐客户的数据看板服务故障恢复目标（RTO）是 60 分钟，超出目标需要在事后复盘报告里说明超时原因并给出改进措施。\n\n### [3] 结果 3\n**相关度:** 55."
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_customer_success_kb",
+      "query": "公司承诺的月度服务可用性是多少？",
+      "keywords": [
+        "99.9"
+      ],
+      "source": "ACME-CS-002",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"公司承诺的月度服务可用性是多少？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.89%\n**来源:** `ACME-CS-002_服务可用性承诺与赔付.txt`\n\n> 文档编号：ACME-CS-002 标题：服务可用性承诺与赔付 所属企业：Acme 有限公司 所属知识库：客户成功知识库 一、承诺 Acme 有限公司承诺月度服务可用性不低于 99.9%。 二、口径 可用性 = (当月总分钟数 − 不可用分钟数) ÷ 当月总分钟数，计划内维护窗口不计入不可用时间。 三、赔付 月度可用性低于 99.9% 但不低于 99% 的，赔付",
+      "default_head": "## 未找到相关结果\n\n查询: **公司承诺的月度服务可用性是多少？**\n\n在集合 `acme_sales_marketing_kb`、`acme_finance_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_customer_success_kb",
+      "query": "发生重大故障后多久内要主动外呼客户？",
+      "keywords": [
+        "30 分钟",
+        "30分钟"
+      ],
+      "source": "ACME-CS-004",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"发生重大故障后多久内要主动外呼客户？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.96%\n**来源:** `ACME-CS-004_重大故障客户沟通规范.txt`\n\n> 文档编号：ACME-CS-004 标题：重大故障客户沟通规范 所属企业：Acme 有限公司 所属知识库：客户成功知识库 一、主动外呼 出现影响黄金套餐客户的重大故障时，客户成功团队须在 30 分钟内主动外呼受影响客户说明情况， 不能等客户先联系。 二、更新频率 故障期间每 60 分钟同步一次进展，即使没有新进展也要同步。 三、口径 只说明影响范围、已采取措",
+      "default_head": "## 检索结果\n\n针对查询 **\"发生重大故障后多久内要主动外呼客户？\"** 找到 2 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.74%\n**来源:** `016.txt`\n\n> 日志采集服务出现影响白银套餐客户的重大故障时，客户成功团队需要在 30 分钟内主动外呼受影响客户说明情况，不能等客户先联系。\n\n### [2] 结果 2\n**相关度:** 99.72%\n**来源:** `011.txt`\n\n> 文件存储服务出现影响白银套餐客户的重大故障时，客户成功团队需要在 30 分钟内主动外呼受影响客户说明情况，不能等客户先联系。\n\n\n---\n\n## 引用来源\n\n- [1]"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_customer_success_kb",
+      "query": "NPS 低于几分要标记为重点关注客户？",
+      "keywords": [
+        "6 分",
+        "6分"
+      ],
+      "source": "ACME-CS-006",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"NPS 低于几分要标记为重点关注客户？\"** 找到 4 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.98%\n**来源:** `003.txt`\n\n> 客户满意度回访每季度一次，NPS 低于 6 分的客户需要标记为重点关注对象，客户成功经理需在两周内制定挽留计划。\n\n### [2] 结果 2\n**相关度:** 99.92%\n**来源:** `ACME-CS-006_客户健康度与_NPS_回访.txt`\n\n> 文档编号：ACME-CS-006 标题：客户健康度与 NPS 回访 所属企业：Acme 有限公司 所属知识库：客户成功知识库 一、频率",
+      "default_head": "## 检索结果\n\n针对查询 **\"NPS 低于几分要标记为重点关注客户？\"** 找到 2 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.98%\n**来源:** `003.txt`\n\n> 客户满意度回访每季度一次，NPS 低于 6 分的客户需要标记为重点关注对象，客户成功经理需在两周内制定挽留计划。\n\n### [2] 结果 2\n**相关度:** 99.92%\n**来源:** `ACME-CS-006_客户健康度与_NPS_回访.txt`\n\n> 文档编号：ACME-CS-006 标题：客户健康度与 NPS 回访 所属企业：Acme 有限公司 所属知识库：客户成功知识库 一、频率"
+    },
+    {
+      "kind": "positive",
+      "account": "alice_acme",
+      "collection": "acme_customer_success_kb",
+      "query": "新客户的标准上手周期是多长？",
+      "keywords": [
+        "30 天",
+        "30天"
+      ],
+      "source": "ACME-CS-009",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"新客户的标准上手周期是多长？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.98%\n**来源:** `ACME-CS-009_新客户上手_Onboarding.txt`\n\n> 文档编号：ACME-CS-009 标题：新客户上手（Onboarding） 所属企业：Acme 有限公司 所属知识库：客户成功知识库 一、周期 标准上手周期为 30 天，从合同生效日起算。 二、里程碑 第 3 天完成开通与账号交付；第 10 天完成管理员培训； 第 20 天完成首批业务场景配置；第 30 天完成验收并转入常规服务。 三、验收 验收标准在",
+      "default_head": "## 未找到相关结果\n\n查询: **新客户的标准上手周期是多长？**\n\n在集合 `acme_it_support_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "bob_acme",
+      "collection": "acme_hr_admin_kb",
+      "query": "入职满一年后每年有多少天年假？",
+      "keywords": [
+        "15 天",
+        "15天"
+      ],
+      "source": "ACME-HR-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"入职满一年后每年有多少天年假？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.96%\n**来源:** `ACME-HR-001_年假管理办法.txt`\n\n> 文档编号：ACME-HR-001 标题：年假管理办法 所属企业：Acme 有限公司 所属知识库：人力行政知识库 一、天数标准 Acme 有限公司全体正式员工入职满一年后，每年享有 15 天带薪年假。此后司龄每满 3 年增加 1 天， 累计上限为 20 天。试用期内不享有年假。 二、顺延规则 当年度未休完的年假，最多顺延到次年 3 月 31 日，逾期作废，不折算工资、不跨",
+      "default_head": "## 检索结果\n\n针对查询 **\"入职满一年后每年有多少天年假？\"** 找到 4 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.96%\n**来源:** `ACME-HR-001_年假管理办法.txt`\n\n> 文档编号：ACME-HR-001 标题：年假管理办法 所属企业：Acme 有限公司 所属知识库：人力行政知识库 一、天数标准 Acme 有限公司全体正式员工入职满一年后，每年享有 15 天带薪年假。此后司龄每满 3 年增加 1 天， 累计上限为 20 天。试用期内不享有年假。 二、顺延规则 当年度未休完的年假，最多顺延到次年 3 月 31 日，逾期作废，不折算工资、不跨"
+    },
+    {
+      "kind": "positive",
+      "account": "bob_acme",
+      "collection": "acme_hr_admin_kb",
+      "query": "当年没休完的年假可以顺延到什么时候？",
+      "keywords": [
+        "3 月 31 日",
+        "3月31日",
+        "次年 3 月"
+      ],
+      "source": "ACME-HR-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"当年没休完的年假可以顺延到什么时候？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.93%\n**来源:** `009.txt`\n\n> 客户成功部的年假按司龄计算，入职满一年起每年 15 天，当年未休完的年假可以顺延到次年 3 月底前用完，超期作废，不折算成工资。\n\n### [2] 结果 2\n**相关度:** 99.89%\n**来源:** `003.txt`\n\n> 平台研发部的年假按司龄计算，入职满一年起每年 20 天，当年未休完的年假可以顺延到次年 3 月底前用完，超期作废，不折算成工资。\n\n### [3] 结果 3\n**相",
+      "default_head": "## 检索结果\n\n针对查询 **\"当年没休完的年假可以顺延到什么时候？\"** 找到 3 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.93%\n**来源:** `009.txt`\n\n> 客户成功部的年假按司龄计算，入职满一年起每年 15 天，当年未休完的年假可以顺延到次年 3 月底前用完，超期作废，不折算成工资。\n\n### [2] 结果 2\n**相关度:** 99.89%\n**来源:** `003.txt`\n\n> 平台研发部的年假按司龄计算，入职满一年起每年 20 天，当年未休完的年假可以顺延到次年 3 月底前用完，超期作废，不折算成工资。\n\n### [3] 结果 3\n**相"
+    },
+    {
+      "kind": "positive",
+      "account": "bob_acme",
+      "collection": "acme_hr_admin_kb",
+      "query": "每个月最多可以远程办公几天？",
+      "keywords": [
+        "8 天",
+        "8天"
+      ],
+      "source": "ACME-HR-006",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"每个月最多可以远程办公几天？\"** 找到 3 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.23%\n**来源:** `ACME-HR-006_远程办公管理规定.txt`\n\n> 文档编号：ACME-HR-006 标题：远程办公管理规定 所属企业：Acme 有限公司 所属知识库：人力行政知识库 一、额度 Acme 有限公司正式员工每月远程办公天数不超过 8 天。试用期员工不适用远程办公。 二、申请 需提前 1 个工作日在 OA 系统提交远程办公申请，由直属主管审批。 三、在岗要求 远程办公期间必须保证核心工作时间在线，会议按时参加，网络与设备问",
+      "default_head": "## 检索结果\n\n针对查询 **\"每个月最多可以远程办公几天？\"** 找到 3 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.23%\n**来源:** `ACME-HR-006_远程办公管理规定.txt`\n\n> 文档编号：ACME-HR-006 标题：远程办公管理规定 所属企业：Acme 有限公司 所属知识库：人力行政知识库 一、额度 Acme 有限公司正式员工每月远程办公天数不超过 8 天。试用期员工不适用远程办公。 二、申请 需提前 1 个工作日在 OA 系统提交远程办公申请，由直属主管审批。 三、在岗要求 远程办公期间必须保证核心工作时间在线，会议按时参加，网络与设备问"
+    },
+    {
+      "kind": "positive",
+      "account": "bob_acme",
+      "collection": "acme_hr_admin_kb",
+      "query": "正式员工和试用期员工的离职通知期分别是多少天？",
+      "keywords": [
+        "30 天",
+        "30天"
+      ],
+      "source": "ACME-HR-008",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"正式员工和试用期员工的离职通知期分别是多少天？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.91%\n**来源:** `ACME-HR-008_离职管理与交接规范.txt`\n\n> 文档编号：ACME-HR-008 标题：离职管理与交接规范 所属企业：Acme 有限公司 所属知识库：人力行政知识库 一、通知期 正式员工离职需提前 30 天提交书面离职申请；试用期内离职提前 3 天。 二、交接 交接清单需经直属主管逐项确认签字，涉及生产系统权限的岗位还需 IT 运维部会签。 三、结算 离职结算在最后工作日之后的 15 个工作日内",
+      "default_head": "## 检索结果\n\n针对查询 **\"正式员工和试用期员工的离职通知期分别是多少天？\"** 找到 2 条相关结果:\n\n### [1] 结果 1\n**相关度:** 97.93%\n**来源:** `010.txt`\n\n> 客户成功部员工离职需要提前 10 天书面通知，交接清单由直属主管确认签字后HR 才会启动离职结算流程。\n\n### [2] 结果 2\n**相关度:** 14.06%\n**来源:** `007.txt`\n\n> 客户成功部的试用期为 5 个月，转正需要提交转正述职报告，由 mentor 和直属主管共同评估后决定是否通过。\n\n\n---\n\n## 引用来源\n\n- [1] `010.txt`\n- "
+    },
+    {
+      "kind": "positive",
+      "account": "bob_acme",
+      "collection": "acme_hr_admin_kb",
+      "query": "公司的核心工作时间是几点到几点？",
+      "keywords": [
+        "10:00",
+        "16:00"
+      ],
+      "source": "ACME-HR-005",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"公司的核心工作时间是几点到几点？\"** 找到 2 条相关结果:\n\n### [1] 结果 1\n**相关度:** 97.79%\n**来源:** `ACME-HR-005_考勤打卡与弹性工作制.txt`\n\n> 文档编号：ACME-HR-005 标题：考勤打卡与弹性工作制 所属企业：Acme 有限公司 所属知识库：人力行政知识库 一、核心工作时间 Acme 有限公司实行弹性工作制，核心工作时间为每个工作日 10:00 至 16:00，此时段内必须在岗（含远程在岗）。 二、打卡 上班打卡时间不晚于 9:30，弹性区间为 30 分钟，即 9:30 之后打卡计为迟到。 三、",
+      "default_head": "## 未找到相关结果\n\n查询: **公司的核心工作时间是几点到几点？**\n\n在集合 `acme_hr_admin_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_hr_admin_kb",
+      "query": "入职满一年后每年有多少天年假？",
+      "keywords": [
+        "20 天",
+        "20天"
+      ],
+      "source": "GLBX-HR-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"入职满一年后每年有多少天年假？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.96%\n**来源:** `GLBX-HR-001_年假管理办法.txt`\n\n> 文档编号：GLBX-HR-001 标题：年假管理办法 所属企业：Globex 环球集团 所属知识库：人力行政知识库 一、天数标准 Globex 环球集团全体正式员工入职满一年后，每年享有 20 天带薪年假。此后司龄每满 5 年增加 2 天， 累计上限为 26 天。驾驶岗位的驾龄可折算为司龄计入。 二、顺延规则 当年度未休完的年假，最多顺延到次年 6 月 30 日，逾期作",
+      "default_head": "## 检索结果\n\n针对查询 **\"入职满一年后每年有多少天年假？\"** 找到 1 条相关结果:\n\n### [1] 结果 1\n**相关度:** 75.22%\n**来源:** `005.txt`\n\n> 青岛枢纽驾驶员年假按驾龄计算，满 3 年起每年增加 1 天，最多累计到 5 天，旺季（11-1 月）原则上不受理年假申请。\n\n\n---\n\n## 引用来源\n\n- [1] `005.txt`"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_hr_admin_kb",
+      "query": "当年没休完的年假可以顺延到什么时候？",
+      "keywords": [
+        "6 月 30 日",
+        "6月30日",
+        "次年 6 月"
+      ],
+      "source": "GLBX-HR-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"当年没休完的年假可以顺延到什么时候？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 97.80%\n**来源:** `GLBX-HR-001_年假管理办法.txt`\n\n> 文档编号：GLBX-HR-001 标题：年假管理办法 所属企业：Globex 环球集团 所属知识库：人力行政知识库 一、天数标准 Globex 环球集团全体正式员工入职满一年后，每年享有 20 天带薪年假。此后司龄每满 5 年增加 2 天， 累计上限为 26 天。驾驶岗位的驾龄可折算为司龄计入。 二、顺延规则 当年度未休完的年假，最多顺延到次年 6 月 30 日，",
+      "default_head": "## 检索结果\n\n针对查询 **\"当年没休完的年假可以顺延到什么时候？\"** 找到 1 条相关结果:\n\n### [1] 结果 1\n**相关度:** 10.77%\n**来源:** `005.txt`\n\n> 青岛枢纽驾驶员年假按驾龄计算，满 3 年起每年增加 1 天，最多累计到 5 天，旺季（11-1 月）原则上不受理年假申请。\n\n\n---\n\n## 引用来源\n\n- [1] `005.txt`"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_hr_admin_kb",
+      "query": "驾驶员连续驾驶最多多少小时，必须休息多久？",
+      "keywords": [
+        "4 小时",
+        "4小时",
+        "20 分钟",
+        "20分钟"
+      ],
+      "source": "GLBX-HR-002",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"驾驶员连续驾驶最多多少小时，必须休息多久？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.46%\n**来源:** `013.txt`\n\n> 深圳枢纽驾驶员超过法定工时的加班按 2.5 倍工资计算，连续驾驶不得超过 4 小时，必须休息至少 20 分钟才能继续上路，这是安全红线不容突破。\n\n### [2] 结果 2\n**相关度:** 99.22%\n**来源:** `020.txt`\n\n> 青岛枢纽驾驶员超过法定工时的加班按 2.5 倍工资计算，连续驾驶不得超过 4 小时，必须休息至少 20 分钟才能继续上路，这是安全红线不容突破",
+      "default_head": "## 未找到相关结果\n\n查询: **驾驶员连续驾驶最多多少小时，必须休息多久？**\n\n在集合 `globex_sales_marketing_kb`、`globex_customer_success_kb`、`globex_it_support_kb`、`globex_finance_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_hr_admin_kb",
+      "query": "仓储岗位夜班是几点到几点，夜班津贴多少？",
+      "keywords": [
+        "22:00",
+        "80 元",
+        "80元"
+      ],
+      "source": "GLBX-HR-003",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"仓储岗位夜班是几点到几点，夜班津贴多少？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.85%\n**来源:** `GLBX-HR-003_三班倒排班管理办法.txt`\n\n> 文档编号：GLBX-HR-003 标题：三班倒排班管理办法 所属企业：Globex 环球集团 所属知识库：人力行政知识库 一、班次 Globex 环球集团各枢纽仓储岗位实行三班倒：早班 06:00-14:00，中班 14:00-22:00，夜班 22:00-次日 06:00。 二、轮换 班次以周为单位轮换，连续上夜班不得超过 6 天，两个班次之间的休息时",
+      "default_head": "## 未找到相关结果\n\n查询: **仓储岗位夜班是几点到几点，夜班津贴多少？**\n\n在集合 `globex_it_support_kb`、`globex_customer_success_kb`、`globex_finance_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_hr_admin_kb",
+      "query": "新员工安全生产培训需要多少学时？",
+      "keywords": [
+        "16 学时",
+        "16学时"
+      ],
+      "source": "GLBX-HR-007",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"新员工安全生产培训需要多少学时？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.87%\n**来源:** `GLBX-HR-007_岗前培训与持证上岗规定.txt`\n\n> 文档编号：GLBX-HR-007 标题：岗前培训与持证上岗规定 所属企业：Globex 环球集团 所属知识库：人力行政知识库 一、安全生产培训 新员工入职必须完成 16 学时的安全生产培训并考核合格，未合格不得上岗。 二、特种作业 叉车、危险品、起重等特种作业岗位，除集团培训外还需取得国家规定的特种作业操作证， 证件到期前 30 天由安全生产部统一组织复审。",
+      "default_head": "## 未找到相关结果\n\n查询: **新员工安全生产培训需要多少学时？**\n\n在集合 `globex_hr_admin_kb`、`globex_finance_kb`、`globex_sales_marketing_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_finance_kb",
+      "query": "客户对账单有异议须在几个工作日内提出？",
+      "keywords": [
+        "7 个工作日",
+        "7个工作日"
+      ],
+      "source": "GLBX-FIN-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"客户对账单有异议须在几个工作日内提出？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.60%\n**来源:** `GLBX-FIN-108_深圳枢纽运费结算要点.txt`\n\n> 文档编号：GLBX-FIN-108 标题：深圳枢纽运费结算要点 所属企业：Globex 环球集团 所属知识库：财务知识库 一、结算 深圳枢纽客户运费统一月结，每月 5 日前出对账单，客户异议须在 7 个工作日内提出。 二、计费口径 本枢纽主要计费方式为按票与体积重孰大计费。 三、附加费 燃油附加费按集团统一机制每月 1 日调整。\n\n### [2] 结果",
+      "default_head": "## 检索结果\n\n针对查询 **\"客户对账单有异议须在几个工作日内提出？\"** 找到 2 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.50%\n**来源:** `012.txt`\n\n> 宁波枢纽的运费结算周期为月结，客户对账单有异议需在收到账单后 3 个工作日内提出，逾期视为确认账单无异议。\n\n### [2] 结果 2\n**相关度:** 51.50%\n**来源:** `001.txt`\n\n> 新签约客户需在 3 个工作日内由销售完成与客户服务部的交接，交接内容包括时效承诺、特殊操作要求和客户对接人信息。\n\n\n---\n\n## 引用来源\n\n- [1] `012.txt`\n- ["
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_finance_kb",
+      "query": "报销单笔超过多少金额需要 CFO 审批？",
+      "keywords": [
+        "30000",
+        "30,000",
+        "3 万",
+        "3万"
+      ],
+      "source": "GLBX-FIN-002",
+      "scoped_pass": false,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": false,
+      "pass": false,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"报销单笔超过多少金额需要 CFO 审批？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 97.44%\n**来源:** `GLBX-FIN-011_预算与超支管控.txt`\n\n> 文档编号：GLBX-FIN-011 标题：预算与超支管控 所属企业：Globex 环球集团 所属知识库：财务知识库 一、下达 预算按季度下达至各枢纽，枢纽负责人为第一责任人。 二、超支 单季度超支 10% 以内由枢纽负责人书面说明；超过 10% 须 CFO 审批。 三、旺季 旺季（11 月至次年 1 月）预算单独编制，不与平季混算。\n\n### [2] 结果",
+      "default_head": "## 检索结果\n\n针对查询 **\"报销单笔超过多少金额需要 CFO 审批？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 97.14%\n**来源:** `GLBX-FIN-016_跨境结算与汇率.txt`\n\n> 文档编号：GLBX-FIN-016 标题：跨境结算与汇率 所属企业：Globex 环球集团 所属知识库：财务知识库 一、结算币种 跨境业务按合同约定币种结算，常用币种为美元与欧元。 二、汇率 外币折算按付款日中国银行现汇卖出价，汇兑损益计入财务费用。 三、审批 单笔等值超过 200000 元人民币的跨境付款须 CFO 审批，并提前 5 个工作日提交材料。 "
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_finance_kb",
+      "query": "进口货物的关税预缴款要在到港前几天完成？",
+      "keywords": [
+        "5 天",
+        "5天"
+      ],
+      "source": "GLBX-FIN-006",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"进口货物的关税预缴款要在到港前几天完成？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.98%\n**来源:** `GLBX-FIN-006_关税预缴与进口费用.txt`\n\n> 文档编号：GLBX-FIN-006 标题：关税预缴与进口费用 所属企业：Globex 环球集团 所属知识库：财务知识库 一、时限 进口货物的关税预缴款必须在货物到港前 5 天完成缴纳，逾期产生的滞纳金由责任枢纽承担。 二、跟进 财务部统一跟进缴纳进度，报关合规部负责提供税号与完税价格资料。 三、垫付 代客户垫付的税费须有客户书面确认，垫付上限按客户信用",
+      "default_head": "## 检索结果\n\n针对查询 **\"进口货物的关税预缴款要在到港前几天完成？\"** 找到 4 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.89%\n**来源:** `008.txt`\n\n> 深圳枢纽进口货物的关税预缴款需要在货物到港前 10 天完成，逾期会产生滞纳金，由财务部统一跟进缴纳进度。\n\n### [2] 结果 2\n**相关度:** 99.89%\n**来源:** `018.txt`\n\n> 青岛枢纽进口货物的关税预缴款需要在货物到港前 7 天完成，逾期会产生滞纳金，由财务部统一跟进缴纳进度。\n\n### [3] 结果 3\n**相关度:** 99.88%\n**来源:** `0"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_finance_kb",
+      "query": "出口退税要在报关单放行后多少天内申报？",
+      "keywords": [
+        "30 天",
+        "30天"
+      ],
+      "source": "GLBX-FIN-007",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"出口退税要在报关单放行后多少天内申报？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.98%\n**来源:** `GLBX-FIN-007_出口退税申报.txt`\n\n> 文档编号：GLBX-FIN-007 标题：出口退税申报 所属企业：Globex 环球集团 所属知识库：财务知识库 一、时限 出口退税申报材料须在报关单放行后 30 天内提交税务系统，逾期影响当月退税进度。 二、材料 包括报关单、出口发票、运输单据与收汇凭证，缺一不可。 三、责任 资料由报关合规部提供，财务部负责申报，任一环节延误须书面说明。\n\n### [2] ",
+      "default_head": "## 检索结果\n\n针对查询 **\"出口退税要在报关单放行后多少天内申报？\"** 找到 3 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.72%\n**来源:** `014.txt`\n\n> 青岛枢纽出口退税申报材料需要在报关单放行后 6 天内提交税务系统，逾期申报会影响当月退税进度。\n\n### [2] 结果 2\n**相关度:** 47.73%\n**来源:** `008.txt`\n\n> 深圳枢纽进口货物的关税预缴款需要在货物到港前 10 天完成，逾期会产生滞纳金，由财务部统一跟进缴纳进度。\n\n### [3] 结果 3\n**相关度:** 44.68%\n**来源:** `019.tx"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_finance_kb",
+      "query": "运营车辆的折旧年限是多少年？",
+      "keywords": [
+        "8 年",
+        "8年"
+      ],
+      "source": "GLBX-FIN-012",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"运营车辆的折旧年限是多少年？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.12%\n**来源:** `GLBX-FIN-012_固定资产与车辆折旧.txt`\n\n> 文档编号：GLBX-FIN-012 标题：固定资产与车辆折旧 所属企业：Globex 环球集团 所属知识库：财务知识库 一、认定 单价 5000 元及以上、使用年限超过 1 年的计入固定资产。 二、折旧年限 运营车辆 8 年，仓储设备（含叉车）10 年，办公设备 3 年，均采用直线法。 三、报废 车辆报废需经安全生产部技术评估，评估通过后走资产处置流程，处置收入统",
+      "default_head": "## 未找到相关结果\n\n查询: **运营车辆的折旧年限是多少年？**\n\n在集合 `globex_sales_marketing_kb`、`globex_hr_admin_kb`、`globex_finance_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_it_support_kb",
+      "query": "WMS 账号密码多久强制更换一次？",
+      "keywords": [
+        "60 天",
+        "60天"
+      ],
+      "source": "GLBX-IT-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"WMS 账号密码多久强制更换一次？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.98%\n**来源:** `GLBX-IT-001_WMS_与_TMS_账号密码策略.txt`\n\n> 文档编号：GLBX-IT-001 标题：WMS 与 TMS 账号密码策略 所属企业：Globex 环球集团 所属知识库：IT支持知识库 一、更换周期 Globex 环球集团仓库管理系统（WMS）与运输管理系统（TMS）账号密码每 60 天强制更换一次。 二、复杂度 密码长度不少于 10 位，须包含字母与数字，不能与最近 3 次使用过的密码重复。 ",
+      "default_head": "## 检索结果\n\n针对查询 **\"WMS 账号密码多久强制更换一次？\"** 找到 1 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.94%\n**来源:** `010.txt`\n\n> 厦门枢纽仓库管理系统（WMS）账号密码每 90 天强制更换一次，忘记密码联系 IT 支持热线现场或电话重置，不接受邮件申请重置。\n\n\n---\n\n## 引用来源\n\n- [1] `010.txt`"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_it_support_kb",
+      "query": "GPS 车载终端故障多久没恢复要联系设备厂商？",
+      "keywords": [
+        "2 小时",
+        "2小时"
+      ],
+      "source": "GLBX-IT-003",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"GPS 车载终端故障多久没恢复要联系设备厂商？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.79%\n**来源:** `GLBX-IT-125_上海枢纽GPS_与车辆终端维护.txt`\n\n> 文档编号：GLBX-IT-125 标题：上海枢纽GPS 与车辆终端维护 所属企业：Globex 环球集团 所属知识库：IT支持知识库 一、保有量 上海枢纽在册车辆 86 台，均安装 GPS 车载终端与行车记录仪。 二、巡检 每季度集中巡检一次，回场车辆随车抽检。 三、故障 终端离线 2 小时未恢复须联系设备厂商上门，本枢纽合作厂商响应时",
+      "default_head": "## 检索结果\n\n针对查询 **\"GPS 车载终端故障多久没恢复要联系设备厂商？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.69%\n**来源:** `GLBX-IT-126_深圳枢纽GPS_与车辆终端维护.txt`\n\n> 文档编号：GLBX-IT-126 标题：深圳枢纽GPS 与车辆终端维护 所属企业：Globex 环球集团 所属知识库：IT支持知识库 一、保有量 深圳枢纽在册车辆 112 台，均安装 GPS 车载终端与行车记录仪。 二、巡检 每季度集中巡检一次，回场车辆随车抽检。 三、故障 终端离线 2 小时未恢复须联系设备厂商上门，本枢纽合作厂商响应"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_it_support_kb",
+      "query": "系统常规变更窗口是什么时候？",
+      "keywords": [
+        "周三",
+        "01:00"
+      ],
+      "source": "GLBX-IT-007",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"系统常规变更窗口是什么时候？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.88%\n**来源:** `GLBX-IT-007_系统变更窗口.txt`\n\n> 文档编号：GLBX-IT-007 标题：系统变更窗口 所属企业：Globex 环球集团 所属知识库：IT支持知识库 一、窗口 WMS、TMS 与报关对接系统的常规变更窗口为每周三 01:00 至 04:00。 二、冻结期 每年 11 月至次年 1 月的旺季为变更冻结期，仅允许故障修复类变更。 三、通知 变更前 2 个工作日通知各枢纽，变更完成后在 IT 门户发布变更结果。",
+      "default_head": "## 未找到相关结果\n\n查询: **系统常规变更窗口是什么时候？**\n\n在集合 `globex_finance_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_it_support_kb",
+      "query": "WMS 库存对不上应该怎么排查？",
+      "keywords": [
+        "盘点",
+        "出库",
+        "调拨"
+      ],
+      "source": "GLBX-IT-010",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"WMS 库存对不上应该怎么排查？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.99%\n**来源:** `GLBX-IT-010_常见排查：WMS_库存对不上.txt`\n\n> 文档编号：GLBX-IT-010 标题：常见排查：WMS 库存对不上 所属企业：Globex 环球集团 所属知识库：IT支持知识库 排查顺序： 1. 核对最近一次盘点记录与出入库单据是否一致。 2. 检查是否存在未及时录入系统的手工出库记录。 3. 确认是否有跨枢纽调拨在途、尚未确认收货。 4. 确认盘点期间是否发生并发作业导致重复计数。 5. 以上均",
+      "default_head": "## 检索结果\n\n针对查询 **\"WMS 库存对不上应该怎么排查？\"** 找到 4 条相关结果:\n\n### [1] 结果 1\n**相关度:** 95.49%\n**来源:** `013.txt`\n\n> WMS 系统新功能上线前需要先在测试枢纽跑满两周，库存差异率控制在 5% 以内才能全量推广到所有枢纽，超标需要回滚排查。\n\n### [2] 结果 2\n**相关度:** 95.33%\n**来源:** `001.txt`\n\n> WMS 系统新功能上线前需要先在测试枢纽跑满两周，库存差异率控制在 1% 以内才能全量推广到所有枢纽，超标需要回滚排查。\n\n### [3] 结果 3\n**相关度:** 94.4"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_it_support_kb",
+      "query": "集团 IT 热线电话是多少？",
+      "keywords": [
+        "400-820-9000"
+      ],
+      "source": "GLBX-IT-006",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"集团 IT 热线电话是多少？\"** 找到 1 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.98%\n**来源:** `GLBX-IT-006_IT_服务台与热线.txt`\n\n> 文档编号：GLBX-IT-006 标题：IT 服务台与热线 所属企业：Globex 环球集团 所属知识库：IT支持知识库 一、热线 集团 IT 热线 400-820-9000 转 2，提供 7x24 支持，覆盖所有枢纽。 二、现场支持 各枢纽设 IT 支持组，工作日 08:00 至 20:00 提供现场支持，非工作时间由值班工程师远程响应。 三、自助 密码重置指引、",
+      "default_head": "## 检索结果\n\n针对查询 **\"集团 IT 热线电话是多少？\"** 找到 1 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.98%\n**来源:** `GLBX-IT-006_IT_服务台与热线.txt`\n\n> 文档编号：GLBX-IT-006 标题：IT 服务台与热线 所属企业：Globex 环球集团 所属知识库：IT支持知识库 一、热线 集团 IT 热线 400-820-9000 转 2，提供 7x24 支持，覆盖所有枢纽。 二、现场支持 各枢纽设 IT 支持组，工作日 08:00 至 20:00 提供现场支持，非工作时间由值班工程师远程响应。 三、自助 密码重置指引、"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_rd_product_kb",
+      "query": "路由优化算法要达到什么指标才允许灰度上线？",
+      "keywords": [
+        "3%"
+      ],
+      "source": "GLBX-RD-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"路由优化算法要达到什么指标才允许灰度上线？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.95%\n**来源:** `GLBX-RD-001_路由优化算法迭代规范.txt`\n\n> 文档编号：GLBX-RD-001 标题：路由优化算法迭代规范 所属企业：Globex 环球集团 所属知识库：研发产品知识库 一、离线回测 算法迭代前必须在不少于 6 个月的历史订单数据上跑离线回测。 二、准入门槛 新算法相比线上版本，平均配送时长必须下降至少 3%，且空驶率不上升， 才允许灰度上线到单个枢纽试运行。 三、试运行 单枢纽试运行不少于 2",
+      "default_head": "## 未找到相关结果\n\n查询: **路由优化算法要达到什么指标才允许灰度上线？**\n\n在集合 `globex_it_support_kb`、`globex_customer_success_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_rd_product_kb",
+      "query": "WMS 新功能全量推广前，库存差异率要控制在多少以内？",
+      "keywords": [
+        "0.5%"
+      ],
+      "source": "GLBX-RD-002",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"WMS 新功能全量推广前，库存差异率要控制在多少以内？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.99%\n**来源:** `GLBX-RD-002_WMS_新功能上线验收.txt`\n\n> 文档编号：GLBX-RD-002 标题：WMS 新功能上线验收 所属企业：Globex 环球集团 所属知识库：研发产品知识库 一、试运行 WMS 系统新功能上线前须先在测试枢纽试运行满 2 周。 二、验收指标 试运行期间库存差异率须控制在 0.5% 以内，才能全量推广到所有枢纽；超标须回滚排查。 三、回退 全量推广后 1 周内保留一键回",
+      "default_head": "## 检索结果\n\n针对查询 **\"WMS 新功能全量推广前，库存差异率要控制在多少以内？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.99%\n**来源:** `GLBX-RD-002_WMS_新功能上线验收.txt`\n\n> 文档编号：GLBX-RD-002 标题：WMS 新功能上线验收 所属企业：Globex 环球集团 所属知识库：研发产品知识库 一、试运行 WMS 系统新功能上线前须先在测试枢纽试运行满 2 周。 二、验收指标 试运行期间库存差异率须控制在 0.5% 以内，才能全量推广到所有枢纽；超标须回滚排查。 三、回退 全量推广后 1 周内保留一键回"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_rd_product_kb",
+      "query": "平台的常规发布窗口是什么时候？",
+      "keywords": [
+        "周三",
+        "01:00"
+      ],
+      "source": "GLBX-RD-003",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"平台的常规发布窗口是什么时候？\"** 找到 2 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.61%\n**来源:** `GLBX-RD-003_发布窗口与变更冻结.txt`\n\n> 文档编号：GLBX-RD-003 标题：发布窗口与变更冻结 所属企业：Globex 环球集团 所属知识库：研发产品知识库 一、窗口 Globex 环球集团物流平台的常规发布窗口为每周三 01:00 至 04:00。 二、冻结期 每年 11 月至次年 1 月的运输旺季为发布冻结期，仅允许故障修复类发布。 三、通知 发布前 2 个工作日通知各枢纽，发布后在 IT 门户",
+      "default_head": "## 未找到相关结果\n\n查询: **平台的常规发布窗口是什么时候？**\n\n在集合 `globex_finance_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_rd_product_kb",
+      "query": "运单和订单数据保留多久？",
+      "keywords": [
+        "3 年",
+        "3年"
+      ],
+      "source": "GLBX-RD-008",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"运单和订单数据保留多久？\"** 找到 4 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.88%\n**来源:** `GLBX-RD-008_订单与轨迹数据留存.txt`\n\n> 文档编号：GLBX-RD-008 标题：订单与轨迹数据留存 所属企业：Globex 环球集团 所属知识库：研发产品知识库 一、留存 运单与订单数据保留 3 年后自动归档到冷存储，轨迹数据保留 1 年。 二、删除 客户主动要求删除个人信息的，须在 15 个工作日内完成关联数据清理并出具回执。 三、归档 归档数据仍可按运单号检索，检索响应时间放宽到 30 秒。 四、合规 删",
+      "default_head": "## 未找到相关结果\n\n查询: **运单和订单数据保留多久？**\n\n在集合 `globex_customer_success_kb`、`globex_hr_admin_kb`、`globex_finance_kb`、`globex_rd_product_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_rd_product_kb",
+      "query": "客户要求删除个人信息，多久内要完成清理？",
+      "keywords": [
+        "15 个工作日",
+        "15个工作日"
+      ],
+      "source": "GLBX-RD-008",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"客户要求删除个人信息，多久内要完成清理？\"** 找到 2 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.76%\n**来源:** `004.txt`\n\n> 平台系统的订单数据保留 3 年后自动归档到冷存储，客户主动要求删除个人信息的，需在 15 个工作日内完成关联数据清理并出具回执。\n\n### [2] 结果 2\n**相关度:** 99.02%\n**来源:** `GLBX-RD-008_订单与轨迹数据留存.txt`\n\n> 文档编号：GLBX-RD-008 标题：订单与轨迹数据留存 所属企业：Globex 环球集团 所属知识库：研发产品知识库 一",
+      "default_head": "## 检索结果\n\n针对查询 **\"客户要求删除个人信息，多久内要完成清理？\"** 找到 1 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.76%\n**来源:** `004.txt`\n\n> 平台系统的订单数据保留 3 年后自动归档到冷存储，客户主动要求删除个人信息的，需在 15 个工作日内完成关联数据清理并出具回执。\n\n\n---\n\n## 引用来源\n\n- [1] `004.txt`"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_sales_marketing_kb",
+      "query": "销售代表最高能给客户多少折扣？",
+      "keywords": [
+        "8%"
+      ],
+      "source": "GLBX-SM-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"销售代表最高能给客户多少折扣？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 96.64%\n**来源:** `GLBX-SM-001_折扣审批权限.txt`\n\n> 文档编号：GLBX-SM-001 标题：折扣审批权限 所属企业：Globex 环球集团 所属知识库：销售市场知识库 一、权限 Globex 环球集团运费报价折扣审批权限如下： - 销售代表：最高 8% - 区域销售总监：最高 15% - 超过 15%，或年运费承诺超过 100 万元的大客户合同：须集团总部特批。 二、留痕 所有超权限折扣的审批意见须留存在 CRM 中，口",
+      "default_head": "## 检索结果\n\n针对查询 **\"销售代表最高能给客户多少折扣？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 88.64%\n**来源:** `008.txt`\n\n> 青岛枢纽新客户首年运费报价折扣权限：销售最高可给 5% 折扣，超出需要区域销售总监审批，年运费承诺超过 1000000 元的大客户合同需总部特批。\n\n### [2] 结果 2\n**相关度:** 88.59%\n**来源:** `017.txt`\n\n> 上海枢纽新客户首年运费报价折扣权限：销售最高可给 12% 折扣，超出需要区域销售总监审批，年运费承诺超过 1000000 元的大客户合同需总部特批。\n\n"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_sales_marketing_kb",
+      "query": "年运费承诺超过多少的大客户合同需要总部特批？",
+      "keywords": [
+        "100 万",
+        "100万"
+      ],
+      "source": "GLBX-SM-001",
+      "scoped_pass": false,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": false,
+      "pass": false,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"年运费承诺超过多少的大客户合同需要总部特批？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.93%\n**来源:** `017.txt`\n\n> 上海枢纽新客户首年运费报价折扣权限：销售最高可给 12% 折扣，超出需要区域销售总监审批，年运费承诺超过 1000000 元的大客户合同需总部特批。\n\n### [2] 结果 2\n**相关度:** 99.93%\n**来源:** `016.txt`\n\n> 天津枢纽新客户首年运费报价折扣权限：销售最高可给 12% 折扣，超出需要区域销售总监审批，年运费承诺超过 100000 元的大客户合同需",
+      "default_head": "## 检索结果\n\n针对查询 **\"年运费承诺超过多少的大客户合同需要总部特批？\"** 找到 4 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.92%\n**来源:** `018.txt`\n\n> 深圳枢纽新客户首年运费报价折扣权限：销售最高可给 12% 折扣，超出需要区域销售总监审批，年运费承诺超过 100000 元的大客户合同需总部特批。\n\n### [2] 结果 2\n**相关度:** 99.92%\n**来源:** `020.txt`\n\n> 厦门枢纽新客户首年运费报价折扣权限：销售最高可给 12% 折扣，超出需要区域销售总监审批，年运费承诺超过 1000000 元的大客户合同需"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_sales_marketing_kb",
+      "query": "运费报价单的有效期是多久？",
+      "keywords": [
+        "15 天",
+        "15天"
+      ],
+      "source": "GLBX-SM-003",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"运费报价单的有效期是多久？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.95%\n**来源:** `GLBX-SM-175_北美空运专线销售常见问答.txt`\n\n> 文档编号：GLBX-SM-175 标题：北美空运专线销售常见问答 所属企业：Globex 环球集团 所属知识库：销售市场知识库 问：北美空运专线客户问「能不能给到 20% 折扣」怎么答？ 答：折扣权限为销售 8%、区域销售总监 15%，超过 15% 或年运费超过 100 万元的须总部特批， 不能口头答应，须走 CRM 审批。 问：客户问「报价单能用多久」？ 答：",
+      "default_head": "## 未找到相关结果\n\n查询: **运费报价单的有效期是多久？**\n\n在集合 `globex_rd_product_kb`、`globex_finance_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_sales_marketing_kb",
+      "query": "集团对外承诺的整体准点率是多少？",
+      "keywords": [
+        "95%"
+      ],
+      "source": "GLBX-SM-005",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"集团对外承诺的整体准点率是多少？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.96%\n**来源:** `GLBX-SM-005_时效承诺与准点率.txt`\n\n> 文档编号：GLBX-SM-005 标题：时效承诺与准点率 所属企业：Globex 环球集团 所属知识库：销售市场知识库 一、承诺 Globex 环球集团对外承诺整体准点率 95%，各专线的具体时效见对应专线说明。 二、口径 准点率 = 实际送达不晚于承诺时效的运单数 ÷ 同期已送达运单总数。 三、免责 不可抗力、海关查验、客户方原因导致的延误不计入准点率考核，但须",
+      "default_head": "## 未找到相关结果\n\n查询: **集团对外承诺的整体准点率是多少？**\n\n在集合 `globex_hr_admin_kb`、`globex_customer_success_kb`、`globex_it_support_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_sales_marketing_kb",
+      "query": "保价服务怎么收费？",
+      "keywords": [
+        "0.3%",
+        "30 元",
+        "30元"
+      ],
+      "source": "GLBX-SM-010",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": true,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"保价服务怎么收费？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 79.26%\n**来源:** `GLBX-SM-137_中欧班列专线增值服务建议.txt`\n\n> 文档编号：GLBX-SM-137 标题：中欧班列专线增值服务建议 所属企业：Globex 环球集团 所属知识库：销售市场知识库 一、推荐组合 中欧班列专线建议主推的增值服务是保价与目的港换单代理。 二、报价 按集团标准报价执行，保价 0.3%（最低 30 元/票），代收货款 1%（最低 50 元/票）。 三、说明 增值服务须在报价单中单独列明，不得混入运费报价。\n\n##",
+      "default_head": "## 未找到相关结果\n\n查询: **保价服务怎么收费？**\n\n在集合 `globex_customer_success_kb`、`globex_finance_kb`、`globex_hr_admin_kb`、`globex_sales_marketing_kb` 中未找到与查询相关的文档。\n\n**建议:**\n- 尝试使用不同的关键词\n- 检查是否已摄取相关文档\n- 扩大搜索范围（如不指定 collection）\n"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_customer_success_kb",
+      "query": "货物破损投诉要多久内首次响应？",
+      "keywords": [
+        "4 小时",
+        "4小时"
+      ],
+      "source": "GLBX-CS-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"货物破损投诉要多久内首次响应？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.92%\n**来源:** `GLBX-CS-001_投诉响应时效.txt`\n\n> 文档编号：GLBX-CS-001 标题：投诉响应时效 所属企业：Globex 环球集团 所属知识库：客户成功知识库 Globex 环球集团客户投诉响应时效： - 货物破损、丢失类投诉：4 小时内首次响应。 - 时效延误类投诉：4 小时内首次响应。 - 一般咨询与服务态度类投诉：8 小时内首次响应。 首次响应指人工实质回复，自动回执不计入。超时未响应的自动升级给值班客服经",
+      "default_head": "## 检索结果\n\n针对查询 **\"货物破损投诉要多久内首次响应？\"** 找到 3 条相关结果:\n\n### [1] 结果 1\n**相关度:** 38.47%\n**来源:** `003.txt`\n\n> 官网询价线索需在 4 小时内由销售跟进回复，超时未跟进的线索会被系统自动分配给下一位空闲销售代表。\n\n### [2] 结果 2\n**相关度:** 37.21%\n**来源:** `010.txt`\n\n> 官网询价线索需在 6 小时内由销售跟进回复，超时未跟进的线索会被系统自动分配给下一位空闲销售代表。\n\n### [3] 结果 3\n**相关度:** 34.83%\n**来源:** `005.txt`\n\n>"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_customer_success_kb",
+      "query": "未保价的货物损坏了怎么赔付？",
+      "keywords": [
+        "3 倍",
+        "3倍",
+        "2000"
+      ],
+      "source": "GLBX-CS-002",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"未保价的货物损坏了怎么赔付？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.75%\n**来源:** `GLBX-CS-002_货损理赔流程与时限.txt`\n\n> 文档编号：GLBX-CS-002 标题：货损理赔流程与时限 所属企业：Globex 环球集团 所属知识库：客户成功知识库 一、受理 客户服务部受理后 4 小时内联系仓储运营部或车队管理部核实破损发生环节。 二、责任认定 责任认定报告由安全生产部与仓储运营部联合出具，一般在 5 个工作日内完成。 三、赔付时限 理赔全流程须在 15 个工作日内完成。 四、赔付标准 已保",
+      "default_head": "## 检索结果\n\n针对查询 **\"未保价的货物损坏了怎么赔付？\"** 找到 4 条相关结果:\n\n### [1] 结果 1\n**相关度:** 90.99%\n**来源:** `007.txt`\n\n> 客户提出「同行报价更低」时的应对话术：先确认对方比较的是否包含同等时效和保险条款，再强调准点率和货损理赔响应速度的差异化优势。\n\n### [2] 结果 2\n**相关度:** 62.93%\n**来源:** `016.txt`\n\n> 青岛枢纽客户投诉货物破损需要在 2 小时内响应，客户服务部联系仓储运营部核实破损发生环节，属于运输环节的走保险理赔流程。\n\n### [3] 结果 3\n**相关度:** 53."
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_customer_success_kb",
+      "query": "客户要改收货地址，多久内免费，超时收多少钱？",
+      "keywords": [
+        "4 小时",
+        "4小时",
+        "80"
+      ],
+      "source": "GLBX-CS-004",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"客户要改收货地址，多久内免费，超时收多少钱？\"** 找到 4 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.97%\n**来源:** `GLBX-CS-004_改派与地址变更.txt`\n\n> 文档编号：GLBX-CS-004 标题：改派与地址变更 所属企业：Globex 环球集团 所属知识库：客户成功知识库 一、免费期 客户要求变更收货地址的，须在货物发出后 4 小时内提出，该时段内改派免费。 二、超时 超过 4 小时的改派申请按 80 元/次收取改派费，且到达时效相应顺延。 三、限制 已进入干线运输或已完成报关的货物不接受改派，只能到目的地",
+      "default_head": "## 检索结果\n\n针对查询 **\"客户要改收货地址，多久内免费，超时收多少钱？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.44%\n**来源:** `001.txt`\n\n> 青岛枢纽客户要求变更收货地址，需要在货物发出后 4 小时内提出，超过时限的变更申请需要额外支付改派费用。\n\n### [2] 结果 2\n**相关度:** 99.28%\n**来源:** `018.txt`\n\n> 宁波枢纽客户要求变更收货地址，需要在货物发出后 2 小时内提出，超过时限的变更申请需要额外支付改派费用。\n\n### [3] 结果 3\n**相关度:** 31.80%\n**来源:**"
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_customer_success_kb",
+      "query": "货损理赔要在多少个工作日内完成？",
+      "keywords": [
+        "15 个工作日",
+        "15个工作日"
+      ],
+      "source": "GLBX-CS-002",
+      "scoped_pass": false,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": false,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"货损理赔要在多少个工作日内完成？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 98.78%\n**来源:** `GLBX-CS-143_上海枢纽责任认定配合要点.txt`\n\n> 文档编号：GLBX-CS-143 标题：上海枢纽责任认定配合要点 所属企业：Globex 环球集团 所属知识库：客户成功知识库 一、配合方 上海枢纽的货损责任认定由客户服务部发起，仓储运营部与车队管理部配合出具意见。 二、材料 需调取装卸监控、交接单与运输轨迹。 三、时限 责任认定报告一般在 5 个工作日内完成，之后 10 个工作日内完成理赔。\n\n### ",
+      "default_head": "## 检索结果\n\n针对查询 **\"货损理赔要在多少个工作日内完成？\"** 找到 2 条相关结果:\n\n### [1] 结果 1\n**相关度:** 57.28%\n**来源:** `001.txt`\n\n> 新签约客户需在 3 个工作日内由销售完成与客户服务部的交接，交接内容包括时效承诺、特殊操作要求和客户对接人信息。\n\n### [2] 结果 2\n**相关度:** 10.33%\n**来源:** `004.txt`\n\n> 平台系统的订单数据保留 3 年后自动归档到冷存储，客户主动要求删除个人信息的，需在 15 个工作日内完成关联数据清理并出具回执。\n\n\n---\n\n## 引用来源\n\n- [1] `001."
+    },
+    {
+      "kind": "positive",
+      "account": "carol_globex",
+      "collection": "globex_customer_success_kb",
+      "query": "报关延误导致客户投诉，多久内要联系报关合规部？",
+      "keywords": [
+        "2 小时",
+        "2小时"
+      ],
+      "source": "GLBX-CS-007",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"报关延误导致客户投诉，多久内要联系报关合规部？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.99%\n**来源:** `GLBX-CS-007_报关延误沟通口径.txt`\n\n> 文档编号：GLBX-CS-007 标题：报关延误沟通口径 所属企业：Globex 环球集团 所属知识库：客户成功知识库 一、时限 报关延误导致客户投诉的，客户服务部须在 2 小时内联系报关合规部确认延误原因。 二、主动同步 确认原因后须主动同步进度给客户，不能等客户先问。 三、口径 只说明当前状态、已采取措施与预计完成时间，不推测海关审核结论，不承诺",
+      "default_head": "## 检索结果\n\n针对查询 **\"报关延误导致客户投诉，多久内要联系报关合规部？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.97%\n**来源:** `010.txt`\n\n> 天津枢纽报关延误导致客户投诉的，客户服务部需在 6 小时内联系报关合规部确认延误原因，并主动同步进度给客户，不能等客户先问。\n\n### [2] 结果 2\n**相关度:** 99.97%\n**来源:** `019.txt`\n\n> 厦门枢纽报关延误导致客户投诉的，客户服务部需在 6 小时内联系报关合规部确认延误原因，并主动同步进度给客户，不能等客户先问。\n\n### [3] 结果 3\n**"
+    },
+    {
+      "kind": "positive",
+      "account": "dave_globex",
+      "collection": "globex_hr_admin_kb",
+      "query": "入职满一年后每年有多少天年假？",
+      "keywords": [
+        "20 天",
+        "20天"
+      ],
+      "source": "GLBX-HR-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"入职满一年后每年有多少天年假？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.96%\n**来源:** `GLBX-HR-001_年假管理办法.txt`\n\n> 文档编号：GLBX-HR-001 标题：年假管理办法 所属企业：Globex 环球集团 所属知识库：人力行政知识库 一、天数标准 Globex 环球集团全体正式员工入职满一年后，每年享有 20 天带薪年假。此后司龄每满 5 年增加 2 天， 累计上限为 26 天。驾驶岗位的驾龄可折算为司龄计入。 二、顺延规则 当年度未休完的年假，最多顺延到次年 6 月 30 日，逾期作",
+      "default_head": "## 检索结果\n\n针对查询 **\"入职满一年后每年有多少天年假？\"** 找到 2 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.96%\n**来源:** `GLBX-HR-001_年假管理办法.txt`\n\n> 文档编号：GLBX-HR-001 标题：年假管理办法 所属企业：Globex 环球集团 所属知识库：人力行政知识库 一、天数标准 Globex 环球集团全体正式员工入职满一年后，每年享有 20 天带薪年假。此后司龄每满 5 年增加 2 天， 累计上限为 26 天。驾驶岗位的驾龄可折算为司龄计入。 二、顺延规则 当年度未休完的年假，最多顺延到次年 6 月 30 日，逾期作"
+    },
+    {
+      "kind": "positive",
+      "account": "dave_globex",
+      "collection": "globex_hr_admin_kb",
+      "query": "当年没休完的年假可以顺延到什么时候？",
+      "keywords": [
+        "6 月 30 日",
+        "6月30日",
+        "次年 6 月"
+      ],
+      "source": "GLBX-HR-001",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"当年没休完的年假可以顺延到什么时候？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 97.80%\n**来源:** `GLBX-HR-001_年假管理办法.txt`\n\n> 文档编号：GLBX-HR-001 标题：年假管理办法 所属企业：Globex 环球集团 所属知识库：人力行政知识库 一、天数标准 Globex 环球集团全体正式员工入职满一年后，每年享有 20 天带薪年假。此后司龄每满 5 年增加 2 天， 累计上限为 26 天。驾驶岗位的驾龄可折算为司龄计入。 二、顺延规则 当年度未休完的年假，最多顺延到次年 6 月 30 日，",
+      "default_head": "## 检索结果\n\n针对查询 **\"当年没休完的年假可以顺延到什么时候？\"** 找到 2 条相关结果:\n\n### [1] 结果 1\n**相关度:** 97.80%\n**来源:** `GLBX-HR-001_年假管理办法.txt`\n\n> 文档编号：GLBX-HR-001 标题：年假管理办法 所属企业：Globex 环球集团 所属知识库：人力行政知识库 一、天数标准 Globex 环球集团全体正式员工入职满一年后，每年享有 20 天带薪年假。此后司龄每满 5 年增加 2 天， 累计上限为 26 天。驾驶岗位的驾龄可折算为司龄计入。 二、顺延规则 当年度未休完的年假，最多顺延到次年 6 月 30 日，"
+    },
+    {
+      "kind": "positive",
+      "account": "dave_globex",
+      "collection": "globex_hr_admin_kb",
+      "query": "驾驶员连续驾驶最多多少小时，必须休息多久？",
+      "keywords": [
+        "4 小时",
+        "4小时",
+        "20 分钟",
+        "20分钟"
+      ],
+      "source": "GLBX-HR-002",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"驾驶员连续驾驶最多多少小时，必须休息多久？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.46%\n**来源:** `013.txt`\n\n> 深圳枢纽驾驶员超过法定工时的加班按 2.5 倍工资计算，连续驾驶不得超过 4 小时，必须休息至少 20 分钟才能继续上路，这是安全红线不容突破。\n\n### [2] 结果 2\n**相关度:** 99.22%\n**来源:** `020.txt`\n\n> 青岛枢纽驾驶员超过法定工时的加班按 2.5 倍工资计算，连续驾驶不得超过 4 小时，必须休息至少 20 分钟才能继续上路，这是安全红线不容突破",
+      "default_head": "## 检索结果\n\n针对查询 **\"驾驶员连续驾驶最多多少小时，必须休息多久？\"** 找到 4 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.06%\n**来源:** `002.txt`\n\n> 宁波枢纽驾驶员超过法定工时的加班按 3 倍工资计算，连续驾驶不得超过 4 小时，必须休息至少 20 分钟才能继续上路，这是安全红线不容突破。\n\n### [2] 结果 2\n**相关度:** 98.75%\n**来源:** `008.txt`\n\n> 厦门枢纽驾驶员超过法定工时的加班按 1.5 倍工资计算，连续驾驶不得超过 4 小时，必须休息至少 20 分钟才能继续上路，这是安全红线不容突破。\n"
+    },
+    {
+      "kind": "positive",
+      "account": "dave_globex",
+      "collection": "globex_hr_admin_kb",
+      "query": "仓储岗位夜班是几点到几点，夜班津贴多少？",
+      "keywords": [
+        "22:00",
+        "80 元",
+        "80元"
+      ],
+      "source": "GLBX-HR-003",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": false,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"仓储岗位夜班是几点到几点，夜班津贴多少？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.85%\n**来源:** `GLBX-HR-003_三班倒排班管理办法.txt`\n\n> 文档编号：GLBX-HR-003 标题：三班倒排班管理办法 所属企业：Globex 环球集团 所属知识库：人力行政知识库 一、班次 Globex 环球集团各枢纽仓储岗位实行三班倒：早班 06:00-14:00，中班 14:00-22:00，夜班 22:00-次日 06:00。 二、轮换 班次以周为单位轮换，连续上夜班不得超过 6 天，两个班次之间的休息时",
+      "default_head": "## 检索结果\n\n针对查询 **\"仓储岗位夜班是几点到几点，夜班津贴多少？\"** 找到 2 条相关结果:\n\n### [1] 结果 1\n**相关度:** 77.63%\n**来源:** `001.txt`\n\n> 上海枢纽仓库员工实行三班倒排班制，换班前必须完成交接记录，交接不清导致的库存差异由当班责任人承担。\n\n### [2] 结果 2\n**相关度:** 65.80%\n**来源:** `014.txt`\n\n> 宁波枢纽仓库员工实行三班倒排班制，换班前必须完成交接记录，交接不清导致的库存差异由当班责任人承担。\n\n\n---\n\n## 引用来源\n\n- [1] `001.txt`\n- [2] `014.tx"
+    },
+    {
+      "kind": "positive",
+      "account": "dave_globex",
+      "collection": "globex_hr_admin_kb",
+      "query": "新员工安全生产培训需要多少学时？",
+      "keywords": [
+        "16 学时",
+        "16学时"
+      ],
+      "source": "GLBX-HR-007",
+      "scoped_pass": true,
+      "scoped_empty": false,
+      "default_pass": true,
+      "default_empty": false,
+      "pass": true,
+      "scoped_head": "## 检索结果\n\n针对查询 **\"新员工安全生产培训需要多少学时？\"** 找到 5 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.87%\n**来源:** `GLBX-HR-007_岗前培训与持证上岗规定.txt`\n\n> 文档编号：GLBX-HR-007 标题：岗前培训与持证上岗规定 所属企业：Globex 环球集团 所属知识库：人力行政知识库 一、安全生产培训 新员工入职必须完成 16 学时的安全生产培训并考核合格，未合格不得上岗。 二、特种作业 叉车、危险品、起重等特种作业岗位，除集团培训外还需取得国家规定的特种作业操作证， 证件到期前 30 天由安全生产部统一组织复审。",
+      "default_head": "## 检索结果\n\n针对查询 **\"新员工安全生产培训需要多少学时？\"** 找到 2 条相关结果:\n\n### [1] 结果 1\n**相关度:** 99.87%\n**来源:** `GLBX-HR-007_岗前培训与持证上岗规定.txt`\n\n> 文档编号：GLBX-HR-007 标题：岗前培训与持证上岗规定 所属企业：Globex 环球集团 所属知识库：人力行政知识库 一、安全生产培训 新员工入职必须完成 16 学时的安全生产培训并考核合格，未合格不得上岗。 二、特种作业 叉车、危险品、起重等特种作业岗位，除集团培训外还需取得国家规定的特种作业操作证， 证件到期前 30 天由安全生产部统一组织复审。"
+    },
+    {
+      "kind": "denial",
+      "account": "alice_acme",
+      "denial_kind": "cross_org",
+      "target": "globex_hr_admin_kb",
+      "query": "驾驶员连续驾驶最多多少小时就必须休息？",
+      "is_empty": true,
+      "denied_marker": false,
+      "forbidden": [
+        "枢纽",
+        "Globex 环球集团",
+        "驾驶员",
+        "报关"
+      ],
+      "leaked": [],
+      "pass": true,
+      "snippets_head": ""
+    },
+    {
+      "kind": "denial",
+      "account": "alice_acme",
+      "denial_kind": "cross_org",
+      "target": "globex_customer_success_kb",
+      "query": "未保价的货物损坏了按运费的几倍赔付？",
+      "is_empty": true,
+      "denied_marker": false,
+      "forbidden": [
+        "枢纽",
+        "Globex 环球集团",
+        "驾驶员",
+        "报关"
+      ],
+      "leaked": [],
+      "pass": true,
+      "snippets_head": ""
+    },
+    {
+      "kind": "denial",
+      "account": "alice_acme",
+      "denial_kind": "cross_org",
+      "target": "product_req_kb（测试新公司）",
+      "query": "产品需求文档库里对需求评审有什么要求？",
+      "is_empty": true,
+      "denied_marker": false,
+      "forbidden": [
+        "产品需求文档库",
+        "测试新公司"
+      ],
+      "leaked": [],
+      "pass": true,
+      "snippets_head": ""
+    },
+    {
+      "kind": "denial",
+      "account": "bob_acme",
+      "denial_kind": "no_permission",
+      "target": "acme_finance_kb",
+      "query": "报销单笔超过多少金额需要 CFO 审批？",
+      "is_empty": true,
+      "denied_marker": false,
+      "forbidden": [],
+      "leaked": [],
+      "pass": true,
+      "snippets_head": ""
+    },
+    {
+      "kind": "denial",
+      "account": "bob_acme",
+      "denial_kind": "no_permission",
+      "target": "acme_it_support_kb",
+      "query": "域账号密码多久强制更换一次？",
+      "is_empty": true,
+      "denied_marker": false,
+      "forbidden": [],
+      "leaked": [],
+      "pass": true,
+      "snippets_head": ""
+    },
+    {
+      "kind": "denial",
+      "account": "bob_acme",
+      "denial_kind": "cross_org",
+      "target": "globex_hr_admin_kb",
+      "query": "驾驶员连续驾驶最多多少小时就必须休息？",
+      "is_empty": true,
+      "denied_marker": false,
+      "forbidden": [
+        "枢纽",
+        "Globex 环球集团",
+        "驾驶员",
+        "报关"
+      ],
+      "leaked": [],
+      "pass": true,
+      "snippets_head": ""
+    },
+    {
+      "kind": "denial",
+      "account": "carol_globex",
+      "denial_kind": "cross_org",
+      "target": "acme_hr_admin_kb",
+      "query": "入职满一年后每年有 15 天年假吗？",
+      "is_empty": false,
+      "denied_marker": false,
+      "forbidden": [
+        "Acme 有限公司",
+        "堡垒机",
+        "域账号",
+        "套餐"
+      ],
+      "leaked": [],
+      "pass": true,
+      "snippets_head": "青岛枢纽驾驶员年假按驾龄计算，满 3 年起每年增加 1 天，最多累计到 5 天，旺季（11-1 月）原则上不受理年假申请。"
+    },
+    {
+      "kind": "denial",
+      "account": "carol_globex",
+      "denial_kind": "cross_org",
+      "target": "acme_it_support_kb",
+      "query": "堡垒机会话录像保留多少天？",
+      "is_empty": true,
+      "denied_marker": false,
+      "forbidden": [
+        "Acme 有限公司",
+        "堡垒机",
+        "域账号",
+        "套餐"
+      ],
+      "leaked": [],
+      "pass": true,
+      "snippets_head": ""
+    },
+    {
+      "kind": "denial",
+      "account": "dave_globex",
+      "denial_kind": "no_permission",
+      "target": "globex_finance_kb",
+      "query": "客户对账单有异议须在几个工作日内提出？",
+      "is_empty": true,
+      "denied_marker": false,
+      "forbidden": [],
+      "leaked": [],
+      "pass": true,
+      "snippets_head": ""
+    },
+    {
+      "kind": "denial",
+      "account": "dave_globex",
+      "denial_kind": "no_permission",
+      "target": "globex_customer_success_kb",
+      "query": "货物破损投诉要多久内首次响应？",
+      "is_empty": true,
+      "denied_marker": false,
+      "forbidden": [],
+      "leaked": [],
+      "pass": true,
+      "snippets_head": ""
+    },
+    {
+      "kind": "denial",
+      "account": "dave_globex",
+      "denial_kind": "cross_org",
+      "target": "acme_hr_admin_kb",
+      "query": "Acme 的员工每月最多可以远程办公几天？",
+      "is_empty": true,
+      "denied_marker": false,
+      "forbidden": [
+        "Acme 有限公司",
+        "堡垒机",
+        "域账号",
+        "套餐"
+      ],
+      "leaked": [],
+      "pass": true,
+      "snippets_head": ""
+    }
+  ]
+}
