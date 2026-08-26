@@ -361,10 +361,10 @@ flowchart TB
    > 但并发至今一次都没实测过**（2026-08-25 的基准是串行单用户），
    > 缺口倍数因此**既没被验证、也没被推翻**，本条维持 P0。
 
-4. **安全四条 —— 3/4 已修复（2026-08-26），见 §5**：
+4. **安全四条 —— ✅ 4/4 已修复（2026-08-26），见 §5**：
    ~~绕过 ACL 的测试端点~~ ✅ 已整体删除 ·
    ~~CORS 全放开 + 允许携带凭证~~ ✅ 已改为显式来源清单 ·
-   **租户凭证明文存库** 🔴 仍未闭环（方案已在独立 worktree 里设计验证，待重新应用到当前分支）·
+   ~~租户凭证明文存库~~ ✅ 已加密（Fernet，fail-fast 密钥校验，存量数据迁移脚本）·
    ~~trace WebSocket 无鉴权~~ ✅ 已加鉴权
 
 5. **知识库文档投毒 → 间接提示注入**，可跨话题传染，ACL 拦不住
@@ -673,6 +673,32 @@ flowchart TB
 ---
 
 ## 5. 已修复（防止重新引入）
+
+- ✅ **2026-08-26　P0：租户连接器凭证明文存库**
+  `tenant_connectors.auth_config`（企业接入自己知识库/考勤系统用的 API token）
+  原来是明文 JSON 直接落库，数据库一旦泄露，所有企业的第三方系统凭证跟着泄露。
+  改为应用层加密（`connector_crypto.py`，`cryptography.fernet.Fernet`）：
+  密钥从 `RAGENT_CONNECTOR_ENCRYPTION_KEY` 读取，密钥解析在
+  `TenantConnectorStore.__init__` 里就 fail-fast（照抄 `resolve_jwt_secret` 的
+  模式，缺失/等于内置不安全默认值时非 `RAGENT_DEBUG=true` 一律拒绝构造）；
+  `upsert()` 写入前加密，`_row_to_connector` 读取时解密，且**向后兼容存量明文
+  行**（迁移前数据库里就是明文 dict，读路径按哨兵 key `__enc__` 分流，命中就解密、
+  不命中就原样透传，不抛异常也不中断服务）。
+  存量数据一次性迁移：`scripts/migrate_connector_auth_config_encryption.py`
+  （幂等，支持 `--dry-run`，按 `id` 原地 UPDATE，不走 `upsert()` 的
+  INSERT-ON-CONFLICT 语义避免误覆盖其它字段）。
+  **不提供"回滚到明文"的开关**——明文存储正是这次要修的问题本身，不留自我否定
+  的后门；**未实现密钥轮转**（`MultiFernet` 可支持，当前只有一个密钥版本，
+  轮转是真的需要换密钥时才有意义的功能，本次不做）。
+  ⚠️ **已知运营风险**：丢失 `RAGENT_CONNECTOR_ENCRYPTION_KEY` 后已加密的凭证
+  永久不可解密（对称加密的正常代价），需要企业管理员通过管理后台重新填一次
+  token。
+  回归测试：`tests/unit/test_connector_crypto.py`（28 条）+
+  `tests/unit/test_tenant_connector_store_encryption.py`（10 条，mock
+  `asyncpg`，不碰真实数据库——本仓库 `RAGENT_POSTGRES_URL` 默认指向跨会话共用的
+  本地库，`conftest.py` 无 DB fixture）。
+  **保留了现有的类级别共享连接池**（`_pool`/`_pool_lock` 不变）——这条 P0 的
+  修复不应该顺带改动 P1-2（连接池分散）相关的既有模式。
 
 - ✅ **2026-08-26　P0：绕过 ACL 的测试端点**
   `app.py` 里一组【测试专用，正式上线前删除】的知识库管理员工具端点

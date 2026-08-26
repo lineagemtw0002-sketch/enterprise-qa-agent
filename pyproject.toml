@@ -49,6 +49,7 @@ dependencies = [
     "bcrypt>=4.0.0",
     "pyjwt>=2.8.0",
     "httpx>=0.25.0",
+    "cryptography>=42.0.0",  # tenant_connector_store.py 加密 auth_config 用（connector_crypto.py）
 ]
 
 [project.optional-dependencies]
