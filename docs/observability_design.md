@@ -1,13 +1,13 @@
 # 结构化日志 + request id 贯穿链路 —— 设计方案
 
-> **状态：阶段一、二已实施（2026-08-26）。阶段三部分实施（print 已转，`_emit_trace` 双 sink 未做）。阶段四未实施。**
+> **状态：阶段一、二、三（除 §2.3 逐节点字段补齐 + 阶段四依赖项外）已实施（2026-08-26）。阶段四未实施。**
 >
 > | 阶段 | 状态 |
 > |---|---|
 > | 阶段 0（清 `traces.jsonl`） | ✅ 已移出活跃路径（见文末「阶段一实施记录」） |
 > | **阶段一**（`context.py` / `redact.py` / `configure_logging` / 8 处 print / 轮转） | ✅ **已实施，117 条单测保护** |
 > | **阶段二**（`app.py`：`RequestContextMiddleware` + `X-Request-Id` 回写 + SSE 端点显式 bind + 29 处 print） | ✅ **2026-08-26 已实施**。`RequestContextMiddleware`（`src/observability/middleware.py`，纯 ASGI 类）注册在 `CORSMiddleware` 之后；`chat_stream` 端点按 R1 的兜底方案显式再绑一次 `request_id`，不依赖中间件透传进 SSE 生成器体这条未验证假设。回归：`tests/unit/test_request_middleware.py`（T-3，9 条，纯 ASGI 假 app，不连 `create_app()`）。「启动摘要日志（合并 C 类刷屏）」这一小项未做——29 处 print 都已逐条转成结构化 `logger` 调用，合并成一条摘要是锦上添花，不是本次范围 |
-> | 阶段三（`workflow.py`：`_emit_trace` 双 sink + 13 处 print） | 🟡 **部分实施（2026-08-26）**：13 处 print 已转 logger（不含 `_emit_trace` 函数本身，未 touch）；`_emit_trace` → 双 sink 改造（D-8，风险最高的一步）**未做**，需要先跑 `test_workflow_stream_isolation.py` 的 9 条并发回归确认不破坏 P0-1 契约，再单独决定是否继续。§2.3 逐节点字段补齐未做。审计 `buffer_preview` 那一项**已随另一批次修掉**（`CLAUDE.md` §5「顺手修掉：审计表里存着泄露原文」，2026-08-25），本文这条待更正 |
+> | **阶段三**（`workflow.py`：`_emit_trace` 双 sink + 13 处 print） | ✅ **2026-08-26 已实施（D-8 走完全部前提条件）**。`_emit_trace` 签名一字未改，内部拆成 `_emit_to_ui_sink`（原行为不变）+ `_emit_to_log_sink`（`redact()` → `logger.info`），`_emit_trace` 对 `_emit_to_log_sink` 的调用额外包了一层 `try/except`（T-11 要求"Log sink 失败绝不能影响 UI sink"，边界要划在调用点，不能只指望被调用方自觉）。13 处 print 已转 logger。回归：`test_workflow_stream_isolation.py` 全部 9 条真并发**改前改后都跑过、都通过**（D-8 前提条件），新增 T-11（sink 失败隔离，2 条）+ 结构化字段可读性回归（1 条，见下）+ 保留字段名冲突回归（1 条），共 13 条。⚠️ **实现时踩过一个真实的坑并已修正**：`node`/`step`/`status` 一开始加了 `trace_` 前缀防止跟 Python logging 保留属性名冲突，结果匹配不上 `redact.py::S0_FIELDS` 的精确字段名，退化成"未知字段默认 S2"被整个哈希掉——手工过了一遍实际渲染的 JSON 日志才发现（`node`/`step`/`status` 变成一串 `_len`/`_sha256`，完全看不出是哪个节点），去掉前缀后已修复并补了专门的回归测试。§2.3 逐节点字段补齐、`QueryKnowledgeHubTool` 打通 `request_id`（"顺带的好处"一节）**未做**——这两条不在 D-8 的前提条件范围内，是后续可选的细化 |
 > | 阶段四（前端短码 + 按 org 分文件 + 保留期运维） | ⬜ 未实施 |
 >
 > ⚠️ 本文 §1 / §2 的「现状」描述写于实施前，**阶段一涉及的部分已经过时**

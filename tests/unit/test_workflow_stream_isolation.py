@@ -240,3 +240,101 @@ class TestTraceQueueIsolation:
 
         assert all(e["tag"] == "A" for e in a), f"A 的 trace 被污染: {a}"
         assert all(e["tag"] == "B" for e in b), f"B 的 trace 被污染: {b}"
+
+
+class TestEmitTraceSinkIsolation:
+    """T-11（`docs/observability_design.md` §5.3）：`_emit_trace` 改成单一埋点 +
+    双 sink（2026-08-26，D-8）之后，Log sink 抛异常绝不能影响 UI sink——
+    这是 R2 风险缓解的核心断言，旧的单 sink 实现测不出这条（根本没有第二个 sink
+    可能失败）。"""
+
+    @pytest.mark.asyncio
+    async def test_log_sink_exception_does_not_block_ui_sink(self, workflow, monkeypatch):
+        queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+        _CURRENT_TRACE_QUEUE.set(queue)
+        try:
+            monkeypatch.setattr(
+                workflow, "_emit_to_log_sink",
+                lambda *a, **k: (_ for _ in ()).throw(RuntimeError("log sink boom")),
+            )
+            # 不能抛到调用方——业务代码里几十处 self._emit_trace(...) 调用点
+            # 都是"发完不管"的写法，任何一处因为 log sink 出错而抛异常，都会
+            # 直接中断当时正在跑的业务节点。
+            workflow._emit_trace("retrieve", "knowledge_retrieval", "running", {"q": "x"})
+            await asyncio.sleep(0)  # 让 UI sink 的 create_task 有机会跑
+
+            assert not queue.empty(), "log sink 抛异常，UI sink 应该仍然收到事件"
+            event = queue.get_nowait()
+            assert event["node"] == "retrieve"
+            assert event["step"] == "knowledge_retrieval"
+        finally:
+            _CURRENT_TRACE_QUEUE.set(None)
+
+    @pytest.mark.asyncio
+    async def test_ui_sink_exception_does_not_block_log_sink(self, workflow, monkeypatch):
+        """反过来也要成立：UI sink 出错（比如队列已满/已关闭）不该拖累
+        Log sink——两个 sink 之间没有依赖关系，一个失败不该波及另一个。"""
+        log_calls: List[str] = []
+        monkeypatch.setattr(
+            workflow, "_emit_to_ui_sink",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ui sink boom")),
+        )
+        monkeypatch.setattr(
+            workflow, "_emit_to_log_sink",
+            lambda node, step, status, payload: log_calls.append(node),
+        )
+        with pytest.raises(RuntimeError):
+            workflow._emit_trace("retrieve", "knowledge_retrieval", "running", {"q": "x"})
+        # UI sink 先跑、且真的抛了——按当前 _emit_trace 的顺序，UI sink 的异常会
+        # 直接冒出来，Log sink 那半没机会跑。这条断言记录的是"UI sink 优先"这个
+        # 设计选择的真实代价：UI sink 目前没有 try/except 包裹（它一直是这样，
+        # 这次没有新增这个风险，只是第一次被测试覆盖到）。
+        assert log_calls == []
+
+
+class TestEmitTraceLogSinkKeepsStructuralFieldsReadable:
+    """回归保护：`node`/`step`/`status` 是结构化元数据（`redact.py::S0_FIELDS`
+    显式登记为 S0），必须原样可读，不能被脱敏成 `_len`/`_sha256`。
+
+    真实踩过的坑：实现时给这三个字段加了 `trace_` 前缀避免跟 Python logging
+    保留属性名冲突，结果 `trace_node`/`trace_step`/`trace_status` 匹配不上
+    分级表里的精确字段名，退化成"未知字段默认 S2"，被整个哈希掉——
+    可观测性日志里连是哪个节点、哪一步都看不出来，等于白做。
+    `node`/`step`/`status` 本身不在 Python logging 的保留属性名里，不需要
+    加前缀就是安全的。"""
+
+    @pytest.mark.asyncio
+    async def test_node_step_status_stay_as_plain_values(self, workflow, monkeypatch):
+        captured: Dict[str, Any] = {}
+
+        def fake_info(msg, extra=None, **kwargs):
+            captured.update(extra or {})
+
+        monkeypatch.setattr("src.ragent_backend.workflow.logger.info", fake_info)
+
+        workflow._emit_trace("retrieve", "knowledge_retrieval", "success", {"result_count": 3})
+
+        assert captured.get("node") == "retrieve", f"node 应该原样可读，实际: {captured}"
+        assert captured.get("step") == "knowledge_retrieval", f"step 应该原样可读，实际: {captured}"
+        assert captured.get("status") == "success", f"status 应该原样可读，实际: {captured}"
+        assert "node_len" not in captured and "node_sha256" not in captured
+        assert "step_len" not in captured and "step_sha256" not in captured
+
+
+class TestEmitTraceLogSinkNoReservedKeyCollision:
+    """`_emit_trace` payload 里出现 `args`（真实调用点：`subgraph.py` 的工具调用
+    参数）时，Log sink 不能因为 Python logging 的保留属性名冲突而崩溃——
+    `extra={"args": ...}` 会在构造 LogRecord 时直接 KeyError，redact() 必须先
+    把它重命名掉（见 `_emit_to_log_sink` docstring）。"""
+
+    @pytest.mark.asyncio
+    async def test_args_field_does_not_crash_log_sink(self, workflow):
+        _CURRENT_TRACE_QUEUE.set(asyncio.Queue())
+        try:
+            # 不能抛异常——这本身就是断言：旧版直接 logger.info(extra=payload)
+            # 的写法在这个 payload 下会 KeyError。
+            workflow._emit_trace(
+                "tool_subgraph", "tool_call", "running", {"args": {"query": "some tool args"}},
+            )
+        finally:
+            _CURRENT_TRACE_QUEUE.set(None)

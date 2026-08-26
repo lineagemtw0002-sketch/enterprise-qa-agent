@@ -32,6 +32,7 @@ from src.ragent_backend.workflow_store import WorkflowStore
 from src.mcp_server.tools.query_knowledge_hub import QueryKnowledgeHubTool
 from src.security.prompt_guard import looks_like_prompt_leak, detect_privilege_claim
 from src.observability.logger import get_logger
+from src.observability.redact import redact
 
 logger = get_logger(__name__)
 
@@ -394,7 +395,34 @@ class RAGWorkflow:
         status: str = "running",
         payload: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """将 trace 事件推送到 trace_queue（仅在流式模式下）"""
+        """将 trace 事件分发给 UI sink 和 Log sink——签名一字不改，
+        见 docs/observability_design.md §2.2（单一埋点 + 双 sink，字段策略在 sink 层分叉）。
+
+        **UI sink 永远第一个执行**（T-11）：即使 Log sink 抛异常，也不能影响
+        用户在 TracePanel 上看到的东西。这个函数在 P0-1 的修复路径上
+        （`_trace_queue` 走 contextvars 按请求隔离），UI sink 那部分行为
+        一字不改，仍然是原来的 `asyncio.create_task(...put(...))`——
+        改完这里必须跑过 `tests/unit/test_workflow_stream_isolation.py`
+        全部 9 条真并发测试（D-8 拍板的前提条件）。
+
+        这里对 `_emit_to_log_sink` 的调用本身也包一层 `try/except`——不是重复
+        保险：`_emit_to_log_sink` 内部那层只挡得住它自己函数体里的失败
+        （`redact()`/`logger.info()`），挡不住"这个方法整个被别的代码改坏了"
+        这类更根本的错误。T-11 的要求是"Log sink 失败绝不能影响 UI sink"，
+        不是"Log sink 内部处理好的那部分失败不影响"——边界要划在调用点，
+        不能只指望被调用方自觉。
+        """
+        self._emit_to_ui_sink(node, step, status, payload)
+        try:
+            self._emit_to_log_sink(node, step, status, payload)
+        except Exception:
+            logger.exception("log sink call failed entirely", extra={"node": node, "step": step})
+
+    def _emit_to_ui_sink(
+        self, node: str, step: str, status: str, payload: Optional[Dict[str, Any]],
+    ) -> None:
+        """UI sink：原 `_emit_trace` 的全部行为，一字不改——推到 `trace_queue`，
+        SSE 广播给 `TracePanel`（仅在流式模式下，`_trace_queue` 为 None 时自然跳过）。"""
         if self._trace_queue is not None:
             asyncio.create_task(
                 self._trace_queue.put({
@@ -405,6 +433,35 @@ class RAGWorkflow:
                     "payload": payload or {},
                     "ts": time.time(),
                 })
+            )
+
+    def _emit_to_log_sink(
+        self, node: str, step: str, status: str, payload: Optional[Dict[str, Any]],
+    ) -> None:
+        """Log sink：脱敏后写运维日志。失败静默但不沉默——不能拖垮业务
+        （对齐 `audit_store.py` 既有原则"审计失败不能拖垮被审计的业务操作"），
+        但自己的失败要留痕，用 `logger.exception` 记一笔。
+
+        这里先用保守默认（`log_content=False, strict=False`）跑一遍
+        `redact()`，唯一目的是避开 Python `logging` 的保留属性名冲突——
+        `extra={"args": ...}` 会在构造 `LogRecord` 时直接抛
+        `KeyError: Attempt to overwrite 'args' in LogRecord`（`args` 本身就是
+        `LogRecord` 的属性），而 S2/S2+ 分级字段（含 `args`，见
+        `redact.py::ARG_DICT_FIELDS`）经过 `redact()` 会被重命名成
+        `_len`/`_sha256` 后缀，天然避开这个碰撞。**真正按环境变量
+        （`RAGENT_LOG_CONTENT`/`strict`）生效的脱敏由 `configure_logging`
+        挂的 `RedactingFilter` 在 handler 阶段做**——`redact()` 是幂等的，
+        这里的预处理不影响最终按策略脱敏的结果。
+        """
+        try:
+            safe_fields = redact(payload or {}, log_content=False, strict=False)
+            logger.info(
+                "trace event",
+                extra={"node": node, "step": step, "status": status, **safe_fields},
+            )
+        except Exception:
+            logger.exception(
+                "log sink failed to emit trace event", extra={"node": node, "step": step},
             )
 
     async def run(

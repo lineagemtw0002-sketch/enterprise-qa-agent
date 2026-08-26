@@ -693,10 +693,29 @@ flowchart TB
     （自动带 traceback）。
   - 回归：`tests/unit/test_request_middleware.py`（9 条，T-3）；完整单测套件
     （含 `test_workflow_stream_isolation.py` 的 9 条真并发）跑过，确认未破坏 P0-1 契约。
-  ⚠️ **未做的**：`workflow.py` 的 `_emit_trace` → 双 sink 改造（`docs/observability_design.md`
-  阶段三里风险最高的一步，D-8 已拍板"接受，但必须先跑并发回归"，本次未动）；
-  启动摘要日志合并（29 处已逐条转好，合并成一条摘要是锦上添花，未做）；
+  ⚠️ **未做的**：启动摘要日志合并（29 处已逐条转好，合并成一条摘要是锦上添花，未做）；
   阶段四（前端短码/按 org 分文件/保留期运维）未做。
+
+- ✅ **2026-08-26　`_emit_trace` → 双 sink 改造（阶段三，D-8 已拍板"接受，
+  但必须先跑并发回归"——本条是那次拍板的落地）**
+  `_emit_trace` 签名一字不改，内部拆成 `_emit_to_ui_sink`（原行为不变：推
+  `trace_queue` → SSE → `TracePanel`）+ `_emit_to_log_sink`（`redact()` →
+  结构化 `logger.info`）。`_emit_trace` 对 `_emit_to_log_sink` 的调用额外包了
+  一层 `try/except`——T-11 的要求是"Log sink 失败绝不能影响 UI sink"，
+  边界要划在调用点，不能只指望被调用方自觉处理好自己的异常。
+  `test_workflow_stream_isolation.py` 全部 9 条真并发**改前改后都跑过、都通过**
+  （D-8 前提条件），新增 T-11 sink 失败隔离（2 条）+ 两条真实踩过的坑的回归
+  测试，共 13 条。
+  ⚠️ **实现时踩过一个真实的坑，靠手工过一遍实际渲染的 JSON 日志才发现**：
+  `node`/`step`/`status` 一开始加了 `trace_` 前缀防止跟 Python logging 保留
+  属性名（如 `args`）冲突，结果匹配不上 `redact.py::S0_FIELDS` 的精确字段名，
+  退化成"未知字段默认 S2"被整个哈希掉——日志里连是哪个节点、哪一步都看不出来，
+  等于把可观测性最基本的东西搞坏了。**测试全绿不代表输出对**，这次是靠人工
+  看渲染结果才抓到，已修复（去掉前缀）并补了专门的回归测试锁死。
+  `args` 字段本身（真实调用点是 `subgraph.py` 的工具参数）经 `redact()` 正确
+  重命名为 `args_keys_len`/`args_keys_sha256`，不再跟 `LogRecord.args` 冲突。
+  ⚠️ **未做的**：§2.3 逐节点字段补齐、`QueryKnowledgeHubTool` 打通 `request_id`
+  （不在 D-8 前提条件范围内，后续可选细化）；阶段四未做。
 
 - ✅ **2026-08-26　P0：租户连接器凭证明文存库**
   `tenant_connectors.auth_config`（企业接入自己知识库/考勤系统用的 API token）
