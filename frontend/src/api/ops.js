@@ -105,3 +105,34 @@ export function setAiopsModuleEnabled(orgId, enabled) {
     .put(`${BASE}/organizations/${encodeURIComponent(orgId)}/aiops-module-enabled`, { enabled })
     .then((res) => res.data)
 }
+
+// ==================== 运维权限授权（role_ops_systems） ====================
+//
+// 语义跟 role_collections 对齐：权限挂在**角色**上，不是挂在用户上——
+// 一个用户一个角色，改角色的授权即刻对该角色全部成员生效，不用逐人配置
+// （见 role_store.py 顶部说明）。
+//
+// ⚠️ `can_approve` 在后端会自动拉齐 `can_view`（能批准的人必然要能看见他在批什么）。
+// 前端提交前也做同样的拉齐，理由不是"防止后端漏做"，而是**不让用户看到自己勾的和
+// 保存后的不一致**——勾了 approve 没勾 view、保存回来变成两个都有，会被当成界面 bug。
+
+export function listConnectorPermissions(connectionId) {
+  return axios
+    .get(`${BASE}/ops/connectors/${encodeURIComponent(connectionId)}/permissions`)
+    .then((res) => res.data)
+}
+
+export function setRoleOpsPermission(roleId, connectionId, { can_view, can_approve }) {
+  return axios
+    .put(
+      `${BASE}/roles/${encodeURIComponent(roleId)}/ops-permissions/${encodeURIComponent(connectionId)}`,
+      { can_view: can_approve ? true : can_view, can_approve },
+    )
+    .then((res) => res.data)
+}
+
+export function revokeRoleOpsPermission(roleId, connectionId) {
+  return axios
+    .delete(`${BASE}/roles/${encodeURIComponent(roleId)}/ops-permissions/${encodeURIComponent(connectionId)}`)
+    .then((res) => res.data)
+}

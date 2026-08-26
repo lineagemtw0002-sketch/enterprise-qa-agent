@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Alert, Button, Card, Empty, Form, Input, InputNumber, Modal, Popconfirm,
-  Segmented, Select, Space, Spin, Table, Tag, Typography, message,
+  Checkbox, Segmented, Select, Space, Spin, Table, Tag, Typography, message,
 } from 'antd'
-import { Plug, KeyRound, ShieldCheck, ClipboardCheck, RefreshCw, Copy } from 'lucide-react'
+import { Plug, KeyRound, ShieldCheck, ClipboardCheck, RefreshCw, Copy, Users } from 'lucide-react'
+import * as adminApi from '../../api/admin.js'
 import * as opsApi from '../../api/ops.js'
 import './OpsConsole.css'
 
@@ -504,8 +505,8 @@ function ApprovalsSection({ onModuleDisabled }) {
         type="warning"
         showIcon
         className="ops-console-alert"
-        message="当前本企业任何管理员都可以审批"
-        description="精细的审批权限（区分「能查看」和「能审批」）尚未实现，因此这里没有指定审批人的概念。另外注意：批准只是授予执行资格，动作不会因为你点了批准就自动跑起来——真正下发是独立的一步。"
+        message="批准 ≠ 已执行"
+        description="批准只是授予执行资格，动作不会因为你点了批准就自动跑起来——真正下发是独立的一步。审批权限按角色授予（见「授权管理」），不是所有管理员默认都能批。"
       />
       <Table
         rowKey="action_id"
@@ -520,12 +521,155 @@ function ApprovalsSection({ onModuleDisabled }) {
   )
 }
 
+// ============================================================ 授权管理
+
+function PermissionsSection({ connectors, onModuleDisabled }) {
+  const [connectionId, setConnectionId] = useState(null)
+  const [roles, setRoles] = useState([])
+  const [perms, setPerms] = useState({})   // role_id -> {can_view, can_approve}
+  const [loading, setLoading] = useState(false)
+  const [savingRole, setSavingRole] = useState('')
+
+  useEffect(() => {
+    if (!connectionId && connectors.length) setConnectionId(connectors[0].connection_id)
+  }, [connectors, connectionId])
+
+  const load = useCallback(async () => {
+    if (!connectionId) return
+    setLoading(true)
+    try {
+      const [roleList, permList] = await Promise.all([
+        adminApi.listRoles(),
+        opsApi.listConnectorPermissions(connectionId),
+      ])
+      // 只列本企业自建角色：系统角色（org_admin/super_admin 那几个）后端拒绝配置，
+      // 列出来只会让人点了才发现不行。org_admin 的通配符是隐式的，不在这里配。
+      setRoles(roleList.filter((r) => !r.is_system))
+      setPerms(Object.fromEntries(
+        permList.map((p) => [p.role_id, { can_view: p.can_view, can_approve: p.can_approve }])))
+    } catch (error) {
+      if (opsApi.isModuleDisabledError(error)) { onModuleDisabled(); return }
+      message.error(opsApi.errorText(error))
+    } finally {
+      setLoading(false)
+    }
+  }, [connectionId, onModuleDisabled])
+
+  useEffect(() => { load() }, [load])
+
+  async function update(roleId, next) {
+    setSavingRole(roleId)
+    try {
+      if (!next.can_view && !next.can_approve) {
+        await opsApi.revokeRoleOpsPermission(roleId, connectionId)
+      } else {
+        await opsApi.setRoleOpsPermission(roleId, connectionId, next)
+      }
+      await load()
+    } catch (error) {
+      message.error(opsApi.errorText(error))
+      await load()   // 失败时也重新拉，避免界面停在一个没真正生效的勾选状态
+    } finally {
+      setSavingRole('')
+    }
+  }
+
+  if (!connectors.length) {
+    return <Empty description="先登记至少一个连接器，才能给角色授权" />
+  }
+
+  const columns = [
+    { title: '角色', dataIndex: 'display_name', render: (v, r) => v || r.name },
+    {
+      title: '能查看',
+      width: 120,
+      render: (_, role) => {
+        const p = perms[role.role_id] || {}
+        return (
+          <Checkbox
+            checked={!!p.can_view}
+            // 能批准的人必然要能看见他在批什么，所以 approve 打开时 view 强制勾上
+            // 且不可单独取消——把这条约束做进控件，而不是等用户取消后被后端悄悄改回来。
+            disabled={!!p.can_approve || savingRole === role.role_id}
+            onChange={(e) => update(role.role_id, { can_view: e.target.checked, can_approve: false })}
+          />
+        )
+      },
+    },
+    {
+      title: '能审批',
+      width: 120,
+      render: (_, role) => {
+        const p = perms[role.role_id] || {}
+        return (
+          <Checkbox
+            checked={!!p.can_approve}
+            disabled={savingRole === role.role_id}
+            onChange={(e) => update(role.role_id,
+              { can_view: true, can_approve: e.target.checked })}
+          />
+        )
+      },
+    },
+    {
+      title: '',
+      render: (_, role) => {
+        const p = perms[role.role_id] || {}
+        if (!p.can_view && !p.can_approve) return null
+        return (
+          <Popconfirm
+            title="撤销这个角色对该连接器的全部权限？"
+            okText="撤销" cancelText="取消"
+            onConfirm={() => update(role.role_id, { can_view: false, can_approve: false })}
+          >
+            <Button size="small" danger type="text">撤销</Button>
+          </Popconfirm>
+        )
+      },
+    },
+  ]
+
+  return (
+    <Card
+      size="small"
+      title="谁能查看 / 谁能审批"
+      loading={loading}
+      extra={
+        <Select
+          value={connectionId}
+          onChange={setConnectionId}
+          style={{ minWidth: 220 }}
+          options={connectors.map((c) => ({ value: c.connection_id, label: c.name }))}
+        />
+      }
+    >
+      <Alert
+        type="info"
+        showIcon
+        className="ops-console-alert"
+        message="权限挂在角色上，不是挂在人上"
+        description="给角色授权后，该角色的全部成员立即生效，不需要逐人配置、也不需要重新登录。企业管理员对本企业连接器天然拥有全部权限，不在这里配置；平台管理员不会自动获得任何企业的运维权限。"
+      />
+      <Table
+        rowKey="role_id"
+        size="small"
+        columns={columns}
+        dataSource={roles}
+        pagination={false}
+        locale={{ emptyText: <Empty description="本企业还没有自建角色。系统角色不能在这里授权。" /> }}
+      />
+    </Card>
+  )
+}
+
+
 // ============================================================ 页面
 
 const SECTIONS = [
   { value: 'connectors', label: '连接器', icon: Plug },
   { value: 'scopes', label: '允许范围', icon: ShieldCheck },
   { value: 'approvals', label: '审批队列', icon: ClipboardCheck },
+  { value: 'permissions', label: '授权管理', icon: Users },
 ]
 
 export default function OpsConsole() {
@@ -575,6 +719,9 @@ export default function OpsConsole() {
         booting ? <Spin /> : <ScopesSection connectors={connectors} onModuleDisabled={onModuleDisabled} />
       )}
       {section === 'approvals' && <ApprovalsSection onModuleDisabled={onModuleDisabled} />}
+      {section === 'permissions' && (
+        booting ? <Spin /> : <PermissionsSection connectors={connectors} onModuleDisabled={onModuleDisabled} />
+      )}
     </div>
   )
 }
