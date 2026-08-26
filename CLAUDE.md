@@ -15,6 +15,10 @@
 
 **当前阶段**：⚠️ **停止新增功能，先补设计**（2026-08-24 起）。
 不要主动提议或开始新功能；允许做的是补设计、补测试、修 P0/P1、清死代码。
+**一个已获用户明确授权的例外**：智能运维模块（`docs/aiops_module_design.md`）
+2026-08-26 用户明确要求插队开工，覆盖了该文档自己"排期维持在 12 条 P0 之后"
+的原始决定——不是本文这条"停止新增功能"规则本身作废，是这一个模块被显式
+豁免，仅次于确认，别把这条豁免误读成规则整体解除。阶段一已实施，见 §5。
 
 **三条最高优先级未闭环**（详见 [§4](#4-已知未闭环)）：
 1. 🔴 文档更新后旧版本片段永久残留 → **产生错误答案**（已实测确认）
@@ -836,6 +840,59 @@ flowchart TB
 
 ## 5. 已修复（防止重新引入）
 
+- 🔵 **2026-08-26　智能运维模块阶段一：数据模型 + 目标越界判定 + 审批状态机存储层**
+  设计 `docs/aiops_module_design.md`。2026-08-26 用户明确要求插队开工，覆盖了
+  该文档自己"排期维持在 12 条 P0 之后"的原始决定——那条决定没有作废，是被
+  这次显式覆盖，如实记录。
+
+  **落地了什么**：
+  1. `src/ragent_backend/aiops_scope.py`（纯函数，不碰数据库，跟
+     `activation.py`/`auth.py::resolve_jwt_secret` 同一个模式）：V1 四类动作
+     类型硬编码（§0⑥，不可运行时扩展）；四类动作各自的目标越界判定
+     （`check_target_in_scope`），`clean_disk` 场景排除规则优先于允许规则
+     （§10.3 的硬性要求）；`approval_timeout_minutes` 边界校验 [5, 1440]
+     （§10.4）。回归：`tests/unit/test_aiops_scope.py`（27 条，四类动作各配
+     一条越界用例 + 一条合法对照组）。
+  2. `src/ragent_backend/ops_store.py`：5 张新表（`ops_system_connections`
+     不含任何凭证字段——§3.2 BYOC 原则的架构约束、`role_ops_systems`、
+     `ops_remediation_scopes`、`remediation_actions`、`ops_analysis_summaries`）
+     + `organizations.aiops_module_enabled` 开关列。走 P1-2 的共享连接池
+     （`db_pool.py`），没有再独立 `create_pool`。
+  3. **审批状态机的硬性不变量已落地**（§3.3）：状态转移表
+     `_STATUS_TRANSITIONS` 是状态图的机器可读版本；`approved`/`executing`
+     两个目标状态**不能**走通用的 `advance_status`，必须走专用方法
+     `approve_action`/`mark_executing`；`mark_executing` 在转移前二次校验
+     `approver_user_id`/`approved_at` 是否存在，防止"状态字段被绕过篡改成
+     approved 但没有真实审批人"这类坏数据被继续往前推进到 executing。
+     回归：`tests/unit/test_ops_store_status_machine.py`（20 条，含专门构造
+     "状态是 approved 但审批人字段缺失"的坏数据来验证二次校验确实生效）。
+
+  **真实验证**（连本机真实 Postgres，不是 mock）：schema 创建、模块开关读写、
+  连接器注册/心跳、修复范围存取 + 越界判定集成、完整审批状态机走一遍
+  `proposed→pending_approval→approved→executing→completed` 全部手工跑通。
+  全量 `tests/unit` 通过（含新增 47 条）。
+
+  ⚠️ **未做的（比做了的多得多，如实列出）**：
+  - BYOC 连接器的 WebSocket 协议（§10.1：注册握手、心跳帧、token 轮换）
+    完全未实现，`connector_status`/`last_heartbeat_at` 目前只有存储方法，
+    没有任何东西会去调用它们
+  - 联邦查询层、AI 分析（异常检测/告警关联/RCA）完全未实现
+  - `role_ops_systems`、`ops_analysis_summaries` 只建了表，**CRUD 方法未实现**
+    ——现在没有任何调用方，属于故意留白，等接权限模型/AI 分析阶段再补，
+    不是遗漏
+  - **权限模型没有接线**：§4.1 的"只有 super_admin 能切换模块开关"、
+    §3.3.1 的"只有 org_admin 能配置白名单"这些规则目前**只存在于设计文档
+    和代码注释里**，`ops_store.py` 的方法本身不做任何权限判断（跟其它
+    Store 的既有分工一致，权限判断在端点层），但端点层根本还不存在，
+    所以这些规则**目前没有任何强制力**
+  - API 端点、LangGraph 接入（`intent_type=ops`/`ops_subgraph`，§10.2）、
+    前端"运维塔台"UI 全部未实现
+  - 审批超时扫描任务未实现（`list_pending_approval_older_than` 只提供
+    查询方法，没有定时调用它的后台任务）
+  - `CLAUDE.md` §3 权限模型正文**没有**回填 §10.6 的 `role_ops_systems`
+    草稿——按 §7.4"§3 只描述已经实现的现状"，权限模型实际还没接线，
+    现在写进去就是"文档说了算但代码不算数"，等真正接权限那一步再回填
+
 - ✅ **2026-08-26　P1-14 扩展审计：逐个核对全部管理端点，修复 2 处同类问题**
   `/admin/users` 本身的 N+1 早前已修（同一条 P1-14），但 CLAUDE.md 一直如实
   标注"其余管理端点未逐个排查"。这次过了一遍全部 GET 列表端点：
@@ -1301,7 +1358,7 @@ flowchart TB
 | **`docs/architecture.md`** | **架构图 · 核心链路 · 双模型 · 性能测试**（与本文同属当前状态正本） | **活文档** |
 | `docs/scale_slo_and_priorities.md` | 容量测算 · 最小 SLO · 27+3 条发现重新分级（12 条 P0） | 活文档 |
 | `docs/orchestration_design.md` | 编排层设计：并行防护 + 记忆异步化 | **部分实施**：A 部分 D4/D5（08-25 第二批）、**D1/D2（08-25 第三批，见 §4.5）** 已落地；D3/D6 未实施；**B 部分整体未实施**（阻塞项 B-R1 已实测查清） |
-| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **设计已确认（2026-08-26），未排期，零代码改动**，死期 2026-09-25（超期需在实施前重新核对时效性）。⚠️ 与 §30秒必读"停止新增功能"矛盾，用户已明确要求立项；**排期已确认维持在 12 条 P0 之后**，不插队 |
+| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **部分实施**：2026-08-26 用户明确要求插队开工（覆盖了文档自己"排期维持在 12 条 P0 之后"的原始决定）。阶段一（数据模型 + 修复目标越界判定纯函数 + 审批状态机存储层）已落地，见 §5。BYOC 连接器协议、联邦查询/AI 分析、LangGraph 接入、API 端点、前端、权限模型实际接线均未实施 |
 | `docs/collaboration_retrospective.md` | 协作复盘与开发流程指南（**每周自查只需读 §1**） | 活文档 |
 | `docs/review_2026-08-24/review_codebase_findings.md` | 代码审计，带行号证据 | 时点快照 |
 | `docs/review_2026-08-24/review_process_retro.md` | 过程复盘量化分析 | 时点快照 |
