@@ -873,6 +873,65 @@ flowchart TB
   `admin_bulk_import_users`）没有纳入这次排查——那类端点是"必须对 N 行分别
   做写入"，跟"读同一类数据 N 次"性质不同，不算严格意义的 N+1，且是低频管理
   操作（CSV 上传）不是页面加载路径，本次判断为不同类问题，未处理。
+- ✅ **2026-08-26　层次化检索粗筛层按"跨库全局 top-N"分配预算 → 改为按库自适应，且粗筛不再有"删库"的权力**
+
+  症状：`alice_acme`（org_admin，Acme 名下 6 个知识库）问「域账号密码多久强制
+  更换一次？」返回"未找到相关结果"，而答案就写在 `acme_it_support_kb` 的
+  `ACME-IT-001` 正文里；换成只有 1 个库权限的 `bob_acme` 问它权限内的问题则一切正常。
+
+  根因有三层，**只改常量解决不了**：
+  ① `_narrow_by_document_summary` 把全部候选库的摘要命中合并后取
+  `all_hits[:top_docs]`（跨库全局前 5），**预算与候选库数量耦合**——
+  候选池从 6×20 涨到 6×121 后正确文档挤不进去；
+  ② `_execute_local_multi` 拿 `narrowed.keys()` 当 `search_collections`，
+  于是"某个库一篇都没进全局前 5" == **这个库整个被从检索里删掉**。
+  这是除 ACL 之外第二个决定"用户这次能看到哪些知识库"的地方，却没有日志也没有兜底；
+  ③ 收窄经 `metadata_filter_post` 连 BM25 命中一起过滤掉，
+  把中文事实型问题最强的信号（关键词精确匹配）也否决了。
+
+  ①②合起来导致**这个 bug 的严重程度与用户权限范围成正比**：候选库只有 1 个时，
+  "全局前 N"恒等于"库内前 N"，缺陷完全不可见——这就是 bob 正常、alice 全错的原因。
+
+  改法：新增 `src/core/query_engine/narrow_plan.py`，把预算分配 + 置信门控抽成
+  **纯函数**（字典进字典出、零 IO；原来焊在 async + 现建 client + 查询的方法里，
+  这正是它上线至今零测试覆盖的原因）。立一条不变量并用类型表达：
+  **粗筛只能在单个 collection 内部收窄文档范围，永远不能改变被检索的 collection 集合**
+  —— `decisions_to_filters()` 的 keys 只是"要加 `source_ref` 过滤的库"，
+  **某个库缺席 = 整库参检，绝不是跳过**。每库预算
+  `clamp(ceil(ratio × 库内文档数), min_docs, max_docs)`，随库内规模走、
+  不随候选库数量走；收窄那一趟拿到空结果时用同一条链路不带过滤重跑一趟。
+
+  ⚠️ **`ingestion.doc_summary.narrow.enabled` 默认 `false`（= 平铺检索），
+  这是结论不是待办**，但**理由必须写对**：不是"层次化检索设计错了"，而是
+  **它的前提在当前全部语料上从未成立**——实测 32 个非空正文 collection 的
+  「块/文档」比全是 1.00（含 `mmarco` 604 篇、`product_req_kb`），
+  `chunk_size: 1000` 而文档 645~1244 字符，一篇文档只切出一个 chunk；
+  而 `use_llm: false` 时摘要就是"标题 + 正文前 600 字"，**摘要向量 ≈ 正文向量**，
+  这一层等于拿一份更差的正文副本给真正的检索器当硬门禁。
+  §1 写的目标客户（几个 G 的 PDF/Word，一篇几十上百个 chunk）正是它被设计出来
+  要解决的场景，**所以是关掉不是删掉**。重新评估的触发条件是**数据形态不是日期**：
+  任一 collection 块/文档比 > 5 且文档数 > 1000，或 `use_llm` 改 true /
+  换更强的中文 embedding；届时重跑 `scripts/probe_summary_narrowing.py`，
+  达标线：每库预算 ≤20% 时金标文档的库内覆盖率 ≥90%。
+
+  验证（30 条 Acme 正向问题，`scripts/probe_narrowing_strategies.py --strategies shipped`）：
+  金标文档召回 **5/30 → 25/30**，关键事实 13/30 → 29/30，空结果 11 → 0；
+  检索段 p50 195ms → 1678ms（**纯粹的延迟换召回，没有做任何性能优化**）。
+  判别力**实测过**（§7.2）：三个文件 `git checkout HEAD --` 回退到旧实现后，
+  `tests/integration/test_hierarchy_narrowing_recall.py` 4 条全部失败，恢复后全过；
+  单测 21 条的判别力是"按新不变量构造"、不是实测跑红，已写进该文件 docstring。
+  回归：`tests/unit` 全量 1885 通过；`test_department_kb_parallel_recall.py` +
+  `test_query_trace.py` 15 通过 5 跳过。`product_req_kb`（黄金 15/17）与
+  `mmarco`（recall@10 85.0%）**结构上不受影响**——它们走 `HybridSearch` 直连与
+  `_execute_local_single` 单库路径，从不经过粗筛。
+  完整实测与四个设计问题的回答见 `docs/hierarchical_narrowing_redesign.md`。
+
+  **顺带查清、本次未修**：`_execute_local_multi` 现在每个候选库的
+  `DenseRetriever` 都会把同一句 query 重新 embed 一次（`dense_retriever.py:140`），
+  6 个库 = 6 次 Ollama 往返、空载 76ms/次 ≈ 460ms，而粗筛层其实已经算过一次该向量。
+  这 6 次是**纯累加**——§4 第 3 条同日实测确认 `NUM_PARALLEL=1` 下 Ollama 完全串行。
+  复用向量可白省约 380ms、零召回代价；重排候选池 60 条 566ms（10/20/30 条 =
+  155/262/391ms）截到 30 条可再省约 175ms，但**对召回的影响未实测**。两条都未实施。
 
 - ✅ **2026-08-26　P1-2：14 个 Store 各建连接池 → 合并为一个按 DSN 缓存的共享池**
   `attendance_store` / `audit_store` / `dashboard_stats` / `conversation_store` /
