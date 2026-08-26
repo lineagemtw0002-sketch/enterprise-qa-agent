@@ -90,6 +90,11 @@ from src.tool_agent.tool_registry import ToolRegistry
 from src.tool_agent.builtin_tools import register_builtin_tools
 from src.tool_agent.mcp_client import MCPClient
 from src.mcp_server.tools.query_knowledge_hub import QueryKnowledgeHubTool
+from src.observability.logger import get_logger
+from src.observability.context import bind_request_context, clear_request_context, get_request_context
+from src.observability.middleware import RequestContextMiddleware
+
+logger = get_logger(__name__)
 
 
 def create_checkpointer():
@@ -130,7 +135,7 @@ def create_checkpointer():
         future = executor.submit(_create)
         checkpointer = future.result()
 
-    print(f"[Checkpointer] Using PostgreSQL (Async)")
+    logger.info("using PostgreSQL checkpointer (async)")
     return checkpointer
 
 
@@ -150,7 +155,7 @@ async def _trim_checkpoints(checkpointer, thread_id: str, keep_checkpoint_id: Op
     """
     conn = getattr(checkpointer, "conn", None)
     if conn is None:
-        print(f"[TrimCheckpoint] checkpointer 没有可用连接，跳过 thread={thread_id}")
+        logger.warning("checkpointer has no available connection, skipping trim", extra={"thread_id": thread_id})
         return
 
     try:
@@ -166,9 +171,12 @@ async def _trim_checkpoints(checkpointer, thread_id: str, keep_checkpoint_id: Op
         else:
             await conn.execute("DELETE FROM checkpoints WHERE thread_id = %s", (thread_id,))
             await conn.execute("DELETE FROM checkpoint_writes WHERE thread_id = %s", (thread_id,))
-        print(f"[TrimCheckpoint] Postgres trimmed for thread={thread_id}, kept={keep_checkpoint_id}")
-    except Exception as e:
-        print(f"[TrimCheckpoint] Postgres trim failed: {e}")
+        logger.info(
+            "postgres checkpoint trimmed",
+            extra={"thread_id": thread_id, "kept_checkpoint_id": keep_checkpoint_id},
+        )
+    except Exception:
+        logger.exception("postgres checkpoint trim failed", extra={"thread_id": thread_id})
 
 
 # 全局并发控制：限制同时执行的 ingest 后台任务数量，防止 LLM API 配额和内存被打爆
@@ -256,7 +264,10 @@ async def ingest_file_task(
                     page_count=page_count,
                     word_count=word_count,
                 )
-                print(f"[Ingest] File {file_id} ingested successfully to {collection}, doc_id={doc_id}, method={extract_method}")
+                logger.info(
+                    "file ingested successfully",
+                    extra={"file_id": file_id, "collection": collection, "doc_id": doc_id, "extract_method": extract_method},
+                )
             else:
                 error_msg = result.error or "Unknown error"
                 await file_store.update_file_status(
@@ -265,10 +276,10 @@ async def ingest_file_task(
                     page_count=page_count,
                     word_count=word_count,
                 )
-                print(f"[Ingest] Failed to ingest file {file_id}: {error_msg}")
-            
+                logger.warning("failed to ingest file", extra={"file_id": file_id, "error": error_msg})
+
         except Exception as e:
-            print(f"[Ingest] Failed to ingest file {file_id}: {e}")
+            logger.exception("failed to ingest file", extra={"file_id": file_id})
             await file_store.update_file_status(
                 conversation_id, file_id, "error", error_message=str(e)
             )
@@ -397,8 +408,8 @@ def create_app() -> FastAPI:
                 detail=detail,
                 success=success,
             )
-        except Exception as e:
-            print(f"[Audit] Failed to record: {e}")
+        except Exception:
+            logger.exception("failed to record audit log", extra={"action": action, "resource_type": resource_type})
 
     # 初始化 ToolRegistry（内置工具 + MCP 外部工具）
     tool_registry = ToolRegistry()
@@ -415,7 +426,7 @@ def create_app() -> FastAPI:
         tenant_connector_store=tenant_connector_store,
         tenant_identity_store=tenant_identity_store,
     )
-    print(f"[Init] Registered {tool_registry.tool_count} built-in tools")
+    logger.info("registered built-in tools", extra={"tool_count": tool_registry.tool_count})
 
     # 初始化组件
     checkpointer = create_checkpointer()
@@ -475,8 +486,8 @@ def create_app() -> FastAPI:
 
     try:
         llm = _build_llm(settings.llm.model)
-    except Exception as e:
-        print(f"[Init] Failed to init LLM: {e}")
+    except Exception:
+        logger.exception("failed to init main LLM")
         llm = None
 
     # 意图分类专用模型（docs/optimization_tracking.md 耗时优化任务）：LoRA 微调
@@ -491,8 +502,11 @@ def create_app() -> FastAPI:
     if intent_model_name:
         try:
             intent_llm = _build_llm(intent_model_name)
-        except Exception as e:
-            print(f"[Init] Failed to init intent-classification LLM ({intent_model_name}), falling back to main LLM: {e}")
+        except Exception:
+            logger.exception(
+                "failed to init intent-classification LLM, falling back to main LLM",
+                extra={"intent_model_name": intent_model_name},
+            )
             intent_llm = llm
     else:
         intent_llm = llm
@@ -535,8 +549,10 @@ def create_app() -> FastAPI:
     async def _ping_llm_once(ping_llm) -> None:
         try:
             await ping_llm.bind(max_tokens=1).ainvoke([HumanMessage(content="ping")])
-        except Exception as e:
-            print(f"[KeepAlive] ping failed for {getattr(ping_llm, 'model_name', '?')}: {e}")
+        except Exception:
+            logger.warning(
+                "keep-alive ping failed", extra={"model_name": getattr(ping_llm, "model_name", "?")}, exc_info=True,
+            )
 
     async def _warm_llms_at_startup() -> None:
         """启动阶段预热 llm/intent_llm 本身（本轮追加，`_keep_models_warm` 之前
@@ -584,8 +600,8 @@ def create_app() -> FastAPI:
                 for name, tool in _retrieval_tools_to_keep_warm.items():
                     try:
                         await tool.preload_models()
-                    except Exception as e:
-                        print(f"[KeepAlive] retrieval warm-up failed for {name}: {e}")
+                    except Exception:
+                        logger.warning("retrieval warm-up failed", extra={"tool_name": name}, exc_info=True)
             except asyncio.CancelledError:
                 break
 
@@ -607,9 +623,11 @@ def create_app() -> FastAPI:
         for name, tool in _retrieval_tools_to_keep_warm.items():
             try:
                 await tool.preload_models()
-                print(f"[Preload] {name}: reranker/embedding client warmed up")
-            except Exception as e:
-                print(f"[Preload] {name} failed (non-fatal, falls back to lazy load): {e}")
+                logger.info("reranker/embedding client warmed up", extra={"tool_name": name})
+            except Exception:
+                logger.warning(
+                    "preload failed (non-fatal, falls back to lazy load)", extra={"tool_name": name}, exc_info=True,
+                )
 
     # lifespan：异步连接 MCP Servers（必须在 FastAPI 构造函数之前定义）
     @asynccontextmanager
@@ -633,21 +651,21 @@ def create_app() -> FastAPI:
                     elif cfg.transport == "sse":
                         await client.connect_sse(url=cfg.url or "")
                     else:
-                        print(f"[MCP] Unknown transport '{cfg.transport}' for server '{name}'")
+                        logger.warning("unknown MCP transport", extra={"transport": cfg.transport, "server_name": name})
                         continue
-                    
+
                     await tool_registry.register_from_mcp_client(
                         client, name, timeout_seconds=cfg.timeout_seconds
                     )
-                    print(f"[MCP] Connected and registered server: {name}")
-                except Exception as e:
-                    print(f"[MCP] Failed to connect server '{name}': {e}")
-        
+                    logger.info("connected and registered MCP server", extra={"server_name": name})
+                except Exception:
+                    logger.exception("failed to connect MCP server", extra={"server_name": name})
+
         yield
 
         # 关闭时断开所有 MCP 连接
         await tool_registry.disconnect_all_mcp()
-        print("[MCP] All MCP connections closed")
+        logger.info("all MCP connections closed")
 
         keep_warm_task.cancel()
         try:
@@ -671,6 +689,11 @@ def create_app() -> FastAPI:
         allow_methods=["*"],  # 允许所有方法
         allow_headers=["*"],  # 允许所有头
     )
+
+    # RequestContextMiddleware 必须在 CORSMiddleware 之后注册——Starlette 中间件是
+    # 洋葱模型，后注册的在更外层，这样连 CORS 预检失败的请求也能带上 request_id。
+    # 见 docs/observability_design.md §5「中间件顺序」。
+    app.add_middleware(RequestContextMiddleware)
 
     @app.get("/health")
     async def health() -> dict:
@@ -1683,7 +1706,7 @@ def create_app() -> FastAPI:
                 success=result.success,
             )
         except Exception as e:
-            print(f"[KB Upload] ingest task failed: upload_id={upload_id}, error={e}")
+            logger.exception("KB upload ingest task failed", extra={"upload_id": upload_id})
             _upload_progress[upload_id].update(done=True, success=False, error=str(e))
             await _audit_log(
                 user_id, "upload_document", "collection", collection_name,
@@ -2619,8 +2642,14 @@ def create_app() -> FastAPI:
         current_user: AuthenticatedUser = Depends(get_current_user),
     ) -> StreamingResponse:
         """真流式对话接口：token-by-token 输出，客户端断开时自动回滚脏 checkpoint"""
-        
+        # `RequestContextMiddleware` 设的 contextvar 能否透传进下面这个生成器体，
+        # 未实测（docs/observability_design.md R1）——这里不依赖那条假设，
+        # 在中间件已确定的上下文里先取一次 request_id，显式传进生成器，
+        # 保证跟响应头里的 X-Request-Id 一致，不会因为透传与否而生成两个不同的 id。
+        _mw_request_id = (get_request_context() or bind_request_context()).request_id
+
         async def event_stream() -> AsyncGenerator[str, None]:
+            bind_request_context(request_id=_mw_request_id, user_id=current_user.user_id)
             # 1. 确定 thread / conversation
             if request.conversation_id:
                 thread_id = request.conversation_id
@@ -2635,11 +2664,14 @@ def create_app() -> FastAPI:
                 conv = await conversation_store.create_conversation(user_id=current_user.user_id)
                 thread_id = conv.conversation_id
             
+            _task_id = request.task_id or os.urandom(8).hex()
+            bind_request_context(conversation_id=thread_id, task_id=_task_id)
+
             initial_state = {
                 "query": request.query,
                 "user_id": current_user.user_id,
                 "conversation_id": thread_id,
-                "task_id": request.task_id or os.urandom(8).hex(),
+                "task_id": _task_id,
                 "top_k": request.top_k,
                 "workflow_type_hint": request.workflow_type,
             }
@@ -2662,9 +2694,9 @@ def create_app() -> FastAPI:
                         clean_checkpoint_id = cp.config.configurable.get('checkpoint_id')
                     elif isinstance(cp, dict):
                         clean_checkpoint_id = cp.get('checkpoint_id') or cp.get('id')
-            except Exception as e:
-                print(f"[ChatStream] Failed to get clean checkpoint: {e}")
-            
+            except Exception:
+                logger.exception("failed to get clean checkpoint", extra={"thread_id": thread_id})
+
             interrupted = False
             final_state = {}
             
@@ -2745,14 +2777,18 @@ def create_app() -> FastAPI:
                     
             except asyncio.CancelledError:
                 interrupted = True
-                print(f"[ChatStream] Stream cancelled, thread={thread_id}")
+                logger.info("stream cancelled", extra={"thread_id": thread_id})
             except Exception as e:
+                logger.exception("chat stream failed", extra={"thread_id": thread_id})
                 yield f"data: {json.dumps({'type': 'error', 'error': str(e)}, ensure_ascii=False)}\n\n"
             finally:
                 # 5. 中断时回滚脏 checkpoint
                 if interrupted and clean_checkpoint_id:
                     await _trim_checkpoints(checkpointer, thread_id, clean_checkpoint_id)
-        
+                # 生成器体是显式再绑的一份上下文（见函数开头注释），用完显式清理，
+                # 不依赖中间件那份 finally 一定覆盖到这里。
+                clear_request_context()
+
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     @app.websocket("/ws/trace/{conversation_id}")
@@ -2835,8 +2871,8 @@ def create_app() -> FastAPI:
                 target_idx = turn_order.index(target_turn_id)
                 if target_idx > 0:
                     previous_turn_id = turn_order[target_idx - 1]
-        except Exception as e:
-            print(f"[Rollback] Failed to determine previous turn: {e}")
+        except Exception:
+            logger.exception("rollback: failed to determine previous turn", extra={"conversation_id": conversation_id})
         
         try:
             if hasattr(checkpointer, 'alist') and previous_turn_id:
@@ -2861,8 +2897,8 @@ def create_app() -> FastAPI:
                     # 取时间戳最大的（即最新的）一个前一 turn 的 checkpoint
                     candidates.sort(key=lambda x: x[0])
                     keep_checkpoint_id = candidates[-1][1]
-        except Exception as e:
-            print(f"[Rollback] Failed to list checkpoints: {e}")
+        except Exception:
+            logger.exception("rollback: failed to list checkpoints", extra={"conversation_id": conversation_id})
         
         # 3. 执行三层回滚（互不阻断）
         trimmed = {"checkpoint": False, "messages": 0, "ltm": 0}
@@ -2870,19 +2906,19 @@ def create_app() -> FastAPI:
         try:
             await _trim_checkpoints(checkpointer, conversation_id, keep_checkpoint_id)
             trimmed["checkpoint"] = True
-        except Exception as e:
-            print(f"[Rollback] Checkpoint trim failed: {e}")
+        except Exception:
+            logger.exception("rollback: checkpoint trim failed", extra={"conversation_id": conversation_id})
         
         try:
             trimmed["messages"] = await archive_store.delete_messages_from_turn(conversation_id, target_turn_id)
-        except Exception as e:
-            print(f"[Rollback] Message delete failed: {e}")
+        except Exception:
+            logger.exception("rollback: message delete failed", extra={"conversation_id": conversation_id})
         
         try:
             if workflow._ltm_store:
                 trimmed["ltm"] = await workflow._ltm_store.delete_facts_from_turn(conversation_id, target_turn_id)
-        except Exception as e:
-            print(f"[Rollback] LTM delete failed: {e}")
+        except Exception:
+            logger.exception("rollback: LTM delete failed", extra={"conversation_id": conversation_id})
         
         # 4. 更新 conversation 的 message_count
         try:
@@ -2892,8 +2928,8 @@ def create_app() -> FastAPI:
                 message_count=len(history),
                 metadata={"last_rollback_turn_id": target_turn_id}
             )
-        except Exception as e:
-            print(f"[Rollback] Failed to update conversation stats: {e}")
+        except Exception:
+            logger.exception("rollback: failed to update conversation stats", extra={"conversation_id": conversation_id})
         
         return {
             "success": True,
@@ -2941,8 +2977,8 @@ def create_app() -> FastAPI:
                 checkpoint = checkpointer.get(config)
             else:
                 checkpoint = None
-        except Exception as e:
-            print(f"[MemoryStats] Failed to load checkpoint: {e}")
+        except Exception:
+            logger.warning("failed to load checkpoint for memory stats", extra={"conversation_id": conversation_id}, exc_info=True)
             checkpoint = None
         
         if not checkpoint:

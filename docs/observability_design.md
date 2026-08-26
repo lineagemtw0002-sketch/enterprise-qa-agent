@@ -1,13 +1,13 @@
 # 结构化日志 + request id 贯穿链路 —— 设计方案
 
-> **状态：阶段一已实施（2026-08-25）。阶段二/三/四未实施。**
+> **状态：阶段一、二已实施（2026-08-26）。阶段三部分实施（print 已转，`_emit_trace` 双 sink 未做）。阶段四未实施。**
 >
 > | 阶段 | 状态 |
 > |---|---|
 > | 阶段 0（清 `traces.jsonl`） | ✅ 已移出活跃路径（见文末「阶段一实施记录」） |
 > | **阶段一**（`context.py` / `redact.py` / `configure_logging` / 8 处 print / 轮转） | ✅ **已实施，117 条单测保护** |
-> | 阶段二（`app.py`：中间件 + 29 处 print） | ⬜ 未实施 |
-> | 阶段三（`workflow.py`：`_emit_trace` 双 sink + 13 处 print） | ⬜ 未实施 |
+> | **阶段二**（`app.py`：`RequestContextMiddleware` + `X-Request-Id` 回写 + SSE 端点显式 bind + 29 处 print） | ✅ **2026-08-26 已实施**。`RequestContextMiddleware`（`src/observability/middleware.py`，纯 ASGI 类）注册在 `CORSMiddleware` 之后；`chat_stream` 端点按 R1 的兜底方案显式再绑一次 `request_id`，不依赖中间件透传进 SSE 生成器体这条未验证假设。回归：`tests/unit/test_request_middleware.py`（T-3，9 条，纯 ASGI 假 app，不连 `create_app()`）。「启动摘要日志（合并 C 类刷屏）」这一小项未做——29 处 print 都已逐条转成结构化 `logger` 调用，合并成一条摘要是锦上添花，不是本次范围 |
+> | 阶段三（`workflow.py`：`_emit_trace` 双 sink + 13 处 print） | 🟡 **部分实施（2026-08-26）**：13 处 print 已转 logger（不含 `_emit_trace` 函数本身，未 touch）；`_emit_trace` → 双 sink 改造（D-8，风险最高的一步）**未做**，需要先跑 `test_workflow_stream_isolation.py` 的 9 条并发回归确认不破坏 P0-1 契约，再单独决定是否继续。§2.3 逐节点字段补齐未做。审计 `buffer_preview` 那一项**已随另一批次修掉**（`CLAUDE.md` §5「顺手修掉：审计表里存着泄露原文」，2026-08-25），本文这条待更正 |
 > | 阶段四（前端短码 + 按 org 分文件 + 保留期运维） | ⬜ 未实施 |
 >
 > ⚠️ 本文 §1 / §2 的「现状」描述写于实施前，**阶段一涉及的部分已经过时**

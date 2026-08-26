@@ -664,7 +664,10 @@ flowchart TB
   修法是 `looks_like_prompt_leak(..., partial=True)` 跳过残行，
   末行的判定推迟到落库前那次全文复查。
 - `ragent_backend` + `tool_agent` 共 **12,200 行零测试覆盖**，`conftest.py` 无 DB/LLM fixture
-- 后端 **48 处 `print()`、0 处 logger**，无结构化日志、无 request id
+- ~~后端 48 处 `print()`、0 处 logger，无结构化日志、无 request id~~ ✅ **已修复（2026-08-26），见 §5**——
+  这条描述本身也是过时的：结构化日志基础设施（`src/observability/logger.py` 等）早在
+  2026-08-25 就已实施（`docs/observability_design.md` 阶段一），只是没写进本文件，
+  且 `app.py`/`workflow.py`/`intent.py` 的 print 一直没接上。现已全部接上并转完
 - 检索链路每查询重建全套组件、全链路无缓存
 - 管理端普遍 N+1（`/admin/users` 约 300 次串行查询）
 - `create_app()` 3038 行 / 72 端点，无路由分层、无依赖注入
@@ -673,6 +676,27 @@ flowchart TB
 ---
 
 ## 5. 已修复（防止重新引入）
+
+- ✅ **2026-08-26　结构化日志接入 + request id 贯穿链路（阶段二，见 `docs/observability_design.md`）**
+  基础设施（`context.py`/`redact.py`/`configure_logging`/`JSONFormatter`）2026-08-25
+  已实施（阶段一，117 条单测），但没接上：`configure_logging` 在 `app.py` 零调用，
+  `bind_request_context`/`clear_request_context` 全代码库零调用，本文件也一直没更新
+  —— 这次一并补上：
+  - 新增 `RequestContextMiddleware`（`src/observability/middleware.py`，纯 ASGI 类，
+    不是 `@app.middleware("http")` 装饰器，为了能用 3 行假 app 单测、不连
+    `create_app()`）。注册在 `CORSMiddleware` **之后**（洋葱模型更外层），生成/校验/
+    回写 `X-Request-Id`，入站非法字符（换行等）一律拒绝重新生成，防日志注入。
+  - `chat_stream`（SSE）端点显式再绑一次 `request_id`——中间件设的 contextvar 能否
+    透传进 `StreamingResponse` 生成器体未实测，不依赖这条假设，两条路径都做。
+  - `app.py` 29 处、`workflow.py` 13 处（不含 `_emit_trace` 本身）、`intent.py` 4 处
+    `print()` 全部转成结构化 `logger` 调用，异常路径统一 `logger.exception`
+    （自动带 traceback）。
+  - 回归：`tests/unit/test_request_middleware.py`（9 条，T-3）；完整单测套件
+    （含 `test_workflow_stream_isolation.py` 的 9 条真并发）跑过，确认未破坏 P0-1 契约。
+  ⚠️ **未做的**：`workflow.py` 的 `_emit_trace` → 双 sink 改造（`docs/observability_design.md`
+  阶段三里风险最高的一步，D-8 已拍板"接受，但必须先跑并发回归"，本次未动）；
+  启动摘要日志合并（29 处已逐条转好，合并成一条摘要是锦上添花，未做）；
+  阶段四（前端短码/按 org 分文件/保留期运维）未做。
 
 - ✅ **2026-08-26　P0：租户连接器凭证明文存库**
   `tenant_connectors.auth_config`（企业接入自己知识库/考勤系统用的 API token）

@@ -31,6 +31,9 @@ from src.ragent_backend.ltm_store import LTMStore
 from src.ragent_backend.workflow_store import WorkflowStore
 from src.mcp_server.tools.query_knowledge_hub import QueryKnowledgeHubTool
 from src.security.prompt_guard import looks_like_prompt_leak, detect_privilege_claim
+from src.observability.logger import get_logger
+
+logger = get_logger(__name__)
 
 # "确认提交"这类简短确认语只有在真的存在一个待确认的工作流草稿
 # （state["active_workflow"]）时才有意义。如果没有草稿（比如用户之前的
@@ -602,9 +605,9 @@ class RAGWorkflow:
                 )
                 if memories:
                     state["memories"] = memories
-                    print(f"[Session] Recalled {len(memories)} LTM facts for user {state['user_id']}")
-            except Exception as e:
-                print(f"[Session] LTM recall failed: {e}")
+                    logger.info("recalled LTM facts", extra={"fact_count": len(memories), "user_id": state["user_id"]})
+            except Exception:
+                logger.exception("LTM recall failed", extra={"user_id": state.get("user_id")})
         
         state.setdefault("trace_events", []).append(
             {"node": "session", "ts": time.time(), "ok": True}
@@ -681,8 +684,8 @@ class RAGWorkflow:
                     {"workflow_type": t.workflow_type, "display_name": t.display_name, "description": t.description}
                     for t in templates
                 ]
-            except Exception as e:
-                print(f"[Intent] Failed to load workflow templates: {e}")
+            except Exception:
+                logger.exception("failed to load workflow templates")
 
         self._emit_trace("intent", "intent_detect", "running")
         # analyze_and_route() 内部已经有完整的失败兜底（合并调用失败退回两次
@@ -1068,8 +1071,8 @@ class RAGWorkflow:
             structured_llm = self._llm.with_structured_output(model_cls, method="json_mode")
             result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
             return {k: v for k, v in result.model_dump().items() if v}
-        except Exception as e:
-            print(f"[Workflow] Field extraction failed: {e}")
+        except Exception:
+            logger.exception("workflow field extraction failed")
             return {}
 
     @staticmethod
@@ -1167,7 +1170,7 @@ class RAGWorkflow:
             }
         except Exception as e:
             # 检索失败时返回提示，不中断工作流
-            print(f"[Retrieve] Error: {e}")
+            logger.exception("retrieval failed")
             self._emit_trace("retrieve", "knowledge_retrieval", "error", {"error": str(e)})
             self._emit_trace("retrieve", "node_end", "error")
             return {
@@ -1202,9 +1205,9 @@ class RAGWorkflow:
         if len(sub_queries) > MAX_SUB_QUERY_FANOUT:
             dropped_sub_queries = sub_queries[MAX_SUB_QUERY_FANOUT:]
             sub_queries = sub_queries[:MAX_SUB_QUERY_FANOUT]
-            print(
-                f"[Retrieve] D2 子查询扇出超上限，截断到 {MAX_SUB_QUERY_FANOUT} 个，"
-                f"丢弃 {len(dropped_sub_queries)} 个: {dropped_sub_queries}"
+            logger.warning(
+                "D2 sub-query fanout exceeded cap, truncated",
+                extra={"max_fanout": MAX_SUB_QUERY_FANOUT, "dropped_sub_queries": dropped_sub_queries},
             )
             self._emit_trace("retrieve", "sub_query_fanout_truncated", "success", {
                 "limit": MAX_SUB_QUERY_FANOUT,
@@ -1312,8 +1315,8 @@ class RAGWorkflow:
                         detail={"query_preview": query_text[:200]},
                         success=True,
                     )
-                except Exception as e:
-                    print(f"[Generate] privilege-claim audit_log callback failed: {e}")
+                except Exception:
+                    logger.exception("privilege-claim audit_log callback failed")
             if self._token_queue is not None:
                 await self._token_queue.put(_PRIVILEGE_CLAIM_BLOCKED_MESSAGE)
             assistant_message = AIMessage(content=_PRIVILEGE_CLAIM_BLOCKED_MESSAGE)
@@ -1497,8 +1500,8 @@ class RAGWorkflow:
                             },
                             success=True,
                         )
-                    except Exception as e:
-                        print(f"[Generate] prompt_leak_blocked audit_log callback failed: {e}")
+                    except Exception:
+                        logger.exception("prompt_leak_blocked audit_log callback failed")
             else:
                 answer = "".join(c.content for c in chunks)
 
@@ -1675,9 +1678,16 @@ class RAGWorkflow:
                 if m.id not in keep_ids
             ]
             
-            print(f"[MemoryManage] Compacting: {len(messages)} -> {len(to_keep)} messages, "
-                  f"archived {len(archived_data)}, summary length {len(new_summary)}")
-            
+            logger.info(
+                "memory compacting",
+                extra={
+                    "before_count": len(messages),
+                    "after_count": len(to_keep),
+                    "archived_count": len(archived_data),
+                    "summary_length": len(new_summary),
+                },
+            )
+
             self._emit_trace("memory_manage", "memory_compact", "success", {
                 "before_count": len(messages),
                 "after_count": len(to_keep),
@@ -1691,7 +1701,7 @@ class RAGWorkflow:
                 "_to_archive": archived_data,     # 标记待归档
             }
         except Exception as e:
-            print(f"[MemoryManage] Compact failed: {e}")
+            logger.exception("memory compact failed")
             self._emit_trace("memory_manage", "memory_compact", "error", {"error": str(e)})
             self._emit_trace("memory_manage", "node_end", "error")
             return result
@@ -1762,9 +1772,11 @@ class RAGWorkflow:
                 self._background_tasks.discard(t)
                 try:
                     t.result()
-                    print(f"[Archive] Saved {len(all_to_archive)} messages for {conversation_id}")
-                except Exception as e:
-                    print(f"[Archive] Failed to save history: {e}")
+                    logger.info(
+                        "archived messages", extra={"message_count": len(all_to_archive), "conversation_id": conversation_id},
+                    )
+                except Exception:
+                    logger.exception("failed to save archive history", extra={"conversation_id": conversation_id})
 
             task.add_done_callback(on_done)
 
@@ -1779,9 +1791,9 @@ class RAGWorkflow:
                         facts = await self._ltm_store.extract_facts(query, answer, self._llm)
                         if facts:
                             await self._ltm_store.save_facts(user_id, facts, conversation_id=conversation_id, turn_id=turn_id)
-                            print(f"[Archive] Extracted {len(facts)} LTM facts for user {user_id}")
-                    except Exception as e:
-                        print(f"[Archive] LTM extraction failed: {e!r}")
+                            logger.info("extracted LTM facts", extra={"fact_count": len(facts), "user_id": user_id})
+                    except Exception:
+                        logger.exception("LTM extraction failed", extra={"user_id": user_id})
 
                 ltm_task = asyncio.create_task(_extract_and_save())
                 self._background_tasks.add(ltm_task)

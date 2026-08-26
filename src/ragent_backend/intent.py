@@ -18,6 +18,9 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage
 from src.ragent_backend.schemas import IntentResult
+from src.observability.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 # 子查询并行扇出的硬上限（`docs/orchestration_design.md` §4.3 决策 D2、§8 Q1）。
@@ -199,8 +202,8 @@ async def analyze_query(query: str, messages: list, llm=None) -> QueryAnalysisRe
         ) or [result.rewritten_query]
 
         return result
-    except Exception as e:
-        print(f"[Intent] Structured query analysis failed: {e}")
+    except Exception:
+        logger.exception("structured query analysis failed")
         # Fallback: 用旧逻辑兜底
         rewritten = await rewrite_query(cleaned, messages, llm)
         return QueryAnalysisResult(
@@ -337,7 +340,7 @@ def _finalize_sub_queries(rewritten_query: str, sub_queries: List[str]) -> List[
 
     reason = _detect_sub_query_dependency(rewritten_query, deduped)
     if reason is not None:
-        print(f"[Intent] D1 子查询存在依赖，降级为单查询（交给 ReAct 决定是否再查一轮）：{reason}")
+        logger.info("D1 sub-query dependency detected, downgraded to single query", extra={"reason": reason})
         return [fallback or deduped[0]]
 
     return deduped
@@ -709,8 +712,8 @@ async def detect_intent(
             return await _detect_intent_with_llm(
                 rewritten_query, llm, available_tools or [], available_workflows or [],
             )
-        except Exception as e:
-            print(f"[Intent] LLM-based detection failed: {e}, falling back to rule-based")
+        except Exception:
+            logger.exception("LLM-based intent detection failed, falling back to rule-based")
 
     # === Step 3: 规则 fallback ===
     return _detect_intent_rule_based(rewritten_query, available_tools or [], available_workflows or [])
@@ -1029,8 +1032,8 @@ async def analyze_and_route(
         intent = _reconcile_intent_result(result, rewritten_query, available_tools, available_workflows)
         return rewritten_query, sub_queries, intent
 
-    except Exception as e:
-        print(f"[Intent] Merged analyze_and_route failed: {e}, falling back to two-call path")
+    except Exception:
+        logger.exception("merged analyze_and_route failed, falling back to two-call path")
         analysis = await analyze_query(query=query, messages=messages, llm=llm)
         intent = await detect_intent(
             rewritten_query=analysis.rewritten_query,
