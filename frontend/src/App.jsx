@@ -915,7 +915,7 @@ export default function App() {
         />
       )}
 
-      {view === 'ops' && <OpsConsole />}
+      {view === 'ops' && <OpsConsole canManage={isAdmin} />}
 
       {view === 'chat' && (
       <>
