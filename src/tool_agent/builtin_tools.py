@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from src.ragent_backend.org_store import OrgStore
     from src.ragent_backend.tenant_connector_store import TenantConnectorStore
     from src.ragent_backend.tenant_identity_store import TenantIdentityStore
+    from src.ops.tools import OpsToolset
 
 # 导入现有工具类
 from src.mcp_server.tools.query_knowledge_hub import (
@@ -68,6 +69,7 @@ def register_builtin_tools(
     org_store: Optional["OrgStore"] = None,
     tenant_connector_store: Optional["TenantConnectorStore"] = None,
     tenant_identity_store: Optional["TenantIdentityStore"] = None,
+    ops_toolset: Optional["OpsToolset"] = None,
 ) -> "QueryKnowledgeHubTool":
     """注册所有内置工具到 ToolRegistry。
 
@@ -91,6 +93,11 @@ def register_builtin_tools(
             我方 user_id 映射成企业考勤系统认得的工号（仅委托考勤查询时用到，见
             attendance-tenant-federation.md 第 3 节）；不传时委托考勤查询会直接
             提示"未关联工号"（因为没有身份映射数据源可查）。
+        ops_toolset: 智能运维模块的工具集（`src/ops/tools.py`）。不传则三个运维
+            工具一律不注册——跟 workflow_store/attendance_store 同一个约定：
+            能力没初始化时不该让 LLM 看到一个调用了会报错的工具。
+            具体注册逻辑（schema + 描述文案）在 `src/ops/tool_registration.py`，
+            不放在本文件里，是为了让并行开发时不必争抢这个共享文件。
 
     Returns:
         注册进去的 `QueryKnowledgeHubTool` 实例——这是 ReAct 工具子图真正会
@@ -106,6 +113,10 @@ def register_builtin_tools(
         _register_resubmit_workflow(registry, workflow_store)
     if attendance_store is not None:
         _register_query_attendance(registry, attendance_store, org_store, tenant_connector_store, tenant_identity_store)
+    if ops_toolset is not None:
+        from src.ops.tool_registration import register_ops_tools
+
+        register_ops_tools(registry, ops_toolset)
     return query_knowledge_hub_tool
 
 
