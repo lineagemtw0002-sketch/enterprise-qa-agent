@@ -501,11 +501,10 @@ def create_app() -> FastAPI:
     # 不引入新的模型/提示词约定。
     ops_toolset = OpsToolset(_ops_engine, ops_store, dispatcher=_ops_dispatcher, llm=llm)
 
-    # ⚠️ 已知缺口：工具注册目前是全局的，没有按 aiops_module_enabled 过滤——
-    # 模块未开通的企业用户也会在 LLM 可用工具列表里看到 query_ops_system 等
-    # 三个工具。不是数据泄露（该企业不可能注册连接器，query 会拿到空结果，
-    # propose/execute 会在 org 归属校验那一步被拒），但体验不完美，见
-    # CLAUDE.md §5 该条"未做的"。
+    # 工具注册表本身仍是全局的（这四个工具对每个 org 都注册进同一个
+    # `tool_registry`），但 2026-08-27 起 `RAGWorkflow._available_tools_for`
+    # 会在每次请求时按调用者的 `aiops_module_enabled` 状态过滤展示给 LLM 的
+    # 工具列表——注册层不区分租户，可见性层区分。见 CLAUDE.md §5。
     chat_kb_tool = register_builtin_tools(
         tool_registry,
         user_store=user_store,

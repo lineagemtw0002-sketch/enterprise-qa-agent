@@ -673,6 +673,48 @@ class RAGWorkflow:
         self._emit_trace("session", "node_end", "success")
         return state
 
+    async def _available_tools_for(self, user_id: Optional[str]) -> List[Dict[str, Any]]:
+        """按调用者过滤后的工具 schema 列表——供意图分类与工具子图共用。
+
+        补的是一个此前记录在案的已知缺口（CLAUDE.md §5"工具列表按调用者动态
+        生成"）：智能运维三个工具是全局注册的（只要 `app.py::create_app` 建了
+        `ops_toolset` 就会注册），执行时早已有 `aiops_module_enabled` 兜底
+        （`OpsToolset._module_disabled_outcome`），但在那之前，模块未开通的
+        企业用户在"可用工具"列表里也能看到它们——不是数据泄露（真去调会被
+        执行层拒绝），但会让 LLM/用户误以为这个能力已经开通。这里把展示层
+        的可见性也收窄到跟执行层一致。
+
+        性能上刻意先做一次零查询的短路：只有当前注册的工具里确实包含运维
+        工具名时才会去查 org/模块开关，独立 MCP server 场景（不挂 ops_toolset）
+        不会为这条逻辑多付一次数据库往返。
+        """
+        if self._tool_registry is None:
+            return []
+        full_tools = self._tool_registry.to_openai_tools()
+        if not user_id:
+            return full_tools
+
+        from src.ops.tool_registration import OPS_TOOL_NAMES
+
+        if not any(t.get("function", {}).get("name") in OPS_TOOL_NAMES for t in full_tools):
+            return full_tools
+
+        from src.ragent_backend.ops_store import OpsStore
+        from src.ragent_backend.org_store import OrgStore
+
+        try:
+            org = await OrgStore().get_org_for_user(user_id)
+            enabled = await OpsStore().is_module_enabled(org.org_id) if org is not None else False
+        except Exception:
+            # 查不出来就当未开通处理——跟 §8"没有约束的目标不给通过"是同一条
+            # 原则：宁可这一轮少展示三个工具，也不要在开关状态不确定时展示它们。
+            logger.exception("failed to resolve aiops module enablement for tool filtering")
+            enabled = False
+
+        if enabled:
+            return full_tools
+        return self._tool_registry.to_openai_tools(exclude_names=OPS_TOOL_NAMES)
+
     async def _intent_node(self, state: RAGState) -> Any:
         """意图识别节点：结构化 LLM 一次完成指代消解 + 子查询拆分 + 四分类"""
         self._emit_trace("intent", "node_start", "running")
@@ -706,7 +748,7 @@ class RAGWorkflow:
                     "target_tool": None,
                     "tool_args": None,
                     "target_workflow_type": hint,
-                    "available_tools": self._tool_registry.to_openai_tools() if self._tool_registry else [],
+                    "available_tools": await self._available_tools_for(state.get("user_id")),
                     "trace_events": [
                         *state.get("trace_events", []),
                         {
@@ -730,8 +772,8 @@ class RAGWorkflow:
         # 准确率不输两次调用的 7b 方案（部分边界案例反而判得更准），单次调用
         # 耗时约 3.2s，比两次调用的约 8.7s 快 2.7 倍左右。
         self._emit_trace("intent", "query_rewrite", "running", {"original_query": query})
-        # 从注册表获取可用工具 schema，供 LLM 判断 tool 意图
-        available_tools = self._tool_registry.to_openai_tools() if self._tool_registry else []
+        # 从注册表获取可用工具 schema，供 LLM 判断 tool 意图（按调用者过滤）
+        available_tools = await self._available_tools_for(state.get("user_id"))
         # 从 WorkflowStore 获取可用流程模板，供 LLM 判断 workflow 意图
         available_workflows: List[Dict[str, Any]] = []
         if self._workflow_store is not None:

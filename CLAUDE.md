@@ -973,10 +973,8 @@ flowchart TB
   17. 全量 `tests/unit` 通过（2054 = 阶段四 2001 + 联邦查询层/工具注册
       53 条并集），`scripts/verify_aiops_endpoints.py` 24 项复跑全过。
 
-  ⚠️ **已知缺口：工具注册没有按 `aiops_module_enabled` 过滤**——模块未开通
-  的企业用户也会在 LLM 可用工具列表里看到这三个工具。不是数据泄露（该企业
-  不可能注册连接器，`query_ops_system` 会拿到空结果，`propose`/`execute`
-  会在 org 归属校验那一步被拒），但体验不完美，留作后续细化。
+  ~~⚠️ 已知缺口：工具注册没有按 `aiops_module_enabled` 过滤~~ ✅ **已实现，
+  见 §5 下方"工具列表按调用者过滤"条目**。
 
   ⚠️ **未做的（阶段四之后）**：
   - ~~`role_ops_systems`（can_view/can_approve 精细权限位）~~ ✅ **已实现，
@@ -1186,15 +1184,65 @@ flowchart TB
   test_ops_store_analysis_summaries.py`（4 条，真实 Postgres，含 JSONB
   存取一圈后逐项相同的判别式）。
 
-  ⚠️ **已知缺口，讨论后判定暂不做**：工具注册（三个运维工具）没有按
-  `aiops_module_enabled` 过滤——查证后确认 `register_builtin_tools` 只在
-  `create_app()` 跑一次、建的是全局工具列表，`workflow.py` 拿工具列表时
-  没有 org 上下文，要修必须让工具列表按调用者动态生成，这是横切核心对话
-  链路的改动（影响所有工具，不只运维三个），判定不适合两人并行、单独排期，
-  谁做都行但只能一个人做。**低成本中间方案已批准去做**：`query_ops_system`
-  在企业未开通模块时，从"静默返回空结果"（LLM 会自己编一个"未查到数据"的
-  解释，误导用户）改成明确返回"本企业未开通智能运维模块"，把"体验不完美"
-  降级成"体验一般但不骗人"，同一个文件内可独立完成。
+  ~~⚠️ 已知缺口，讨论后判定暂不做：工具注册（三个运维工具）没有按
+  `aiops_module_enabled` 过滤~~ ✅ **已实现，见 §5"工具列表按调用者过滤"
+  条目**——当时判定"要修必须让工具列表按调用者动态生成，是横切核心对话
+  链路的改动"这个障碍描述本身没有错，只是后来找到了一个不需要改
+  `RAGState`/`ToolSubgraphState` 结构、不需要新增 state 字段的更小实现，
+  见下方条目的"为什么架构上比预想的小"。
+
+- ✅ **2026-08-27　工具列表按调用者过滤——补上运维模块阶段四遗留的已知缺口**
+  （本会话「张学友」实现，独立完成，不涉及设计变更）
+
+  **为什么架构上比预想的小**：早前判定这个改动要动 `RAGState`/
+  `ToolSubgraphState`（新增 `org_id` 字段），因为以为"按调用者过滤"必须先
+  把 `org_id` 变成 state 的一等字段。实际排查发现 `workflow.py::_workflow_node`
+  已经有一个不走 state、每次现查的先例（`from src.ragent_backend.org_store
+  import OrgStore; requester_org = await OrgStore().get_org_for_user(user_id)`,
+  `workflow.py:898-899`）——`OrgStore()`/`OpsStore()` 走 P1-2 的共享连接池
+  缓存，构造成本可以忽略，不需要为了避免"重复查"而把 `org_id` 提升成 state
+  字段。照抄这个既有模式即可，改动收窄到一个新方法 + 两处调用点替换。
+
+  新增 `RAGWorkflow._available_tools_for(user_id)`（`workflow.py`），替换掉
+  `_intent_node` 里两处原来直接调 `self._tool_registry.to_openai_tools()`
+  的位置（`workflow.py:709`/`:734`，分别对应"前端显式指定 workflow_type"
+  的早退分支和主分类路径——这条 state 字段随后原样流入
+  `ToolSubgraphState`，所以 ReAct 工具子图看到的也是过滤后的列表，不是只有
+  意图分类这一层生效）。逻辑：
+  1. 先拿未过滤的全量列表；
+  2. **零查询短路**：只有当前注册的工具里确实包含运维工具名时才会去查
+     org/模块开关——独立跑的 MCP server 场景（不挂 `ops_toolset`）不会为
+     这条逻辑多付一次数据库往返；
+  3. 查询失败（如 Postgres 抖动）**fail-closed**（隐藏运维工具而不是放行）
+     ——跟 §8"没有约束的目标不给通过"是同一条原则，这不是一个安全边界
+     （执行层本来就有兜底），选 fail-closed 单纯是不想在开关状态不确定时
+     误导用户以为模块已开通。
+  `ToolRegistry.to_openai_tools()` 新增可选 `exclude_names` 参数（默认
+  `None`，行为不变）；运维四个工具名从 `tool_registration.py` 里散落的
+  字面量收敛成一个导出常量 `OPS_TOOL_NAMES`，`workflow.py` 直接复用，不
+  重复维护一份工具名列表。
+
+  **验证**：`tests/unit/test_workflow_ops_tool_filtering.py`（10 条，含
+  模块开启/关闭两种状态、非运维工具不受影响、无运维工具时零查询、用户无
+  归属企业、查询异常时 fail-closed、`to_openai_tools(exclude_names=...)`
+  本身的三条）。判别力：把改动过的四个源文件 `git stash` 掉后重跑，测试
+  文件因为 `OPS_TOOL_NAMES` 不存在直接 `ImportError`（能立刻证明测试不是
+  空转）；`stash pop` 恢复后确认工作区无残留改动。
+  **真机验证**：直接连本机真实 Postgres + 真实 `OrgStore`/`OpsStore`/
+  `register_builtin_tools`（不是 mock），对比 `alice_acme`（Acme，
+  `aiops_module_enabled=True`）与 `dave_globex`（Globex，
+  `aiops_module_enabled=False`）两个真实账号：前者 `_available_tools_for`
+  返回全部 4 个运维工具，后者 0 个，其余（`query_knowledge_hub` 等）两边
+  一致——这是刘德华在完成"事后复盘视图"时主动提的建议（怕改
+  `to_openai_tools()` 调用链漏传上下文导致"过滤没生效但不报错"，建议不要
+  只信单测、要真机对比两个不同 org），照做后确认结果符合预期。
+  全量 `tests/unit` 2359 通过（较之前 2349 多 10 条，即本次新增）；
+  `scripts/verify_aiops_endpoints.py` 27 项复跑全过。
+
+  **本次未覆盖**：没有跑一次真实的"用户在对话里问运维问题 → 前端 SSE
+  trace 面板 → 确认工具子图看到的工具列表确实变短"这个最终用户视角的
+  端到端验证——上面的真机验证止于直接调用 `_available_tools_for` 这一层，
+  没有经过真实 HTTP `/api/v1/chat` 请求 + SSE 流。
 
 - ✅ **2026-08-26　AI 分析层（异常检测/告警关联降噪/RCA 辅助，§2 三项 V1
   已确认能力）落地**（「刘德华」开发，本会话合并 + 接上 `llm` 依赖）
@@ -2044,7 +2092,7 @@ flowchart TB
 | **`docs/architecture.md`** | **架构图 · 核心链路 · 双模型 · 性能测试**（与本文同属当前状态正本） | **活文档** |
 | `docs/scale_slo_and_priorities.md` | 容量测算 · 最小 SLO · 27+3 条发现重新分级（12 条 P0） | 活文档 |
 | `docs/orchestration_design.md` | 编排层设计：并行防护 + 记忆异步化 | **部分实施**：A 部分 D4/D5（08-25 第二批）、**D1/D2（08-25 第三批，见 §4.5）** 已落地；D3/D6 未实施；**B 部分整体未实施**（阻塞项 B-R1 已实测查清） |
-| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **部分实施**：2026-08-26 用户明确要求插队开工（覆盖了文档自己"排期维持在 12 条 P0 之后"的原始决定）。阶段一～四全部落地并合并：数据模型/越界判定/审批状态机/管理面端点/审批工作流端点/BYOC 连接器协议（`ConnectorTransport` 实现）+ 联邦查询层/工具注册，粗粒度门禁已升级为 `role_ops_systems` 细粒度审批权限（§10.6，org_admin 通配符 + super_admin 零权限 + can_approve 隐含 can_view）；6 处越界判定漏洞 + 审批状态机 TOCTOU 竞态 + 运维工具 `org_id` 从未被注入过的阻塞 bug 均已修复，见 §5。**LangGraph 接入已确认不需要新增 `intent_type`/`ops_subgraph`**（§10.2 已更正）——既有 `tool_subgraph` 的 `general_agent` 路由天然覆盖。审批超时扫描任务已接线；前端"运维塔台"UI 已完成并真机联调验收（刘德华开发）；`ops_analysis_summaries` CRUD 已实现。**AI 分析层（异常检测/告警关联降噪/RCA 辅助，§2 三项 V1 已确认能力）已实现**（刘德华开发）：异常检测用中位数+MAD 稳健统计（不用均值+标准差，抗遮蔽效应）、告警关联走时间窗+标签规则，两者都不用 LLM；RCA 复用既有生成用 7b LLM，依据引用只从输入推导、不采信模型输出，降级结果不落库；整合点是 `tool_registration.py` 新增的 `analyze_ops_incident` 工具，走既有 `intent_type="tool"` 路由。`role_ops_systems`、`ops_analysis_summaries`、AI 分析层、前端均已实现；真实 BYOC 连接器进程（客户环境那一端）、工具列表按 org 动态生成未实施 |
+| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **部分实施**：2026-08-26 用户明确要求插队开工（覆盖了文档自己"排期维持在 12 条 P0 之后"的原始决定）。阶段一～四全部落地并合并：数据模型/越界判定/审批状态机/管理面端点/审批工作流端点/BYOC 连接器协议（`ConnectorTransport` 实现）+ 联邦查询层/工具注册，粗粒度门禁已升级为 `role_ops_systems` 细粒度审批权限（§10.6，org_admin 通配符 + super_admin 零权限 + can_approve 隐含 can_view）；6 处越界判定漏洞 + 审批状态机 TOCTOU 竞态 + 运维工具 `org_id` 从未被注入过的阻塞 bug 均已修复，见 §5。**LangGraph 接入已确认不需要新增 `intent_type`/`ops_subgraph`**（§10.2 已更正）——既有 `tool_subgraph` 的 `general_agent` 路由天然覆盖。审批超时扫描任务已接线；前端"运维塔台"UI 已完成并真机联调验收（刘德华开发）；`ops_analysis_summaries` CRUD 已实现。**AI 分析层（异常检测/告警关联降噪/RCA 辅助，§2 三项 V1 已确认能力）已实现**（刘德华开发）：异常检测用中位数+MAD 稳健统计（不用均值+标准差，抗遮蔽效应）、告警关联走时间窗+标签规则，两者都不用 LLM；RCA 复用既有生成用 7b LLM，依据引用只从输入推导、不采信模型输出，降级结果不落库；整合点是 `tool_registration.py` 新增的 `analyze_ops_incident` 工具，走既有 `intent_type="tool"` 路由。`role_ops_systems`、`ops_analysis_summaries`、AI 分析层、前端、工具列表按调用者动态过滤（2026-08-27）、§9.2 事后复盘聚合视图最小可行版、§10.5 验收指标公式均已实现；真实 BYOC 连接器进程（客户环境那一端）未实施 |
 | `docs/collaboration_retrospective.md` | 协作复盘与开发流程指南（**每周自查只需读 §1**） | 活文档 |
 | `docs/review_2026-08-24/review_codebase_findings.md` | 代码审计，带行号证据 | 时点快照 |
 | `docs/review_2026-08-24/review_process_retro.md` | 过程复盘量化分析 | 时点快照 |

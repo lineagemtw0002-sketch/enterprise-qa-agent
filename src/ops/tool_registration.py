@@ -110,6 +110,16 @@ EXECUTE_REMEDIATION_SCHEMA = {
     "required": ["action_id"],
 }
 
+# 本模块注册进 registry 的全部工具名——供调用方（`workflow.py`）在
+# `aiops_module_enabled=False` 的企业下按名称从可见工具列表里剔除，
+# 不需要 workflow.py 自己重复维护一份工具名字面量。
+OPS_TOOL_NAMES = frozenset({
+    QUERY_OPS_SYSTEM_NAME,
+    PROPOSE_REMEDIATION_NAME,
+    ANALYZE_OPS_INCIDENT_NAME,
+    EXECUTE_REMEDIATION_NAME,
+})
+
 
 def register_ops_tools(
     registry: "ToolRegistry", toolset: "OpsToolset", org_store: "OrgStore" = None,
