@@ -11,10 +11,18 @@
 > `claude/aiops-federation` 分支已合并）。三个运维工具已真正注册进 ReAct
 > 工具子图（`create_app()` 实测工具数 6→9）。粗粒度门禁，已用真实
 > Postgres + 真实 app 端到端验证（24 项，含真实 WebSocket），全量
-> `tests/unit` 2054 条通过，见 `CLAUDE.md` §5。LangGraph 接入、
+> `tests/unit` 2314 条通过，见 `CLAUDE.md` §5。
+> **LangGraph 接入已确认不需要新增结构（§10.2 已更正，2026-08-26）**：
+> 三个运维工具走既有 `intent_type="tool"` + `tool_subgraph` 的
+> `general_agent` 路由即可，原设计"新增 `intent_type="ops"` + `ops_subgraph`"
+> 未实施、也不该实施，理由见 §10.2。同批顺带修复一个从未被跑通过的完全
+> 阻塞 bug：运维工具 handler 一直期待 `tool_node` 注入 `org_id`，但那条
+> 注入路径从未存在过，任何真实对话调用都会先撞"缺少调用方身份"，已改成
+> 内部反查 `org_store.get_org_for_user(user_id)` 修复。
 > `role_ops_systems` 细粒度权限、前端、真实 BYOC 连接器进程（客户环境
-> 那一端）均未实施。**当前阶段：零代码改动**这句话已经不成立，改为
-> "阶段一～四代码已落地并合并，其余阶段未开工"。**
+> 那一端）、审批超时扫描任务仍未实施。**当前阶段：零代码改动**这句话已经
+> 不成立，改为"阶段一～四代码 + LangGraph 接入确认已落地并合并，其余阶段
+> 未开工"。**
 > 创建：2026-08-26　确认：2026-08-26　开工：2026-08-26
 > **死期：2026-09-25**（若届时仍未排入实施队列，实施前必须重新核对行业现状与项目 P0 队列——
 > 不是"确认过期"，设计已经定了，是"隔太久再启动要先确认时效性"这层含义）
@@ -497,6 +505,48 @@ stateDiagram-v2
 （`CLAUDE.md` §4 P1 提到的"闲聊路由"问题，根因之一正是"`_INTENT_CLASSIFY_RULES` 四个桶
 没有第五类"，补类目要同时改 `IntentDetectionResult` 的 `Literal`、`_route_after_intent`、
 新增生成节点）。这条在实施阶段要按同样的重量级对待，不能想当然。
+
+⚠️ **2026-08-26 实施后更正：上面"触发链路"那条新增 `intent_type="ops"` 的设计
+没有落地，也不该落地——现有 `intent_type="tool"` + `tool_subgraph` 的既有机制
+已经覆盖了它想解决的问题，补新类目反而是不必要的结构性改动。**
+
+- **决策**：三个运维工具（`query_ops_system`/`propose_remediation`/
+  `execute_approved_remediation`）就注册进现有 `ToolRegistry`（已完成，见
+  `src/ops/tool_registration.py`），走既有的 `intent_type="tool"` 分类，
+  不新增 `intent_type="ops"`、不新增 `ops_subgraph`。
+- **理由**：核对 `src/tool_agent/subgraph.py::supervisor_node` 的路由逻辑
+  发现，不属于 `RETRIEVAL_TOOLS`/`ACTION_TOOLS` 的工具（运维三个工具都不在
+  这两个集合里）会落到 `else` 分支——只要同一次请求里 `RETRIEVAL_TOOLS` 和
+  `ACTION_TOOLS` 各自都至少有一个工具可用（正常部署下 `query_knowledge_hub`
+  和 `check_workflow_status`/`resubmit_workflow` 通常都已初始化），就会
+  路由到 `general_agent`（"协调 Agent"），而 `general_agent` 本来就"可以
+  根据需要综合使用检索类和执行类工具"、拿到的是**全部**可用工具，运维三个
+  工具天然在列。也就是说"接收请求 → 决定要不要调运维工具 → 调用"这条链路，
+  ReAct 循环里已经有了，不需要另起一个子图重新实现一遍"要不要调用工具"的
+  判断——那正是 `tool_subgraph` 已经在做的事。上面设想的"触发链路"三步
+  （联邦查询 → AI 分析 → 写入 proposed 记录）本质就是 LLM 依次调用
+  `query_ops_system` 再调用 `propose_remediation` 这两个工具，ReAct 循环
+  天然支持多步工具调用，不需要专门编排。
+  "审批/执行链路"（REST/WS API + 独立后台任务，不反馈进原始对话 session）
+  这部分设计**依然成立且已落地**（阶段二/三/四的管理面端点 + BYOC 协议），
+  没有被这次更正推翻的是这一半。
+- **作废**：本节"触发链路"里"新增 `intent_type = 'ops'`，走一个新的
+  `ops_subgraph`"这句设计描述作废。**影响面**：无代码影响（这条设计从未
+  被实施，`IntentDetectionResult.Literal` 至今仍是四类，没有改过）。
+- **仍需要 LangGraph 层面确认的**：这条决策依赖"正常部署下 KB 检索工具和
+  工作流工具都已初始化"这个前提——如果某个企业只开通了智能运维模块、没开
+  知识库检索也没开工作流（`RETRIEVAL_TOOLS`/`ACTION_TOOLS` 在那次请求里
+  都为空集），`supervisor_node` 的 `else` 分支同样会落到 `general_agent`
+  （`has_action=False` 且 `has_retrieval=False` 也满足 `not (has_action and
+  not has_retrieval)` 和 `not (has_retrieval and not has_action)`，两个
+  `elif` 都不命中，照样落到 `general_agent`），运维工具依然可见——**已用
+  这条分支逻辑本身复核过，不依赖"正常部署"这个前提也成立**，唯一会让运维
+  工具从 `general_agent` 视野里消失的情形是"该次请求里只有 `RETRIEVAL_TOOLS`
+  没有 `ACTION_TOOLS`"或反过来（这时会退化路由到 `retrieval_agent`/
+  `action_agent`，二者的可用工具集合按 `category` 过滤，运维工具被排除在
+  外）——这在当前的工具注册配置下（`register_builtin_tools` 一次性注册
+  全部能力）不会发生，但如果将来某个部署形态允许"只挂知识库检索、不挂
+  工作流"这种更细粒度的能力裁剪，需要重新核对这条分支。
 
 ### 10.3 `scope_config_json` 字段 schema
 
