@@ -953,16 +953,32 @@ flowchart TB
   自己还有一份类级别的 `_pool` 缓存（`OpsStore._pool` 等），两处都要清，
   见脚本里的 `_reset_pool_caches()`。
 
+  **阶段四补充：两条并行分支已合并 + 工具注册真正接线**（同日，第二次更新）
+  15. 合入 `claude/aiops-federation`（另一会话的 §3.5/§3.6 成果）：
+      `src/ops/federation/`（fan-out 引擎 + 短 TTL 内存缓存）、
+      `src/ops/tools.py`（三个工具：`query_ops_system`/`propose_remediation`/
+      `execute_approved_remediation`，执行类工具在**工具层**二次核验四道
+      检查，其中"目标仍在白名单内"这道是下游完全没有的独立复查——提议到
+      批准之间可能隔 §10.4 默认的 30 分钟，管理员可能在这期间把目标从
+      白名单摘掉）、`src/ops/store_adapters.py`（`OpsStoreDirectory` 适配层）。
+      `git merge-tree` 试算/实测均零冲突，`src/ops/types.py` 逐字节相同
+      （双方各自持有一份、约定不改，验证过没有漂移）。
+  16. `app.py` 正式实例化 `FederatedQueryEngine`/`OpsToolset`，传给
+      `register_builtin_tools(..., ops_toolset=...)`——**三个运维工具现在
+      真的注册进 ReAct 工具子图了**（`create_app()` 实测工具数 6→9）。
+      `WebSocketConnectorTransport`/`WebSocketRemediationDispatcher` 复用
+      `ops_connector_register_ws` 维护的同一份连接注册表
+      （`active_ops_connector_ws`/`active_ops_pending_requests`），不另建
+      一套连接状态。
+  17. 全量 `tests/unit` 通过（2054 = 阶段四 2001 + 联邦查询层/工具注册
+      53 条并集），`scripts/verify_aiops_endpoints.py` 24 项复跑全过。
+
+  ⚠️ **已知缺口：工具注册没有按 `aiops_module_enabled` 过滤**——模块未开通
+  的企业用户也会在 LLM 可用工具列表里看到这三个工具。不是数据泄露（该企业
+  不可能注册连接器，`query_ops_system` 会拿到空结果，`propose`/`execute`
+  会在 org 归属校验那一步被拒），但体验不完美，留作后续细化。
+
   ⚠️ **未做的（阶段四之后）**：
-  - `execute_approved_remediation` 下发前重新跑一次 `check_target_in_scope`
-    这道复查（另一会话负责，理由：提议到批准之间可能隔 30 分钟，管理员
-    完全可能在这期间把目标从白名单摘掉）**在他们的工具层实现，不在这里**
-  - `ops_toolset`/`register_ops_tools` 的实际接线到 `app.py`/`builtin_tools.py`
-    **还没做**——`src/ops/types.py`/`federation/`/`tools.py` 目前在另一条
-    未合并的分支（`claude/aiops-federation`）上，本阶段为了能独立测试
-    `connector_transport.py`，从那条分支**只读复制**了一份 `types.py`
-    过来（内容逐字节相同，未修改），真正的合并 + 工具注册接线要等两条
-    分支合并之后
   - `role_ops_systems`（can_view/can_approve 精细权限位）、
     `ops_analysis_summaries` 只建了表，**CRUD 方法未实现**——当前的权限
     粒度只有"org_admin 能管自己企业的一切 / super_admin 管开关"两档，
@@ -1538,7 +1554,7 @@ flowchart TB
 | **`docs/architecture.md`** | **架构图 · 核心链路 · 双模型 · 性能测试**（与本文同属当前状态正本） | **活文档** |
 | `docs/scale_slo_and_priorities.md` | 容量测算 · 最小 SLO · 27+3 条发现重新分级（12 条 P0） | 活文档 |
 | `docs/orchestration_design.md` | 编排层设计：并行防护 + 记忆异步化 | **部分实施**：A 部分 D4/D5（08-25 第二批）、**D1/D2（08-25 第三批，见 §4.5）** 已落地；D3/D6 未实施；**B 部分整体未实施**（阻塞项 B-R1 已实测查清） |
-| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **部分实施**：2026-08-26 用户明确要求插队开工（覆盖了文档自己"排期维持在 12 条 P0 之后"的原始决定）。阶段一～三（数据模型/越界判定/审批状态机/管理面端点/审批工作流端点）+ 阶段四（BYOC 连接器协议：注册握手/心跳/refresh 轮换/重放检测，`ConnectorTransport` 实现）已落地，粗粒度 org_admin/super_admin 门禁，见 §5。与另一会话并行做的 §3.5 联邦查询层+§3.6 工具注册在未合并分支 `claude/aiops-federation` 上，尚未接线进 `app.py`。LangGraph 接入、`role_ops_systems` 细粒度权限、前端均未实施 |
+| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **部分实施**：2026-08-26 用户明确要求插队开工（覆盖了文档自己"排期维持在 12 条 P0 之后"的原始决定）。阶段一～四全部落地并合并：数据模型/越界判定/审批状态机/管理面端点/审批工作流端点/BYOC 连接器协议（`ConnectorTransport` 实现）+ 联邦查询层/工具注册（两条并行分支已合并，三个运维工具真正注册进 ReAct 工具子图），粗粒度 org_admin/super_admin 门禁，见 §5。LangGraph 接入、`role_ops_systems` 细粒度权限、前端、真实 BYOC 连接器进程（客户环境那一端）均未实施 |
 | `docs/collaboration_retrospective.md` | 协作复盘与开发流程指南（**每周自查只需读 §1**） | 活文档 |
 | `docs/review_2026-08-24/review_codebase_findings.md` | 代码审计，带行号证据 | 时点快照 |
 | `docs/review_2026-08-24/review_process_retro.md` | 过程复盘量化分析 | 时点快照 |

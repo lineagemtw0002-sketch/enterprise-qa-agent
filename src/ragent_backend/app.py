@@ -93,6 +93,10 @@ from src.ragent_backend.ops_store import (
 )
 from src.ragent_backend import aiops_scope
 from src.ops import connector_session
+from src.ops.connector_transport import WebSocketConnectorTransport, WebSocketRemediationDispatcher
+from src.ops.federation.engine import FederatedQueryEngine
+from src.ops.store_adapters import OpsStoreDirectory
+from src.ops.tools import OpsToolset
 from src.ragent_backend.auth import (
     AuthenticatedUser, create_access_token, get_current_user, require_role,
     require_same_org_or_platform, require_platform_admin, get_jwt_secret,
@@ -449,6 +453,21 @@ def create_app() -> FastAPI:
     # 跟下面的 _kb_management_tool、RAGWorkflow 内部的 _retrieval_tool 是三个
     # 各自独立的实例，启动阶段预热（见 lifespan 里的 _preload_retrieval_models）
     # 需要拿到这个引用，见 register_builtin_tools 的 Returns 说明。
+    # 智能运维模块工具集（docs/aiops_module_design.md §3.5/§3.6）——
+    # WebSocketConnectorTransport/WebSocketRemediationDispatcher 复用
+    # ops_connector_register_ws 那个 WS 端点维护的两个模块级注册表
+    # （active_ops_connector_ws/active_ops_pending_requests），保证"谁在维护
+    # 活连接"只有一份权威来源，不会出现协议实现自己另建一套连接表。
+    _ops_transport = WebSocketConnectorTransport(active_ops_connector_ws, active_ops_pending_requests, ops_store)
+    _ops_dispatcher = WebSocketRemediationDispatcher(active_ops_connector_ws, active_ops_pending_requests, ops_store)
+    _ops_engine = FederatedQueryEngine(transport=_ops_transport, directory=OpsStoreDirectory(ops_store))
+    ops_toolset = OpsToolset(_ops_engine, ops_store, dispatcher=_ops_dispatcher)
+
+    # ⚠️ 已知缺口：工具注册目前是全局的，没有按 aiops_module_enabled 过滤——
+    # 模块未开通的企业用户也会在 LLM 可用工具列表里看到 query_ops_system 等
+    # 三个工具。不是数据泄露（该企业不可能注册连接器，query 会拿到空结果，
+    # propose/execute 会在 org 归属校验那一步被拒），但体验不完美，见
+    # CLAUDE.md §5 该条"未做的"。
     chat_kb_tool = register_builtin_tools(
         tool_registry,
         user_store=user_store,
@@ -457,6 +476,7 @@ def create_app() -> FastAPI:
         org_store=org_store,
         tenant_connector_store=tenant_connector_store,
         tenant_identity_store=tenant_identity_store,
+        ops_toolset=ops_toolset,
     )
     logger.info("registered built-in tools", extra={"tool_count": tool_registry.tool_count})
 
