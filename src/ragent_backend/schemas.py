@@ -264,6 +264,43 @@ class UpsertRemediationScopeRequest(BaseModel):
     scope_config: Dict[str, Any]
 
 
+class RemediationActionResponse(BaseModel):
+    action_id: str
+    org_id: str
+    connection_id: str
+    proposed_by: str
+    intent: str
+    plan: Dict[str, Any]
+    impact_radius: Optional[str]
+    status: str
+    approver_user_id: Optional[str]
+    approved_at: Optional[float]
+    executed_at: Optional[float]
+    result: Optional[Dict[str, Any]]
+    rollback_plan: Optional[Dict[str, Any]]
+    outcome_effective: Optional[bool]
+    created_at: float
+    # 越界判定的结果（§3.3.1，进入 pending_approval 之前的硬拦截）——只在刚
+    # proposed 完就被拒绝（rejected_pre）时有值，给调用方看拒绝原因用，不
+    # 落库（remediation_actions 表没有这个字段，越界原因是判定时才有的临时
+    # 信息，落库的只有"结果是 rejected_pre"这个状态本身）。
+    scope_check_reason: Optional[str] = None
+
+
+class ProposeRemediationActionRequest(BaseModel):
+    action_type: str = Field(..., description="必须是 V1 四类之一，见 aiops_scope.ACTION_TYPES")
+    intent: str = Field(..., min_length=1, description="这个修复动作要解决什么问题")
+    plan: Dict[str, Any] = Field(
+        ..., description="动作类型专属的目标字段（如 restart_service 的 target），"
+        "同时也是越界判定 check_target_in_scope 的 proposed 参数"
+    )
+    impact_radius: Optional[str] = Field(
+        default=None,
+        description="AI 定性推断，非实时拓扑图，不允许当成唯一决策依据（§3.3）",
+    )
+    rollback_plan: Optional[Dict[str, Any]] = None
+
+
 # 2026-08-26 已删除：这里原有 AdminTestKBQueryRequest/Response、
 # AdminKbCollectionStat 三个类，专供已删除的【测试专用】知识库超权测试端点使用，
 # 随端点一并删除，见 `CLAUDE.md` §5「已修复」。AdminKbChunkPreview 继续保留，

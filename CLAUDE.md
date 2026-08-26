@@ -840,8 +840,8 @@ flowchart TB
 
 ## 5. 已修复（防止重新引入）
 
-- 🔵 **2026-08-26　智能运维模块阶段一 + 阶段二：数据模型 + 目标越界判定 +
-  审批状态机存储层 + 管理面 API 端点**
+- 🔵 **2026-08-26　智能运维模块阶段一 + 阶段二 + 阶段三：数据模型 + 目标越界
+  判定 + 审批状态机存储层 + 管理面 API 端点 + 审批工作流端点**
   设计 `docs/aiops_module_design.md`。2026-08-26 用户明确要求插队开工，覆盖了
   该文档自己"排期维持在 12 条 P0 之后"的原始决定——那条决定没有作废，是被
   这次显式覆盖，如实记录。
@@ -895,19 +895,42 @@ flowchart TB
      `CREATE INDEX` 报权限错误；已用 `ALTER TABLE ... OWNER TO ragent`
      转移所有权修复（未使用 `DROP TABLE`，被沙箱拦下，也没必要——无真实数据）。
 
-  ⚠️ **未做的（阶段二之后，比做了的还是多）**：
+  **阶段三追加落地了什么**（同日）：
+  7. `POST /api/v1/admin/ops/connectors/{connection_id}/remediation-actions`
+     ——**§3.3.1 的核心拦截点真正接线了**：`create_proposed_action` 先落一条
+     `proposed`，再调 `aiops_scope.check_target_in_scope`，通过则
+     `advance_status` 到 `pending_approval`，越界或**没配白名单**都转
+     `rejected_pre`（默认拒绝，不是默认放行——没有约束的目标不给通过，跟
+     §8"不留跳过审批的快速通道"是同一条原则）。两条路径都在
+     `remediation_actions` 表留下记录，不是"判定失败就当没发生过"，审计
+     需要看到"提议过这个、但被拦下了"这件事本身。
+  8. `GET /api/v1/admin/ops/remediation-actions`（列出本企业）、
+     `POST .../{action_id}/approve`、`POST .../{action_id}/reject`——状态机
+     的非法转移会被 `IllegalStatusTransition` 拦下，映射成 HTTP 409（不是
+     500，调用方能区分"这是个业务规则冲突"还是"服务器炸了"）。
+  9. **真实端到端验证追加 8 项**（同一个 `scripts/verify_aiops_endpoints.py`，
+     共 17 项）：在白名单内的提议 → `pending_approval`；越界提议 →
+     `rejected_pre` 带原因；没配白名单的动作类型 → `rejected_pre`；批准
+     `pending_approval` → `approved`；已经是终态的动作再批准 → 409。
+
+  ⚠️ **未做的（阶段三之后，比做了的还是多）**：
   - BYOC 连接器的 WebSocket 协议（§10.1：注册握手、心跳帧、token 轮换）
     完全未实现，`connector_status`/`last_heartbeat_at` 已有存储方法和
     `record_heartbeat`/`mark_offline`，但**没有任何东西会去调用它们**——
     注册的连接器目前只是"元数据存在"，不会真的连上任何客户系统
-  - 联邦查询层、AI 分析（异常检测/告警关联/RCA）完全未实现
+  - 联邦查询层、AI 分析（异常检测/告警关联/RCA）完全未实现——`propose`
+    端点目前只能由 org_admin **手动**发起，是占位而非设计终态，等 AI
+    分析阶段落地后 `proposed_by` 应该能是系统身份
   - `role_ops_systems`（can_view/can_approve 精细权限位）、
     `ops_analysis_summaries` 只建了表，**CRUD 方法未实现**——当前的权限
     粒度只有"org_admin 能管自己企业的一切 / super_admin 管开关"两档，
-    §10.6 设想的"审批权限比查看权限更窄"这层还没有落地
-  - **审批工作流的端点未实现**：`create_proposed_action`/`approve_action`/
-    `mark_executing` 等状态机方法阶段一就有了，但没有对应的 API 端点，
-    没有任何东西能触发一次真实的审批流程
+    §10.6 设想的"审批权限比查看权限更窄"这层还没有落地，**任何本企业
+    org_admin 都能批准，不是只有被指定的审批人**，这条差距已如实记录在
+    `admin_approve_remediation_action` 的函数注释里
+  - **`approved` 之后没有下文**：`mark_executing`/`mark_result` 状态机方法
+    阶段一就有了，但没有对应端点——真正执行需要 BYOC 连接器的运行时把
+    "已批准的执行计划"发给客户环境本地执行，那部分完全没做，`approved`
+    目前是实际能走到的终点
   - LangGraph 接入（`intent_type=ops`/`ops_subgraph`，§10.2）、
     前端"运维塔台"UI 全部未实现
   - 审批超时扫描任务未实现（`list_pending_approval_older_than` 只提供
@@ -917,7 +940,9 @@ flowchart TB
     接线，现在写进去就是"文档说了算但代码不算数"，等真正接细粒度权限那一步
     再回填
   - `scripts/verify_aiops_endpoints.py` 只覆盖了粗粒度的 org_admin/
-    super_admin 门禁，没有测并发场景（两个 org_admin 同时注册连接器等）
+    super_admin 门禁，没有测并发场景（两个 org_admin 同时批准同一条动作等）；
+    `reject` 端点没有单独测（跟 `approve` 共用同一段状态机校验，判别力已经
+    在 `approve` 的 409 用例里验过）
 
 - ✅ **2026-08-26　P1-14 扩展审计：逐个核对全部管理端点，修复 2 处同类问题**
   `/admin/users` 本身的 N+1 早前已修（同一条 P1-14），但 CLAUDE.md 一直如实
@@ -1458,7 +1483,7 @@ flowchart TB
 | **`docs/architecture.md`** | **架构图 · 核心链路 · 双模型 · 性能测试**（与本文同属当前状态正本） | **活文档** |
 | `docs/scale_slo_and_priorities.md` | 容量测算 · 最小 SLO · 27+3 条发现重新分级（12 条 P0） | 活文档 |
 | `docs/orchestration_design.md` | 编排层设计：并行防护 + 记忆异步化 | **部分实施**：A 部分 D4/D5（08-25 第二批）、**D1/D2（08-25 第三批，见 §4.5）** 已落地；D3/D6 未实施；**B 部分整体未实施**（阻塞项 B-R1 已实测查清） |
-| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **部分实施**：2026-08-26 用户明确要求插队开工（覆盖了文档自己"排期维持在 12 条 P0 之后"的原始决定）。阶段一（数据模型 + 修复目标越界判定纯函数 + 审批状态机存储层）+ 阶段二（连接器/模块开关/修复范围白名单的管理面 API 端点，粗粒度 org_admin/super_admin 门禁）已落地，见 §5。BYOC 连接器协议、联邦查询/AI 分析、LangGraph 接入、审批工作流端点、前端、`role_ops_systems` 细粒度权限均未实施 |
+| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **部分实施**：2026-08-26 用户明确要求插队开工（覆盖了文档自己"排期维持在 12 条 P0 之后"的原始决定）。阶段一（数据模型 + 修复目标越界判定纯函数 + 审批状态机存储层）+ 阶段二（连接器/模块开关/修复范围白名单的管理面 API 端点）+ 阶段三（提议/批准/拒绝的审批工作流端点，§3.3.1 越界拦截真正接线）已落地，粗粒度 org_admin/super_admin 门禁，见 §5。BYOC 连接器协议、联邦查询/AI 分析、LangGraph 接入、`approved` 之后的真实执行、前端、`role_ops_systems` 细粒度权限均未实施 |
 | `docs/collaboration_retrospective.md` | 协作复盘与开发流程指南（**每周自查只需读 §1**） | 活文档 |
 | `docs/review_2026-08-24/review_codebase_findings.md` | 代码审计，带行号证据 | 时点快照 |
 | `docs/review_2026-08-24/review_process_retro.md` | 过程复盘量化分析 | 时点快照 |

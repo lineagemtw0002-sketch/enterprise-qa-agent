@@ -66,6 +66,7 @@ from src.ragent_backend.schemas import (
     ActivateAccountRequest, BulkImportRowResult, BulkImportResponse,
     OpsConnectorResponse, RegisterOpsConnectorRequest, SetAiopsModuleEnabledRequest,
     RemediationScopeResponse, UpsertRemediationScopeRequest,
+    RemediationActionResponse, ProposeRemediationActionRequest,
 )
 from src.ragent_backend import account_import as _acct_import
 from src.ragent_backend import activation as _activation
@@ -85,7 +86,10 @@ from src.ragent_backend.collection_store import OrgCollectionStore
 from src.ragent_backend.dashboard_stats import DashboardStatsService
 from src.ragent_backend.tenant_identity_store import TenantIdentityStore
 from src.ragent_backend.audit_store import AuditStore
-from src.ragent_backend.ops_store import OpsStore
+from src.ragent_backend.ops_store import (
+    OpsStore, IllegalStatusTransition,
+    STATUS_PENDING_APPROVAL, STATUS_REJECTED, STATUS_REJECTED_PRE,
+)
 from src.ragent_backend import aiops_scope
 from src.ragent_backend.auth import (
     AuthenticatedUser, create_access_token, get_current_user, require_role,
@@ -1696,6 +1700,149 @@ def create_app() -> FastAPI:
         await _get_owned_connector(org.org_id, connection_id)
         scopes = await ops_store.list_remediation_scopes(connection_id)
         return [_remediation_scope_response(s) for s in scopes]
+
+    def _remediation_action_response(a, scope_check_reason: Optional[str] = None) -> RemediationActionResponse:
+        return RemediationActionResponse(
+            action_id=a.action_id, org_id=a.org_id, connection_id=a.connection_id,
+            proposed_by=a.proposed_by, intent=a.intent, plan=a.plan,
+            impact_radius=a.impact_radius, status=a.status,
+            approver_user_id=a.approver_user_id, approved_at=a.approved_at,
+            executed_at=a.executed_at, result=a.result, rollback_plan=a.rollback_plan,
+            outcome_effective=a.outcome_effective, created_at=a.created_at,
+            scope_check_reason=scope_check_reason,
+        )
+
+    async def _get_owned_action(org_id: str, action_id: str):
+        """跟 `_get_owned_connector` 同一个约定：404 不是 403。"""
+        action = await ops_store.get_action(action_id)
+        if action is None or action.org_id != org_id:
+            raise HTTPException(status_code=404, detail="修复动作不存在")
+        return action
+
+    @app.post(
+        "/api/v1/admin/ops/connectors/{connection_id}/remediation-actions",
+        response_model=RemediationActionResponse,
+    )
+    async def admin_propose_remediation_action(
+        connection_id: str,
+        request: ProposeRemediationActionRequest,
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> RemediationActionResponse:
+        """§3.3.1 的核心拦截点：越界判定必须在进入 `pending_approval` 之前发生，
+        不能流到审批人那一步才依赖人肉发现。这里的流程是
+        `create_proposed_action`（总是先落一条 `proposed`）→
+        `aiops_scope.check_target_in_scope` → 通过则 `advance_status` 到
+        `pending_approval`，越界或没配白名单则转 `rejected_pre`——两条路径
+        都会在 `remediation_actions` 表里留下记录，不是"判定失败就当没发生过"，
+        审计需要看到"AI/管理员提议过这个、但被拦下了"这件事本身。
+
+        ⚠️ **V1 还没有 AI 分析**（§3 待实现），`proposed_by` 目前只能是发起
+        这次调用的 org_admin 本人——这是"手动提议"当占位符，不是设计终态，
+        等 AI 分析阶段落地后 `proposed_by` 应该能是系统身份。"""
+        org = await _require_aiops_enabled_org(current_user)
+        try:
+            aiops_scope.validate_action_type(request.action_type)
+        except aiops_scope.InvalidActionType as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        await _get_owned_connector(org.org_id, connection_id)
+
+        action = await ops_store.create_proposed_action(
+            org.org_id, connection_id, current_user.user_id, request.intent,
+            request.plan, impact_radius=request.impact_radius, rollback_plan=request.rollback_plan,
+        )
+
+        scope = await ops_store.get_remediation_scope(connection_id, request.action_type)
+        if scope is None:
+            # 没有配置白名单 = 没有边界可言，默认拒绝，不是默认放行
+            # （§8"明确不做的"：跳过审批的快速通道一律不留口子，这条是它的
+            # 姊妹原则——没有约束的目标同样不给通过）。
+            action = await ops_store.advance_status(action.action_id, STATUS_REJECTED_PRE)
+            await _audit_log(
+                current_user.user_id, "propose_remediation_action_rejected_no_scope",
+                "remediation_action", action.action_id, {"connection_id": connection_id, "action_type": request.action_type},
+            )
+            return _remediation_action_response(
+                action, scope_check_reason=f"连接器 '{connection_id}' 尚未为 '{request.action_type}' 配置修复范围白名单"
+            )
+
+        try:
+            check = aiops_scope.check_target_in_scope(request.action_type, scope.scope_config, request.plan)
+        except aiops_scope.InvalidScopeConfig as e:
+            action = await ops_store.advance_status(action.action_id, STATUS_REJECTED_PRE)
+            return _remediation_action_response(action, scope_check_reason=f"白名单配置本身有问题：{e}")
+
+        if not check.allowed:
+            action = await ops_store.advance_status(action.action_id, STATUS_REJECTED_PRE)
+            await _audit_log(
+                current_user.user_id, "propose_remediation_action_rejected_out_of_scope",
+                "remediation_action", action.action_id,
+                {"connection_id": connection_id, "action_type": request.action_type, "reason": check.reason},
+            )
+            return _remediation_action_response(action, scope_check_reason=check.reason)
+
+        action = await ops_store.advance_status(action.action_id, STATUS_PENDING_APPROVAL)
+        await _audit_log(
+            current_user.user_id, "propose_remediation_action", "remediation_action", action.action_id,
+            {"connection_id": connection_id, "action_type": request.action_type},
+        )
+        return _remediation_action_response(action)
+
+    @app.get("/api/v1/admin/ops/remediation-actions", response_model=List[RemediationActionResponse])
+    async def admin_list_remediation_actions(
+        status: Optional[str] = None,
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> List[RemediationActionResponse]:
+        org = await _require_aiops_enabled_org(current_user)
+        actions = await ops_store.list_actions_for_org(org.org_id, status=status)
+        return [_remediation_action_response(a) for a in actions]
+
+    @app.post(
+        "/api/v1/admin/ops/remediation-actions/{action_id}/approve",
+        response_model=RemediationActionResponse,
+    )
+    async def admin_approve_remediation_action(
+        action_id: str,
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> RemediationActionResponse:
+        """⚠️ **权限粒度是已知的临时状态**：§3.3.1 设想的审批权限应该是
+        `role_ops_systems.can_approve`（比查看权限更窄），但那张表的 CRUD
+        还没实现（见 CLAUDE.md §5），这里暂时用 `_require_org_admin` 这个
+        粗粒度门禁占位——任何本企业的 org_admin 都能批，不是只有被指定的
+        审批人。**这条差距已经如实记录，不是遗漏。**"""
+        org = await _require_aiops_enabled_org(current_user)
+        action = await _get_owned_action(org.org_id, action_id)
+        try:
+            action = await ops_store.approve_action(action.action_id, approver_user_id=current_user.user_id)
+        except IllegalStatusTransition as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        await _audit_log(
+            current_user.user_id, "approve_remediation_action", "remediation_action", action.action_id, {},
+        )
+        return _remediation_action_response(action)
+
+    @app.post(
+        "/api/v1/admin/ops/remediation-actions/{action_id}/reject",
+        response_model=RemediationActionResponse,
+    )
+    async def admin_reject_remediation_action(
+        action_id: str,
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> RemediationActionResponse:
+        org = await _require_aiops_enabled_org(current_user)
+        action = await _get_owned_action(org.org_id, action_id)
+        try:
+            action = await ops_store.advance_status(action.action_id, STATUS_REJECTED)
+        except IllegalStatusTransition as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        await _audit_log(
+            current_user.user_id, "reject_remediation_action", "remediation_action", action.action_id, {},
+        )
+        return _remediation_action_response(action)
+
+    # ⚠️ 未实现：mark_executing / mark_result 没有对应端点——真正执行需要
+    # BYOC 连接器的运行时（§10.1 WebSocket 协议）把"已批准的执行计划"发给
+    # 客户环境本地执行，那部分完全没做，approved 状态目前是终点，走不到
+    # executing。见 CLAUDE.md §5 该条"未做的"。
 
     # ==================== 运营仪表盘 API（仅平台管理员，见 dashboard_stats.py） ====================
     # _require_platform_tier 目前只剩 super_admin 一档（2026-08-24 起平台侧

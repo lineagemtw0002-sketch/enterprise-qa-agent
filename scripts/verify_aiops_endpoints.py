@@ -16,12 +16,20 @@
   4. approval_timeout_minutes 越界应 400，不是静默夹紧
   5. 修复范围白名单 upsert/list
   6. 非法 action_type 应 400
-  7. 跨企业访问应 404（不是 403，避免泄露"这个连接器存在但不是你的"）
+  7. 在白名单内的目标提议 -> pending_approval（§3.3.1 核心拦截点的正向路径）
+  8. 越界目标提议 -> rejected_pre，带原因（负向路径）
+  9. 没配白名单的动作类型 -> rejected_pre（默认拒绝，不是默认放行）
+  10. 批准一条 pending_approval 的动作 -> approved
+  11. 已经是终态的动作不能再被批准 -> 409（状态机不允许非法转移）
+  12. 跨企业访问应 404（不是 403，避免泄露"这个连接器/动作存在但不是你的"）
 
-本次未覆盖：BYOC 连接器的真实 WebSocket 心跳/联邦查询/AI 分析/审批执行链路
-（阶段一/二都还没实现这些，见 CLAUDE.md §5 该条"什么没做"）；`role_ops_systems`
-的 can_view/can_approve 精细权限（尚未接线，当前只有 org_admin/super_admin
-两档粗粒度门禁）；并发场景（两个 org_admin 同时注册连接器等）。
+本次未覆盖：BYOC 连接器的真实 WebSocket 心跳/联邦查询/AI 分析/审批后的真实
+执行链路（approved 之后没有对应端点把它推进到 executing，见 CLAUDE.md §5
+该条"什么没做"）；`role_ops_systems` 的 can_view/can_approve 精细权限（尚未
+接线，当前只有 org_admin/super_admin 两档粗粒度门禁——任何本企业 org_admin
+都能批准，不是只有被指定的审批人）；并发场景（两个 org_admin 同时批准同一条
+动作等）；`reject` 端点本次没有单独测（跟 `approve` 共用同一段状态机校验，
+判别力已经在 `approve` 的 409 用例里验过了）。
 """
 
 from __future__ import annotations
@@ -70,6 +78,9 @@ async def _cleanup(user_store: UserStore) -> None:
                 )
             ]
             if conn_ids:
+                await conn.execute(
+                    "DELETE FROM remediation_actions WHERE connection_id = ANY($1::text[])", conn_ids,
+                )
                 await conn.execute(
                     "DELETE FROM ops_remediation_scopes WHERE connection_id = ANY($1::text[])", conn_ids,
                 )
@@ -177,6 +188,70 @@ async def main() -> None:
         print("9) list scopes:", resp.status_code, len(resp.json()))
         assert resp.status_code == 200 and len(resp.json()) == 1
 
+        # 11) 提议一个在白名单内的目标 -> 应该进 pending_approval
+        resp = await client.post(
+            f"/api/v1/admin/ops/connectors/{connection_id}/remediation-actions", headers=headers,
+            json={
+                "action_type": "restart_service", "intent": "服务卡死重启",
+                "plan": {"target": "order-service"},
+            },
+        )
+        print("11) propose in-scope action:", resp.status_code, resp.json()["status"])
+        assert resp.status_code == 200
+        in_scope_action = resp.json()
+        assert in_scope_action["status"] == "pending_approval"
+        assert in_scope_action["scope_check_reason"] is None
+
+        # 12) 提议一个越界目标 -> 应该被拒到 rejected_pre，且带上原因
+        resp = await client.post(
+            f"/api/v1/admin/ops/connectors/{connection_id}/remediation-actions", headers=headers,
+            json={
+                "action_type": "restart_service", "intent": "尝试重启一个不在白名单里的服务",
+                "plan": {"target": "admin-database"},
+            },
+        )
+        print("12) propose out-of-scope action:", resp.status_code, resp.json()["status"])
+        assert resp.status_code == 200
+        out_of_scope_action = resp.json()
+        assert out_of_scope_action["status"] == "rejected_pre"
+        assert "admin-database" in out_of_scope_action["scope_check_reason"]
+
+        # 13) 提议一个没配白名单的动作类型 -> 应该被拒（默认拒绝，不是默认放行）
+        resp = await client.post(
+            f"/api/v1/admin/ops/connectors/{connection_id}/remediation-actions", headers=headers,
+            json={
+                "action_type": "clean_disk", "intent": "磁盘满了清一下",
+                "plan": {"path": "/var/log/app/x.log"},
+            },
+        )
+        print("13) propose action with no scope configured:", resp.status_code, resp.json()["status"])
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "rejected_pre"
+        assert "尚未" in resp.json()["scope_check_reason"]
+
+        # 14) 列出本企业的修复动作
+        resp = await client.get("/api/v1/admin/ops/remediation-actions", headers=headers)
+        print("14) list remediation actions:", resp.status_code, len(resp.json()))
+        assert resp.status_code == 200 and len(resp.json()) == 3
+
+        # 15) 批准那条在白名单内的（pending_approval -> approved）
+        resp = await client.post(
+            f"/api/v1/admin/ops/remediation-actions/{in_scope_action['action_id']}/approve",
+            headers=headers,
+        )
+        print("15) approve pending action:", resp.status_code, resp.json()["status"])
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "approved"
+        assert resp.json()["approver_user_id"] == user.user_id
+
+        # 16) 已经是终态（rejected_pre）的动作不能再被批准 -> 409
+        resp = await client.post(
+            f"/api/v1/admin/ops/remediation-actions/{out_of_scope_action['action_id']}/approve",
+            headers=headers,
+        )
+        print("16) approve an already-rejected action:", resp.status_code)
+        assert resp.status_code == 409
+
         other_org = await org_store.create_organization(_TEST_ORG_NAME_2)
         other_user = await user_store.create_user("aiops_smoke_admin_2", "pw12345678")
         pool = await user_store._get_pool()
@@ -195,7 +270,7 @@ async def main() -> None:
         resp = await client.get(
             f"/api/v1/admin/ops/connectors/{connection_id}/remediation-scopes", headers=other_headers,
         )
-        print("10) cross-org access:", resp.status_code)
+        print("17) cross-org access:", resp.status_code)
         assert resp.status_code == 404
 
     print("\nALL CHECKS PASSED")
