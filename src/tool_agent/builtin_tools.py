@@ -98,6 +98,11 @@ def register_builtin_tools(
             能力没初始化时不该让 LLM 看到一个调用了会报错的工具。
             具体注册逻辑（schema + 描述文案）在 `src/ops/tool_registration.py`，
             不放在本文件里，是为了让并行开发时不必争抢这个共享文件。
+            **同时依赖上面的 `org_store` 参数**——三个运维工具的 schema 里都没有
+            `org_id` 字段（不给模型这个参数防止伪造），`org_id` 由 handler 内部
+            用 `tool_subgraph` 注入的 `user_id` 反查 `org_store.get_org_for_user`
+            得到，跟 `query_attendance` 是同一个模式；`org_store` 传 `None` 时
+            三个工具会直接回"缺少调用方身份"，不会静默用错误的 org 去查。
 
     Returns:
         注册进去的 `QueryKnowledgeHubTool` 实例——这是 ReAct 工具子图真正会
@@ -116,7 +121,7 @@ def register_builtin_tools(
     if ops_toolset is not None:
         from src.ops.tool_registration import register_ops_tools
 
-        register_ops_tools(registry, ops_toolset)
+        register_ops_tools(registry, ops_toolset, org_store)
     return query_knowledge_hub_tool
 
 

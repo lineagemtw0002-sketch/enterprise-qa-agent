@@ -24,6 +24,7 @@ from src.tool_agent.adapters import wrap_function_tool
 
 if TYPE_CHECKING:
     from src.ops.tools import OpsToolset
+    from src.ragent_backend.org_store import OrgStore
     from src.tool_agent.tool_registry import ToolRegistry
 
 QUERY_OPS_SYSTEM_NAME = "query_ops_system"
@@ -83,36 +84,60 @@ EXECUTE_REMEDIATION_SCHEMA = {
 }
 
 
-def register_ops_tools(registry: "ToolRegistry", toolset: "OpsToolset") -> None:
+def register_ops_tools(
+    registry: "ToolRegistry", toolset: "OpsToolset", org_store: "OrgStore" = None,
+) -> None:
     """把三个工具注册进 registry。
 
     ⚠️ **`org_id` 由调用方从服务端会话注入，不能来自 LLM 的工具入参**——
     跟 `query_knowledge_hub` 的 `user_id` 是同一条铁律（见那个工具 `execute()`
     的 docstring）。所以三个 schema 里都**没有** org_id 字段：不给模型这个参数，
-    它就没法伪造。运行时由 `tool_subgraph` 注入，跟现有 user_id 走同一条路。
+    它就没法伪造。
+
+    ⚠️ **2026-08-26 修复的一处真实 bug，如实记录**：本函数的 docstring 原来
+    写着"运行时由 `tool_subgraph` 注入，跟现有 user_id 走同一条路"，但
+    `src/tool_agent/subgraph.py::tool_node` 的注入逻辑**只覆盖 `user_id`，
+    从未注入过 `org_id`**——三个 handler 原来直接接收一个不存在的 `org_id`
+    形参，运行时恒为 `None`，任何真实对话调用这三个工具都会立刻撞上
+    "缺少调用方身份"，是一个从未被跑通过的完全阻塞的 bug（只在直接单测
+    handler、手工传 org_id 的场景下测不出来）。
+    修法：改成跟 `query_attendance` 相同的模式——只信任 `tool_node` 真正
+    注入的 `user_id`，`org_id` 由 handler 内部用
+    `org_store.get_org_for_user(user_id)` 反查得到，不再假设一个不存在的
+    注入通道。`org_store` 传 `None`（未初始化）时三个工具直接回"缺少调用方
+    身份"，不会尝试用 `None` 去查。
     """
     from src.ops.tools import ToolOutcome
 
     def _format(outcome: "ToolOutcome") -> str:
         return outcome.message
 
+    async def _resolve_org_id(user_id: Optional[str]) -> Optional[str]:
+        if not user_id or org_store is None:
+            return None
+        org = await org_store.get_org_for_user(user_id)
+        return org.org_id if org is not None else None
+
     async def _query(target: str, metric: str = "error_rate", window_minutes: int = 60,
-                     org_id: str = None, **_: Any) -> Any:
+                     user_id: str = None, **_: Any) -> Any:
+        org_id = await _resolve_org_id(user_id)
         if not org_id:
             return ToolOutcome(ok=False, message="缺少调用方身份，无法查询运维系统。")
         return await toolset.query_ops_system(
             org_id=org_id, target=target, metric=metric, window_minutes=window_minutes)
 
     async def _propose(connection_id: str, action_type: str, intent: str, plan: dict,
-                       impact_radius: str = None, org_id: str = None, user_id: str = None,
+                       impact_radius: str = None, user_id: str = None,
                        **_: Any) -> Any:
+        org_id = await _resolve_org_id(user_id)
         if not org_id or not user_id:
             return ToolOutcome(ok=False, message="缺少调用方身份，无法提交修复建议。")
         return await toolset.propose_remediation(
             org_id=org_id, connection_id=connection_id, proposed_by=user_id,
             action_type=action_type, intent=intent, plan=plan, impact_radius=impact_radius)
 
-    async def _execute(action_id: str, action_type: str = None, org_id: str = None, **_: Any) -> Any:
+    async def _execute(action_id: str, action_type: str = None, user_id: str = None, **_: Any) -> Any:
+        org_id = await _resolve_org_id(user_id)
         if not org_id:
             return ToolOutcome(ok=False, message="缺少调用方身份，无法执行修复动作。")
         return await toolset.execute_approved_remediation(

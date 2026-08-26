@@ -1070,6 +1070,42 @@ flowchart TB
   `_conditional_update` 目前只用于 `remediation_actions` 表，其余表若未来
   出现类似"先读后写"模式需要单独排查。
 
+- ✅ **2026-08-26　修复一个从未被跑通过的完全阻塞 bug：运维工具的 `org_id`
+  从来没有被真正注入过**（本会话「张学友」自查 LangGraph 接入现状时发现，
+  不是 peer 发现的）
+
+  `src/ops/tool_registration.py` 的三个工具 handler（`_query`/`_propose`/
+  `_execute`）原来直接声明一个 `org_id: str = None` 形参，docstring 写着
+  "运行时由 `tool_subgraph` 注入，跟现有 `user_id` 走同一条路"——但核对
+  `src/tool_agent/subgraph.py::tool_node` 的注入逻辑发现**它只覆盖
+  `user_id`，从来没有注入过 `org_id`**（`args["user_id"] = user_id` 是唯一
+  一处身份注入，压根没有对应的 `org_id` 分支）。意味着从阶段四工具真正
+  接线进 ReAct 子图（§5 上一条第 16 项）到本次修复之间，**任何一次真实对话
+  调用这三个工具都会立刻撞上"缺少调用方身份"拒绝**——这个缺口纯手工单测
+  handler、直接传 `org_id=` 参数测不出来，只有跑一遍真实调用路径才会现形，
+  之前也确实没有人跑过这条路径。
+
+  修法：改成跟 `query_attendance` 完全相同的既有模式——handler 只信任
+  `tool_node` 真正会注入的 `user_id`，`org_id` 由 handler 内部新增的
+  `_resolve_org_id` 用 `org_store.get_org_for_user(user_id)` 反查得到。
+  `register_ops_tools` 新增 `org_store` 形参，`register_builtin_tools` 里
+  的调用点已同步把已有的 `org_store` 参数传过去（该参数本来就在，之前只是
+  没接给这三个工具）；`org_store` 缺失（None）或查不到该 `user_id` 时，
+  三个工具直接回"缺少调用方身份"，不会用空值/猜测值去查。
+
+  ⚠️ **补的判别力缺口**：原有 `tests/unit/test_ops_tool_registration.py`
+  只测了"身份完全缺失时拒绝"这一种情形，没有测"身份齐全时真的转发正确的
+  `org_id`"——这正是当时留下这个 bug 的洞。新增
+  `TestOrgIdResolvedFromInjectedUserId`（4 条：三个工具各一条正向验证 +
+  一条"user_id 查不到对应 org 时不许瞎猜"）。判别力已用 `git stash`
+  反证：回退到旧签名/旧逻辑后这 4 条里有 3 条直接 `TypeError`（旧
+  `register_ops_tools` 不接受 `org_store` 参数）、1 条同理失败，新代码下
+  4 条全过。全量 `tests/unit` 2314 通过（较上一条修复时的 2310 多 4 条，
+  即本次新增）；`scripts/verify_aiops_endpoints.py` 24 项复跑全过。
+  **本次未覆盖**：仍未跑一次真实的"用户在对话里问运维问题 → LLM 决定调
+  `query_ops_system` → 工具真正查到数据"完整链路（需要真实 LLM 决策，
+  当前验证止于"handler 收到 user_id 后能不能转发正确的 org_id"这一层）。
+
 - ✅ **2026-08-26　P1-14 扩展审计：逐个核对全部管理端点，修复 2 处同类问题**
   `/admin/users` 本身的 N+1 早前已修（同一条 P1-14），但 CLAUDE.md 一直如实
   标注"其余管理端点未逐个排查"。这次过了一遍全部 GET 列表端点：

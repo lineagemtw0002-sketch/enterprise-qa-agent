@@ -9,14 +9,23 @@
    schema 里给了这个字段，就等于把越权做成了一个模型可以直接填的参数。
 2. **不传 toolset 时一个运维工具都不注册。** 跟 workflow_store/attendance_store
    同一个约定：能力没初始化时，不该让 LLM 看到一个调用了必然报错的工具。
+
+⚠️ **2026-08-26 补的判别力缺口**：原版本只测了"身份完全缺失时拒绝"，没有测
+"身份注入齐全时真的能查到东西"——而这条正是当时踩过的真实 bug：`tool_node`
+（`src/tool_agent/subgraph.py`）只注入 `user_id`，从未注入过 `org_id`，但三个
+handler 原来直接接收一个不存在的 `org_id` 形参，实战中恒为 `None`，三个工具
+调用一次挂一次。`TestOrgIdResolvedFromInjectedUserId` 就是补这个洞的判别式——
+把 `_resolve_org_id` 改回"直接读一个不存在的 org_id kwarg"会让它变红。
 """
 
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
+from src.ops.tools import ToolOutcome as _ToolOutcome
 from src.ops.tool_registration import (
     EXECUTE_REMEDIATION_NAME,
     EXECUTE_REMEDIATION_SCHEMA,
@@ -32,9 +41,34 @@ OPS_TOOL_NAMES = {QUERY_OPS_SYSTEM_NAME, PROPOSE_REMEDIATION_NAME, EXECUTE_REMED
 
 
 class _StubToolset:
-    async def query_ops_system(self, **kw): ...
-    async def propose_remediation(self, **kw): ...
-    async def execute_approved_remediation(self, **kw): ...
+    def __init__(self):
+        self.calls = []
+
+    async def query_ops_system(self, **kw):
+        self.calls.append(("query", kw))
+        return _ToolOutcome(ok=True, message="ok")
+
+    async def propose_remediation(self, **kw):
+        self.calls.append(("propose", kw))
+        return _ToolOutcome(ok=True, message="ok")
+
+    async def execute_approved_remediation(self, **kw):
+        self.calls.append(("execute", kw))
+        return _ToolOutcome(ok=True, message="ok")
+
+
+class _StubOrgStore:
+    """模拟 `OrgStore.get_org_for_user`——只认一个 user_id，其余一律查不到，
+    用来钉住"org_id 是查出来的、不是随便信一个字符串"这件事。"""
+
+    def __init__(self, user_id: str, org_id: str):
+        self._user_id = user_id
+        self._org_id = org_id
+
+    async def get_org_for_user(self, user_id: str):
+        if user_id == self._user_id:
+            return SimpleNamespace(org_id=self._org_id)
+        return None
 
 
 def _registered_names(registry: ToolRegistry) -> set:
@@ -61,6 +95,76 @@ class TestIdentityIsNotAnLLMParameter:
         tool = registry.get(QUERY_OPS_SYSTEM_NAME)
         result = await tool.execute(target="order-service")
         assert "身份" in (result.output or "")
+
+
+class TestOrgIdResolvedFromInjectedUserId:
+    """真实调用路径只会注入 `user_id`（见 `subgraph.py::tool_node`），
+    `org_id` 必须由 handler 内部反查得到，不能指望有人替它注入一个不存在的
+    参数。三条各覆盖一个工具，判别力：把 `_resolve_org_id` 改回直接读
+    `org_id` kwarg（旧实现），这三条会失败——因为下面只传 `user_id`，
+    旧实现读到的 `org_id` kwarg 恒为 None，工具会拒绝而不是真的调用 toolset。
+    """
+
+    @pytest.mark.asyncio
+    async def test_query_resolves_org_id_and_forwards_to_toolset(self):
+        registry = ToolRegistry()
+        toolset = _StubToolset()
+        register_ops_tools(registry, toolset, _StubOrgStore("u1", "org_acme"))
+        tool = registry.get(QUERY_OPS_SYSTEM_NAME)
+
+        result = await tool.execute(target="order-service", user_id="u1")
+
+        assert result.error is None, result.output
+        assert toolset.calls == [("query", {
+            "org_id": "org_acme", "target": "order-service",
+            "metric": "error_rate", "window_minutes": 60,
+        })]
+
+    @pytest.mark.asyncio
+    async def test_propose_resolves_org_id_and_forwards_to_toolset(self):
+        registry = ToolRegistry()
+        toolset = _StubToolset()
+        register_ops_tools(registry, toolset, _StubOrgStore("u1", "org_acme"))
+        tool = registry.get(PROPOSE_REMEDIATION_NAME)
+
+        result = await tool.execute(
+            connection_id="conn1", action_type="restart_service",
+            intent="服务卡死", plan={"target": "order-service"}, user_id="u1",
+        )
+
+        assert result.error is None, result.output
+        assert toolset.calls == [("propose", {
+            "org_id": "org_acme", "connection_id": "conn1", "proposed_by": "u1",
+            "action_type": "restart_service", "intent": "服务卡死",
+            "plan": {"target": "order-service"}, "impact_radius": None,
+        })]
+
+    @pytest.mark.asyncio
+    async def test_execute_resolves_org_id_and_forwards_to_toolset(self):
+        registry = ToolRegistry()
+        toolset = _StubToolset()
+        register_ops_tools(registry, toolset, _StubOrgStore("u1", "org_acme"))
+        tool = registry.get(EXECUTE_REMEDIATION_NAME)
+
+        result = await tool.execute(action_id="remact_1", user_id="u1")
+
+        assert result.error is None, result.output
+        assert toolset.calls == [("execute", {
+            "org_id": "org_acme", "action_id": "remact_1", "action_type": None,
+        })]
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_user_id_still_refuses(self):
+        """org_store 查不到这个 user_id（比如账号已删）时不能瞎猜一个 org。"""
+        registry = ToolRegistry()
+        toolset = _StubToolset()
+        register_ops_tools(registry, toolset, _StubOrgStore("u1", "org_acme"))
+        tool = registry.get(QUERY_OPS_SYSTEM_NAME)
+
+        result = await tool.execute(target="order-service", user_id="ghost-user")
+
+        assert "身份" in (result.output or "")
+        assert toolset.calls == []
 
 
 class TestRegistration:
