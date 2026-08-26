@@ -74,6 +74,25 @@ EXECUTE_REMEDIATION_DESCRIPTION = (
     "必须由有审批权限的人在运维塔台点了批准之后才可以。"
     "如果动作还没被批准，这个工具会拒绝执行并告诉你当前状态。"
 )
+ANALYZE_OPS_INCIDENT_NAME = "analyze_ops_incident"
+ANALYZE_OPS_INCIDENT_DESCRIPTION = (
+    "对某个服务做一次运维分析：查它的指标和告警，检测基线偏离，把重复告警合并成事件，"
+    "并给出可能的根因方向和排查建议。"
+    "⚠️ 产出是**排查线索，不是结论**——转述给用户时必须保留这个性质，不要说成"
+    "「已确认原因是 X」。"
+    "如果结果里带了「本次分析未经模型推理」或「以下数据源本次不可用」，"
+    "**必须原样告诉用户**：结论可能建立在残缺数据上，隐瞒这一点比不分析更糟。"
+)
+ANALYZE_OPS_INCIDENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "target": {"type": "string", "description": "要分析的服务或实例名，例如 order-service"},
+        "metric": {"type": "string", "description": "主要观察的指标，默认 error_rate", "default": "error_rate"},
+        "window_minutes": {"type": "integer", "description": "往前看多少分钟，默认 60", "default": 60},
+    },
+    "required": ["target"],
+}
+
 EXECUTE_REMEDIATION_SCHEMA = {
     "type": "object",
     "properties": {
@@ -136,6 +155,14 @@ def register_ops_tools(
             org_id=org_id, connection_id=connection_id, proposed_by=user_id,
             action_type=action_type, intent=intent, plan=plan, impact_radius=impact_radius)
 
+    async def _analyze(target: str, metric: str = "error_rate", window_minutes: int = 60,
+                       user_id: str = None, **_: Any) -> Any:
+        org_id = await _resolve_org_id(user_id)
+        if not org_id:
+            return ToolOutcome(ok=False, message="缺少调用方身份，无法执行运维分析。")
+        return await toolset.analyze_ops_incident(
+            org_id=org_id, target=target, metric=metric, window_minutes=window_minutes)
+
     async def _execute(action_id: str, action_type: str = None, user_id: str = None, **_: Any) -> Any:
         org_id = await _resolve_org_id(user_id)
         if not org_id:
@@ -146,6 +173,8 @@ def register_ops_tools(
     for name, desc, schema, handler, timeout in (
         (QUERY_OPS_SYSTEM_NAME, QUERY_OPS_SYSTEM_DESCRIPTION, QUERY_OPS_SYSTEM_SCHEMA, _query, 30.0),
         (PROPOSE_REMEDIATION_NAME, PROPOSE_REMEDIATION_DESCRIPTION, PROPOSE_REMEDIATION_SCHEMA, _propose, 30.0),
+        # 分析要跑两次联邦查询 + 一次模型推理，比单次查询慢得多，超时给宽一点。
+        (ANALYZE_OPS_INCIDENT_NAME, ANALYZE_OPS_INCIDENT_DESCRIPTION, ANALYZE_OPS_INCIDENT_SCHEMA, _analyze, 90.0),
         # 执行超时给得比查询宽：重启/扩容/回滚都不是秒级动作。
         (EXECUTE_REMEDIATION_NAME, EXECUTE_REMEDIATION_DESCRIPTION, EXECUTE_REMEDIATION_SCHEMA, _execute, 90.0),
     ):

@@ -27,6 +27,8 @@ import pytest
 
 from src.ops.tools import ToolOutcome as _ToolOutcome
 from src.ops.tool_registration import (
+    ANALYZE_OPS_INCIDENT_NAME,
+    ANALYZE_OPS_INCIDENT_SCHEMA,
     EXECUTE_REMEDIATION_NAME,
     EXECUTE_REMEDIATION_SCHEMA,
     PROPOSE_REMEDIATION_NAME,
@@ -37,7 +39,8 @@ from src.ops.tool_registration import (
 )
 from src.tool_agent.tool_registry import ToolRegistry
 
-OPS_TOOL_NAMES = {QUERY_OPS_SYSTEM_NAME, PROPOSE_REMEDIATION_NAME, EXECUTE_REMEDIATION_NAME}
+OPS_TOOL_NAMES = {QUERY_OPS_SYSTEM_NAME, PROPOSE_REMEDIATION_NAME,
+                  EXECUTE_REMEDIATION_NAME, ANALYZE_OPS_INCIDENT_NAME}
 
 
 class _StubToolset:
@@ -81,6 +84,7 @@ class TestIdentityIsNotAnLLMParameter:
         (QUERY_OPS_SYSTEM_SCHEMA, QUERY_OPS_SYSTEM_NAME),
         (PROPOSE_REMEDIATION_SCHEMA, PROPOSE_REMEDIATION_NAME),
         (EXECUTE_REMEDIATION_SCHEMA, EXECUTE_REMEDIATION_NAME),
+        (ANALYZE_OPS_INCIDENT_SCHEMA, ANALYZE_OPS_INCIDENT_NAME),
     ])
     def test_schema_does_not_expose_identity_fields(self, schema, name):
         blob = json.dumps(schema)
@@ -189,3 +193,10 @@ class TestRegistration:
         )
         assert "不会执行" in PROPOSE_REMEDIATION_DESCRIPTION
         assert "不能自己批准" in EXECUTE_REMEDIATION_DESCRIPTION
+
+    def test_analysis_description_forbids_presenting_leads_as_conclusions(self):
+        """分析产出是排查线索不是结论；降级/数据缺失必须原样转述给用户——
+        隐瞒"这次分析没有模型参与"或"有数据源挂了"，比不分析更糟。"""
+        from src.ops.tool_registration import ANALYZE_OPS_INCIDENT_DESCRIPTION as D
+        assert "不是结论" in D
+        assert "必须原样告诉用户" in D
