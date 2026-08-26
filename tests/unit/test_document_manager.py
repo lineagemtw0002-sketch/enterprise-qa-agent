@@ -36,8 +36,20 @@ from src.libs.loader.file_integrity import SQLiteIntegrityChecker
 class TestBM25RemoveDocument:
     """Tests for BM25Indexer.remove_document."""
 
-    def _build_index(self, tmp_path: Path, postings: dict, collection: str = "default"):
-        """Helper: write a minimal BM25 index file and return an indexer."""
+    def _build_index(
+        self, tmp_path: Path, postings: dict, collection: str = "default",
+        doc_hash_by_chunk: Optional[dict] = None,
+    ):
+        """Helper: write a minimal BM25 index file and return an indexer.
+
+        2026-08-26：加了 `doc_hash_by_chunk` 参数，写进 `metadata.chunk_doc_hash`。
+        这是 CLAUDE.md §4 第 7 条那条 P0 修复后的真实存盘格式——
+        `remove_document` 现在按这份映射精确匹配 chunk_id 归属哪个文档，
+        不再是 `chunk_id.startswith(doc_id)` 的前缀猜测（那条在真实数据下
+        恒为 False：doc_id 是 64 位文件哈希，chunk_id 比它还短）。
+        旧版本这里用 "docA"/"docB" 当 doc_id、"docA_c0" 当 chunk_id，
+        利用的正是前缀匹配这个已经证明是 bug 的行为，不能再依赖它。
+        """
         indexer = BM25Indexer(index_dir=str(tmp_path))
         # Build a valid index structure
         index_data = {}
@@ -65,6 +77,7 @@ class TestBM25RemoveDocument:
                 "avg_doc_length": avg_doc_length,
                 "total_terms": len(index_data),
                 "collection": collection,
+                "chunk_doc_hash": doc_hash_by_chunk or {},
             },
             "index": index_data,
         }
@@ -73,16 +86,20 @@ class TestBM25RemoveDocument:
         return indexer
 
     def test_remove_existing_document(self, tmp_path):
-        indexer = self._build_index(tmp_path, {
-            "hello": [
-                {"chunk_id": "docA_c0", "tf": 2, "doc_length": 10},
-                {"chunk_id": "docB_c0", "tf": 1, "doc_length": 8},
-            ],
-            "world": [
-                {"chunk_id": "docA_c0", "tf": 1, "doc_length": 10},
-            ],
-        })
-        removed = indexer.remove_document("docA", "default")
+        indexer = self._build_index(
+            tmp_path,
+            {
+                "hello": [
+                    {"chunk_id": "docA_c0", "tf": 2, "doc_length": 10},
+                    {"chunk_id": "docB_c0", "tf": 1, "doc_length": 8},
+                ],
+                "world": [
+                    {"chunk_id": "docA_c0", "tf": 1, "doc_length": 10},
+                ],
+            },
+            doc_hash_by_chunk={"docA_c0": "docA_hash", "docB_c0": "docB_hash"},
+        )
+        removed = indexer.remove_document("docA_hash", "default")
         assert removed is True
         # docA postings gone, docB remains
         assert "hello" in indexer._index
@@ -93,29 +110,37 @@ class TestBM25RemoveDocument:
         assert indexer._metadata["num_docs"] == 1
 
     def test_remove_nonexistent_document(self, tmp_path):
-        indexer = self._build_index(tmp_path, {
-            "hello": [{"chunk_id": "docA_c0", "tf": 1, "doc_length": 5}],
-        })
-        removed = indexer.remove_document("docZ", "default")
+        indexer = self._build_index(
+            tmp_path,
+            {"hello": [{"chunk_id": "docA_c0", "tf": 1, "doc_length": 5}]},
+            doc_hash_by_chunk={"docA_c0": "docA_hash"},
+        )
+        removed = indexer.remove_document("docZ_hash", "default")
         assert removed is False
 
     def test_remove_all_documents_empties_index(self, tmp_path):
-        indexer = self._build_index(tmp_path, {
-            "hello": [{"chunk_id": "docA_c0", "tf": 1, "doc_length": 5}],
-        })
-        removed = indexer.remove_document("docA", "default")
+        indexer = self._build_index(
+            tmp_path,
+            {"hello": [{"chunk_id": "docA_c0", "tf": 1, "doc_length": 5}]},
+            doc_hash_by_chunk={"docA_c0": "docA_hash"},
+        )
+        removed = indexer.remove_document("docA_hash", "default")
         assert removed is True
         assert len(indexer._index) == 0
         assert indexer._metadata["num_docs"] == 0
 
     def test_remove_saves_to_disk(self, tmp_path):
-        indexer = self._build_index(tmp_path, {
-            "foo": [
-                {"chunk_id": "docA_c0", "tf": 1, "doc_length": 5},
-                {"chunk_id": "docB_c0", "tf": 1, "doc_length": 6},
-            ],
-        })
-        indexer.remove_document("docA", "default")
+        indexer = self._build_index(
+            tmp_path,
+            {
+                "foo": [
+                    {"chunk_id": "docA_c0", "tf": 1, "doc_length": 5},
+                    {"chunk_id": "docB_c0", "tf": 1, "doc_length": 6},
+                ],
+            },
+            doc_hash_by_chunk={"docA_c0": "docA_hash", "docB_c0": "docB_hash"},
+        )
+        indexer.remove_document("docA_hash", "default")
         # Load from disk and verify
         indexer2 = BM25Indexer(index_dir=str(tmp_path))
         loaded = indexer2.load("default")

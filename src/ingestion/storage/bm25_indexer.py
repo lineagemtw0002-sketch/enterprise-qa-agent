@@ -217,13 +217,39 @@ class BM25Indexer:
             }
 
         # Step 3: Store metadata
+        #
+        # 2026-08-26：`chunk_doc_hash` 是 JSON 侧新增的持久化字段——
+        # chunk_id -> 该 chunk 所属文档的内容哈希（doc_id）。修的是
+        # `remove_document` JSON 侧那条恒为 False 的 P0（见该方法的说明）：
+        # SQLite 侧本来就按 doc_hash 精确匹配，但 JSON 索引以前从不存这份映射，
+        # 没法照搬同样的思路。这里补上。
+        #
+        # `build()` 是"用 combined 整体重建"的语义（见上面单遍改写那段注释），
+        # 调用前 `self._metadata` 还是重建前（本次 build 之前）的旧值，所以
+        # 这里读的是"上一次持久化的映射"，不是这次的空白 dict。合并规则：
+        #   1. 先按 `valid_chunk_ids` 裁掉这次 term_stats 里已经不存在的
+        #      chunk（真正被删除/被同 chunk_id 新内容覆盖的），避免映射
+        #      无限增长；
+        #   2. 本次调用方显式传入的 `doc_hash_by_chunk`（通常是新摄入的那批
+        #      chunk）覆盖同 chunk_id 的旧值。
+        valid_chunk_ids = {stat["chunk_id"] for stat in term_stats}
+        existing_chunk_doc_hash = (
+            self._metadata.get("chunk_doc_hash", {}) if isinstance(self._metadata, dict) else {}
+        )
+        merged_chunk_doc_hash = {
+            cid: dh for cid, dh in existing_chunk_doc_hash.items() if cid in valid_chunk_ids
+        }
+        if doc_hash_by_chunk:
+            merged_chunk_doc_hash.update(doc_hash_by_chunk)
+
         self._metadata = {
             "num_docs": num_docs,
             "avg_doc_length": avg_doc_length,
             "total_terms": len(index),
             "collection": collection,
+            "chunk_doc_hash": merged_chunk_doc_hash,
         }
-        
+
         self._index = index
 
         # Step 4: Persist to disk
@@ -509,20 +535,22 @@ class BM25Indexer:
         """Remove all postings for a document from the BM25 index.
 
         Loads the index (if not already loaded), removes any postings
-        whose ``chunk_id`` starts with *doc_id*, recalculates statistics,
-        and re-saves the index.
+        whose ``chunk_id`` is recorded (in the persisted ``chunk_doc_hash``
+        map) as belonging to *doc_id*, recalculates statistics, and
+        re-saves the index.
 
         Args:
-            doc_id: Document identifier (or prefix).  All postings whose
-                ``chunk_id`` starts with this value are removed.
+            doc_id: Document content hash. All postings whose ``chunk_id``
+                maps to this hash in ``chunk_doc_hash`` are removed.
             collection: Collection name.
 
         Returns:
             ``True`` if any postings were removed, ``False`` otherwise.
         """
         # SQLite 侧先删：它按 doc_hash 精确匹配，是这条 P0 的正解。
-        # 放在前面是因为下面 JSON 侧的前缀匹配恒不命中，会提前 return False，
-        # 跟在后面就永远执行不到。
+        # 放在前面是因为下面 JSON 侧在旧实现下的前缀匹配恒不命中，会提前
+        # return False；现在 JSON 侧也改成精确匹配了，顺序不再关键，
+        # 但保留不改（两侧独立执行，互不依赖顺序）。
         sqlite_deleted = self._delete_from_sqlite(collection, doc_id)
 
         if not self._index:
@@ -530,26 +558,46 @@ class BM25Indexer:
             if not self._load_json_index(collection):
                 return sqlite_deleted > 0
 
+        # 2026-08-26 修复：原来是 `chunk_id.startswith(doc_id)`——doc_id 是
+        # 文件内容 SHA256（64 字符），chunk_id 形如 `65046ad1_0000_2a3ac7ab`
+        # （`sha256(源路径)[:8]` 开头，本身就比 doc_id 短），前缀匹配恒为
+        # False（见 CLAUDE.md §4 第 7 条）。改为查 `build()` 里新增持久化的
+        # `chunk_doc_hash` 映射（chunk_id -> 所属文档哈希），按 doc_id 精确
+        # 圈定要删的 chunk_id 集合——这是 SQLite 侧本来就在用的思路，现在
+        # JSON 侧补上同一份映射。
+        #
+        # ⚠️ 已知边界：这份映射只覆盖"本次修复之后（新）摄入或重新摄入过"的
+        # chunk。修复前就已经在索引里、从未被重新摄入过的旧 chunk 没有这份
+        # 映射，对它们调用本方法仍然找不到、删不掉——直到那份文档被重新摄入
+        # 一次为止。这不是本次修复要解决的问题（版本替换识别是独立的设计
+        # 决策，见 CLAUDE.md §4 第 1 条），本次只保证"映射存在时，匹配是对
+        # 的"，不保证"所有历史数据都有映射"。
+        chunk_doc_hash: Dict[str, str] = (
+            self._metadata.get("chunk_doc_hash", {}) if isinstance(self._metadata, dict) else {}
+        )
+        chunk_ids_to_remove = {cid for cid, dh in chunk_doc_hash.items() if dh == doc_id}
+
         removed_any = False
         terms_to_delete: list[str] = []
 
-        for term, term_data in self._index.items():
-            original_len = len(term_data["postings"])
-            term_data["postings"] = [
-                p for p in term_data["postings"]
-                if not p["chunk_id"].startswith(doc_id)
-            ]
-            if len(term_data["postings"]) < original_len:
-                removed_any = True
-            # Mark empty terms for cleanup
-            if not term_data["postings"]:
-                terms_to_delete.append(term)
-            else:
-                term_data["df"] = len(term_data["postings"])
+        if chunk_ids_to_remove:
+            for term, term_data in self._index.items():
+                original_len = len(term_data["postings"])
+                term_data["postings"] = [
+                    p for p in term_data["postings"]
+                    if p["chunk_id"] not in chunk_ids_to_remove
+                ]
+                if len(term_data["postings"]) < original_len:
+                    removed_any = True
+                # Mark empty terms for cleanup
+                if not term_data["postings"]:
+                    terms_to_delete.append(term)
+                else:
+                    term_data["df"] = len(term_data["postings"])
 
-        # Remove empty terms
-        for term in terms_to_delete:
-            del self._index[term]
+            # Remove empty terms
+            for term in terms_to_delete:
+                del self._index[term]
 
         if removed_any:
             # Recalculate global metadata
@@ -567,11 +615,18 @@ class BM25Indexer:
             for td in self._index.values():
                 td["idf"] = self._calculate_idf(num_docs, td["df"])
 
+            # 被删掉的 chunk 也要从 chunk_doc_hash 里摘掉，否则这份映射会
+            # 无限增长（永远只加不减）。
+            remaining_chunk_doc_hash = {
+                cid: dh for cid, dh in chunk_doc_hash.items() if cid not in chunk_ids_to_remove
+            }
+
             self._metadata = {
                 "num_docs": num_docs,
                 "avg_doc_length": avg_doc_length,
                 "total_terms": len(self._index),
                 "collection": collection,
+                "chunk_doc_hash": remaining_chunk_doc_hash,
             }
             self._save(collection)
             # JSON 侧真删掉了东西时才回镜像，否则会把上面刚做完的 SQLite 删除

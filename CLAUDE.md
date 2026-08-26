@@ -454,13 +454,36 @@ flowchart TB
    **修复路径现在有了**：SQLite 后端下同一操作删掉 317 条 postings（317→0），
    即这条 P0 随方案 C 一起解决，不需要单独设计。
 
-   🟡 **阶段 1 已落地一半**（08-25，见第 2c 条）：`remove_document` 现在会先
-   调 `_delete_from_sqlite` 按 `doc_hash` 精确删除，SQLite 侧**确实删掉了**
-   （`test_remove_document_deletes_on_sqlite_side`）。
-   ⚠️ **但 JSON 侧依旧删不掉，而生产读路径还在读 JSON** ——
-   所以这条 P0 **对线上行为尚未闭环**，要等阶段 2 切读。
-   `test_json_backend_still_cannot_delete_this` 故意断言"现状是坏的"，
-   切读后它会变红，那正是提醒删掉它的信号，**不要在那之前把它改绿**。
+   🟢 **JSON 侧匹配已修复（2026-08-26），但这不等于关闭这条 P0——见下方"未关闭"说明。**
+   `remove_document` 现在会先调 `_delete_from_sqlite` 按 `doc_hash` 精确删除，
+   SQLite 侧**确实删掉了**（`test_remove_document_deletes_on_sqlite_side`）。
+   JSON 侧原来的修复思路是"等阶段 2 切读到 SQLite 就不用管 JSON 了"，
+   **这次改用了另一条路**：`build()`/`add_documents()` 新增持久化字段
+   `chunk_doc_hash`（chunk_id -> 所属文档哈希，JSON 索引里从此真的存了这份
+   映射），`remove_document` 的 JSON 侧改成查这份映射精确匹配，不再猜前缀。
+   映射存在时，JSON 侧现在**真的能删掉**——回归测试见
+   `tests/unit/test_bm25_json_remove_document.py`（8 条）。
+   `test_json_backend_still_cannot_delete_this` **依然通过、没有变红**——
+   它测的是"从不传 `doc_id` 调用 `build()`"这个场景，本来就不会产生映射，
+   这条边界修复后依然成立，不是遗留的坏行为，之前那句"切读后它会变红"的
+   预期已经不适用（因为没有走切读这条路），如实更正。
+
+   ⚠️ **未关闭：修好 `remove_document` 本身不等于关闭"文档更新后旧版本
+   残留"这条 P0（本文件最上面第 1 条）。** 现在的问题分两层：
+   - **第一层（已修复）**：`remove_document` 传对 doc_hash 时，映射存在
+     的话真的能精确删除，不再是死代码。
+   - **第二层（仍未做，是真正的空白）**：`add_documents` 内部调用
+     `remove_document` 时传的是**新文档自己的哈希**（处理"完全相同内容
+     重复摄入"的幂等场景），不是"旧版本的哈希"——因为**全仓没有任何地方
+     知道"这次上传是哪份旧文档的新版本"**，内容一变、哈希一变，就是一份
+     全新文档，无从谈起"删旧的"。修好匹配逻辑消除的是"就算知道该删谁也
+     删不掉"这个技术障碍，没有回答"怎么知道该删谁"这个更根本的问题——
+     那是一个独立的、需要走设计评审的决策（按什么识别"这是同一份文档的
+     新版本"：文件路径？文件名？其他？），本次没有擅自拍板。
+   - **已知的技术边界**：`chunk_doc_hash` 映射只覆盖"本次修复之后（新）
+     摄入或重新摄入过"的 chunk。修复前就已经在索引里、从未重新摄入过的
+     旧 chunk 没有这份映射，删不掉，要等对应文档重新摄入一次才补上——
+     跟方案 C 迁移时"`doc_hash` 迁不过来"是同一类边界。
 
 8. **跨主题数值幻觉（"把两份无关文档拼成一条因果链"）—— 大幅改善，未完全闭环** 🟡
    （2026-08-25 第二批：`_build_prompt` 落地了 `docs/orchestration_design.md`
