@@ -448,6 +448,36 @@ def create_app() -> FastAPI:
         except Exception:
             logger.exception("failed to record audit log", extra={"action": action, "resource_type": resource_type})
 
+    # 初始化 LLM（配置完全来自 settings.yaml + 环境变量覆盖）——挪到工具注册
+    # 之前，因为下面的 OpsToolset（RCA 分析要用）需要在构造时就拿到这个实例，
+    # 不是原来"先注册工具、后建 LLM"的顺序。
+    def _build_llm(model: str):
+        from langchain_openai import ChatOpenAI
+        llm_kwargs = {
+            "model": model,
+            "temperature": settings.llm.temperature,
+            "max_tokens": settings.llm.max_tokens,
+        }
+        base_url = getattr(settings.llm, "base_url", None)
+        api_key = getattr(settings.llm, "api_key", None)
+        if settings.llm.provider == "ollama":
+            # Ollama exposes an OpenAI-compatible endpoint under /v1; ChatOpenAI
+            # requires a non-empty api_key even though Ollama ignores it.
+            llm_kwargs["base_url"] = f"{(base_url or 'http://localhost:11434').rstrip('/')}/v1"
+            llm_kwargs["api_key"] = api_key or "ollama"
+        else:
+            if base_url:
+                llm_kwargs["base_url"] = base_url
+            if api_key:
+                llm_kwargs["api_key"] = api_key
+        return ChatOpenAI(**llm_kwargs)
+
+    try:
+        llm = _build_llm(settings.llm.model)
+    except Exception:
+        logger.exception("failed to init main LLM")
+        llm = None
+
     # 初始化 ToolRegistry（内置工具 + MCP 外部工具）
     tool_registry = ToolRegistry()
     # 返回值是真正会被 ReAct 工具子图调用的 QueryKnowledgeHubTool 实例——
@@ -462,7 +492,12 @@ def create_app() -> FastAPI:
     _ops_transport = WebSocketConnectorTransport(active_ops_connector_ws, active_ops_pending_requests, ops_store)
     _ops_dispatcher = WebSocketRemediationDispatcher(active_ops_connector_ws, active_ops_pending_requests, ops_store)
     _ops_engine = FederatedQueryEngine(transport=_ops_transport, directory=OpsStoreDirectory(ops_store))
-    ops_toolset = OpsToolset(_ops_engine, ops_store, dispatcher=_ops_dispatcher)
+    # `llm` 在这里已经建好（见下面"初始化 LLM"那段——为了让 OpsToolset 能拿到
+    # 它，那段被挪到了这一行之前，不再是原来"先注册工具、后建 LLM"的顺序）。
+    # 不传 llm 的话 RCA 分析会一直走降级路径（`src/ops/analysis/rca.py`），
+    # 功能仍可用但没有模型参与——复用主链路同一个生成模型实例，不新建、
+    # 不引入新的模型/提示词约定。
+    ops_toolset = OpsToolset(_ops_engine, ops_store, dispatcher=_ops_dispatcher, llm=llm)
 
     # ⚠️ 已知缺口：工具注册目前是全局的，没有按 aiops_module_enabled 过滤——
     # 模块未开通的企业用户也会在 LLM 可用工具列表里看到 query_ops_system 等
@@ -514,34 +549,6 @@ def create_app() -> FastAPI:
             return False
         user_role_ids = {r.role_id for r in await role_store.get_user_roles(user_id)}
         return approver_role_id in user_role_ids
-
-    # 初始化 LLM（配置完全来自 settings.yaml + 环境变量覆盖）
-    def _build_llm(model: str):
-        from langchain_openai import ChatOpenAI
-        llm_kwargs = {
-            "model": model,
-            "temperature": settings.llm.temperature,
-            "max_tokens": settings.llm.max_tokens,
-        }
-        base_url = getattr(settings.llm, "base_url", None)
-        api_key = getattr(settings.llm, "api_key", None)
-        if settings.llm.provider == "ollama":
-            # Ollama exposes an OpenAI-compatible endpoint under /v1; ChatOpenAI
-            # requires a non-empty api_key even though Ollama ignores it.
-            llm_kwargs["base_url"] = f"{(base_url or 'http://localhost:11434').rstrip('/')}/v1"
-            llm_kwargs["api_key"] = api_key or "ollama"
-        else:
-            if base_url:
-                llm_kwargs["base_url"] = base_url
-            if api_key:
-                llm_kwargs["api_key"] = api_key
-        return ChatOpenAI(**llm_kwargs)
-
-    try:
-        llm = _build_llm(settings.llm.model)
-    except Exception:
-        logger.exception("failed to init main LLM")
-        llm = None
 
     # 意图分类专用模型（docs/optimization_tracking.md 耗时优化任务）：LoRA 微调
     # qwen2.5:1.5b（训练数据覆盖"指代消解 + 子查询拆分 + 四分类"合并任务
