@@ -146,12 +146,17 @@ class TestTemplateLaneSkipsLLM:
     @pytest.mark.asyncio
     async def test_template_hit_streams_verbatim_text(self):
         """T17：`_token_queue` 收到的就是模板原文，不许被二次加工（比如被
-        当成 LLM 输出去过一遍泄露过滤/截断逻辑）。"""
+        当成 LLM 输出去过一遍泄露过滤/截断逻辑）。用"你能做什么"（能力模板，
+        设计上是单条固定文案、不随机，见 `chitchat.py::match_chitchat_reply`）
+        而不是问候/致谢——那两类模板是随机挑选 2~3 条候选之一，`_generate_node`
+        内部与本测试各自独立调用 `match_chitchat_reply` 会各摇一次骰子，
+        用它们做"逐字相等"断言在统计上必然偶尔失败，不是本条测试该测的内容。
+        """
         from src.ragent_backend.chitchat import match_chitchat_reply
 
         workflow = _make_workflow()
-        result, streamed = await _run(workflow, _chitchat_state("谢谢"))
-        expected = match_chitchat_reply("谢谢")
+        result, streamed = await _run(workflow, _chitchat_state("你能做什么"))
+        expected = match_chitchat_reply("你能做什么")
         assert expected is not None
         assert streamed == expected
         assert result["final_answer"] == expected
