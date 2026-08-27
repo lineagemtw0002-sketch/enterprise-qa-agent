@@ -181,7 +181,8 @@ def main() -> int:
     state = FaultState()
     probe = OpsProbe(args.platform, args.connection_id, args.token,
                      exec_fails=args.exec_fails, environment=env.key, state=state)
-    serve_control(state, env, port=args.control_port)
+    serve_control(state, env, port=args.control_port,
+                  platform=args.platform, connection_id=args.connection_id)
     print(f"[probe] 环境={env.label}（{env.key}）　控制口=http://127.0.0.1:{args.control_port}")
     print(f"[probe] 注入故障：.venv/bin/python -m services.ops_probe_demo.control "
           f"inject --service <服务名> --kind error_spike --port {args.control_port}")

@@ -333,6 +333,34 @@ class ServiceHealthEntry(BaseModel):
     connector_name: Optional[str] = None
 
 
+class AnalyzeOpsIncidentRequest(BaseModel):
+    target: str = Field(..., min_length=1, description="要分析哪个服务")
+    metric: str = "error_rate"
+    window_minutes: int = Field(default=60, ge=5, le=1440)
+
+
+class AnalyzeOpsIncidentResponse(BaseModel):
+    """⚠️ 字段名**照抄** `OpsToolset.analyze_ops_incident` 返回的 `data`，不是凭
+    语义猜的——本产品线已经三次栽在猜字段名上（§10.5 指标的四个键、
+    `/auth/me` 的 roles 形状、`Segmented` 白屏）。"""
+
+    ok: bool
+    message: str
+    summary_id: Optional[str] = None
+    # 分析可能"跑通了但没发现问题"——那**不是失败**。调用方要能区分
+    # "没查到数据/被拒绝"和"查了，一切正常"。
+    has_findings: bool = False
+    # 降级 = RCA 那一步没有模型参与，结论只是数据复述。必须显式告诉用户，
+    # 否则他会把一段复述当成分析结论。
+    degraded: bool = False
+    anomaly_targets: List[str] = []
+    alert_count: int = 0
+    incident_count: int = 0
+    # 部分连接器查不到时要显式说出来（§3.5 第 4 条）——
+    # "分析完了没发现问题"和"有一半数据没拿到"在结论可信度上完全不同。
+    unavailable: List[str] = []
+
+
 class ServiceThresholdsRequest(BaseModel):
     # 可以只写其中几个字段，缺的逐字段回退到连接器默认、再回退到平台默认。
     # **不要求写全**——要求写全等于把没打算改的那几个也冻结在填写那天的值上。

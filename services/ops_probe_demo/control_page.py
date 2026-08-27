@@ -25,7 +25,16 @@ from typing import Dict
 from services.ops_probe_demo.environments import FAULT_KINDS, Environment
 
 
-def render(env: Environment, faults: Dict[str, str]) -> str:
+def render(env: Environment, faults: Dict[str, str], *,
+           platform: str = "", connection_id: str = "", org_label: str = "") -> str:
+    """⚠️ **必须显示"这个控制口接的是哪个平台、哪个连接器"。**
+
+    第一版只显示环境名（"电商主站"），而三套环境的默认都是它——本机同时跑
+    多个后端/多个探针时（开发常态），根本分辨不出眼前这个页面控制的是哪一个。
+    实际就踩了：在 9330 上注入故障，却跑去另一个后端的界面上找变化，找不到。
+    企业名同样要显示——连接器是挂在某个企业名下的，看的人得知道该用哪个企业的
+    账号去登录才看得到变化。
+    """
     services = sorted(env.services)
     kind_opts = "".join(
         f'<option value="{k}">{v.label}（{k} → {v.suggested_action}）</option>'
@@ -79,12 +88,21 @@ def render(env: Environment, faults: Dict[str, str]) -> str:
   .bad {{ color:#f8717a; background:#3d1e22; }}
   .bar {{ display:flex; gap:10px; margin-top:18px; }}
   .note {{ color:#5c5f70; font-size:12px; margin-top:20px; line-height:1.7; }}
+  /* 接在哪个平台上，是这个页面最容易搞错也最要命的一条信息，给它足够的存在感。 */
+  .target {{ background:#21232f; border:1px solid #2b2e3d; border-radius:8px;
+             padding:9px 13px; font-size:12.5px; color:#8d90a3; margin-bottom:18px; }}
+  .target b {{ color:#eef0f6; }}
+  .target code {{ color:#8b7ffb; font-family:ui-monospace,Menlo,monospace; }}
   a {{ color:#8b7ffb; }}
 </style></head><body><div class="wrap">
   <div class="banner">⚠️ 这是<b>演示/测试工具</b>，不是产品功能。它能让被监控系统随时"坏掉"，
      只监听 127.0.0.1，不做鉴权，永远不会随产品发布。</div>
   <h1>故障注入 · {env.label}</h1>
   <div class="sub">环境 {env.key}　集群 {env.cluster}</div>
+  <div class="target">
+    <b>这个控制口接的是</b>　企业 <code>{org_label or "(未知)"}</code>
+    　平台 <code>{platform or "(未知)"}</code>　连接器 <code>{connection_id or "(未知)"}</code>
+  </div>
   <table>
     <tr><th style="width:34%">服务</th><th style="width:22%">当前状态</th><th>操作</th></tr>
     {rows}

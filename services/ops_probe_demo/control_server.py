@@ -52,7 +52,8 @@ class FaultState:
                 self._faults.pop(service, None)
 
 
-def _make_handler(state: FaultState, env: Environment):
+def _make_handler(state: FaultState, env: Environment, platform: str,
+                  connection_id: str, org_label: str):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):     # 别把每个请求都打到探针日志里
             pass
@@ -68,7 +69,9 @@ def _make_handler(state: FaultState, env: Environment):
         def do_GET(self):                  # noqa: N802
             path = self.path.rstrip("/") or "/"
             if path == "/":
-                body = render_control_page(env, state.snapshot()).encode()
+                body = render_control_page(env, state.snapshot(),
+                                           platform=platform, connection_id=connection_id,
+                                           org_label=org_label).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -81,6 +84,8 @@ def _make_handler(state: FaultState, env: Environment):
             faults = state.snapshot()
             self._send(200, {
                 "environment": env.key, "label": env.label,
+                "platform": platform, "connection_id": connection_id,
+                "org": org_label,
                 "services": sorted(env.services),
                 "faults": faults,
                 "fault_kinds": {k: v.label for k, v in FAULT_KINDS.items()},
@@ -122,8 +127,15 @@ def _make_handler(state: FaultState, env: Environment):
     return Handler
 
 
-def serve_control(state: FaultState, env: Environment, *, port: int = 9330) -> ThreadingHTTPServer:
-    """在后台线程里起控制口，返回 server（调用方一般不用管它）。"""
-    server = ThreadingHTTPServer(("127.0.0.1", port), _make_handler(state, env))
+def serve_control(state: FaultState, env: Environment, *, port: int = 9330,
+                  platform: str = "", connection_id: str = "",
+                  org_label: str = "") -> ThreadingHTTPServer:
+    """在后台线程里起控制口，返回 server（调用方一般不用管它）。
+
+    `platform` / `connection_id` 会显示在页面上——本机跑多个探针时，
+    这是唯一能分辨"眼前这个控制口管的是哪一个"的信息。
+    """
+    server = ThreadingHTTPServer(("127.0.0.1", port),
+                                 _make_handler(state, env, platform, connection_id, org_label))
     threading.Thread(target=server.serve_forever, daemon=True, name="ops-probe-control").start()
     return server
