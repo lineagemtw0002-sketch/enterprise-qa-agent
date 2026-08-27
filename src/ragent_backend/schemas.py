@@ -333,6 +333,19 @@ class ServiceHealthEntry(BaseModel):
     connector_name: Optional[str] = None
 
 
+class ServiceThresholdsRequest(BaseModel):
+    # 可以只写其中几个字段，缺的逐字段回退到连接器默认、再回退到平台默认。
+    # **不要求写全**——要求写全等于把没打算改的那几个也冻结在填写那天的值上。
+    thresholds: Dict[str, float]
+
+
+class ServiceThresholdsEntry(BaseModel):
+    service: str                      # "*" = 该连接器的默认配置
+    thresholds: Dict[str, float]      # 只含被覆盖的字段，不是完整的六个
+    effective: Dict[str, float]       # 叠加平台默认之后**真正生效**的六个值
+    updated_at: Optional[float] = None
+
+
 class OpsLiveOverviewResponse(BaseModel):
     """总览大屏里**需要现场问连接器**的那部分（服务健康网格 + 今日告警合并）。
 

@@ -71,6 +71,7 @@ from src.ragent_backend.schemas import (
     RoleOpsPermissionResponse, SetRoleOpsPermissionRequest,
     AnalysisSummaryResponse, SetOutcomeEffectiveRequest, OpsMetricsResponse,
     OpsLiveOverviewResponse, ServiceHealthEntry,
+    ServiceThresholdsRequest, ServiceThresholdsEntry,
     PostmortemEntryResponse,
 )
 from src.ragent_backend import account_import as _acct_import
@@ -2251,6 +2252,84 @@ def create_app() -> FastAPI:
         metrics = await ops_store.compute_ops_metrics(org.org_id, connection_ids=viewable)
         return OpsMetricsResponse(**metrics)
 
+    @app.get(
+        "/api/v1/admin/ops/connectors/{connection_id}/service-thresholds",
+        response_model=List[ServiceThresholdsEntry],
+    )
+    async def admin_list_service_thresholds(
+        connection_id: str,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> List[ServiceThresholdsEntry]:
+        """列出这个连接器上配过的健康阈值覆盖。
+
+        每一条同时返回 `thresholds`（管理员实际填的那几个字段）和 `effective`
+        （叠加平台默认之后真正生效的六个值）——**只回其中一个都不够**：
+        只回填过的，界面上没法告诉用户"没填的那几个现在是多少"；
+        只回生效值，用户分不清哪些是自己配的、哪些是平台默认，
+        点了"恢复默认"之后会以为界面坏了。
+        """
+        org = await _require_aiops_enabled_org(current_user)
+        await _get_owned_connector(org.org_id, connection_id)
+        rows = await ops_store.list_service_thresholds(connection_id)
+        by_service = {r["service"]: r["thresholds"] for r in rows}
+        return [
+            ServiceThresholdsEntry(
+                service=r["service"], thresholds=r["thresholds"],
+                effective=service_health.resolve_thresholds(
+                    by_service.get(service_health.WILDCARD_SERVICE)
+                    if r["service"] != service_health.WILDCARD_SERVICE else None,
+                    r["thresholds"],
+                ).to_dict(),
+                updated_at=r["updated_at"],
+            )
+            for r in rows
+        ]
+
+    @app.put(
+        "/api/v1/admin/ops/connectors/{connection_id}/service-thresholds/{service}",
+        response_model=ServiceThresholdsEntry,
+    )
+    async def admin_set_service_thresholds(
+        connection_id: str, service: str, request: ServiceThresholdsRequest,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> ServiceThresholdsEntry:
+        """配置某个服务（`service="*"` 表示该连接器的默认）的健康判定阈值。
+
+        跟白名单配置同一档权限（org_admin）——这是配置不是审批。
+
+        非法配置一律 400 **当场报错，不夹紧成一个看起来正常的值**：写错字段名
+        静默忽略的后果是管理员以为改了、界面也显示保存成功，实际一点没生效。
+        """
+        org = await _require_aiops_enabled_org(current_user)
+        await _get_owned_connector(org.org_id, connection_id)
+        try:
+            cleaned = service_health.validate_thresholds(request.thresholds)
+        except service_health.InvalidThresholds as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        saved = await ops_store.upsert_service_thresholds(
+            org.org_id, connection_id, service, cleaned, current_user.user_id)
+        wildcard = None
+        if service != service_health.WILDCARD_SERVICE:
+            existing = await ops_store.list_service_thresholds(connection_id)
+            wildcard = next((r["thresholds"] for r in existing
+                             if r["service"] == service_health.WILDCARD_SERVICE), None)
+        return ServiceThresholdsEntry(
+            service=saved["service"], thresholds=saved["thresholds"],
+            effective=service_health.resolve_thresholds(wildcard, saved["thresholds"]).to_dict(),
+            updated_at=saved["updated_at"],
+        )
+
+    @app.delete("/api/v1/admin/ops/connectors/{connection_id}/service-thresholds/{service}")
+    async def admin_delete_service_thresholds(
+        connection_id: str, service: str,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> Dict[str, bool]:
+        """删掉一条覆盖 = 这个服务回到上一层（连接器默认 → 平台默认）。"""
+        org = await _require_aiops_enabled_org(current_user)
+        await _get_owned_connector(org.org_id, connection_id)
+        return {"deleted": await ops_store.delete_service_thresholds(connection_id, service)}
+
     @app.get("/api/v1/admin/ops/live-overview", response_model=OpsLiveOverviewResponse)
     async def admin_ops_live_overview(
         current_user: AuthenticatedUser = Depends(get_current_user),
@@ -2292,7 +2371,10 @@ def create_app() -> FastAPI:
             _ops_engine.query(org.org_id, alert_req, connection_ids=viewable),
         )
 
-        names = {c.connection_id: c.name for c in await ops_store.list_connectors_for_org(org.org_id)}
+        connectors = await ops_store.list_connectors_for_org(org.org_id)
+        names = {c.connection_id: c.name for c in connectors}
+        # 一次查完全部连接器的阈值覆盖，不逐个查（N+1）。
+        overrides = await ops_store.thresholds_by_connection([r.connection_id for r in health_res.results])
         services: List[ServiceHealthEntry] = []
         for result in health_res.results:
             services.extend(
@@ -2305,6 +2387,7 @@ def create_app() -> FastAPI:
                      for p in result.points],
                     connection_id=result.connection_id,
                     connector_name=names.get(result.connection_id),
+                    overrides=overrides.get(result.connection_id),
                 )
             )
 

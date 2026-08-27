@@ -322,9 +322,141 @@ function ConnectorsSection({ onModuleDisabled, onConnectorsLoaded }) {
   )
 }
 
+
+// ============================================================ 服务健康阈值
+
+const THRESHOLD_FIELDS = [
+  { name: 'error_rate_warning', label: '错误率 · 观察中起点', step: 0.001, suffix: '（0.01 = 1%）' },
+  { name: 'error_rate_critical', label: '错误率 · 异常起点', step: 0.001, suffix: '（0.05 = 5%）' },
+  { name: 'p95_warning_ms', label: 'P95 延迟 · 观察中起点', step: 50, suffix: 'ms' },
+  { name: 'p95_critical_ms', label: 'P95 延迟 · 异常起点', step: 50, suffix: 'ms' },
+  { name: 'queue_warning_ms', label: '队列延迟 · 观察中起点', step: 500, suffix: 'ms' },
+  { name: 'queue_critical_ms', label: '队列延迟 · 异常起点', step: 500, suffix: 'ms' },
+]
+
+function ThresholdsSection({ connectors, onModuleDisabled }) {
+  const [connectionId, setConnectionId] = useState(null)
+  const [rows, setRows] = useState([])
+  const [service, setService] = useState('*')
+  const [form] = Form.useForm()
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    if (!connectionId && connectors.length) setConnectionId(connectors[0].connection_id)
+  }, [connectors, connectionId])
+
+  const load = useCallback(async () => {
+    if (!connectionId) return
+    try {
+      setRows(await opsApi.listServiceThresholds(connectionId))
+    } catch (error) {
+      if (opsApi.isModuleDisabledError(error)) { onModuleDisabled(); return }
+      message.error(opsApi.errorText(error))
+    }
+  }, [connectionId, onModuleDisabled])
+
+  useEffect(() => { load() }, [load])
+
+  const current = rows.find((r) => r.service === service)
+  useEffect(() => {
+    // 只回填**管理员实际填过**的字段，没填的留空 —— 留空表示"跟随上一层"。
+    // 把生效值预填进去会让用户一保存就把六个数字全冻结成当天的值，
+    // 以后平台默认值改了它们也不会跟着动，而用户完全不知道自己做了这件事。
+    form.setFieldsValue(
+      THRESHOLD_FIELDS.reduce((acc, f) => ({ ...acc, [f.name]: current?.thresholds?.[f.name] ?? null }), {}),
+    )
+  }, [current, form])
+
+  async function handleSave() {
+    const values = await form.validateFields()
+    const filled = Object.fromEntries(
+      Object.entries(values).filter(([, v]) => v !== null && v !== undefined && v !== ''),
+    )
+    if (!Object.keys(filled).length) {
+      message.warning('一个字段都没填 —— 想恢复默认请用下面的「恢复默认」')
+      return
+    }
+    setSaving(true)
+    try {
+      await opsApi.setServiceThresholds(connectionId, service.trim(), filled)
+      message.success('阈值已保存')
+      load()
+    } catch (error) {
+      // 400 = 阈值本身不合法（写错字段名 / 非正数 / warning 大于 critical）。
+      // 后端当场报错而不是夹紧成一个看起来正常的值，这里如实转述给用户。
+      message.error(opsApi.errorText(error))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function handleReset() {
+    try {
+      await opsApi.deleteServiceThresholds(connectionId, service.trim())
+      message.success('已恢复默认')
+      load()
+    } catch (error) {
+      message.error(opsApi.errorText(error))
+    }
+  }
+
+  return (
+    <Card size="small" title="服务健康判定阈值" style={{ marginTop: 12 }}>
+      <Alert
+        type="info"
+        showIcon
+        className="ops-console-alert"
+        message="留空 = 跟随上一层，不是 0"
+        description="解析顺序是逐字段回退：这个服务的配置 → 该连接器的默认（服务名填 *）→ 平台内置默认值。只想改一个数就只填那一个，其余留空 —— 全填等于把没打算改的那几个也冻结在今天的值上。"
+      />
+      <Space className="ops-console-toolbar" wrap>
+        <Select
+          value={connectionId}
+          onChange={setConnectionId}
+          style={{ minWidth: 220 }}
+          options={connectors.map((c) => ({ value: c.connection_id, label: c.name }))}
+        />
+        <Input
+          value={service}
+          onChange={(e) => setService(e.target.value)}
+          style={{ width: 220 }}
+          placeholder="服务名，* 表示该连接器默认"
+        />
+      </Space>
+
+      <Form form={form} layout="vertical" className="ops-console-form">
+        {THRESHOLD_FIELDS.map((f) => (
+          <Form.Item key={f.name} name={f.name} label={`${f.label} ${f.suffix}`}>
+            <InputNumber min={0} step={f.step} style={{ width: '100%' }} placeholder="留空 = 跟随上一层" />
+          </Form.Item>
+        ))}
+        <Space>
+          <Button type="primary" loading={saving} onClick={handleSave}>保存阈值</Button>
+          {current && <Button danger onClick={handleReset}>恢复默认</Button>}
+        </Space>
+      </Form>
+
+      {current && (
+        <Paragraph type="secondary" className="ops-console-hint">
+          实际生效：{THRESHOLD_FIELDS.map((f) => `${f.label.split(' · ')[0]}${f.label.includes('观察中') ? '观察' : '异常'} ${current.effective[f.name]}`).join('　')}
+        </Paragraph>
+      )}
+      {rows.length > 0 && (
+        <Paragraph type="secondary" className="ops-console-hint">
+          已配置：{rows.map((r) => (r.service === '*' ? '连接器默认' : r.service)).join('、')}
+        </Paragraph>
+      )}
+    </Card>
+  )
+}
+
 // ============================================================ 修复范围白名单
 
 function ScopesSection({ connectors, onModuleDisabled }) {
+  // ⚠️ 用共享的 `useUserNames`/`displayUser`，**不要在这里另写一份**。
+  // 总览/审批队列/事后复盘三处早前已经统一过 UUID→用户名，这里是第四处漏网：
+  // 界面上显示的是 `5a5cb2cb-a870-...` 而不是人名。各写各的正是当初要消灭的模式。
+  const userNames = useUserNames()
   const [connectionId, setConnectionId] = useState(null)
   const [scopes, setScopes] = useState([])
   const [loading, setLoading] = useState(false)
@@ -436,7 +568,7 @@ function ScopesSection({ connectors, onModuleDisabled }) {
         </Button>
         {existing && (
           <Text type="secondary" className="ops-console-hint">
-            　当前配置由 {existing.configured_by} 于 {fmtTime(existing.updated_at)} 更新
+            　当前配置由 {displayUser(userNames, existing.configured_by)} 于 {fmtTime(existing.updated_at)} 更新
           </Text>
         )}
       </Form>
@@ -534,7 +666,29 @@ function ApprovalsSection({ onModuleDisabled }) {
     },
     { title: '影响范围', dataIndex: 'impact_radius', render: (v) => v || '—' },
     { title: '提议人', dataIndex: 'proposed_by', render: (v) => displayUser(userNames, v) },
-    { title: '状态', dataIndex: 'status', render: (s) => <StatusTag status={s} /> },
+    {
+      title: '状态',
+      dataIndex: 'status',
+      render: (s, row) => {
+        // ⚠️ **失败必须说清为什么失败。**
+        // 之前这里只有一个红色的"执行失败"标签，探针回的失败原因
+        //（`result.detail`，比如"目标进程无响应，操作超时"）**在界面上任何地方
+        // 都看不到**——运维人员只知道失败了，得去翻后端日志才知道发生了什么，
+        // 而这正是这个控制台本该替他做的事。成功时的详情同样显示：
+        // "重启了但健康检查没过"和"重启后一切正常"对下一步决策完全不同。
+        const detail = (row.result || {}).detail
+        return (
+          <Space direction="vertical" size={2}>
+            <StatusTag status={s} />
+            {detail && (
+              <Text type={s === 'failed' ? 'danger' : 'secondary'} style={{ fontSize: 11 }}>
+                {detail}
+              </Text>
+            )}
+          </Space>
+        )
+      },
+    },
     { title: '提议时间', dataIndex: 'created_at', render: fmtTime },
     {
       title: '事后有效性',
@@ -788,7 +942,7 @@ const SECTIONS = [
   // viewable_connection_ids_for_user（跟审批队列同一套 can_view），
   // 被授权的普通员工本来就能看到自己权限内的动作，复盘同理。
   { value: 'postmortems', label: '事后复盘', icon: History, everyone: true },
-  { value: 'scopes', label: '白名单配置', icon: ShieldCheck },
+  { value: 'scopes', label: '策略配置', icon: ShieldCheck },
   { value: 'connectors', label: '连接器管理', icon: Plug },
   { value: 'permissions', label: '授权管理', icon: Users },
 ]
@@ -880,7 +1034,12 @@ export default function OpsConsole({ canManage = true }) {
         <ConnectorsSection onModuleDisabled={onModuleDisabled} onConnectorsLoaded={onConnectorsLoaded} />
       )}
       {section === 'scopes' && canManage && (
-        booting ? <Spin /> : <ScopesSection connectors={connectors} onModuleDisabled={onModuleDisabled} />
+        booting ? <Spin /> : (
+          <>
+            <ScopesSection connectors={connectors} onModuleDisabled={onModuleDisabled} />
+            <ThresholdsSection connectors={connectors} onModuleDisabled={onModuleDisabled} />
+          </>
+        )
       )}
       {section === 'approvals' && <ApprovalsSection onModuleDisabled={onModuleDisabled} />}
       {section === 'postmortems' && <OpsPostmortems onModuleDisabled={onModuleDisabled} />}

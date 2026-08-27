@@ -160,6 +160,19 @@ class AnalysisSummary:
     created_at: float
 
 
+def _threshold_row(row: Any) -> Dict[str, Any]:
+    """asyncpg 的 JSONB 有时回字符串有时回 dict（取决于是否注册了编解码器），
+    两种都得认——只处理其中一种会在换环境时静默变成空配置。"""
+    import json
+
+    raw = row["thresholds"]
+    return {
+        "service": row["service"],
+        "thresholds": json.loads(raw) if isinstance(raw, str) else (raw or {}),
+        "updated_at": row["updated_at"] if "updated_at" in row.keys() else None,
+    }
+
+
 class OpsStore:
     """智能运维模块存储 (PostgreSQL)。"""
 
@@ -260,6 +273,24 @@ class OpsStore:
                 """
             )
 
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ops_service_health_thresholds (
+                    id             TEXT PRIMARY KEY,
+                    org_id         TEXT NOT NULL REFERENCES organizations(id),
+                    connection_id  TEXT NOT NULL REFERENCES ops_system_connections(id),
+                    -- '*' 表示该连接器的默认配置，其余是具体服务名。
+                    service        TEXT NOT NULL,
+                    -- 可以只写其中几个字段，缺的按 `service_health.resolve_thresholds`
+                    -- 逐字段回退。**不要求写全六个**——要求写全等于把没打算改的
+                    -- 那几个也冻结在填写那天的值上。
+                    thresholds     JSONB NOT NULL,
+                    configured_by  TEXT NOT NULL,
+                    updated_at     DOUBLE PRECISION NOT NULL,
+                    UNIQUE (connection_id, service)
+                )
+                """
+            )
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ops_remediation_scopes (
@@ -648,6 +679,76 @@ class OpsStore:
             action_type=row["action_type"], scope_config=scope_config,
             configured_by=row["configured_by"], updated_at=row["updated_at"],
         )
+
+    async def upsert_service_thresholds(
+        self, org_id: str, connection_id: str, service: str,
+        thresholds: Dict[str, Any], configured_by: str,
+    ) -> Dict[str, Any]:
+        """写入某个服务（或 `*` 默认）的阈值覆盖。
+
+        调用方必须先用 `service_health.validate_thresholds` 校验——跟白名单那条
+        一样，校验放在纯函数里、权限判断放在端点层，这里都不重复。
+        """
+        import json
+
+        row_id = f"opsthr_{uuid.uuid4().hex[:12]}"
+        now = time.time()
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO ops_service_health_thresholds
+                    (id, org_id, connection_id, service, thresholds, configured_by, updated_at)
+                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+                ON CONFLICT (connection_id, service) DO UPDATE
+                    SET thresholds = EXCLUDED.thresholds,
+                        configured_by = EXCLUDED.configured_by,
+                        updated_at = EXCLUDED.updated_at
+                RETURNING service, thresholds, updated_at
+                """,
+                row_id, org_id, connection_id, service, json.dumps(thresholds), configured_by, now,
+            )
+        return _threshold_row(row)
+
+    async def list_service_thresholds(self, connection_id: str) -> List[Dict[str, Any]]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT service, thresholds, updated_at FROM ops_service_health_thresholds "
+                "WHERE connection_id = $1 ORDER BY service",
+                connection_id,
+            )
+        return [_threshold_row(r) for r in rows]
+
+    async def thresholds_by_connection(self, connection_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """一次查完多个连接器的阈值覆盖，返回 `{connection_id: {service: 覆盖}}`。
+
+        **批量**是因为总览大屏一次要渲染这个企业名下全部连接器的服务——
+        逐个连接器查一次就是 N+1，跟 P1-14 那一路的纪律一致。
+        """
+        if not connection_ids:
+            return {}
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT connection_id, service, thresholds FROM ops_service_health_thresholds "
+                "WHERE connection_id = ANY($1::text[])",
+                connection_ids,
+            )
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            parsed = _threshold_row(r)
+            out.setdefault(r["connection_id"], {})[parsed["service"]] = parsed["thresholds"]
+        return out
+
+    async def delete_service_thresholds(self, connection_id: str, service: str) -> bool:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM ops_service_health_thresholds WHERE connection_id = $1 AND service = $2",
+                connection_id, service,
+            )
+        return result.split()[-1] != "0"
 
     async def upsert_remediation_scope(
         self, org_id: str, connection_id: str, action_type: str,
