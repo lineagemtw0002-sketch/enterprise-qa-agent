@@ -14,8 +14,9 @@
 import pytest
 
 from src.ops.service_health import (
-    STATUS_CRITICAL, STATUS_OK, STATUS_STALE, STATUS_WARNING,
-    classify, median_seconds, points_to_services,
+    DEFAULT_THRESHOLDS, STATUS_CRITICAL, STATUS_OK, STATUS_STALE, STATUS_WARNING,
+    InvalidThresholds, classify, median_seconds, points_to_services,
+    resolve_thresholds, validate_thresholds,
 )
 
 
@@ -101,3 +102,80 @@ class TestMedianSeconds:
     def test_negative_durations_are_dropped(self):
         # 执行时间早于告警时间说明数据有问题，不能让它把中位数拉低
         assert median_seconds([-5, 10, 20, 30]) == 20.0
+
+
+class TestThresholdValidation:
+    """阈值校验。**非法配置必须当场报错，不能夹紧成一个看起来正常的值。**"""
+
+    def test_unknown_field_is_rejected_not_ignored(self):
+        """静默忽略的后果是管理员以为改了、界面也显示保存成功，实际一点没生效。"""
+        with pytest.raises(InvalidThresholds, match="未知的阈值字段"):
+            validate_thresholds({"err_rate": 0.5})
+
+    @pytest.mark.parametrize("bad", [
+        {"error_rate_warning": -1}, {"error_rate_warning": 0},
+        {"p95_warning_ms": "500"}, {"p95_warning_ms": True},
+    ])
+    def test_non_positive_or_non_numeric_rejected(self, bad):
+        with pytest.raises(InvalidThresholds):
+            validate_thresholds(bad)
+
+    def test_warning_above_critical_is_rejected_even_when_only_one_is_given(self):
+        """只改 warning 把它顶到默认 critical 之上，那个指标就**永远跳不到
+        warning 档**——一个永远不会出现的状态比配错更难被发现，所以要跟已经
+        生效的另一半合起来判，不能只看这次传了什么。"""
+        with pytest.raises(InvalidThresholds, match="不能大于"):
+            validate_thresholds({"error_rate_warning": 0.5})
+        # 两个一起改成自洽的一对就该通过
+        assert validate_thresholds({"error_rate_warning": 0.1, "error_rate_critical": 0.2})
+
+    def test_not_a_dict(self):
+        with pytest.raises(InvalidThresholds):
+            validate_thresholds(["error_rate_warning", 0.1])
+
+
+class TestThresholdResolution:
+    def test_field_level_fallback_not_whole_block(self):
+        """只覆盖一个字段时，其余五个必须仍然跟随平台默认。
+
+        整块替换的话，管理员改一个错误率就等于把另外五个冻结在填写那天的值上，
+        以后平台默认改了它们也不会跟着动——而他完全不知道自己做了这件事。
+        """
+        th = resolve_thresholds(None, {"error_rate_critical": 0.2})
+        assert th.error_rate_critical == 0.2
+        assert th.p95_critical_ms == DEFAULT_THRESHOLDS.p95_critical_ms
+        assert th.queue_warning_ms == DEFAULT_THRESHOLDS.queue_warning_ms
+
+    def test_later_overrides_win(self):
+        th = resolve_thresholds({"p95_warning_ms": 1000}, {"p95_warning_ms": 50})
+        assert th.p95_warning_ms == 50
+
+    def test_none_and_empty_layers_are_skipped(self):
+        assert resolve_thresholds(None, {}, None) == DEFAULT_THRESHOLDS
+
+    def test_unknown_keys_in_stored_overrides_are_ignored(self):
+        """解析时对历史脏数据要宽容——校验发生在写入端，读取端再抛异常
+        会让一条坏数据把整个大屏打挂。"""
+        assert resolve_thresholds({"legacy_field": 1, "p95_warning_ms": 700}).p95_warning_ms == 700
+
+
+class TestClassifyWithCustomThresholds:
+    def test_relaxed_thresholds_flip_a_critical_service_to_ok(self):
+        loose = resolve_thresholds({"error_rate_warning": 0.1, "error_rate_critical": 0.2,
+                                    "p95_warning_ms": 3000, "p95_critical_ms": 5000})
+        assert classify(0.081, 2400.0) == STATUS_CRITICAL          # 平台默认下是异常
+        assert classify(0.081, 2400.0, thresholds=loose) == STATUS_OK
+
+    def test_per_service_override_beats_connector_default(self):
+        out = points_to_services(
+            [_pt("auth-service", "p95_latency_ms", 88.0)],
+            overrides={"*": {"p95_warning_ms": 1000}, "auth-service": {"p95_warning_ms": 50}},
+        )
+        assert out[0].status == STATUS_WARNING   # 服务级 50ms 生效，不是连接器默认的 1000ms
+
+    def test_override_for_one_service_does_not_touch_another(self):
+        out = {s.service: s.status for s in points_to_services(
+            [_pt("a", "error_rate", 0.081), _pt("b", "error_rate", 0.081)],
+            overrides={"a": {"error_rate_warning": 0.1, "error_rate_critical": 0.2}},
+        )}
+        assert out == {"a": STATUS_OK, "b": STATUS_CRITICAL}

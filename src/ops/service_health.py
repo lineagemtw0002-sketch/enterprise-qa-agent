@@ -15,12 +15,19 @@ Datadog Service Catalog 从 APM 遥测里自动长出服务、Grafana 从
 ⚠️ **平台侧不存服务清单**，每次打开总览现查现用——跟 §3.1「不落库原始运维
 数据」是同一条原则。清单是运维现状的投影，存下来就会跟现实脱节。
 
-## 阈值是平台默认值，不是客户配的
+## 阈值：平台默认值 + 两级覆盖（2026-08-27）
 
-下面这套阈值是**平台内置的默认值**，V1 没有做"每个企业/每个服务各自配阈值"。
-真实场景里不同服务的可接受错误率差别很大（支付网关和内部报表不是一回事），
-所以这是一个**已知的简化**，不要在 UI 上把它说成"按你们的 SLO 判定"。
-要做成可配置是独立的产品决策（配在哪、谁能改、要不要按服务粒度）。
+不同服务的可接受错误率差别很大——支付网关和内部报表不是一回事，用一套固定
+阈值判所有服务，要么把正常服务染红、要么把真故障判成正常。两者都会让人很快
+学会忽略这个网格。
+
+解析顺序（**逐字段**，不是整块替换）：
+
+    某个服务的配置 → 该连接器的默认配置（`service="*"`）→ 平台内置默认值
+
+**逐字段回退是刻意的**：管理员只想改一个错误率阈值时，不该被迫把六个数字
+全填一遍——填了就等于把其余五个也冻结在填写那天的值上，以后平台默认值改了
+它们也不会跟着动。
 """
 
 from __future__ import annotations
@@ -65,6 +72,90 @@ METRIC_DISCOVERED = "discovered"
 _KNOWN_METRICS = (METRIC_ERROR_RATE, METRIC_P95_MS, METRIC_QUEUE_LATENCY_MS, METRIC_DISCOVERED)
 
 
+@dataclass(frozen=True)
+class Thresholds:
+    """一套完整的判定阈值。**每个字段都必须有值**——`resolve_thresholds()`
+    负责把不完整的覆盖补齐，到了这里就不该再有 None，否则判定逻辑里到处都要
+    判空，而"这个阈值没配"和"这个指标没有值"会混成一团。"""
+
+    error_rate_warning: float = ERROR_RATE_WARNING
+    error_rate_critical: float = ERROR_RATE_CRITICAL
+    p95_warning_ms: float = P95_WARNING_MS
+    p95_critical_ms: float = P95_CRITICAL_MS
+    queue_warning_ms: float = QUEUE_LATENCY_WARNING_MS
+    queue_critical_ms: float = QUEUE_LATENCY_CRITICAL_MS
+
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            "error_rate_warning": self.error_rate_warning,
+            "error_rate_critical": self.error_rate_critical,
+            "p95_warning_ms": self.p95_warning_ms,
+            "p95_critical_ms": self.p95_critical_ms,
+            "queue_warning_ms": self.queue_warning_ms,
+            "queue_critical_ms": self.queue_critical_ms,
+        }
+
+
+DEFAULT_THRESHOLDS = Thresholds()
+THRESHOLD_FIELDS = tuple(DEFAULT_THRESHOLDS.to_dict().keys())
+WILDCARD_SERVICE = "*"
+
+
+class InvalidThresholds(ValueError):
+    """阈值配置非法。跟 `aiops_scope.InvalidScopeConfig` 同一个档位：
+    管理员填错了要当场报错，不能夹紧成一个看起来正常的值悄悄用下去。"""
+
+
+def validate_thresholds(raw: Any) -> Dict[str, float]:
+    """校验一份（可能不完整的）阈值覆盖，返回只含合法字段的字典。
+
+    三条硬规则：
+    1. **只认已知字段**——写错字段名必须报错，不能静默忽略。静默忽略的后果是
+       管理员以为自己改了阈值、界面也保存成功，实际一点没生效。
+    2. **必须是正数**（`bool` 显式排除，它是 `int` 的子类）。
+    3. **同一指标的 warning 必须 ≤ critical**，且**要一起判**：只改 critical
+       把它压到已有的 warning 之下，那个指标就永远跳不到 warning 档——一个
+       永远不会出现的状态比配错更难被发现。
+    """
+    if not isinstance(raw, dict):
+        raise InvalidThresholds("阈值配置必须是一个对象")
+
+    unknown = sorted(set(raw) - set(THRESHOLD_FIELDS))
+    if unknown:
+        raise InvalidThresholds(f"未知的阈值字段：{unknown}（可选：{list(THRESHOLD_FIELDS)}）")
+
+    out: Dict[str, float] = {}
+    for key, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise InvalidThresholds(f"{key} 必须是数字，收到 {value!r}")
+        if value <= 0:
+            raise InvalidThresholds(f"{key} 必须大于 0，收到 {value}")
+        out[key] = float(value)
+
+    merged = {**DEFAULT_THRESHOLDS.to_dict(), **out}
+    for warn_key, crit_key in (("error_rate_warning", "error_rate_critical"),
+                               ("p95_warning_ms", "p95_critical_ms"),
+                               ("queue_warning_ms", "queue_critical_ms")):
+        if merged[warn_key] > merged[crit_key]:
+            raise InvalidThresholds(
+                f"{warn_key}({merged[warn_key]}) 不能大于 {crit_key}({merged[crit_key]})"
+                "——那会让这个指标永远跳不到「观察中」这一档")
+    return out
+
+
+def resolve_thresholds(*overrides: Optional[Dict[str, Any]]) -> Thresholds:
+    """按传入顺序**逐字段**叠加覆盖，后面的优先级更高。
+
+    调用方按 `(连接器默认, 该服务专属)` 的顺序传即可；`None` 和空字典都表示
+    "这一层没有配置"，直接跳过。
+    """
+    merged = DEFAULT_THRESHOLDS.to_dict()
+    for override in overrides:
+        if override:
+            merged.update({k: float(v) for k, v in override.items() if k in THRESHOLD_FIELDS})
+    return Thresholds(**merged)
+
+
 @dataclass
 class ServiceHealth:
     service: str
@@ -85,7 +176,8 @@ class ServiceHealth:
 
 
 def classify(error_rate: Optional[float], p95_latency_ms: Optional[float],
-             queue_latency_ms: Optional[float] = None) -> str:
+             queue_latency_ms: Optional[float] = None,
+             thresholds: Optional[Thresholds] = None) -> str:
     """两个指标各判一次，**取较严重的那个**。
 
     ⚠️ 取严重侧而不是取平均，是刻意的：一个服务延迟正常但错误率 8%，它就是
@@ -98,16 +190,17 @@ def classify(error_rate: Optional[float], p95_latency_ms: Optional[float],
     if error_rate is None and p95_latency_ms is None and queue_latency_ms is None:
         return STATUS_STALE
 
+    th = thresholds or DEFAULT_THRESHOLDS
     levels = []
     if error_rate is not None:
-        levels.append(STATUS_CRITICAL if error_rate >= ERROR_RATE_CRITICAL
-                      else STATUS_WARNING if error_rate >= ERROR_RATE_WARNING else STATUS_OK)
+        levels.append(STATUS_CRITICAL if error_rate >= th.error_rate_critical
+                      else STATUS_WARNING if error_rate >= th.error_rate_warning else STATUS_OK)
     if p95_latency_ms is not None:
-        levels.append(STATUS_CRITICAL if p95_latency_ms >= P95_CRITICAL_MS
-                      else STATUS_WARNING if p95_latency_ms >= P95_WARNING_MS else STATUS_OK)
+        levels.append(STATUS_CRITICAL if p95_latency_ms >= th.p95_critical_ms
+                      else STATUS_WARNING if p95_latency_ms >= th.p95_warning_ms else STATUS_OK)
     if queue_latency_ms is not None:
-        levels.append(STATUS_CRITICAL if queue_latency_ms >= QUEUE_LATENCY_CRITICAL_MS
-                      else STATUS_WARNING if queue_latency_ms >= QUEUE_LATENCY_WARNING_MS else STATUS_OK)
+        levels.append(STATUS_CRITICAL if queue_latency_ms >= th.queue_critical_ms
+                      else STATUS_WARNING if queue_latency_ms >= th.queue_warning_ms else STATUS_OK)
     for worst in (STATUS_CRITICAL, STATUS_WARNING):
         if worst in levels:
             return worst
@@ -115,7 +208,8 @@ def classify(error_rate: Optional[float], p95_latency_ms: Optional[float],
 
 
 def points_to_services(points: Iterable[Dict[str, Any]], *, connection_id: Optional[str] = None,
-                       connector_name: Optional[str] = None) -> List[ServiceHealth]:
+                       connector_name: Optional[str] = None,
+                       overrides: Optional[Dict[str, Dict[str, Any]]] = None) -> List[ServiceHealth]:
     """把连接器回的扁平数据点聚成一个个服务。
 
     **刻意复用现有的 `DataPoint` 形状（ts/value/labels），没有给连接器协议加新帧型**
@@ -144,7 +238,10 @@ def points_to_services(points: Iterable[Dict[str, Any]], *, connection_id: Optio
         ServiceHealth(
             service=name,
             status=classify(m.get(METRIC_ERROR_RATE), m.get(METRIC_P95_MS),
-                            m.get(METRIC_QUEUE_LATENCY_MS)),
+                            m.get(METRIC_QUEUE_LATENCY_MS),
+                            thresholds=resolve_thresholds(
+                                (overrides or {}).get(WILDCARD_SERVICE),
+                                (overrides or {}).get(name))),
             error_rate=m.get(METRIC_ERROR_RATE), p95_latency_ms=m.get(METRIC_P95_MS),
             queue_latency_ms=m.get(METRIC_QUEUE_LATENCY_MS),
             connection_id=connection_id, connector_name=connector_name,

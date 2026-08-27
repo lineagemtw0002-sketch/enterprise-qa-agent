@@ -219,3 +219,36 @@ export function executeRemediationAction(actionId) {
     .post(`${BASE}/ops/remediation-actions/${encodeURIComponent(actionId)}/execute`)
     .then((res) => res.data)
 }
+
+// ==================== 服务健康阈值 ====================
+//
+// 不同服务的可接受错误率差别很大——支付网关和内部报表不是一回事。一套固定阈值
+// 判所有服务，要么把正常服务染红、要么把真故障判成正常，两者都会让人很快学会
+// 忽略这个网格。
+//
+// `service = "*"` 表示该连接器的默认配置。解析顺序是**逐字段**回退：
+// 具体服务的配置 → 连接器默认（`*`）→ 平台内置默认值。
+//
+// ⚠️ 返回项里 `thresholds` 是管理员实际填的那几个字段，`effective` 是叠加平台
+// 默认之后真正生效的六个值——**两个都要用**：只显示前者，用户不知道没填的那几个
+// 现在是多少；只显示后者，用户分不清哪些是自己配的。
+export function listServiceThresholds(connectionId) {
+  return axios
+    .get(`${BASE}/ops/connectors/${encodeURIComponent(connectionId)}/service-thresholds`)
+    .then((res) => res.data)
+}
+
+export function setServiceThresholds(connectionId, service, thresholds) {
+  return axios
+    .put(
+      `${BASE}/ops/connectors/${encodeURIComponent(connectionId)}/service-thresholds/${encodeURIComponent(service)}`,
+      { thresholds },
+    )
+    .then((res) => res.data)
+}
+
+export function deleteServiceThresholds(connectionId, service) {
+  return axios
+    .delete(`${BASE}/ops/connectors/${encodeURIComponent(connectionId)}/service-thresholds/${encodeURIComponent(service)}`)
+    .then((res) => res.data)
+}
