@@ -163,6 +163,22 @@ class AnalysisSummary:
     created_at: float
 
 
+def _incident_row(row: Any) -> Dict[str, Any]:
+    """asyncpg 的 JSONB 有时回字符串有时回 dict（取决于是否注册了编解码器），
+    两种都要认——只处理其中一种会在换环境时静默变成空列表。"""
+    import json
+
+    def _j(v, default):
+        if v is None:
+            return default
+        return json.loads(v) if isinstance(v, str) else v
+
+    d = dict(row)
+    d["targets"] = _j(d.get("targets"), [])
+    d["labels"] = _j(d.get("labels"), {})
+    return d
+
+
 def _threshold_row(row: Any) -> Dict[str, Any]:
     """asyncpg 的 JSONB 有时回字符串有时回 dict（取决于是否注册了编解码器），
     两种都得认——只处理其中一种会在换环境时静默变成空配置。"""
@@ -369,6 +385,50 @@ class OpsStore:
             await conn.execute(
                 "ALTER TABLE remediation_actions ADD COLUMN IF NOT EXISTS "
                 "summary_id TEXT REFERENCES ops_analysis_summaries(id)"
+            )
+
+            # ops_incidents：持续存在的"事件"，是告警推送去重的落点。
+            # 设计见 docs/alert_push_design.md §4。
+            #
+            # ⚠️ **`fingerprint` 上的唯一约束是 (connection_id, fingerprint)，
+            # 不是全局唯一**——两个企业、两套系统完全可能产生相同的标签组合，
+            # 全局唯一会让它们互相覆盖，那是跨企业的数据串台。
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ops_incidents (
+                    id             TEXT PRIMARY KEY,
+                    org_id         TEXT NOT NULL REFERENCES organizations(id),
+                    connection_id  TEXT NOT NULL REFERENCES ops_system_connections(id),
+                    fingerprint    TEXT NOT NULL,
+                    status         VARCHAR(16) NOT NULL,
+                    targets        JSONB NOT NULL,
+                    labels         JSONB NOT NULL,
+                    alert_count    INTEGER NOT NULL DEFAULT 0,
+                    -- 被从 resolved 拉回 open 的次数。越过阈值就是"反复重启"，
+                    -- 那是一类独立故障，不是 N 次独立故障。
+                    flap_count     INTEGER NOT NULL DEFAULT 0,
+                    first_seen_at  DOUBLE PRECISION NOT NULL,
+                    last_seen_at   DOUBLE PRECISION NOT NULL,
+                    resolved_at    DOUBLE PRECISION,
+                    summary_id     TEXT,
+                    UNIQUE (connection_id, fingerprint)
+                )
+                """
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ops_incidents_open "
+                "ON ops_incidents(org_id, status, last_seen_at DESC)"
+            )
+            # 分析摘要记录触发来源：auto（告警推送自动触发）/ manual（人点的）。
+            # 不区分的话，时间线上"系统主动发现的"和"有人手动查的"分不出来，
+            # 而这两件事在复盘时意义完全不同（设计 §4.4）。
+            await conn.execute(
+                "ALTER TABLE ops_analysis_summaries ADD COLUMN IF NOT EXISTS "
+                "trigger_source VARCHAR(16) NOT NULL DEFAULT 'manual'"
+            )
+            await conn.execute(
+                "ALTER TABLE ops_analysis_summaries ADD COLUMN IF NOT EXISTS "
+                "triggered_by TEXT"
             )
 
             # ⚠️ **`role_ops_systems.role_id` 补上外键 + 级联删除。**
@@ -722,6 +782,110 @@ class OpsStore:
             action_type=row["action_type"], scope_config=scope_config,
             configured_by=row["configured_by"], updated_at=row["updated_at"],
         )
+
+    # ==================== 事件（告警推送的落点） ====================
+
+    async def apply_alert_batch(
+        self, org_id: str, connection_id: str, *, fingerprint: str,
+        targets: List[str], labels: Dict[str, Any], alert_count: int, now: float,
+    ) -> Dict[str, Any]:
+        """把一批同指纹的告警落到事件上，返回 `{incident, decision}`。
+
+        ⚠️ **整段在一个事务里做，且对已有行加 `FOR UPDATE` 行锁。**
+        告警风暴时同一指纹的推送会并发到达，"先查后写"在并发下会产生
+        **两个同指纹的事件**——之后每一批告警落到哪一个全看运气，
+        计数分裂、时间线上出现两条一模一样的记录。
+        `UNIQUE (connection_id, fingerprint)` 是兜底，但让它报错不如不产生冲突。
+
+        判定逻辑本身在 `src/ops/incident_identity.decide`（纯函数，可单测）；
+        这里只负责"读 → 判 → 写"这三步的原子性。
+        """
+        import json as _json
+
+        from src.ops.incident_identity import STATUS_OPEN, decide
+
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT id, status, resolved_at, flap_count, targets, alert_count "
+                    "FROM ops_incidents WHERE connection_id = $1 AND fingerprint = $2 "
+                    "FOR UPDATE",
+                    connection_id, fingerprint,
+                )
+                existing = dict(row) if row else None
+                d = decide(existing, now=now)
+
+                if d.action == "create":
+                    incident_id = f"opsinc_{uuid.uuid4().hex[:12]}"
+                    # ⚠️ 用 upsert 而不是纯 INSERT：`decide` 判"新建"时，行可能
+                    # 已被同一批次的另一个连接抢先建出来（FOR UPDATE 锁不住
+                    # 还不存在的行）。冲突时退化成更新，不让整批告警丢掉。
+                    saved = await conn.fetchrow(
+                        """
+                        INSERT INTO ops_incidents
+                            (id, org_id, connection_id, fingerprint, status, targets, labels,
+                             alert_count, flap_count, first_seen_at, last_seen_at)
+                        VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,0,$9,$9)
+                        ON CONFLICT (connection_id, fingerprint) DO UPDATE
+                            SET status = $5, alert_count = ops_incidents.alert_count + $8,
+                                last_seen_at = $9, resolved_at = NULL
+                        RETURNING *
+                        """,
+                        incident_id, org_id, connection_id, fingerprint, STATUS_OPEN,
+                        _json.dumps(targets), _json.dumps(labels), alert_count, now,
+                    )
+                else:
+                    saved = await conn.fetchrow(
+                        """
+                        UPDATE ops_incidents
+                           SET status = $2, alert_count = alert_count + $3,
+                               last_seen_at = $4, resolved_at = NULL,
+                               flap_count = $5, targets = $6::jsonb
+                         WHERE id = $1
+                        RETURNING *
+                        """,
+                        existing["id"], STATUS_OPEN, alert_count, now,
+                        d.flap_count, _json.dumps(targets),
+                    )
+        return {"incident": _incident_row(saved), "decision": d}
+
+    async def resolve_incident(self, incident_id: str, *, now: float) -> bool:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE ops_incidents SET status = 'resolved', resolved_at = $2 "
+                "WHERE id = $1 AND status = 'open'",
+                incident_id, now,
+            )
+        return result.split()[-1] != "0"
+
+    async def attach_summary_to_incident(self, incident_id: str, summary_id: str) -> None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE ops_incidents SET summary_id = $2 WHERE id = $1",
+                incident_id, summary_id,
+            )
+
+    async def list_incidents(self, org_id: str, *, status: Optional[str] = None,
+                             connection_ids: Optional[List[str]] = None,
+                             limit: int = 50) -> List[Dict[str, Any]]:
+        clauses = ["org_id = $1"]
+        args: List[Any] = [org_id]
+        if status:
+            args.append(status); clauses.append(f"status = ${len(args)}")
+        if connection_ids is not None:
+            args.append(connection_ids); clauses.append(f"connection_id = ANY(${len(args)}::text[])")
+        args.append(limit)
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT * FROM ops_incidents WHERE {' AND '.join(clauses)} "
+                f"ORDER BY last_seen_at DESC LIMIT ${len(args)}",
+                *args,
+            )
+        return [_incident_row(r) for r in rows]
 
     async def upsert_service_thresholds(
         self, org_id: str, connection_id: str, service: str,
