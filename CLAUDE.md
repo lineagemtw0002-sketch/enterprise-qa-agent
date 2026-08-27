@@ -1204,6 +1204,100 @@ flowchart TB
   对话里传附件"而不是"部门知识库每天更新"，不是这条 P0 的目标场景，
   本次未改；`version_key` 相同但内容确实无关（撞名）这类误判场景没有
   防护，依赖上传方不复用文件名，如实记录为已知边界。
+- ✅ **2026-08-27　智能运维：演示探针 + 执行端点 + 服务健康 + 塔台独立页面**
+  （本会话「刘德华」，整条链路第一次真跑通；另一会话负责合并）
+
+  ⚠️ **本条晚于下面那句"V1 阶段至此收尾"**——那句话没错，它说的是设计文档
+  列出的 V1 范围；本条是收尾之后用户新提的需求（真实模拟环境 + 界面按设计稿
+  对齐）。别把它读成"收尾那条作废了"。
+
+  **1. 演示探针 `services/ops_probe_demo/`（探针 + 模拟数据）+
+  `scripts/run_ops_probe_scenario.py`（一键场景）。**
+  定位跟 `services/tenant_kb_demo/` 一致：**演示件不是产品交付件**，
+  真实 BYOC 连接器进程仍不在本项目范围内。刻意不做断线重连、凭证落盘加密、
+  多系统适配层——做了会让它看起来像可以拿去部署的东西。
+  模拟数据**刻意不 import 平台侧的检测阈值**：照着阈值造数据等于把"检测器
+  能不能发现问题"变成自证；改用把量级拉开 + 场景脚本实际断言检测确实触发，
+  并且提供 `healthy=True` 分支验证"没异常时不报"。
+
+  **2. `POST /admin/ops/remediation-actions/{id}/execute` + 塔台「执行」按钮。**
+  在它之前，`_ops_dispatcher` **只被 `OpsToolset` 引用**——审批通过之后人在
+  界面上没有任何办法让动作执行，唯一通路是跟 7B 聊天、指望它把 `action_id`
+  传对（实测两次都失败：一次被 1.5b 意图路由判成 `workflow/laptop_repair`
+  根本没进工具子图、一次参数名传错）。动作永远停在 `approved`，看起来像
+  "下发失败"，实际是**下发这件事压根没发生**。
+  端点**直接调 `ops_toolset.execute_approved_remediation`，不另写执行逻辑**
+  ——四道检查两条路完全一致。一个"给人用的快捷入口"如果比 AI 那条路少一道
+  检查，它就是这个模块最大的漏洞。权限跟批准同一档（`can_approve`）。
+
+  **3. `GET /admin/ops/live-overview`（服务健康网格 + 今日告警合并）+
+  `src/ops/service_health.py`（纯函数判定）+ MTTR 接进 `compute_ops_metrics`。**
+  三条口径 2026-08-27 由用户拍板：
+  - **服务清单由连接器自动发现**（`kind="service_health"`），不是企业手工配
+    ——业界共识（Datadog Service Catalog / Grafana `label_values`）是手工清单
+    必然腐烂。**平台侧一条都不存**，每次现查（§3.1 不落库原始运维数据）。
+  - **MTTR = 最早关联告警（`evidence_refs` 的 `alert_correlation.detail.
+    started_at`）→ 动作 `executed_at`**。没有告警关联依据的动作**跳过，
+    不拿 `created_at` 凑数**——那是"平台内部处理时长"，混进去谁也解释不清。
+  - **今日告警合并 = 向连接器查当天全部告警，当场跑一次 `correlate_alerts``**。
+
+  **4. 服务健康阈值可按服务/按连接器配置**（`ops_service_health_thresholds`，
+  `service="*"` 表示连接器默认）。解析**逐字段回退**：该服务 → 连接器默认 →
+  平台内置。逐字段是刻意的：要求填满六个等于把没打算改的那几个也冻结在填写
+  那天的值上。校验三条（未知字段拒收 / 必须正数 / **warning ≤ critical 且要跟
+  已生效的另一半合起来判**——只改 critical 压到已有 warning 之下，那个指标就
+  永远跳不到 warning 档，一个永远不会出现的状态比配错更难发现）。
+
+  **5. 运维塔台改成独立页面 `/ops.html`**（vite 多页入口，不是前端路由）。
+  塔台整屏深色、主应用浅色，嵌在一个壳里两种视觉语言互相打架。
+  顶部「智能运维」改为新开标签页，`App.jsx` 不再内嵌渲染它。
+  字体**自托管**（`@fontsource/titillium-web` + `@fontsource/jetbrains-mono`），
+  刻意不引 Google Fonts 外链——内网隔离环境会静默失败退回系统字体，且每个
+  用户浏览器都会向 `fonts.googleapis.com` 发请求，跟 BYOC 原则冲突。
+  ⚠️ **`frontend/package-lock.json` 在 .gitignore 里**（P1「无依赖锁定」），
+  这两个新依赖不会被锁版本，别的 checkout 合并后**必须先 `npm install`**，
+  否则 vite 解析不到字体包直接白屏。
+
+  **⚠️ 六条今天踩出来、值得防止重犯的**：
+
+  a. **"连接器在线"是按库里的心跳时间算的，而能不能真正查询取决于
+     WebSocket 握在哪个后端进程手里。** 本机多后端共用同一个 Postgres 时，
+     A 后端上挂的探针会在 B 后端界面上**显示在线、却查不到数据**——总览
+     一边说"2/3 在线"、一边说"数据没取到"，看起来像平台自相矛盾。
+     生产单后端不会有这问题，但开发环境里它会实实在在把排查带偏。
+     同一根因的第二面：场景脚本按名字清理旧连接器，多后端会互删，
+     已加 `--name`。
+  b. **`action_type` 根本没落库**（`remediation_actions` 没这个列，只活在
+     请求参数里），而执行前的白名单复查需要它——拿不到就**静默跳过那道
+     检查**，也就是模型漏传一个参数，"目标是否仍在允许范围内"这道唯一在
+     下游没有对应检查的复查就没了。已在提议时盖进 `plan`、执行时从 `plan`
+     推导。
+  c. **工具 handler 的必填参数不要写成 Python 位置参数。** schema 标了
+     required，7B 模型照样不带参数就调，于是抛
+     `TypeError: missing a required positional argument`，而**模型把这句
+     Python 内部错误原样转述给了最终用户**。四个 handler 已改成显式校验 +
+     人话回复。
+  d. **同一个事件循环里跑 WebSocket 客户端 + 阻塞的 `urllib` 请求**，
+     会因为回不了 keepalive ping 被服务端以 `1011 keepalive ping timeout`
+     断开——这个报错**一个字都没提到真正的原因**。
+  e. **只写上界的媒体查询，在多断点叠加时必然被后面的规则覆盖。**
+     手机上 KPI 仍是三列就是这么来的，桌面宽度完全看不出来。已改成区间。
+  f. **本产品线第三次"猜字段名/API 形状"翻车**：`/auth/me` 的 `roles` 是
+     **对象数组**（`[{name}]`）不是字符串数组，判据恒为 false，页面照常渲染
+     只是管理分段静默消失。前两次是 §10.5 指标的四个键名、`Segmented` 白屏。
+     **一律照抄既有调用点，不要凭印象写。**
+
+  **验证**：`tests/unit` 2391 通过（新增 `test_service_health.py` 28 条、
+  `test_ops_tool_registration.py` 缺参数 4 条）；真机端到端跑通
+  探针上线 → 分析（真 LLM 调 `analyze_ops_incident`，探针真实应答 60 指标点
+  / 19 告警）→ 检出 4 异常、19 告警合并为 1 事件 → 提议 → 审批 → **执行
+  completed**（探针 `exec[restart_service] -> 成功`）→ MTTR 首次有真实值
+  4.5 分钟；失败态用 `--exec-fails` 探针验过（`failed` + 失败原因回填，
+  执行成功率 100%→66.7%）；375/768/桌面三档宽度真机走查。
+
+  **本次未覆盖**：中文字形仍走系统字体（Titillium Web 不含中文，设计稿亦然）；
+  窄屏表格靠横向滚动是权宜之计，真要好用应换卡片式布局；`--exec-fails`
+  只验了 API 路径没在界面上点；未登录状态那一屏没真机走过。
 
 - 🔵 **2026-08-26　智能运维模块阶段一～四：数据模型 + 目标越界
   判定 + 审批状态机存储层 + 管理面 API 端点 + 审批工作流端点 + BYOC 连接器协议**
@@ -1633,6 +1727,10 @@ flowchart TB
   真机点开总览/审批队列/事后复盘三个 tab 确认渲染正常、控制台零错误
   （此次因为没有真实数据，UUID→用户名这条没能在复核环节重新目测到，
   依据的是刘德华的真机验证记录 + 代码审查，不是本会话独立复现）。
+
+  ⚠️ **这句"收尾"指的是设计文档列出的 V1 范围，不是"此后没再动过"**
+  ——2026-08-27 用户又提了新需求（真实模拟环境 + 界面按设计稿对齐），
+  见 §5 最上面那条 08-27 的条目。
 
   **本模块 V1 阶段至此收尾**：智能运维模块从 2026-08-26 插队开工到本条，
   设计文档（`docs/aiops_module_design.md`）列出的 V1 范围（异常检测/告警
@@ -2503,7 +2601,7 @@ flowchart TB
 | **`docs/architecture.md`** | **架构图 · 核心链路 · 双模型 · 性能测试**（与本文同属当前状态正本） | **活文档** |
 | `docs/scale_slo_and_priorities.md` | 容量测算 · 最小 SLO · 27+3 条发现重新分级（12 条 P0） | 活文档 |
 | `docs/orchestration_design.md` | 编排层设计：并行防护 + 记忆异步化 | **部分实施**：A 部分 D4/D5（08-25 第二批）、**D1/D2（08-25 第三批，见 §4.5）** 已落地；D3/D6 未实施；**B 部分整体未实施**（阻塞项 B-R1 已实测查清） |
-| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **V1 范围已收尾（2026-08-27）**：2026-08-26 用户明确要求插队开工（覆盖了文档自己"排期维持在 12 条 P0 之后"的原始决定）。阶段一～四全部落地并合并：数据模型/越界判定/审批状态机/管理面端点/审批工作流端点/BYOC 连接器协议（`ConnectorTransport` 实现）+ 联邦查询层/工具注册，粗粒度门禁已升级为 `role_ops_systems` 细粒度审批权限（§10.6，org_admin 通配符 + super_admin 零权限 + can_approve 隐含 can_view）；6 处越界判定漏洞 + 审批状态机 TOCTOU 竞态 + 运维工具 `org_id` 从未被注入过的阻塞 bug 均已修复，见 §5。**LangGraph 接入已确认不需要新增 `intent_type`/`ops_subgraph`**（§10.2 已更正）——既有 `tool_subgraph` 的 `general_agent` 路由天然覆盖。审批超时扫描任务已接线；前端"运维塔台"UI 已完成并真机联调验收（刘德华开发）；`ops_analysis_summaries` CRUD 已实现。**AI 分析层（异常检测/告警关联降噪/RCA 辅助，§2 三项 V1 已确认能力）已实现**（刘德华开发）：异常检测用中位数+MAD 稳健统计（不用均值+标准差，抗遮蔽效应）、告警关联走时间窗+标签规则，两者都不用 LLM；RCA 复用既有生成用 7b LLM，依据引用只从输入推导、不采信模型输出，降级结果不落库；整合点是 `tool_registration.py` 新增的 `analyze_ops_incident` 工具，走既有 `intent_type="tool"` 路由。`role_ops_systems`、`ops_analysis_summaries`、AI 分析层、前端、工具列表按调用者动态过滤（2026-08-27）、§9.2 事后复盘聚合视图最小可行版、§10.5 验收指标公式、三视图展示逻辑统一（UUID→用户名 + `plan` 可读化）均已实现；真实 BYOC 连接器进程（客户环境那一端）未实施。**有意不做**：P1-4 零测试覆盖（阻塞在"无 DB fixture 隔离方案"这个设计问题，非体力活）、§10.3 `scale_instances` baseline 自指（需要 scope schema 设计变更，`xfail(strict=True)` 留作提醒） |
+| `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **V1 范围已收尾（2026-08-27）**：2026-08-26 用户明确要求插队开工（覆盖了文档自己"排期维持在 12 条 P0 之后"的原始决定）。阶段一～四全部落地并合并：数据模型/越界判定/审批状态机/管理面端点/审批工作流端点/BYOC 连接器协议（`ConnectorTransport` 实现）+ 联邦查询层/工具注册，粗粒度门禁已升级为 `role_ops_systems` 细粒度审批权限（§10.6，org_admin 通配符 + super_admin 零权限 + can_approve 隐含 can_view）；6 处越界判定漏洞 + 审批状态机 TOCTOU 竞态 + 运维工具 `org_id` 从未被注入过的阻塞 bug 均已修复，见 §5。**LangGraph 接入已确认不需要新增 `intent_type`/`ops_subgraph`**（§10.2 已更正）——既有 `tool_subgraph` 的 `general_agent` 路由天然覆盖。审批超时扫描任务已接线；前端"运维塔台"UI 已完成并真机联调验收（刘德华开发）；`ops_analysis_summaries` CRUD 已实现。**AI 分析层（异常检测/告警关联降噪/RCA 辅助，§2 三项 V1 已确认能力）已实现**（刘德华开发）：异常检测用中位数+MAD 稳健统计（不用均值+标准差，抗遮蔽效应）、告警关联走时间窗+标签规则，两者都不用 LLM；RCA 复用既有生成用 7b LLM，依据引用只从输入推导、不采信模型输出，降级结果不落库；整合点是 `tool_registration.py` 新增的 `analyze_ops_incident` 工具，走既有 `intent_type="tool"` 路由。`role_ops_systems`、`ops_analysis_summaries`、AI 分析层、前端、工具列表按调用者动态过滤（2026-08-27）、§9.2 事后复盘聚合视图最小可行版、§10.5 验收指标公式、三视图展示逻辑统一（UUID→用户名 + `plan` 可读化）均已实现；真实 BYOC 连接器进程（客户环境那一端）未实施。**2026-08-27 收尾后又补了一轮**（用户新提的需求，见 §5 最上面那条）：演示探针 `services/ops_probe_demo/` + 一键场景脚本（整条链路第一次真跑通）、执行端点 + 塔台「执行」按钮（在此之前**审批通过后没有任何人能让动作执行**，唯一通路是跟 LLM 聊天）、`/live-overview`（服务健康网格由连接器自动发现 + 今日告警合并）、MTTR、服务健康阈值按服务可配置、塔台改独立页面 `/ops.html` + 自托管设计稿字体。**有意不做**：P1-4 零测试覆盖（阻塞在"无 DB fixture 隔离方案"这个设计问题，非体力活）、§10.3 `scale_instances` baseline 自指（需要 scope schema 设计变更，`xfail(strict=True)` 留作提醒） |
 | `docs/chitchat_intent_design.md` | 意图分类第五类 `chitchat` 设计方案（路由方案 B+、能力白名单、重训配比） | **Phase 1a/1b/2 已实施并验证（2026-08-27）**：`intent_type` 新增 `chitchat`，`chitchat.py` 模板+受约束 prompt，`workflow.py` 接线（真机验证）。**Phase 3 数据/评估设施已备好，训练本身未执行**（无 `mlx-lm`/`peft`/`torch`）：`router_lora_data/train_batch1.jsonl`（320 条）+ `tests/fixtures/router_eval.jsonl`（73 条 holdout）+ 真实基线（总体 53.4%，chitchat 11.1%）。死期 2026-10-31（仅约束剩余的训练执行部分） |
 | `docs/collaboration_retrospective.md` | 协作复盘与开发流程指南（**每周自查只需读 §1**） | 活文档 |
 | `docs/review_2026-08-24/review_codebase_findings.md` | 代码审计，带行号证据 | 时点快照 |

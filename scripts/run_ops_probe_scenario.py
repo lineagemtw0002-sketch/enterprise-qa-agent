@@ -42,6 +42,8 @@ from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from services.ops_probe_demo.control_server import FaultState, serve_control  # noqa: E402
+from services.ops_probe_demo.environments import DEFAULT_ENVIRONMENT, resolve_environment  # noqa: E402
 from services.ops_probe_demo.fake_ops_data import points_for  # noqa: E402
 from services.ops_probe_demo.probe import OpsProbe  # noqa: E402
 from src.ops.analysis import Alert, correlate_alerts, detect_anomalies  # noqa: E402
@@ -70,35 +72,46 @@ def _call(api: str, method: str, path: str, token: str, body: Optional[dict] = N
     return json.loads(raw) if raw else None
 
 
-def _self_check() -> None:
-    """**先验数据、再跑链路。**
+def _self_check(environment: str, fault_kind: str) -> Dict[str, str]:
+    """**先验数据、再跑链路**，返回要注入的故障。
 
-    这一步是刻意放在最前面的：如果模拟数据本身触发不了检测器，后面整条链路会
-    "全绿但大屏是空的"，而且很容易被误判成平台侧的 bug。先在本地用真实的检测
-    函数验一遍，不通过就直接退出——用验证代替调参（见 fake_ops_data.py 顶部）。
+    这一步刻意放在最前面：如果模拟数据本身触发不了检测器，后面整条链路会
+    "全绿但大屏是空的"，而且很容易被误判成平台侧的 bug。先在本地用真实的
+    检测函数验一遍，不通过就直接退出——用验证代替调参。
+
+    ⚠️ **两个方向都要验**：健康态不能报异常、故障态必须报。只验后者的话，
+    一个"永远说有异常"的检测器也能通过自检。
     """
     end = time.time()
     start = end - 3600
-    metric = points_for("metric", target=TARGET_SERVICE, start_ts=start, end_ts=end)
+    faults = {TARGET_SERVICE: fault_kind}
+
+    calm = points_for("metric", target=TARGET_SERVICE, start_ts=start, end_ts=end,
+                      environment=environment)
+    calm_report = detect_anomalies(
+        [DataPoint(ts=p["ts"], value=p["value"]) for p in calm], target=TARGET_SERVICE)
+    assert not calm_report.has_anomaly, "没注入故障却检出了异常——数据或检测器有问题，先查清"
+    assert not points_for("alert", target="", start_ts=start, end_ts=end,
+                          environment=environment), "没注入故障却有告警"
+
+    metric = points_for("metric", target=TARGET_SERVICE, start_ts=start, end_ts=end,
+                        environment=environment, faults=faults)
     report = detect_anomalies(
         [DataPoint(ts=p["ts"], value=p["value"]) for p in metric],
-        target=TARGET_SERVICE, metric="error_rate",
-    )
-    assert report.has_anomaly, "模拟指标触发不了异常检测——数据不够典型，先修 fake_ops_data"
+        target=TARGET_SERVICE, metric="error_rate")
+    assert report.has_anomaly, "注入故障后仍触发不了异常检测——先修 fake_ops_data"
 
-    healthy = points_for("metric", target=TARGET_SERVICE, start_ts=start, end_ts=end, healthy=True)
-    calm = detect_anomalies([DataPoint(ts=p["ts"], value=p["value"]) for p in healthy], target=TARGET_SERVICE)
-    assert not calm.has_anomaly, "健康序列被误报成异常——检测器或数据有问题，先查清再往下跑"
-
-    raw_alerts = points_for("alert", target=TARGET_SERVICE, start_ts=start, end_ts=end)
+    raw_alerts = points_for("alert", target=TARGET_SERVICE, start_ts=start, end_ts=end,
+                            environment=environment, faults=faults)
     corr = correlate_alerts([
         Alert(f"a{i}", ts=p["ts"], target=p["labels"]["target"], labels=p["labels"],
               text=p["text"], severity=p["labels"]["severity"])
         for i, p in enumerate(raw_alerts)
     ])
     assert len(corr.incidents) == 1, f"{corr.original_count} 条同源告警没能合并成 1 个事件"
-    print(f"✅ 数据自检：{len(report.anomalies)} 个异常点、健康序列不误报、"
+    print(f"✅ 数据自检：健康态零异常零告警；注入 {fault_kind} 后检出 {len(report.anomalies)} 个异常点、"
           f"{corr.original_count} 条告警 → {len(corr.incidents)} 个事件（降噪 {corr.noise_reduction:.0%}）")
+    return faults
 
 
 async def _wait_online(api: str, token: str, connection_id: str, timeout_s: float = 30.0) -> bool:
@@ -128,12 +141,13 @@ def _chat(api: str, token: str, query: str, timeout_s: float = 180.0) -> str:
 
 
 async def run(api: str, ws_url: str, username: str, cleanup: bool, exec_fails: bool,
-              keep_alive: bool, connector_name: str) -> int:
+              keep_alive: bool, connector_name: str, environment: str, fault_kind: str,
+              control_port: int) -> int:
     from src.ragent_backend import auth
     from src.ragent_backend.org_store import OrgStore
     from src.ragent_backend.user_store import UserStore
 
-    _self_check()
+    faults = _self_check(environment, fault_kind)
 
     users = await UserStore().list_users()
     user = next((u for u in users if u.username == username), None)
@@ -177,7 +191,17 @@ async def run(api: str, ws_url: str, username: str, cleanup: bool, exec_fails: b
     print(f"✅ 连接器已登记 {cid}")
 
     reg = await asyncio.to_thread(_call, api, "POST", f"/api/v1/admin/ops/connectors/{cid}/register-token", token)
-    probe = OpsProbe(ws_url, cid, reg["register_token"], exec_fails=exec_fails)
+    # 场景一开始就把故障注入好——否则一切正常，分析出不了结论、也没东西可修。
+    # 探针在**执行成功后会自动恢复**这个故障，所以跑完一轮服务会重新变绿。
+    state = FaultState()
+    for service, kind in faults.items():
+        state.inject(service, kind)
+    probe = OpsProbe(ws_url, cid, reg["register_token"], exec_fails=exec_fails,
+                     environment=environment, state=state)
+    # 控制口也起起来——**演示时要能随时再弄坏一个服务**。
+    # 第一版漏了这一步：场景跑完探针常驻着，但没有任何办法往里注入新故障，
+    # 只能重跑整个场景，而重跑会把连接器和数据全部重建。
+    serve_control(state, resolve_environment(environment), port=control_port)
     probe_task = asyncio.create_task(probe.run())
     try:
         if not await _wait_online(api, token, cid):
@@ -247,6 +271,10 @@ async def run(api: str, ws_url: str, username: str, cleanup: bool, exec_fails: b
         print("\n" + "=" * 62)
         print("场景跑完。现在去 运维塔台 → 总览 看数据。")
         print(f"连接器编号（留给另一个会话复核，别急着删）：{cid}")
+        print(f"故障注入：.venv/bin/python -m services.ops_probe_demo.control "
+              f"inject --service <服务名> --kind <故障类型> --port {control_port}")
+        print(f"查看可用服务/故障类型：.venv/bin/python -m services.ops_probe_demo.control "
+              f"state --port {control_port}")
         print(f"清理：.venv/bin/python scripts/{Path(__file__).name} --api {api} --cleanup")
         print("=" * 62)
 
@@ -271,6 +299,13 @@ def main() -> int:
     ap.add_argument("--user", default="alice_acme", help="用哪个企业管理员账号跑")
     ap.add_argument("--cleanup", action="store_true", help="删掉本企业全部连接器（级联清数据）后退出")
     ap.add_argument("--exec-fails", action="store_true", help="让探针的执行一律失败，验证失败态展示")
+    ap.add_argument("--environment", default=DEFAULT_ENVIRONMENT,
+                    help="用哪套模拟环境（ecommerce / payments / internal）")
+    ap.add_argument("--control-port", type=int, default=9330,
+                    help="故障注入控制口（只监听 127.0.0.1）。演示时用 "
+                         "`python -m services.ops_probe_demo.control` 往里注入/恢复故障")
+    ap.add_argument("--fault", default="error_spike",
+                    help="场景一开始注入哪种故障（error_spike / latency_spike / queue_backlog / down）")
     ap.add_argument("--name", default=DEFAULT_CONNECTOR_NAME,
                     help="连接器名字。⚠️ **本机同时跑多个后端时必须区分**——脚本每次启动会先"
                          "按名字清掉同名的旧连接器，而多个后端共用同一个 Postgres，"
@@ -283,8 +318,9 @@ def main() -> int:
                          "因为大屏的实时查询需要一个活着的客户侧进程")
     args = ap.parse_args()
     ws = args.ws or args.api.replace("http://", "ws://").replace("https://", "wss://")
+    env = resolve_environment(args.environment)
     return asyncio.run(run(args.api, ws, args.user, args.cleanup, args.exec_fails,
-                          not args.once, args.name))
+                          not args.once, args.name, env.key, args.fault, args.control_port))
 
 
 if __name__ == "__main__":

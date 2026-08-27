@@ -179,12 +179,46 @@ export default function OpsOverview({ canManage, onModuleDisabled }) {
   const [actions, setActions] = useState([])
   const [metrics, setMetrics] = useState(null)
   const [live, setLive] = useState(null)
+  const [analyzing, setAnalyzing] = useState('')
   const [connectors, setConnectors] = useState([])
   const [summaries, setSummaries] = useState([])
   const [loading, setLoading] = useState(true)
   const [acting, setActing] = useState('')
   // user_id → 用户名，三个视图共用同一份实现（见 opsDisplay.jsx）
   const userNames = useUserNames(canManage)
+
+  /** 对一个服务跑一次分析。
+   *
+   * ⚠️ **三种结果要分开表达**，不能都说成"分析完成"：
+   * 1. 有发现 → 时间线会多一条，提示用户去看；
+   * 2. 查了但一切正常 → 这**不是失败**，也不该让人以为分析没跑；
+   * 3. 降级（RCA 没有模型参与）→ 结论只是数据复述，不说出来的话，
+   *    用户会把复述当成分析结论。
+   */
+  const analyze = useCallback(async (target) => {
+    setAnalyzing(target)
+    try {
+      const r = await opsApi.analyzeOpsIncident(target)
+      if (!r.ok) { message.warning(r.message || '分析未能完成'); return }
+      if (r.has_findings) {
+        message.success(`${target}：发现 ${r.anomaly_targets.length} 处异常、`
+          + `${r.alert_count} 条告警合并为 ${r.incident_count} 个事件，已记入时间线`)
+      } else {
+        message.info(`${target}：已分析，未发现异常`)
+      }
+      if (r.degraded) message.warning('本次分析未经模型推理，结论仅为数据复述')
+      if (r.unavailable.length) {
+        message.warning(`部分数据未取到：${r.unavailable.join('、')}，结论并不完整`)
+      }
+      load(true)
+    } catch (error) {
+      if (opsApi.isModuleDisabledError(error)) { onModuleDisabled(); return }
+      message.error(opsApi.errorText(error))
+    } finally {
+      setAnalyzing('')
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onModuleDisabled])
 
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
@@ -241,6 +275,14 @@ export default function OpsOverview({ canManage, onModuleDisabled }) {
   const pending = actions.filter((a) => a.status === 'pending_approval')
   const executing = actions.filter((a) => a.status === 'executing')
   const online = connectors.filter((c) => c.connector_status === 'online').length
+  const connectorDelta = !canManage
+    ? { text: '需要管理员权限', tone: 'flat' }
+    : !connectors.length
+      // 还没登记过任何连接器：这是**待办不是故障**，给下一步而不是红色警告。
+      ? { text: '去「连接器管理」登记第一个', tone: 'flat' }
+      : online === connectors.length
+        ? { text: '全部在线', tone: 'good' }
+        : { text: `${connectors.length - online} 个离线`, tone: 'bad' }
 
   if (loading) return <div className="panel-empty"><Spin /></div>
 
@@ -273,11 +315,17 @@ export default function OpsOverview({ canManage, onModuleDisabled }) {
           delta={pending.length ? '需要人工确认' : '暂无待办'}
           deltaTone={pending.length ? 'bad' : 'flat'}
         />
+        {/* ⚠️ **"从没接入过"和"接入了但全掉线"是两回事**，不能混成一个红色告警。
+            前者是待办（这家企业还没开始用），后者是故障（该在线的东西掉了）。
+            早前的判据是 `connectors.length && online === connectors.length ? good : bad`，
+            零连接器时 `length` 为假、落进 else，于是新企业一进来就看到
+            「0/0　有连接器离线」——一个连接器都没有，何来离线。 */}
         <Kpi
           label="连接器在线"
-          value={canManage ? `${online}/${connectors.length}` : '—'}
-          delta={!canManage ? '需要管理员权限' : (connectors.length && online === connectors.length ? '全部在线' : '有连接器离线')}
-          deltaTone={!canManage ? 'flat' : (connectors.length && online === connectors.length ? 'good' : 'bad')}
+          value={!canManage ? '—' : (connectors.length ? `${online}/${connectors.length}` : '未接入')}
+          placeholder={canManage && !connectors.length}
+          delta={connectorDelta.text}
+          deltaTone={connectorDelta.tone}
         />
         <Kpi
           label="进行中事件"
@@ -314,6 +362,13 @@ export default function OpsOverview({ canManage, onModuleDisabled }) {
                         </span>
                       </div>
                       <div className="svc-metrics">{serviceMetricText(s)}</div>
+                      <button
+                        className="svc-analyze"
+                        disabled={analyzing === s.service}
+                        onClick={() => analyze(s.service)}
+                      >
+                        {analyzing === s.service ? '分析中…' : '分析'}
+                      </button>
                     </div>
                   ))}
                 </div>

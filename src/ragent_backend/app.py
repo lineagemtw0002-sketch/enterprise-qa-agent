@@ -72,6 +72,7 @@ from src.ragent_backend.schemas import (
     AnalysisSummaryResponse, SetOutcomeEffectiveRequest, OpsMetricsResponse,
     OpsLiveOverviewResponse, ServiceHealthEntry,
     ServiceThresholdsRequest, ServiceThresholdsEntry,
+    AnalyzeOpsIncidentRequest, AnalyzeOpsIncidentResponse,
     PostmortemEntryResponse,
 )
 from src.ragent_backend import account_import as _acct_import
@@ -2330,6 +2331,61 @@ def create_app() -> FastAPI:
         org = await _require_aiops_enabled_org(current_user)
         await _get_owned_connector(org.org_id, connection_id)
         return {"deleted": await ops_store.delete_service_thresholds(connection_id, service)}
+
+    @app.post("/api/v1/admin/ops/analyze", response_model=AnalyzeOpsIncidentResponse)
+    async def admin_analyze_ops_incident(
+        request: AnalyzeOpsIncidentRequest,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> AnalyzeOpsIncidentResponse:
+        """对某个服务跑一次分析（异常检测 → 告警关联 → 根因辅助）。
+
+        ## 为什么需要这个端点
+
+        在它之前，`analyze_ops_incident` **只注册给了 LLM**——运维人员在塔台上
+        看到一个服务变红，没有任何办法让系统去分析它，只能去对话里说一句、
+        指望 7B 模型决定调那个工具。实测三次只成功一次：自然措辞时模型经常
+        直接用知识库回答、或者不带 `target` 参数就调。
+        **这跟"审批通过后没人能执行"是同一类缺陷**：人在界面上做不了 AI 能做
+        的事，而这件事本来就该是人主动发起的。
+
+        ## 跟 LLM 那条路走同一段代码
+
+        直接调 `ops_toolset.analyze_ops_incident`，不另写一份编排——落库格式、
+        依据引用规则、降级行为两条路径完全一致，不会随时间漂移。
+
+        ## 权限
+
+        `can_view` 就够（跟列表类端点同一档），**不是 `can_approve`**：
+        分析是只读的，它不改变任何东西，也不给任何人执行资格。
+        把只读操作卡在审批权限上，只会逼人去要更高的权限。
+        """
+        org = await _require_aiops_enabled_org(current_user)
+        viewable = await ops_store.viewable_connection_ids_for_user(current_user.user_id, org.org_id)
+        if viewable is not None and not viewable:
+            raise HTTPException(status_code=403, detail="你没有被授权查看任何运维系统")
+
+        outcome = await ops_toolset.analyze_ops_incident(
+            org.org_id, request.target, metric=request.metric,
+            window_minutes=request.window_minutes, connection_ids=viewable,
+        )
+        await _audit_log(
+            current_user.user_id, "analyze_ops_incident", "ops_analysis",
+            request.target, {"ok": outcome.ok},
+        )
+        data = outcome.data or {}
+        return AnalyzeOpsIncidentResponse(
+            ok=outcome.ok, message=outcome.message,
+            summary_id=data.get("summary_id"),
+            # "跑通了但一切正常"不是失败——调用方要能区分它和"查不到数据"。
+            has_findings=bool(data.get("anomaly_targets") or data.get("incident_count")),
+            degraded=bool(data.get("degraded")),
+            anomaly_targets=list(data.get("anomaly_targets") or []),
+            alert_count=int(data.get("alert_count") or 0),
+            incident_count=int(data.get("incident_count") or 0),
+            # 去重：指标查询和告警查询是两次 fan-out，同一个连接器失败会被报两次。
+            # 界面上把同一个系统列两遍，看起来像"有两个系统出问题了"。
+            unavailable=sorted({u.get("system", "") for u in (data.get("unavailable") or []) if u.get("system")}),
+        )
 
     @app.get("/api/v1/admin/ops/live-overview", response_model=OpsLiveOverviewResponse)
     async def admin_ops_live_overview(

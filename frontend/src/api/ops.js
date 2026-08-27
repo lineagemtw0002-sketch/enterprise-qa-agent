@@ -252,3 +252,18 @@ export function deleteServiceThresholds(connectionId, service) {
     .delete(`${BASE}/ops/connectors/${encodeURIComponent(connectionId)}/service-thresholds/${encodeURIComponent(service)}`)
     .then((res) => res.data)
 }
+
+// 对某个服务跑一次分析（异常检测 → 告警关联 → 根因辅助）。
+//
+// 在这个接口之前，`analyze_ops_incident` **只注册给了 LLM**——运维人员在塔台上
+// 看到服务变红，没有任何办法让系统去分析它，只能去对话里说一句、指望 7B 模型
+// 决定调那个工具（实测三次只成功一次）。跟"审批通过后没人能执行"是同一类缺陷。
+//
+// ⚠️ 返回的 `has_findings === false` **不是失败**，是"查了，没发现问题"。
+// `degraded === true` 表示 RCA 那一步没有模型参与、结论只是数据复述，必须显式
+// 告诉用户，否则他会把一段复述当成分析结论。
+export function analyzeOpsIncident(target, { metric = 'error_rate', windowMinutes = 60 } = {}) {
+  return axios
+    .post(`${BASE}/ops/analyze`, { target, metric, window_minutes: windowMinutes })
+    .then((res) => res.data)
+}

@@ -386,3 +386,18 @@
 @media (prefers-reduced-motion: reduce) {
   .ops-live-pill.live .ops-live-dot { animation: none; }
 }
+
+/* 服务卡片上的「分析」按钮。刻意做得克制——它是一个随手可点的只读操作，
+   不该跟「执行」那种有后果的动作长得一样醒目。 */
+.svc-analyze {
+  align-self: flex-start;
+  background: transparent;
+  color: var(--ink-muted);
+  border: 1px solid var(--ops-border);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.svc-analyze:hover:not(:disabled) { color: var(--ops-accent); border-color: var(--ops-accent); }
+.svc-analyze:disabled { opacity: 0.5; cursor: progress; }
