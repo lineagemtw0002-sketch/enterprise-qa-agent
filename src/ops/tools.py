@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Protocol
 
 from src.ops.federation.engine import FederatedQueryEngine, describe_unavailable
+from src.ops.measured_baseline import with_measured_baseline
 from src.ops.types import (
     QUERY_KIND_ALERT,
     QUERY_KIND_METRIC,
@@ -234,8 +235,11 @@ class OpsToolset:
                 ),
             )
 
+        # 同 app.py 那个提议端点：扩缩容基线只认实测值。**两条提议路径必须一致**
+        # ——只在其中一条上防，模型换一条路就能绕过去。
+        checked_plan = await with_measured_baseline(self._engine, org_id, plan)
         try:
-            check = check_target_in_scope(action_type, scope.scope_config, plan)
+            check = check_target_in_scope(action_type, scope.scope_config, checked_plan)
         except InvalidActionType as e:
             return ToolOutcome(ok=False, refused=True, message=str(e))
         except InvalidScopeConfig as e:
@@ -345,7 +349,11 @@ class OpsToolset:
                 ok=False, refused=True,
                 message="这类动作的允许范围已经被管理员移除，本次执行已拒绝。",
             )
-        check = check_target_in_scope(action_type, scope.scope_config, action.plan)
+        # 执行前复查同样要重新实测——**不能复用提议时那次的值**：提议到执行
+        # 之间可能隔了 30 分钟（§10.4 默认超时），实例数完全可能已经变了，
+        # 而这道复查的全部意义就是"批准之后到现在，情况有没有变"。
+        checked_plan = await with_measured_baseline(self._engine, action.org_id, action.plan)
+        check = check_target_in_scope(action_type, scope.scope_config, checked_plan)
         if not check.allowed:
             logger.warning(
                 "Refused approved-but-now-out-of-scope execution: action=%s reason=%s",

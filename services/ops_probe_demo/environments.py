@@ -35,6 +35,11 @@ class ServiceSpec:
     # 只被发现、不上报指标的服务（比如刚接入还在同步）。留一个这样的服务，
     # 是为了让"数据中断"这个状态在演示环境里真的被走到，而不是只存在于单测。
     reports_metrics: bool = True
+    # 当前实例数。**扩缩容的越界判定只认这个实测值**，不认 AI 提议里自报的
+    # baseline（见 `src/ragent_backend/aiops_scope.py::_check_scale_instances`）。
+    # 各服务规模不同是刻意的：都设成一样的话，"上界按各自基线算"这件事在演示里
+    # 看不出区别。
+    instances: int = 3
 
 
 @dataclass(frozen=True)
@@ -49,34 +54,34 @@ ENVIRONMENTS: Dict[str, Environment] = {
     "ecommerce": Environment(
         key="ecommerce", label="电商主站", cluster="prod-cluster-1",
         services={
-            "order-service": ServiceSpec(error_rate=0.0008, p95_latency_ms=180.0),
-            "payment-gateway": ServiceSpec(error_rate=0.0004, p95_latency_ms=210.0),
-            "inventory-api": ServiceSpec(error_rate=0.0005, p95_latency_ms=121.0),
-            "auth-service": ServiceSpec(error_rate=0.0002, p95_latency_ms=88.0),
+            "order-service": ServiceSpec(error_rate=0.0008, p95_latency_ms=180.0, instances=6),
+            "payment-gateway": ServiceSpec(error_rate=0.0004, p95_latency_ms=210.0, instances=4),
+            "inventory-api": ServiceSpec(error_rate=0.0005, p95_latency_ms=121.0, instances=3),
+            "auth-service": ServiceSpec(error_rate=0.0002, p95_latency_ms=88.0, instances=8),
             "notification-worker": ServiceSpec(error_rate=0.001, p95_latency_ms=None,
-                                               queue_latency_ms=3000.0),
+                                               queue_latency_ms=3000.0, instances=2),
             "search-index": ServiceSpec(reports_metrics=False),
         },
     ),
     "payments": Environment(
         key="payments", label="支付清结算", cluster="pay-cluster-a",
         services={
-            "payment-api": ServiceSpec(error_rate=0.0002, p95_latency_ms=140.0),
-            "ledger-service": ServiceSpec(error_rate=0.0001, p95_latency_ms=95.0),
-            "fraud-detector": ServiceSpec(error_rate=0.0009, p95_latency_ms=320.0),
+            "payment-api": ServiceSpec(error_rate=0.0002, p95_latency_ms=140.0, instances=5),
+            "ledger-service": ServiceSpec(error_rate=0.0001, p95_latency_ms=95.0, instances=3),
+            "fraud-detector": ServiceSpec(error_rate=0.0009, p95_latency_ms=320.0, instances=4),
             "settlement-worker": ServiceSpec(error_rate=0.0003, p95_latency_ms=None,
-                                             queue_latency_ms=6000.0),
-            "kyc-service": ServiceSpec(error_rate=0.0006, p95_latency_ms=260.0),
+                                             queue_latency_ms=6000.0, instances=2),
+            "kyc-service": ServiceSpec(error_rate=0.0006, p95_latency_ms=260.0, instances=2),
         },
     ),
     "internal": Environment(
         key="internal", label="内部平台", cluster="corp-cluster",
         services={
-            "hr-portal": ServiceSpec(error_rate=0.0011, p95_latency_ms=340.0),
-            "wiki-service": ServiceSpec(error_rate=0.0007, p95_latency_ms=190.0),
+            "hr-portal": ServiceSpec(error_rate=0.0011, p95_latency_ms=340.0, instances=2),
+            "wiki-service": ServiceSpec(error_rate=0.0007, p95_latency_ms=190.0, instances=2),
             "ci-runner": ServiceSpec(error_rate=0.0021, p95_latency_ms=None,
-                                     queue_latency_ms=8000.0),
-            "artifact-registry": ServiceSpec(error_rate=0.0004, p95_latency_ms=150.0),
+                                     queue_latency_ms=8000.0, instances=4),
+            "artifact-registry": ServiceSpec(error_rate=0.0004, p95_latency_ms=150.0, instances=2),
             "ldap-sync": ServiceSpec(reports_metrics=False),
         },
     ),

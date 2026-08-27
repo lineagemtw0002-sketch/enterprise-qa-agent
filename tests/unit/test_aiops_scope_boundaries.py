@@ -27,7 +27,7 @@
 校验，`validate_approval_timeout_minutes` 补 bool/非 int 拒绝），XPASS
 后已摘除对应 xfail 标记（就地保留原有断言，改成纯粹的回归保护）。
 
-**剩 1 条仍是 xfail，未修**：`TestScaleInstancesBoundaries::
+~~剩 1 条仍是 xfail，未修~~ **2026-08-27 已修复并摘除标记**：`TestScaleInstancesBoundaries::
 test_self_reported_baseline_cannot_inflate_the_ceiling`——baseline
 自指问题是设计层缺口（scope schema 没规定 baseline 该从哪来，不是单纯的
 实现手滑），需要先过设计评审再动代码，本次未擅自决定修法，见 `CLAUDE.md` §5。
@@ -276,20 +276,20 @@ class TestScaleInstancesBoundaries:
 
     def test_at_lower_bound_allowed(self):
         result = check_target_in_scope(
-            "scale_instances", self.SCOPE, {"target_instances": 2, "baseline_instances": 4}
+            "scale_instances", self.SCOPE, {"target_instances": 2, "measured_baseline_instances": 4}
         )
         assert result.allowed is True
 
     def test_one_below_lower_bound_denied(self):
         result = check_target_in_scope(
-            "scale_instances", self.SCOPE, {"target_instances": 1, "baseline_instances": 4}
+            "scale_instances", self.SCOPE, {"target_instances": 1, "measured_baseline_instances": 4}
         )
         assert result.allowed is False
 
     def test_one_above_upper_bound_denied(self):
         # 基线 4 × 2.0 = 8，9 越界。
         result = check_target_in_scope(
-            "scale_instances", self.SCOPE, {"target_instances": 9, "baseline_instances": 4}
+            "scale_instances", self.SCOPE, {"target_instances": 9, "measured_baseline_instances": 4}
         )
         assert result.allowed is False
 
@@ -297,14 +297,14 @@ class TestScaleInstancesBoundaries:
         # 基线 3 × 1.5 = 4.5，4 <= 4.5 放行。
         scope = {"min_instances": 1, "max_multiplier_of_baseline": 1.5}
         result = check_target_in_scope(
-            "scale_instances", scope, {"target_instances": 4, "baseline_instances": 3}
+            "scale_instances", scope, {"target_instances": 4, "measured_baseline_instances": 3}
         )
         assert result.allowed is True
 
     def test_fractional_upper_bound_above_ceiling_denied(self):
         scope = {"min_instances": 1, "max_multiplier_of_baseline": 1.5}
         result = check_target_in_scope(
-            "scale_instances", scope, {"target_instances": 5, "baseline_instances": 3}
+            "scale_instances", scope, {"target_instances": 5, "measured_baseline_instances": 3}
         )
         assert result.allowed is False
 
@@ -313,7 +313,7 @@ class TestScaleInstancesBoundaries:
         0 是 falsy 但不是"没配"——实现必须用 `is None` 判断存在性。"""
         scope = {"min_instances": 0, "max_multiplier_of_baseline": 2.0}
         result = check_target_in_scope(
-            "scale_instances", scope, {"target_instances": 0, "baseline_instances": 4}
+            "scale_instances", scope, {"target_instances": 0, "measured_baseline_instances": 4}
         )
         assert result.allowed is True
 
@@ -322,7 +322,7 @@ class TestScaleInstancesBoundaries:
         scope = {"min_instances": 0, "max_multiplier_of_baseline": 0}
         assert (
             check_target_in_scope(
-                "scale_instances", scope, {"target_instances": 1, "baseline_instances": 4}
+                "scale_instances", scope, {"target_instances": 1, "measured_baseline_instances": 4}
             ).allowed
             is False
         )
@@ -354,26 +354,71 @@ class TestScaleInstancesBoundaries:
                 "scale_instances", scope, {"target_instances": 3, "baseline_instances": 4}
             )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "已确认设计缺口：上界 = baseline × multiplier，而 baseline_instances 跟 "
-            "target_instances 一样来自同一份 AI 提议，边界因此是自指的 —— 提议方自报一个"
-            "虚高基线就能把天花板抬到任意高度。§3.3.1 要求边界由管理员预先登记，"
-            "baseline 应取连接器上报的实测值，不是提议里的自报值。"
-            "这是设计层缺口（scope schema 没规定 baseline 从哪来），不是单纯的实现手滑。"
-        ),
-    )
     def test_self_reported_baseline_cannot_inflate_the_ceiling(self):
-        """AI 提议"基线 5000，扩容到 10000"，倍数刚好 2.0，通过白名单校验。
+        """AI 自报"基线 5000、扩容到 10000"（倍数刚好 2.0），必须拒绝。
 
-        §3.3.1 举的反例正是"拒绝明显异常值（如'扩容到 10000'）"，
-        当前实现拦不住这个例子本身。
+        §3.3.1 举的反例正是"拒绝明显异常值（如『扩容到 10000』）"。
+        这条曾以 `xfail(strict=True)` 记录该缺陷（2026-08-26 变异测试发现），
+        **2026-08-27 用户拍板修复后摘除标记**：基线改为只认平台实测值。
+
+        **它在旧实现下会失败吗**：会。旧实现读的是 `baseline_instances`，
+        5000 × 2.0 = 10000，`target_instances=10000` 恰好落在上界上被判合法。
         """
         result = check_target_in_scope(
             "scale_instances",
             {"min_instances": 1, "max_multiplier_of_baseline": 2.0},
             {"target_instances": 10000, "baseline_instances": 5000},
+        )
+        assert result.allowed is False
+
+    def test_measured_baseline_overrides_the_self_reported_one(self):
+        """同时给出自报值和实测值时，**以实测值为准**。
+
+        这是这次修复的核心断言：模型可以继续在提议里写它以为的基线
+        （那是个有用的信号），但判定一个字都不看它。
+        """
+        result = check_target_in_scope(
+            "scale_instances",
+            {"min_instances": 1, "max_multiplier_of_baseline": 2.0},
+            {"target_instances": 10000, "baseline_instances": 5000,
+             "measured_baseline_instances": 3},
+        )
+        assert result.allowed is False
+        assert "实测基线 3" in (result.reason or "")
+
+    def test_missing_measured_baseline_denies_instead_of_falling_back(self):
+        """**测不到基线时拒绝，不回退到自报值。**
+
+        回退等于让这个防护在最需要它的时候（连接器离线、不支持上报实例数）
+        自动失效——而那恰恰是攻击者/幻觉最容易赶上的时机。
+        跟白名单"没配置 = 一律不允许"是同一个默认。
+        """
+        result = check_target_in_scope(
+            "scale_instances",
+            {"min_instances": 1, "max_multiplier_of_baseline": 2.0},
+            {"target_instances": 4, "baseline_instances": 3},   # 自报值本来"合法"
+        )
+        assert result.allowed is False
+        assert "实测基线" in (result.reason or "") or "无法确认" in (result.reason or "")
+
+    def test_measured_baseline_allows_a_reasonable_scale_up(self):
+        """别把正常扩容也拦了——实测基线 3、扩到 6、倍数 2.0，应放行。"""
+        result = check_target_in_scope(
+            "scale_instances",
+            {"min_instances": 1, "max_multiplier_of_baseline": 2.0},
+            {"target_instances": 6, "measured_baseline_instances": 3},
+        )
+        assert result.allowed is True
+
+    @pytest.mark.parametrize("bad", [0, -1])
+    def test_non_positive_measured_baseline_is_refused(self, bad):
+        """实测到 0 个实例（服务已经全挂了？）时不能据此算上界——
+        0 × 任何倍数都是 0，会把所有扩容都拦下并给出一个看不懂的理由。
+        显式拒绝并说明原因，比算出一个荒谬的上界强。"""
+        result = check_target_in_scope(
+            "scale_instances",
+            {"min_instances": 1, "max_multiplier_of_baseline": 2.0},
+            {"target_instances": 4, "measured_baseline_instances": bad},
         )
         assert result.allowed is False
 

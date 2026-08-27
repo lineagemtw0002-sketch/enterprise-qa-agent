@@ -488,3 +488,85 @@ class TestAnalyzeOpsIncident:
             llm=_JsonLLM('{"summary":"s"}'))
         out = await toolset.analyze_ops_incident(ORG, "order-service")
         assert out.ok is True and out.data["summary_id"] is None and out.message
+
+
+# ==================== 扩缩容基线：只认实测值 ====================
+
+
+class _InstanceReportingTransport(FakeTransport):
+    """一个会上报 `instances` 的连接器。`count=None` 表示它不报实例数
+    （老连接器、或该服务查不到）——用来验证"测不到就拒绝"。"""
+
+    def __init__(self, count=None):
+        super().__init__()
+        self._count = count
+
+    async def query(self, connection_id, org_id, request, timeout_s):
+        if request.kind != "service_health":
+            return await super().query(connection_id, org_id, request, timeout_s)
+        points = []
+        if self._count is not None:
+            points.append(DataPoint(ts=0.0, value=float(self._count), text="",
+                                    labels={"service": "order-service", "metric": "instances"}))
+        return QueryResult(connection_id, "Prometheus", points)
+
+
+SCALE_SCOPE = FakeScope({"min_instances": 1, "max_multiplier_of_baseline": 2.0})
+
+
+class TestScaleBaselineComesFromMeasurementNotFromTheProposal:
+    """扩缩容的上界基线只认平台实测值。
+
+    **为什么要在工具层单独测一遍**：`aiops_scope` 那边测的是"给了实测值时判定
+    正确"，但那只有在**调用方真的去测了**的前提下才有意义。这两条测的正是
+    "调用方到底测没测"——只在纯函数层测，等于假设接线是对的，而这次修复里
+    最容易漏的恰恰是三个调用点中的某一个没接上。
+
+    **它们在修复前会失败吗**：会。修复前 `check_target_in_scope` 收到的是
+    原始 `plan`，里面只有 AI 自报的 `baseline_instances=5000`，
+    5000 × 2.0 = 10000，`target_instances=10000` 恰好被判合法、提议会进入待审批。
+    """
+
+    @pytest.mark.asyncio
+    async def test_proposal_uses_measured_baseline_and_rejects_inflated_one(self):
+        store = FakeStore(scope=SCALE_SCOPE)
+        toolset = _toolset(store, transport=_InstanceReportingTransport(count=3))
+        out = await toolset.propose_remediation(
+            org_id="org1", connection_id="c1", action_type="scale_instances",
+            proposed_by="u1", intent="扩容", impact_radius="单服务",
+            # AI 自报基线 5000（谎报），目标 10000
+            plan={"action_type": "scale_instances", "target": "order-service",
+                  "baseline_instances": 5000, "target_instances": 10000},
+        )
+        assert out.ok is False
+        assert "实测基线 3" in (out.message or ""), out.message
+
+    @pytest.mark.asyncio
+    async def test_proposal_allows_a_scale_up_within_the_measured_ceiling(self):
+        """别把正常扩容也拦了：实测 3 个实例、扩到 6、倍数 2.0 → 放行。"""
+        store = FakeStore(scope=SCALE_SCOPE)
+        toolset = _toolset(store, transport=_InstanceReportingTransport(count=3))
+        out = await toolset.propose_remediation(
+            org_id="org1", connection_id="c1", action_type="scale_instances",
+            proposed_by="u1", intent="扩容", impact_radius="单服务",
+            plan={"action_type": "scale_instances", "target": "order-service",
+                  "target_instances": 6},
+        )
+        assert out.ok is True, out.message
+
+    @pytest.mark.asyncio
+    async def test_connector_not_reporting_instances_denies_the_proposal(self):
+        """连接器不上报实例数时**拒绝**，不回退到 AI 自报值。
+
+        回退等于让这个防护在最需要它的时候（连接器不可达/老版本）自动失效。
+        """
+        store = FakeStore(scope=SCALE_SCOPE)
+        toolset = _toolset(store, transport=_InstanceReportingTransport(count=None))
+        out = await toolset.propose_remediation(
+            org_id="org1", connection_id="c1", action_type="scale_instances",
+            proposed_by="u1", intent="扩容", impact_radius="单服务",
+            plan={"action_type": "scale_instances", "target": "order-service",
+                  "baseline_instances": 3, "target_instances": 4},
+        )
+        assert out.ok is False
+        assert "无法确认" in (out.message or ""), out.message

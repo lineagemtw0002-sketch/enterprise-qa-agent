@@ -160,17 +160,38 @@ def _check_scale_instances(scope_config: Dict[str, Any], proposed: Dict[str, Any
     target_instances = _require_proposed_number(proposed, "target_instances")
     if isinstance(target_instances, ScopeCheckResult):
         return target_instances
-    baseline_instances = _require_proposed_number(proposed, "baseline_instances")
+    # ⚠️ **基线只认平台实测值，不认 AI 自陈述**（2026-08-27 用户拍板修复）。
+    #
+    # 原来的实现里 `target_instances` 和 `baseline_instances` 都来自同一份 AI
+    # 提议——模型谎报一个虚高基线就能把自己的天花板抬到任意高
+    # （baseline=5000 / target=10000 在 multiplier=2.0 下被判合法）。
+    # 一个由被约束方自己填写的约束，不是约束。
+    #
+    # 现在基线走 `measured_baseline_instances`：**只有平台侧的调用方能填**，
+    # 值来自向连接器实测（见 `src/ops/measured_baseline.py`）。
+    # 提议里那个 `baseline_instances` 保留但**不参与判定**——它现在只是
+    # "模型以为有几个实例"，跟实测值不一致本身是个有用的信号（模型看错了、
+    # 或者状态在提议之后变了），留给上层去比对。
+    #
+    # ⚠️ **缺失即拒绝，不是跳过。** 调用方没测就调进来（连接器离线、忘了测），
+    # 这里必须拒绝而不是回退到 AI 自报的值——回退等于这个修复在最需要它的
+    # 时候（连接器不可达）自动失效。判定不了就不放行，是这个模块一贯的默认。
+    measured = proposed.get("measured_baseline_instances")
+    if measured is None:
+        return ScopeCheckResult(
+            allowed=False,
+            reason=("无法确认该服务当前的实例数（未取到实测基线），因此无法判定扩缩容"
+                    "是否越界。连接器离线或不支持上报实例数时，扩缩容一律不予放行。"),
+        )
+    baseline_instances = _require_proposed_number(proposed, "measured_baseline_instances")
     if isinstance(baseline_instances, ScopeCheckResult):
         return baseline_instances
+    if baseline_instances <= 0:
+        return ScopeCheckResult(
+            allowed=False,
+            reason=f"实测基线实例数为 {baseline_instances}，无法据此推算上界",
+        )
 
-    # ⚠️ **已知设计缺口，本次不修**（2026-08-26 变异测试实测发现）：
-    # target_instances 和 baseline_instances 都来自同一份 AI 提议，AI 谎报
-    # 一个虚高的 baseline 就能把自己的上界一起抬高（baseline=5000/target=10000
-    # 在 multiplier=2.0 下会被判合法）。真正的修复需要 baseline 来自连接器
-    # 实测的当前实例数，而不是提议里的自陈述字段——这是 scope_config/
-    # proposed 数据形状的设计变更，不是这个函数内部能悄悄改掉的实现细节，
-    # 按 §7.1 需要单独走一次设计评审。
     max_allowed = baseline_instances * max_multiplier
     if target_instances < min_instances:
         return ScopeCheckResult(
@@ -182,7 +203,7 @@ def _check_scale_instances(scope_config: Dict[str, Any], proposed: Dict[str, Any
             allowed=False,
             reason=(
                 f"目标实例数 {target_instances} 超过上界 "
-                f"{max_allowed}（基线 {baseline_instances} × {max_multiplier}）"
+                f"{max_allowed}（实测基线 {baseline_instances} × {max_multiplier}）"
             ),
         )
     return ScopeCheckResult(allowed=True)

@@ -187,7 +187,11 @@ def service_health_points(*, environment: Optional[str] = None,
             continue
         for metric, value in (("error_rate", spec.error_rate),
                               ("p95_latency_ms", spec.p95_latency_ms),
-                              ("queue_latency_ms", spec.queue_latency_ms)):
+                              ("queue_latency_ms", spec.queue_latency_ms),
+                              # 实例数：扩缩容越界判定的唯一可信基线来源。
+                              # 真实连接器在这里回 `kube_deployment_status_replicas`
+                              # 之类的实测值。
+                              ("instances", float(spec.instances))):
             if value is not None:
                 points.append({"ts": now, "value": value, "text": "",
                                "labels": {"service": name, "metric": metric}})

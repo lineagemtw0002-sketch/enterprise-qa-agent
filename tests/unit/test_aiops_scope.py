@@ -59,16 +59,23 @@ class TestRestartServiceScope:
 class TestScaleInstancesScope:
     SCOPE = {"min_instances": 1, "max_multiplier_of_baseline": 2.0}
 
+    # ⚠️ **2026-08-27 契约变更**：扩缩容的基线从"AI 提议里自报的
+    # `baseline_instances`"改成"平台向连接器实测的 `measured_baseline_instances`"
+    # ——原来的边界是自指的，提议方抬高自己的基线就能抬高自己的天花板。
+    # 下面这些测的是**上下界算法本身**（等于上界放行、超过拒绝、低于下界拒绝），
+    # 那部分逻辑没变，只是基线从哪个键读变了，所以按新键名原样保留。
+    # "自报值不再被采信"由 `test_aiops_scope_boundaries.py` 里那几条专门断言。
+
     def test_within_bounds_is_allowed(self):
         result = check_target_in_scope(
-            "scale_instances", self.SCOPE, {"target_instances": 6, "baseline_instances": 4},
+            "scale_instances", self.SCOPE, {"target_instances": 6, "measured_baseline_instances": 4},
         )
         assert result.allowed is True
 
     def test_exceeds_upper_bound_is_rejected(self):
         # 基线 4，上限 4*2.0=8，提议 10 越界。
         result = check_target_in_scope(
-            "scale_instances", self.SCOPE, {"target_instances": 10, "baseline_instances": 4},
+            "scale_instances", self.SCOPE, {"target_instances": 10, "measured_baseline_instances": 4},
         )
         assert result.allowed is False
         assert "10" in result.reason
@@ -76,20 +83,20 @@ class TestScaleInstancesScope:
     def test_boundary_value_exactly_at_max_is_allowed(self):
         # 8 == 4*2.0，等于上界应该放行，不是"严格小于才行"。
         result = check_target_in_scope(
-            "scale_instances", self.SCOPE, {"target_instances": 8, "baseline_instances": 4},
+            "scale_instances", self.SCOPE, {"target_instances": 8, "measured_baseline_instances": 4},
         )
         assert result.allowed is True
 
     def test_below_lower_bound_is_rejected(self):
         result = check_target_in_scope(
-            "scale_instances", self.SCOPE, {"target_instances": 0, "baseline_instances": 4},
+            "scale_instances", self.SCOPE, {"target_instances": 0, "measured_baseline_instances": 4},
         )
         assert result.allowed is False
 
     def test_malformed_scope_config_raises(self):
         with pytest.raises(InvalidScopeConfig):
             check_target_in_scope(
-                "scale_instances", {"min_instances": 1}, {"target_instances": 2, "baseline_instances": 4},
+                "scale_instances", {"min_instances": 1}, {"target_instances": 2, "measured_baseline_instances": 4},
             )
 
 

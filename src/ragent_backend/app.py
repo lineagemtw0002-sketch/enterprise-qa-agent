@@ -99,6 +99,7 @@ from src.ragent_backend.ops_store import (
 )
 from src.ragent_backend import aiops_scope
 from src.ops import connector_session, service_health
+from src.ops.measured_baseline import with_measured_baseline
 from src.ops.analysis import Alert, correlate_alerts
 from src.ops.types import QueryRequest, TimeRange
 from src.ops.connector_transport import WebSocketConnectorTransport, WebSocketRemediationDispatcher
@@ -2167,8 +2168,12 @@ def create_app() -> FastAPI:
                 action, scope_check_reason=f"连接器 '{connection_id}' 尚未为 '{request.action_type}' 配置修复范围白名单"
             )
 
+        # 扩缩容的基线必须现场向连接器实测——AI 提议里那个 `baseline_instances`
+        # 不参与判定（它是被约束方自己填的，抬高它就能抬高自己的天花板）。
+        # 测不到时下面的判定会直接拒绝，见 `measured_baseline.py`。
+        checked_plan = await with_measured_baseline(_ops_engine, org.org_id, request.plan)
         try:
-            check = aiops_scope.check_target_in_scope(request.action_type, scope.scope_config, request.plan)
+            check = aiops_scope.check_target_in_scope(request.action_type, scope.scope_config, checked_plan)
         except aiops_scope.InvalidScopeConfig as e:
             action = await ops_store.advance_status(action.action_id, STATUS_REJECTED_PRE)
             return _remediation_action_response(action, scope_check_reason=f"白名单配置本身有问题：{e}")
