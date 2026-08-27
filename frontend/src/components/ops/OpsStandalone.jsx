@@ -16,6 +16,7 @@ import axios from 'axios'
 import { ConfigProvider, Spin, theme } from 'antd'
 import OpsConsole from './OpsConsole.jsx'
 import './OpsConsole.css'
+import './OpsStandalone.css'
 
 // ⚠️ 同步挂 token，不放进 useEffect。理由见文件头第 1 条。
 const _token = localStorage.getItem('ragent_token')

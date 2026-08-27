@@ -11,7 +11,10 @@
       新标签页会先闪一帧白屏——在一个整屏深色的监控大屏上这一下非常刺眼。
     -->
     <style>
-      html, body { margin: 0; padding: 0; background: #0b0c12; }
+      /* 底色必须跟 `--ground` 一模一样（#12131a，取自设计稿的 :root）。
+         内容区有 1440px 上限，宽屏下两侧和底部露出的是 body 的底色——
+         这里填一个更黑的值，整屏就会出现一深一浅两块，不是"整体黑"。 */
+      html, body { margin: 0; padding: 0; background: #12131a; }
     </style>
   </head>
   <body>

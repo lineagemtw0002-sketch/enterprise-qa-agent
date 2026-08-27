@@ -11,11 +11,28 @@
  * 是杀鸡用牛刀；而多页入口在**开发和构建下都是真实的两个页面**，
  * 不依赖任何 SPA fallback 配置，也不会有白闪。
  */
+// 设计稿的两款字体，**自托管**（`@fontsource/*` 把字体文件打进我们自己的产物）。
+// ⚠️ 刻意不引 Google Fonts 外链：这是企业内网工具，隔离网络里外链会静默失败、
+// 退回系统字体（"有时候好看有时候不好看"这种问题最难查）；而且每个用户的浏览器
+// 都会向 fonts.googleapis.com 发一次请求，跟本模块"不向外泄漏客户侧信息"的
+// BYOC 原则直接冲突。
+//
+// **只引实际用到的字重**，不是整套家族——Titillium Web 有 9 档字重 × 正斜体，
+// 全引进来是十几个文件几百 KB，而这个界面只用到下面这几档。
+import '@fontsource/titillium-web/300.css'
+import '@fontsource/titillium-web/400.css'
+import '@fontsource/titillium-web/600.css'
+import '@fontsource/titillium-web/700.css'
+import '@fontsource/jetbrains-mono/400.css'
+import '@fontsource/jetbrains-mono/500.css'
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { ConfigProvider } from 'antd'
-import OpsStandalone, { OPS_THEME } from './components/ops/OpsStandalone.jsx'
+// ⚠️ **顺序要紧**：`index.css` 是主应用的全局样式（body 是浅色的），
+// 必须排在塔台自己的覆盖**之前**，否则它会把深色底盖掉——第一版就是这样，
+// 页面中间是深色、两侧露出白底，看起来像"整体黑"没做到。
 import './index.css'
+import OpsStandalone, { OPS_THEME } from './components/ops/OpsStandalone.jsx'
 
 // ⚠️ **antd 的静态 `message.success(...)` 拿不到 ConfigProvider 的主题。**
 // 它挂在组件树之外的一个独立 holder 上，所以在这块整屏深色的大屏上，
