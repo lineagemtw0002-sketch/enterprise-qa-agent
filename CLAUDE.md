@@ -1015,7 +1015,10 @@ flowchart TB
   `_org_response` 的 `seats_used` 注释）
 - `create_app()` 3038 行 / 72 端点，无路由分层、无依赖注入
 - ~~无 Dockerfile / CI / 依赖锁定~~ ✅ **三者均已补齐（Dockerfile/requirements.lock
-  自 `f8fd428`，CI 自本条），见 §5**
+  自 `f8fd428`，CI 自本条），见 §5**。
+  ⚠️ **「依赖锁定」当初只覆盖了 Python 一侧**——前端的 `package-lock.json`
+  一直被 .gitignore 忽略，2026-08-27 才补上（同日 CI 增加 `frontend` job）。
+  勾掉一条 P1 时注意它是不是只解决了问题的一半。
 
 ---
 
@@ -1346,9 +1349,13 @@ flowchart TB
   字体**自托管**（`@fontsource/titillium-web` + `@fontsource/jetbrains-mono`），
   刻意不引 Google Fonts 外链——内网隔离环境会静默失败退回系统字体，且每个
   用户浏览器都会向 `fonts.googleapis.com` 发请求，跟 BYOC 原则冲突。
-  ⚠️ **`frontend/package-lock.json` 在 .gitignore 里**（P1「无依赖锁定」），
-  这两个新依赖不会被锁版本，别的 checkout 合并后**必须先 `npm install`**，
-  否则 vite 解析不到字体包直接白屏。
+  ✅ **前端依赖锁定已于同日补上（这条原来的警告已不再成立）**：
+  `frontend/package-lock.json` 曾跟 `node_modules/` 一起被归在 .gitignore
+  的「# Node modules」下忽略掉，导致这两个字体包只进了 `package.json`、
+  别的 checkout 装不到，vite 解析不到依赖**直接白屏**。现已从 .gitignore
+  移除并纳入版本管理，CI 增加 `frontend` job（`npm ci` + `npx vite build`）
+  守住它——`npm ci` 在 lockfile 与 `package.json` 对不上时直接失败，不会
+  像 `npm install` 那样顺手改写 lockfile 然后绿灯放行。详见 §5 对应条目。
 
   **⚠️ 六条今天踩出来、值得防止重犯的**：
 

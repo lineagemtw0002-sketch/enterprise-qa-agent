@@ -34,8 +34,13 @@ truly fresh checkout:
 
 ```bash
 python3.12 -m venv .venv && .venv/bin/pip install -e .
-cd frontend && npm install && cd ..
+cd frontend && npm ci && cd ..
 ```
+
+前端用 `npm ci` 而不是 `npm install`：`frontend/package-lock.json` 已纳入
+版本管理，`npm ci` 严格按它装出与 CI、与别人机器完全一致的版本；
+`npm install` 会按 `package.json` 里的 `^` 范围重新解析，可能装到别的版本
+并顺手改写 lockfile，让工作区凭空多出一份 diff。
 
 ## Run (agent path)
 

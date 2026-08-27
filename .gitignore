@@ -107,7 +107,14 @@ checkpoints.sqlite*
 
 # Node modules
 frontend/node_modules/
-frontend/package-lock.json
+#
+# frontend/package-lock.json 刻意**不**忽略。它此前跟 node_modules/ 一起被
+# 归在这条注释下忽略掉，但两者性质相反：node_modules/ 是可从 lockfile 重建的
+# 产物，lockfile 本身才是那份"该装哪些确切版本"的事实来源，丢掉它 package.json
+# 里的 ^5.3.0 这类范围就会让不同时间的 npm install 装出不同版本组合。
+# 2026-08-27 已真实付过一次代价：运维塔台新增的两个 @fontsource 字体包只进了
+# package.json，别的 checkout 装不到，vite 解析不到依赖直接白屏。
+# 跟 Python 侧 requirements.lock 是同一层保障（见 Dockerfile / ci.yml 注释）。
 
 # MCP sync artifacts
 .mcp_dirty_snap/
