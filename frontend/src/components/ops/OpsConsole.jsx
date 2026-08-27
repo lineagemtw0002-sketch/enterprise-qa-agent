@@ -706,8 +706,13 @@ function ScopesSection({ connectors, onModuleDisabled }) {
 
 const POLL_INTERVAL_MS = 10000
 
-function ApprovalsSection({ onModuleDisabled }) {
+function ApprovalsSection({ onModuleDisabled, canManage = true }) {
   const [rows, setRows] = useState([])
+  // 提议表单需要这两样。**在这一层拉而不是在表单里拉**——表单是否渲染取决于
+  // 权限，放在表单里拉的话，没权限的人看不到表单、也就不会触发请求，
+  // 但一旦将来表单条件变了就会多出一次没人预料的请求。
+  const [connectors, setConnectors] = useState([])
+  const [summaries, setSummaries] = useState([])
   const [loading, setLoading] = useState(false)
   const [acting, setActing] = useState('')
   const [marking, setMarking] = useState('')
@@ -718,7 +723,16 @@ function ApprovalsSection({ onModuleDisabled }) {
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
     try {
-      setRows(await opsApi.listRemediationActions())
+      const [actions, conns, sums] = await Promise.all([
+        opsApi.listRemediationActions(),
+        // 非管理员没有连接器列表权限（后端 org_admin 专属），拿不到就当空
+        // ——他看不到提议表单，但审批队列照常可用。
+        canManage ? opsApi.listConnectors().catch(() => []) : Promise.resolve([]),
+        opsApi.listAnalysisSummaries().catch(() => []),
+      ])
+      setRows(actions)
+      setConnectors(conns)
+      setSummaries(sums)
     } catch (error) {
       if (opsApi.isModuleDisabledError(error)) { onModuleDisabled(); return }
       if (!silent) message.error(opsApi.errorText(error))
@@ -916,6 +930,13 @@ function ApprovalsSection({ onModuleDisabled }) {
       title={`修复动作审批（待处理 ${pending.length} 条）`}
       extra={<Button size="small" icon={<RefreshCw size={14} />} onClick={() => load()}>刷新</Button>}
     >
+      {canManage && (
+        <ProposeRemediationForm
+          connectors={connectors}
+          summaries={summaries}
+          onProposed={load}
+        />
+      )}
       {/* 如实反映当前权限粒度：role_ops_systems（can_view/can_approve）只建了表、
           CRUD 未实现，所以现在**任何本企业管理员都能批准**，不存在"指定审批人"
           这一层。UI 上不能暗示有——那会让人以为有一层其实不存在的管控。 */}
@@ -949,6 +970,148 @@ function ApprovalsSection({ onModuleDisabled }) {
           locale={{ emptyText: <Empty description="还没有任何修复动作" /> }}
         />
       )}
+    </Card>
+  )
+}
+
+
+// ============================================================ 发起修复提议
+
+/** 各动作类型在 `plan` 里要填什么。
+ *
+ * ⚠️ **字段名必须跟 `src/ragent_backend/aiops_scope.py` 里读的完全一致**
+ * （`target` / `target_instances` / `path` / `target_version_offset`）——
+ * 名字写错不会报错，只会让越界判定读不到值然后拒绝，而拒绝原因看起来像
+ * "参数缺失"，排查方向会被带偏。这里的名字是照着那个文件抄的，不是猜的。
+ *
+ * ⚠️ `scale_instances` **不需要填基线**：基线由平台向连接器实测，提议里报的
+ * 基线一概不采信（那是被约束方自己填自己的约束）。所以表单里干脆不给这个框。
+ */
+const PROPOSE_FIELDS = {
+  restart_service: [
+    { name: 'target', label: '目标服务', placeholder: 'order-service', required: true },
+  ],
+  scale_instances: [
+    { name: 'target', label: '目标服务', placeholder: 'settlement-worker', required: true },
+    { name: 'target_instances', label: '目标实例数', kind: 'number', required: true,
+      help: '上界 = 平台向连接器实测的当前实例数 × 白名单里配的倍数。提议里不需要报基线。' },
+  ],
+  clean_disk: [
+    { name: 'target', label: '目标主机/服务', placeholder: 'ci-runner', required: true },
+    { name: 'path', label: '要清理的路径', placeholder: '/var/cache/ci', required: true,
+      help: '必须落在白名单的允许路径里，且不能命中排除路径（排除优先）。' },
+  ],
+  rollback_deployment: [
+    { name: 'target', label: '目标服务', placeholder: 'payment-api', required: true },
+    { name: 'target_version_offset', label: '回滚几个版本', kind: 'number', required: true,
+      help: '1 = 回到上一个版本。上限由白名单的 max_versions_back 决定。' },
+  ],
+}
+
+function ProposeRemediationForm({ connectors, summaries, onProposed }) {
+  const [connectionId, setConnectionId] = useState(null)
+  const [actionType, setActionType] = useState('restart_service')
+  const [summaryId, setSummaryId] = useState(null)
+  const [form] = Form.useForm()
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    if (!connectionId && connectors.length) setConnectionId(connectors[0].connection_id)
+  }, [connectors, connectionId])
+
+  const fields = PROPOSE_FIELDS[actionType] || []
+
+  async function handleSubmit() {
+    const values = await form.validateFields()
+    const plan = { action_type: actionType }
+    for (const f of fields) {
+      const v = values[f.name]
+      plan[f.name] = f.kind === 'number' ? Number(v) : v
+    }
+    setSaving(true)
+    try {
+      const act = await opsApi.proposeRemediationAction(connectionId, {
+        action_type: actionType,
+        intent: values.intent,
+        impact_radius: values.impact_radius,
+        plan,
+        summary_id: summaryId || undefined,
+      })
+      // ⚠️ **越界提议也会返回 200**——它照样落库，只是状态是 rejected_pre。
+      // 这是刻意的（审计需要看到"提议过这个但被拦下了"这件事本身），
+      // 所以这里不能只看 HTTP 码，要看状态。
+      if (act.status === 'rejected_pre') {
+        message.warning(`提议已记录但被白名单拦下：${act.scope_check_reason || '越界'}`)
+      } else {
+        message.success('已提交，等待审批')
+        form.resetFields()
+      }
+      onProposed?.()
+    } catch (error) {
+      if (opsApi.isModuleDisabledError(error)) return
+      message.error(opsApi.errorText(error))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (!connectors.length) return null
+
+  return (
+    <Card size="small" title="发起修复提议" style={{ marginBottom: 12 }}>
+      <Alert
+        type="info"
+        showIcon
+        className="ops-console-alert"
+        message="人也可以发起，不是只能等 AI"
+        description="AI 只在有人跟它对话时才会提出修复；出事的时候人往往比 AI 更清楚该做什么。这里发起的提议跟 AI 提的走完全相同的白名单校验和审批流程——没有任何快捷通道。"
+      />
+      <Space className="ops-console-toolbar" wrap>
+        <Select
+          value={connectionId}
+          onChange={setConnectionId}
+          style={{ minWidth: 200 }}
+          options={connectors.map((c) => ({ value: c.connection_id, label: c.name }))}
+        />
+        <Segmented
+          value={actionType}
+          onChange={(v) => { setActionType(v); form.resetFields() }}
+          options={ACTION_TYPES.map((a) => ({ value: a.value, label: a.label }))}
+        />
+      </Space>
+
+      <Form form={form} layout="vertical" className="ops-console-form">
+        <Form.Item name="intent" label="为什么要做这个修复"
+                   rules={[{ required: true, message: '写清楚原因——审批人要靠它判断' }]}>
+          <Input placeholder="如：CI 构建缓存把磁盘写满，清理 /var/cache" />
+        </Form.Item>
+        {fields.map((f) => (
+          <Form.Item key={f.name} name={f.name} label={f.label} extra={f.help}
+                     rules={[{ required: f.required, message: `请填写${f.label}` }]}>
+            {f.kind === 'number'
+              ? <InputNumber min={1} style={{ width: '100%' }} />
+              : <Input placeholder={f.placeholder} />}
+          </Form.Item>
+        ))}
+        <Form.Item name="impact_radius" label="影响范围"
+                   rules={[{ required: true, message: '影响范围是审批人最需要看到的一栏' }]}>
+          <Input placeholder="如：ci-runner 单节点，清理期间构建会变慢" />
+        </Form.Item>
+        <Form.Item label="关联哪次分析（可选）"
+                   extra="不关联的话这条动作算不进 MTTR——MTTR 的起点取自所关联分析里最早那条告警的时间。">
+          <Select
+            allowClear
+            value={summaryId}
+            onChange={setSummaryId}
+            placeholder="选择一次已跑过的分析"
+            options={summaries.map((s) => ({
+              value: s.summary_id,
+              label: `${fmtTime(s.created_at)}　${(s.summary || '').slice(0, 40)}…`,
+            }))}
+          />
+        </Form.Item>
+        <Button type="primary" loading={saving} onClick={handleSubmit}>提交提议</Button>
+      </Form>
     </Card>
   )
 }
@@ -1219,7 +1382,7 @@ export default function OpsConsole({ canManage = true, onConnectorsChange }) {
           </>
         )
       )}
-      {section === 'approvals' && <ApprovalsSection onModuleDisabled={onModuleDisabled} />}
+      {section === 'approvals' && <ApprovalsSection onModuleDisabled={onModuleDisabled} canManage={canManage} />}
       {section === 'postmortems' && <OpsPostmortems onModuleDisabled={onModuleDisabled} />}
       {section === 'permissions' && canManage && (
         booting ? <Spin /> : <PermissionsSection connectors={connectors} onModuleDisabled={onModuleDisabled} />

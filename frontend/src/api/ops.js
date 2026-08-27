@@ -88,13 +88,25 @@ export function listRemediationActions() {
   return axios.get(`${BASE}/ops/remediation-actions`).then((res) => res.data)
 }
 
-export function proposeRemediationAction(connectionId, { action_type, intent, plan, impact_radius }) {
+// 发起一条修复提议。
+//
+// ⚠️ **`summary_id` 不是可选的锦上添花——MTTR 完全依赖它。** MTTR 的起点取的是
+// 所链接分析摘要里最早那条告警的时间；没有链接的动作会被跳过（不会拿 created_at
+// 凑数，那是"平台内部处理时长"、混进去谁也解释不清）。所以人工发起提议时，
+// 只要能对上某次分析就应当带上。
+//
+// ⚠️ 无效或跨企业的 `summary_id` 后端会**静默丢弃**、不拒绝这次提议——
+// 链接只是复盘用的辅助信息，不该因为它填错就拒掉一条正确的修复建议。
+export function proposeRemediationAction(
+  connectionId, { action_type, intent, plan, impact_radius, summary_id },
+) {
   return axios
     .post(`${BASE}/ops/connectors/${encodeURIComponent(connectionId)}/remediation-actions`, {
       action_type,
       intent,
       plan,
       impact_radius,
+      summary_id,
     })
     .then((res) => res.data)
 }
