@@ -42,6 +42,7 @@ from src.ops.analysis import Alert, correlate_alerts, detect_anomalies  # noqa: 
 from src.ops.types import DataPoint  # noqa: E402
 
 TARGET_SERVICE = "order-service"
+CONNECTOR_NAME = "演示探针（模拟客户环境）"
 
 
 def _call(api: str, method: str, path: str, token: str, body: Optional[dict] = None) -> Any:
@@ -151,8 +152,19 @@ async def run(api: str, ws_url: str, username: str, cleanup: bool, exec_fails: b
             print(f"🧹 已删除连接器 {c['name']}")
         return 0
 
+    # ⚠️ **先清掉上一次跑剩下的同名连接器。**
+    # 第一版每跑一次就新建一个，跑三次库里就有三个同名连接器、两个是离线僵尸。
+    # 后果不只是脏数据：总览的"部分数据不可用"会把这些僵尸如实报出来，
+    # 而它们跟真探针**同名**，看起来像"我的探针一会儿在线一会儿掉线"，
+    # 排查方向会被带到完全错误的地方（我自己就被带偏过一次）。
+    for old_conn in await asyncio.to_thread(_call, api, "GET", "/api/v1/admin/ops/connectors", token):
+        if old_conn["name"] == CONNECTOR_NAME:
+            await asyncio.to_thread(_call, api, "DELETE",
+                                    f"/api/v1/admin/ops/connectors/{old_conn['connection_id']}", token)
+            print(f"🧹 清掉上次残留的连接器 {old_conn['connection_id']}")
+
     conn = await asyncio.to_thread(_call, api, "POST", "/api/v1/admin/ops/connectors", token, {
-        "name": "演示探针（模拟客户环境）", "system_type": "prometheus",
+        "name": CONNECTOR_NAME, "system_type": "prometheus",
         "approval_timeout_minutes": 30,
     })
     cid = conn["connection_id"]

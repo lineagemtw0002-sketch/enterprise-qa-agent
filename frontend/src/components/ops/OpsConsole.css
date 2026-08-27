@@ -72,7 +72,7 @@
 /* ---------- KPI ---------- */
 .kpi-strip {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);   /* 设计稿是 5 张，我们只做 3 张真实可算的 */
+  grid-template-columns: repeat(5, 1fr);   /* 跟设计稿一致：5 张 */
   gap: 12px;
   margin-bottom: 14px;
 }
@@ -85,6 +85,9 @@
 .kpi-label { font-size: 11.5px; color: var(--ink-muted); margin-bottom: 6px; }
 .kpi-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .kpi-value { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.kpi-value.placeholder {
+  font-size: 14px; font-weight: 500; color: var(--ink-faint); white-space: nowrap;
+}
 .kpi-value .kpi-unit { font-size: 13px; color: var(--ink-muted); font-weight: 500; }
 .kpi-delta { font-size: 11px; font-weight: 600; }
 .kpi-delta.good { color: var(--good); }
@@ -226,3 +229,40 @@
 .pm-none b { color: var(--ink-muted); }
 .pm-outcome { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-soft); }
 .pm-ask { font-size: 11.5px; color: var(--ink-muted); margin-right: 4px; }
+
+@media (max-width: 1180px) { .kpi-strip { grid-template-columns: repeat(3, 1fr); } }
+
+/* ---------- 服务健康网格 ---------- */
+/* 布局照搬设计稿（docs/design_reference/aiops_console_mockup.html）。 */
+.svc-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+@media (max-width: 900px) { .svc-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 620px) { .svc-grid { grid-template-columns: 1fr; } }
+
+.svc-card {
+  background: var(--surface-inset);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  padding: 12px 13px;
+  display: flex; flex-direction: column; gap: 9px;
+}
+.svc-card.critical { border-color: rgba(248, 113, 122, 0.35); }
+.svc-card.warning { border-color: rgba(251, 191, 36, 0.3); }
+/* 「数据中断」用中性描边，**不用绿色也不用黄色**——它既不是"没问题"，
+   也不是"发现了一个小问题"，我们对这个服务的状态根本一无所知。 */
+.svc-card.stale { border-color: var(--border-soft); opacity: 0.72; }
+
+.svc-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.svc-name { font-family: var(--font-mono); font-size: 12.5px; font-weight: 500; }
+.svc-metrics {
+  display: flex; justify-content: space-between; gap: 10px;
+  font-family: var(--font-mono); font-size: 11px; color: var(--ink-muted);
+}
+.svc-metrics b { color: var(--ink); font-weight: 500; }
+
+/* 后端的状态名是 ok/stale，设计稿的类名是 good/pending——两边都留着，
+   免得以后有人改了一侧就静默丢样式（这类"构建通过但界面不对"的问题
+   在这条产品线上已经出现过两次）。 */
+.status-pill.ok { color: var(--good); background: var(--good-dim); }
+.status-pill.ok .dot { background: var(--good); }
+.status-pill.stale { color: var(--ink-muted); background: rgba(148, 163, 184, 0.14); }
+.status-pill.stale .dot { background: var(--ink-muted); }

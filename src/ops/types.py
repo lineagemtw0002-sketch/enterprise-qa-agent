@@ -28,7 +28,27 @@ from typing import Any, Dict, List, Optional, Protocol, Sequence, runtime_checka
 QUERY_KIND_METRIC = "metric"
 QUERY_KIND_LOG = "log"
 QUERY_KIND_ALERT = "alert"
-QUERY_KINDS = frozenset({QUERY_KIND_METRIC, QUERY_KIND_LOG, QUERY_KIND_ALERT})
+QUERY_KIND_SERVICE_HEALTH = "service_health"
+"""服务发现 + 每个服务的当前健康指标（总览大屏的服务健康网格）。
+
+**没有为它新增帧型**，仍然回 `DataPoint`：每个服务两个点，靠
+`labels.service` + `labels.metric` 区分（见 `src/ops/service_health.py`）。
+新增帧型意味着所有已部署的连接器都要跟着升级；多一个 kind 取值是向后兼容的
+——老连接器不认识它就报错，走既有的部分失败路径，界面上照常标注"数据不可用"。"""
+
+QUERY_KINDS = frozenset({QUERY_KIND_METRIC, QUERY_KIND_LOG, QUERY_KIND_ALERT,
+                         QUERY_KIND_SERVICE_HEALTH})
+
+TARGETLESS_QUERY_KINDS = frozenset({QUERY_KIND_SERVICE_HEALTH, QUERY_KIND_ALERT})
+"""这两类允许 `target` 为空，含义是**整个企业范围**，不是"忘了填"。
+
+- `service_health`：服务清单本来就是这次查询要发现的东西，事先没有可填的目标。
+- `alert`：「今天一共有多少告警」是一个合法的全局问题；指定 target 时仍然照旧
+  只查那一个目标。
+
+⚠️ `metric` / `log` **不在这里面**，且刻意不放进来：一个不指定目标的指标查询
+没有意义，允许它只会让"忘了传 target"变成一次昂贵的全量扫描，而不是一个当场
+就能看见的报错。"""
 
 # 连接器失败的原因分类——**给人看的**，UI 上要能明确告诉用户"来自 XX 系统的数据
 # 为什么不可用"（§3.5 第 4 条），所以不能只有一个笼统的 "error"。
@@ -84,8 +104,10 @@ class QueryRequest:
     def __post_init__(self) -> None:
         if self.kind not in QUERY_KINDS:
             raise InvalidQueryRequest(f"未知查询类别: {self.kind!r}（可选：{sorted(QUERY_KINDS)}）")
-        if not self.target or not self.target.strip():
-            raise InvalidQueryRequest("target 不能为空")
+        if (not self.target or not self.target.strip()) and self.kind not in TARGETLESS_QUERY_KINDS:
+            raise InvalidQueryRequest(
+                f"target 不能为空（kind={self.kind!r}；只有 {sorted(TARGETLESS_QUERY_KINDS)} "
+                "允许留空表示企业全范围）")
         if self.limit <= 0:
             raise InvalidQueryRequest(f"limit 必须为正数，收到 {self.limit}")
         if self.kind == QUERY_KIND_METRIC and not self.metric:

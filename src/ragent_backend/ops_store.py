@@ -35,6 +35,8 @@ from typing import Any, Dict, List, Optional
 
 import asyncpg
 
+from src.ops import service_health
+
 from src.ragent_backend.db_pool import get_shared_pool
 from src.ragent_backend.role_store import ROLE_ORG_ADMIN
 
@@ -1007,6 +1009,25 @@ class OpsStore:
                     org_id, connection_ids,
                 )
 
+            if connection_ids is None:
+                mttr_rows = await conn.fetch(
+                    "SELECT a.executed_at, s.evidence_refs "
+                    "FROM remediation_actions a "
+                    "JOIN ops_analysis_summaries s ON s.id = a.summary_id "
+                    "WHERE a.org_id = $1 AND a.status = 'completed' "
+                    "AND a.executed_at IS NOT NULL",
+                    org_id,
+                )
+            else:
+                mttr_rows = await conn.fetch(
+                    "SELECT a.executed_at, s.evidence_refs "
+                    "FROM remediation_actions a "
+                    "JOIN ops_analysis_summaries s ON s.id = a.summary_id "
+                    "WHERE a.org_id = $1 AND a.connection_id = ANY($2::text[]) "
+                    "AND a.status = 'completed' AND a.executed_at IS NOT NULL",
+                    org_id, connection_ids,
+                )
+
         approved_n = rejected_n = expired_n = completed_n = failed_n = 0
         effective_n = ineffective_n = unlabeled_n = 0
         for row in status_rows:
@@ -1043,7 +1064,28 @@ class OpsStore:
         def _ratio(numerator: int, denominator: int) -> Optional[float]:
             return round(numerator / denominator, 4) if denominator > 0 else None
 
+        durations: List[float] = []
+        for row in mttr_rows:
+            refs = row["evidence_refs"]
+            refs = json.loads(refs) if isinstance(refs, str) else (refs or [])
+            starts = [
+                ref["detail"]["started_at"] for ref in refs
+                if isinstance(ref, dict) and ref.get("source") == "alert_correlation"
+                and isinstance(ref.get("detail"), dict)
+                and isinstance(ref["detail"].get("started_at"), (int, float))
+            ]
+            if not starts:
+                # 这条动作虽然链接了分析摘要，但摘要里没有告警关联依据
+                # （比如只做了异常检测）——**跳过，不要用别的时间戳凑数**。
+                # 拿 created_at 顶替会把"平台内部处理时长"混进 MTTR，
+                # 那是另一个口径的数字，混在一起谁也解释不清。
+                continue
+            elapsed = float(row["executed_at"]) - float(min(starts))
+            if elapsed >= 0:
+                durations.append(elapsed)
+
         return {
+            "mttr_seconds": service_health.median_seconds(durations),
             "approval_timeliness_rate": _ratio(approved_n + rejected_n, approved_n + rejected_n + expired_n),
             "execution_success_rate": _ratio(completed_n, completed_n + failed_n),
             "alert_noise_reduction": (
@@ -1053,6 +1095,7 @@ class OpsStore:
                 "effective": effective_n, "ineffective": ineffective_n, "unlabeled": unlabeled_n,
             },
             "sample_sizes": {
+                "mttr": len(durations),
                 "approved": approved_n, "rejected": rejected_n, "expired": expired_n,
                 "completed": completed_n, "failed": failed_n,
                 "alert_count": total_alerts, "incident_count": total_incidents,

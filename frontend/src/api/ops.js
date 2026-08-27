@@ -193,3 +193,14 @@ export function setActionOutcome(actionId, effective) {
 export function listPostmortems(limit = 100) {
   return axios.get(`${BASE}/ops/postmortems`, { params: { limit } }).then((res) => res.data)
 }
+
+// ==================== 总览大屏：需要现场问连接器的那部分 ====================
+//
+// 服务健康网格 + 今日告警合并。跟 `getOpsMetrics()`（纯数据库统计）分开，
+// 是因为这个要走联邦查询、耗时取决于客户环境，不该把纯数据库那几个指标一起拖慢。
+//
+// ⚠️ **`unavailable` 非空时必须在界面上显示出来。** 服务网格少了几个服务，
+// 跟"这些服务都健康"在视觉上没有任何区别——不标注就是在骗人。
+export function getLiveOverview() {
+  return axios.get(`${BASE}/ops/live-overview`).then((res) => res.data)
+}

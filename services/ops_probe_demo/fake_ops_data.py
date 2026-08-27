@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from typing import Any, Dict, List
 
 # 基线与异常的量级刻意拉开：不针对任何具体阈值调参，见模块顶部说明。
@@ -80,6 +81,27 @@ def alert_points(
     ]
 
 
+def daily_alert_points(*, target: str, start_ts: float, end_ts: float,
+                       clusters: int = 4) -> List[Dict[str, Any]]:
+    """一整天的告警：几簇彼此隔开的同源告警串，用于「今日告警合并」这个 KPI。
+
+    每簇内部挤在几分钟里（能被合并），簇与簇之间隔几小时（不该被合并）。
+    这样合并率是一个**有意义**的数字：多条重复告警收敛成少数几个事件。
+    如果所有告警都挤在一起，合并率会趋近 100%，好看但毫无信息量。
+    """
+    span = max(end_ts - start_ts, 1.0)
+    gap = span / (clusters + 1)
+    out: List[Dict[str, Any]] = []
+    for i in range(clusters):
+        cluster_end = start_ts + gap * (i + 1)
+        out.extend(alert_points(
+            target=target, start_ts=cluster_end - 300.0, end_ts=cluster_end,
+            count=19 if i == 0 else 12 + i,
+            cluster=f"prod-cluster-{i + 1}",
+        ))
+    return out
+
+
 def log_points(*, target: str, start_ts: float, end_ts: float, count: int = 12) -> List[Dict[str, Any]]:
     """日志样本。RCA 那一层会把它们当上下文喂给模型，所以内容要像真的
     ——全是"log line 1/2/3"的话，模型只能编。"""
@@ -107,7 +129,62 @@ def points_for(kind: str, *, target: str, start_ts: float, end_ts: float,
     if kind == "metric":
         return metric_points(start_ts=start_ts, end_ts=end_ts, inject_anomaly=not healthy)
     if kind == "alert":
-        return [] if healthy else alert_points(target=target, start_ts=start_ts, end_ts=end_ts)
+        if healthy:
+            return []
+        # 查询窗口超过 6 小时 = 调用方在问"今天的告警"，给多簇；
+        # 短窗口 = 在查某一次故障，给单簇。**簇之间必须隔开**，否则
+        # 关联层会把一整天的告警合成一个事件，合并率虚高到没有意义。
+        if end_ts - start_ts > 6 * 3600:
+            return daily_alert_points(target=target, start_ts=start_ts, end_ts=end_ts)
+        return alert_points(target=target, start_ts=start_ts, end_ts=end_ts)
+    if kind == "service_health":
+        return service_health_points(healthy=healthy)
     if kind == "log":
         return [] if healthy else log_points(target=target, start_ts=start_ts, end_ts=end_ts)
     return []
+
+
+# 设计稿（`docs/design_reference/aiops_console_mockup.html`）里那六个服务。
+# **数字刻意跟设计稿对齐**，这样演示环境长出来的样子跟设计稿一致；
+# 数据本身是假的没关系——这个包整体就是模拟的客户环境，不假装是真实测量。
+#
+# ⚠️ `search-index` 刻意**不返回任何指标点**：设计稿上它那格是"—/同步中"，
+# 而 `service_health.classify()` 在两个指标都缺时判 `warning` 而不是 `ok`
+# ——"查不到"和"很健康"是两件不同的事。留着这个服务是为了让这条边界
+# 在演示环境里真的被走到，而不是只存在于单测里。
+_SERVICES = {
+    "order-service":       {"error_rate": 0.081,  "p95_latency_ms": 2400.0},
+    "payment-gateway":     {"error_rate": 0.012,  "p95_latency_ms": 640.0},
+    "auth-service":        {"error_rate": 0.0002, "p95_latency_ms": 88.0},
+    "inventory-api":       {"error_rate": 0.0005, "p95_latency_ms": 121.0},
+    # 队列延迟走独立的指标名和独立的阈值——异步 worker 排队 3 秒是正常的，
+    # 同一个数字放在 HTTP 延迟上就是严重故障。
+    "notification-worker": {"error_rate": 0.001,  "queue_latency_ms": 3000.0},
+    # 只报"我发现了这个服务"，不报任何指标值 → 网格上是「数据中断」，
+    # 跟设计稿上那一格的"—/同步中"一致。
+    "search-index":        {"discovered": 1.0},
+}
+
+
+def service_health_points(healthy: bool = False):
+    """服务健康网格的数据源：每个服务回两个点，靠 `labels.service` + `labels.metric` 区分。
+
+    **刻意复用现有的数据点形状，没有给连接器协议加新帧型**——新增的只是一个
+    `kind` 取值（`service_health`）。加新帧型意味着所有已部署的连接器都得跟着
+    升级；多一个 kind 取值是向后兼容的，老连接器不认识就报错，走既有的
+    部分失败路径。
+
+    真实连接器在这里做的是 `label_values(up, job)` 之类的服务发现 + 逐个查指标；
+    服务清单**不是**企业在平台上手工配的（见 `src/ops/service_health.py` 顶部）。
+    """
+    now = time.time()
+    points = []
+    for name, metrics in _SERVICES.items():
+        for metric, value in metrics.items():
+            if healthy and metric == "error_rate":
+                value = 0.0003
+            if healthy and metric == "p95_latency_ms":
+                value = min(value, 150.0)
+            points.append({"ts": now, "value": value, "text": "",
+                           "labels": {"service": name, "metric": metric}})
+    return points
