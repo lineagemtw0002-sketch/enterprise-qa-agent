@@ -492,13 +492,19 @@ def _has_vague_pronoun(text: str) -> bool:
 # 之前用高精度白名单把闲聊摘出来，长度阈值**原样不动**——"他呢""多少"这类
 # 真正模糊的短查询仍然被拦成 clarify，那个能力一点没丢。
 #
-# 为什么终判是 "rag" 而不是新增一类 "chitchat"：四分类里确实没有"直接对话
-# 回答"这一桶（根因三），补第五类要同时改 `IntentDetectionResult` 的 Literal、
-# `workflow.py` 的 `_route_after_intent` 并新增一个生成节点，属于结构性改动、
-# 本次不做。"rag" 是现有四个桶里唯一能走到"正常调 LLM 生成回答"的：
-# `_route_after_intent` 把 rag 送进 `_retrieve_node`（只搜本次对话上传的附件，
-# 闲聊时零命中），再进 `_generate_node` 正常生成——**不会**碰到只认
-# `target_tool == "query_knowledge_hub"` 的知识库空命中闸门。
+# 2026-08-27 更新（Phase 1a，`docs/chitchat_intent_design.md`）：终判改成了
+# 真正的第五类 "chitchat"，不再借用 "rag"。历史背景（为什么曾经借用 "rag"）：
+# 旧版四分类里没有"直接对话回答"这一桶（根因三），补第五类要同时改
+# `IntentDetectionResult` 的 Literal、`workflow.py` 的 `_route_after_intent`，
+# 当时判定属于结构性改动、搁置不做，"rag" 是那时四个桶里唯一能走到"正常调
+# LLM 生成回答"的临时借位。搁置的理由与代价见该设计文档 §1.2；本次已按
+# 用户批准的方案 B+ 正式启动，"rag" 的语义收回到"只回答本次对话上传附件
+# 本身的内容"。`_route_after_intent`（workflow.py）在 Phase 1a 阶段还没有
+# `chitchat` 对应的路由分支，会落到默认分支 `return "retrieve"`——这与旧版
+# "rag" 的走法逐字相同，Phase 1a 上线不改变任何用户可见行为
+# （`docs/chitchat_intent_design.md` §2.5"关键设计"）。Phase 2 会给
+# `chitchat` 接上真正的路由（直连 generate + 模板/受约束 prompt 两条 lane，
+# 见 `src/ragent_backend/chitchat.py`）。
 
 # 归一化后**整句精确相等**才命中（不是子串匹配）——子串匹配会把
 # "报销流程你好像提过" 这类正常业务问句也吞掉。
@@ -584,8 +590,7 @@ def _is_chitchat_segment(segment: str) -> bool:
 
 def _match_chitchat_intent(query: str) -> Optional[IntentResult]:
     """闲聊白名单短路：整句（按标点切成的**每一个**片段）都是寒暄/致谢/告别/
-    问助手自身身份能力时，直接判成 rag —— 不调 LLM、不进知识库检索工具，
-    让主图走 `_retrieve_node` -> `_generate_node` 正常生成一句对话回答。
+    问助手自身身份能力时，直接判成 chitchat —— 不调 LLM、不进知识库检索工具。
 
     与 `_needs_clarify_rule` 的分工（这是本函数存在的关键）：本函数只认**白名单
     里那些确定无疑的寒暄**，`_needs_clarify_rule` 继续负责拦真正模糊的短查询。
@@ -612,7 +617,7 @@ def _match_chitchat_intent(query: str) -> Optional[IntentResult]:
         return None
 
     return IntentResult(
-        intent_type="rag",
+        intent_type="chitchat",
         rewritten_query=cleaned,
         confidence=0.9,
         need_clarify=False,

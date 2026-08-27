@@ -250,7 +250,10 @@ class TestChitchatPathUnaffected:
         rewritten, sub_queries, intent = await analyze_and_route(
             query=query, messages=[], llm=llm, available_tools=[], available_workflows=[],
         )
-        assert intent.intent_type == "rag"
+        # 2026-08-27 Phase 1a（docs/chitchat_intent_design.md）：闲聊标签从
+        # 借用的 "rag" 改成真正的第五类 "chitchat"，本条同步更新，见
+        # tests/unit/test_intent_chitchat_routing.py 顶部说明。
+        assert intent.intent_type == "chitchat"
         assert intent.need_clarify is False
         assert sub_queries == [query]
         assert rewritten == query
