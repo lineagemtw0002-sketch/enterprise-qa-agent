@@ -201,7 +201,8 @@ async def run(api: str, ws_url: str, username: str, cleanup: bool, exec_fails: b
     # 控制口也起起来——**演示时要能随时再弄坏一个服务**。
     # 第一版漏了这一步：场景跑完探针常驻着，但没有任何办法往里注入新故障，
     # 只能重跑整个场景，而重跑会把连接器和数据全部重建。
-    serve_control(state, resolve_environment(environment), port=control_port)
+    serve_control(state, resolve_environment(environment), port=control_port,
+                  platform=api, connection_id=cid, org_label=org.name)
     probe_task = asyncio.create_task(probe.run())
     try:
         if not await _wait_online(api, token, cid):
