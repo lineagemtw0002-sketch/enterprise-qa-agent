@@ -437,25 +437,14 @@ def create_app() -> FastAPI:
         detail: dict,
         success: bool = True,
     ) -> None:
-        """审计日志回调：补上 org_id/username 再落库。传给 RAGWorkflow（工具
-        调用审计）和各管理端点（管理操作审计）共用同一个函数，保证两类事件
-        落进同一张表、同一套字段。org_store/user_store 这里都能查——跟工具
-        调用发生在同一个进程内，不需要额外的服务间调用。"""
-        try:
-            org = await org_store.get_org_for_user(user_id) if user_id else None
-            user = await user_store.get_user_by_id(user_id) if user_id else None
-            await audit_store.record(
-                org_id=org.org_id if org else None,
-                user_id=user_id,
-                username=user.username if user else None,
-                action=action,
-                resource_type=resource_type,
-                resource_id=resource_id,
-                detail=detail,
-                success=success,
-            )
-        except Exception:
-            logger.exception("failed to record audit log", extra={"action": action, "resource_type": resource_type})
+        """薄包装：把 Store 绑给 `api_helpers.audit_log`（批次 0 提取出去的公共层）。
+        **保留这层包装是刻意的**——93 个端点的调用点因此一个字都不用改，
+        本次是纯提取、零行为变化。"""
+        await api_helpers.audit_log(
+            audit_store=audit_store, org_store=org_store, user_store=user_store,
+            user_id=user_id, action=action, resource_type=resource_type,
+            resource_id=resource_id, detail=detail, success=success,
+        )
 
     # 初始化 LLM（配置完全来自 settings.yaml + 环境变量覆盖）——挪到工具注册
     # 之前，因为下面的 OpsToolset（RCA 分析要用）需要在构造时就拿到这个实例，
@@ -533,13 +522,11 @@ def create_app() -> FastAPI:
     async def _require_conversation_owner(
         conversation_id: str, current_user: AuthenticatedUser
     ) -> Conversation:
-        """校验对话存在且属于当前登录用户；不存在 404，存在但不是自己的 403。"""
-        conv = await conversation_store.get_conversation(conversation_id)
-        if not conv:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        if conv.user_id != current_user.user_id:
-            raise HTTPException(status_code=403, detail="无权访问该对话")
-        return conv
+        """薄包装，实现见 `api_helpers.require_conversation_owner`。"""
+        return await api_helpers.require_conversation_owner(
+            conversation_store=conversation_store,
+            conversation_id=conversation_id, current_user=current_user,
+        )
 
     async def _is_workflow_approver_for_conversation(conversation_id: str, user_id: str) -> bool:
         """这个对话上有没有一条工作流实例，且当前用户持有"申请人所在企业"给
@@ -1687,24 +1674,16 @@ def create_app() -> FastAPI:
     # 真的连上任何客户系统。见 CLAUDE.md §5 该条"什么没做"。
 
     async def _require_aiops_enabled_org(current_user: AuthenticatedUser):
-        """模块开关叠加在角色/ACL 校验之前的新一层（§4.1），不是替代——
-        `_require_org_admin` 这层 Depends 已经先过了，这里再加一道"这家企业
-        开没开通"的业务闸。跟 `_require_local_retrieval_org` 是同一个模式：
-        返回调用方所属的 Organization，避免调用方再查一次。"""
-        org = await org_store.get_org_for_user(current_user.user_id)
-        if org is None:
-            raise HTTPException(status_code=403, detail="账号未关联任何企业")
-        if not await ops_store.is_module_enabled(org.org_id):
-            raise HTTPException(status_code=403, detail="智能运维模块未对本企业开通，请联系平台管理员")
-        return org
+        """薄包装，实现见 `api_helpers.require_aiops_enabled_org`。"""
+        return await api_helpers.require_aiops_enabled_org(
+            org_store=org_store, ops_store=ops_store, current_user=current_user,
+        )
 
     async def _get_owned_connector(org_id: str, connection_id: str):
-        """404 不是 403——不能让"这个连接器存在但不是你的"这个信息泄露给
-        跨企业的调用方，跟 admin_delete_collection 的既有约定一致。"""
-        connector = await ops_store.get_connector(connection_id)
-        if connector is None or connector.org_id != org_id:
-            raise HTTPException(status_code=404, detail="连接器不存在")
-        return connector
+        """薄包装，实现见 `api_helpers.get_owned_connector`。"""
+        return await api_helpers.get_owned_connector(
+            ops_store=ops_store, org_id=org_id, connection_id=connection_id,
+        )
 
     def _ops_connector_response(c) -> OpsConnectorResponse:
         return OpsConnectorResponse(
@@ -2008,10 +1987,8 @@ def create_app() -> FastAPI:
         return [_remediation_scope_response(s) for s in scopes]
 
     def _role_ops_permission_response(p) -> RoleOpsPermissionResponse:
-        return RoleOpsPermissionResponse(
-            role_id=p.role_id, connection_id=p.connection_id,
-            can_view=p.can_view, can_approve=p.can_approve,
-        )
+        """薄包装，实现见 `api_helpers.role_ops_permission_response`（纯函数）。"""
+        return api_helpers.role_ops_permission_response(p)
 
     async def _require_grantable_role(actor_org_id: str, role_id: str):
         """§10.6：`role_ops_systems` 只能配给企业自建角色，两个内置系统角色
@@ -2930,24 +2907,11 @@ def create_app() -> FastAPI:
         return _role_response(next(r for r in roles if r.role_id == role_id))
 
     async def _require_local_retrieval_org(current_user: AuthenticatedUser):
-        """企业自建知识库只对"走本地 Chroma 检索"的企业开放（跟平台自己的 6 个
-        部门库同一套检索机制）——像 Acme/Globex 这类把 knowledge_base 能力委托
-        给自己微服务的企业（`tenant_connectors` 里配了 http_api 连接器），本地
-        新建/关联的 collection 对它们的实际问答毫无意义（`query_knowledge_hub.py`
-        的 `is_remote` 分支完全绕开本地检索，见该模块说明），所以在这里就地
-        拒绝，报出清楚的原因，而不是让管理员建了一堆库、配了半天角色，结果
-        员工提问永远用不上，自己也不知道为什么。返回调用方所属的 Organization，
-        避免调用方再查一次。"""
-        org = await org_store.get_org_for_user(current_user.user_id)
-        if org is None:
-            raise HTTPException(status_code=403, detail="账号未关联任何企业")
-        connector = await tenant_connector_store.get(org.org_id, CAPABILITY_KNOWLEDGE_BASE)
-        if connector is not None and connector.connector_type == CONNECTOR_TYPE_HTTP_API:
-            raise HTTPException(
-                status_code=400,
-                detail="该企业的知识库检索已委托给企业自己的系统管理，不支持在平台内新增/配置知识库",
-            )
-        return org
+        """薄包装，实现见 `api_helpers.require_local_retrieval_org`。"""
+        return await api_helpers.require_local_retrieval_org(
+            org_store=org_store, tenant_connector_store=tenant_connector_store,
+            current_user=current_user,
+        )
 
     @app.get("/api/v1/admin/collections", response_model=List[CollectionResponse])
     async def admin_list_collections(
@@ -3387,16 +3351,8 @@ def create_app() -> FastAPI:
     # API」），平台这里不再管。
 
     def _workflow_template_response(template: WorkflowTemplate) -> WorkflowTemplateResponse:
-        return WorkflowTemplateResponse(
-            template_id=template.template_id,
-            workflow_type=template.workflow_type,
-            display_name=template.display_name,
-            description=template.description,
-            required_fields=template.required_fields,
-            attachments_note=template.attachments_note,
-            is_system=template.is_system,
-            created_at=template.created_at,
-        )
+        """薄包装，实现见 `api_helpers.workflow_template_response`（纯函数）。"""
+        return api_helpers.workflow_template_response(template)
 
     @app.get("/api/v1/admin/workflow-templates", response_model=List[WorkflowTemplateResponse])
     async def admin_list_workflow_templates(

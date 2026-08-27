@@ -54,8 +54,8 @@ fixture 正在做（2026-08-27 并行开工）。它落地之后，本方案第�
 
 | 批次 | 内容 | 端点数 | 为什么排这个位置 |
 |---|---|---|---|
-| 0 | 建 `dependencies.py`（provider 函数）+ 空 router 骨架，**不搬任何端点** | 0 | 零行为变化，先让新结构存在并被 import 一次 |
-| 1 | `admin/ops`（智能运维） | 10 | 最近写的、有 `verify_aiops_endpoints.py` 27 项真实 HTTP 覆盖，**验收证据最强** |
+| 0 | **把 7 个跨域共用的辅助函数提取到公共层** + 建 provider 骨架，**不搬任何端点** | 0 | 见 §4.1——不先做这步，后面每一批都切不干净 |
+| 1 | `admin/ops`（智能运维）+ `admin/roles` 下的 ops-permissions | 23 | 最近写的、有 `verify_aiops_endpoints.py` 27 项真实 HTTP 覆盖，**验收证据最强** |
 | 2 | `admin/dashboard`、`notifications`、`collections` | ~10 | 只读为主，权限判据简单 |
 | 3 | `admin/users`、`admin/roles`、`admin/organizations` | ~12 | 写操作 + 权限敏感，但有账号体系那批脚本 |
 | 4 | `workflows` | 8 | 状态机，改错了不容易一眼看出来 |
@@ -63,6 +63,39 @@ fixture 正在做（2026-08-27 并行开工）。它落地之后，本方案第�
 `contextvars` 那条 P0 的隔离契约就挂在这里 |
 
 剩余未归类端点在批次 5 之后按同样方式收尾。
+
+### 4.1 批次 0 为什么变成"提取共用辅助函数"（2026-08-27 调用图实测）
+
+对 `create_app()` 做了一次 AST 调用图分析，**推翻了原来"批次 0 只是建骨架"的
+安排**，也修正了几个数字：
+
+| 原设计写的 | 实测 |
+|---|---|
+| 内嵌 143 个函数 | **138 个**（93 端点 + 45 辅助函数） |
+| `admin/ops` 10 个端点 | **21 个**（原来按 URL 前两段分组，漏了 `connectors/{id}/…` 这类子路径） |
+
+**关键发现：7 个辅助函数被多个域共用。**
+
+| 辅助函数 | 被几个域调用 | 涉及的域 |
+|---|---|---|
+| `_audit_log` | **9** | 几乎所有写操作 |
+| `_require_conversation_owner` | 5 | chat / conversations / history / memory / ws |
+| `_require_aiops_enabled_org` | 2 | admin/ops · admin/roles |
+| `_get_owned_connector` | 2 | admin/ops · admin/roles |
+| `_role_ops_permission_response` | 2 | admin/ops · admin/roles |
+| `_require_local_retrieval_org` | 2 | admin/collections · collections |
+| `_workflow_template_response` | 2 | admin/workflow-templates · workflow-templates |
+
+**按 URL 前缀切会出事**：批次 1 搬 `admin/ops` 时会把 `_get_owned_connector`
+一起带走，而 `admin/roles` 下的 ops-permissions 端点还在用它——要么编译不过，
+要么有人顺手复制一份，**两个副本从此各自演化**。这正是 §7 那条风险的具体形态。
+
+所以批次 0 改成：**先把这 7 个提取到公共层**（`create_app()` 里改为 import），
+零行为变化、零端点搬迁，但它是后面每一批能干净切开的前提。
+
+**顺带一条归属调整**：`admin/roles` 下那两个 `ops-permissions` 端点，URL 在
+roles 域、语义属于运维权限，且跟 `admin/ops` 共用 3 个辅助函数——**批次 1 应当
+把它们一起搬**，而不是留到批次 3 再拆一次。
 
 ## 5. 每批的验收判据（三条都要满足）
 
