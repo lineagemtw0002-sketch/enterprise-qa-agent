@@ -826,13 +826,50 @@ flowchart TB
   其余端点核对后确认干净（批量查询 + 内存 join，或已有意识地避免了 N+1，如
   `_org_response` 的 `seats_used` 注释）
 - `create_app()` 3038 行 / 72 端点，无路由分层、无依赖注入
-- ~~无 Dockerfile / CI / 依赖锁定~~ 🟡 **Dockerfile + `requirements.lock` + docker-compose 已有**
-  （`f8fd428`，OpenSearch 迁移阶段 0 前置），但**本文件此前一直没同步更正**——
-  CI（`.github/workflows`）仍然没有，这条只剩 CI 缺失是真的
+- ~~无 Dockerfile / CI / 依赖锁定~~ ✅ **三者均已补齐（Dockerfile/requirements.lock
+  自 `f8fd428`，CI 自本条），见 §5**
 
 ---
 
 ## 5. 已修复（防止重新引入）
+
+- ✅ **2026-08-27　P1：补齐 CI（`.github/workflows/ci.yml`）——Dockerfile/
+  requirements.lock/docker-compose 已有、CI 缺失这条 P1 至此闭环**
+
+  新增 `.github/workflows/ci.yml`：push/PR 触发，Python 3.12（与 `Dockerfile`
+  的 `python:3.12-slim` 一致）、`pip install --no-cache-dir -r requirements.lock`
+  （与 `Dockerfile` deps 阶段完全一致的方式，不用 `pyproject.toml` 直接装——
+  理由跟 `Dockerfile` 开头注释一样：21 条依赖大多只有 `>=` 下界，直接装得到
+  不可复现的版本组合）、`python -m pytest tests/unit -q`、`actions/setup-python`
+  自带 `cache: pip` + `cache-dependency-path: requirements.lock`。
+
+  **范围限定在 `tests/unit`**：`tests/integration`/`tests/e2e` 要连真实
+  Postgres/Chroma/OpenSearch/Ollama，而 `conftest.py` 至今没有对应 fixture
+  （§4 P1 已记录的独立空白，需要设计评审，不在这次任务范围）。已确认
+  `tests/unit` 里零处 `pytest.mark.llm`/`integration`/`e2e` 标记、
+  `pyproject.toml` 的 `addopts` 也没有默认排除 marker 的配置，所以
+  `pytest tests/unit -q` 不会意外连到本机才有的 Ollama。真实跑过：
+  2371 passed / 1 skipped / 1 xfailed / 1 xpassed，约 31 秒，全程未起任何
+  外部服务。
+
+  ⚠️ **没有接 ruff/mypy 检查 job，且这不是遗漏**：`pyproject.toml` 里
+  `[tool.ruff]`/`[tool.mypy]` 确实配置了，但核实后发现是"配置存在但
+  从未被真正执行过"——对全仓跑 `ruff check .` 现状 **10,266 处违规**；
+  `mypy src` 因 numpy 类型桩语法要求 3.12+、而 `[tool.mypy]` 配的
+  `python_version = "3.10"` 组合直接报语法错误、**完全跑不起来**，
+  连一个真实文件都没检查到就整体失败。把这两者接成 CI 门禁会让流水线
+  一上线就对所有人和所有 PR 报红，这是需要先做代码/配置清理的独立决策，
+  按 §7.1 不该在补 CI 这个任务里顺带拍板，故未接入，如实记录而非静默跳过。
+
+  **验收怎么做**：push 一个 commit 或开一个 PR，去 GitHub Actions 页面看
+  `CI / unit tests` job 是否变绿；也可以故意改坏一个 `tests/unit` 里的断言
+  推一个分支，确认 job 会变红。
+  **回归怎么保**：`.github/workflows/ci.yml` 本身即回归保护——往后任何
+  破坏 `tests/unit` 的改动都会在 PR 上直接显示失败，不需要额外测试文件。
+  **什么没做**：没有本地方式真正验证 GitHub Actions 会按预期跑（只验证过
+  YAML 语法合法、用的 `actions/checkout@v4`/`actions/setup-python@v5` 是
+  当前可用版本、命令本身在本地 venv 里跑通）；lint/类型检查未接入（见上）；
+  `tests/integration`/`tests/e2e` 未接入 CI。
 
 - ✅ **2026-08-27　P0 第 1 条：文档更新后旧版本片段永久残留 —— 已修复并真机验证通过**
 

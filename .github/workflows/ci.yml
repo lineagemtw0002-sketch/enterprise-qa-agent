@@ -1,0 +1,46 @@
+# CI —— 只跑 tests/unit（自包含，不连外部服务）。
+#
+# 范围刻意不包含 tests/integration / tests/e2e：那两类要连真实
+# Postgres/Chroma/OpenSearch/Ollama，而 conftest.py 至今没有对应的
+# DB/LLM fixture（CLAUDE.md §4 P1 已记录的已知空白，需要单独的设计
+# 评审，不在这次任务范围内）。
+#
+# 装依赖用 requirements.lock 而不是 pyproject.toml：与 Dockerfile 的
+# deps 阶段完全一致的方式（pyproject 里的依赖大多只有 >= 下界，直接
+# 装会得到不可复现的版本组合，这正是引入 requirements.lock 的原因，
+# 见 Dockerfile 开头注释）。
+#
+# 没有加 ruff/mypy 检查 job：两者在 pyproject.toml 里都已配置，但
+# 核实过并非"配置好了只是没接自动化"——ruff 现状对全仓 check 有
+# 10000+ 处违规（配置存在但从未真正执行过），mypy 在当前环境下
+# 因 numpy 类型桩与 [tool.mypy] 里 python_version=3.10 的组合直接
+# 报语法错误、完全跑不起来。把它们接成 CI 门禁会让这条流水线一
+# 上线就对所有人和所有 PR 报红，这是需要先做代码/配置清理的独立
+# 决策，不该在补 CI 这个任务里顺带拍板，故未接入。
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.lock
+
+      - name: Install dependencies
+        run: pip install --no-cache-dir -r requirements.lock
+
+      - name: Run unit tests
+        run: python -m pytest tests/unit -q
