@@ -812,7 +812,14 @@ flowchart TB
   的那一瞬间会被判成泄露——窗口越小、中途检查次数越多，踩中的机会越大。
   修法是 `looks_like_prompt_leak(..., partial=True)` 跳过残行，
   末行的判定推迟到落库前那次全文复查。
-- `ragent_backend` + `tool_agent` 共 **12,200 行零测试覆盖**，`conftest.py` 无 DB/LLM fixture
+- `ragent_backend` + `tool_agent` 共 **12,200 行零测试覆盖**（2026-08-27 实测已涨至
+  17,937 行，见下），`conftest.py` 无 DB/LLM fixture。
+  🔵 **fixture 策略设计已完成**（2026-08-27，`docs/test_fixture_strategy_design.md`）——
+  只回答"该用什么 fixture"这一个问题：推荐 testcontainers（临时 Postgres/OpenSearch，
+  复用 `docker-compose.yml` 已有镜像）覆盖真正绕不开真实 DB 的那部分（`*_store.py`
+  SQL 语义 + `app.py` 端点接线），主体覆盖率提升仍靠现有 Mock 分层模式抽纯函数；
+  明确不采用"复用共享开发库+事务回滚"（本仓库 Store 层不接受外部注入连接、
+  且共享库已处于多会话并发状态）。**未实施，等用户拍板**，死期 2026-11-27。
 - ~~后端 48 处 `print()`、0 处 logger，无结构化日志、无 request id~~ ✅ **已修复（2026-08-26），见 §5**——
   这条描述本身也是过时的：结构化日志基础设施（`src/observability/logger.py` 等）早在
   2026-08-25 就已实施（`docs/observability_design.md` 阶段一），只是没写进本文件，
@@ -2316,6 +2323,7 @@ flowchart TB
 | `docs/optimization_tracking.md` | 优化前后对比（任务一含两轮：08-24 第一轮、**08-25 第二轮安全批次 1+2**，按「修复前→怎样修→修复后→遗留」结构） | 活文档 |
 | `scripts/verify_security_posture.py` | **现行安全复测脚本**，18 用例 6 组（A 幻觉/B 越权话术/C 泄露/D 注入/E 跨租户/F 认证），结果 JSON 落 `scripts/security_results/` | **可复现，活脚本**（替代已丢失的 `jailbreak_test.py`） |
 | `docs/account_lifecycle_design.md` | 账号体系四档演进设计（批量导入/激活码/停用/席位；SSO·SCIM 只写触发条件） | **阶段一已实施（08-26）**，二～四档未实施，死期 2026-11-26 |
+| `docs/test_fixture_strategy_design.md` | 12,200+ 行零测试覆盖的 fixture 策略设计：testcontainers（临时 Postgres/OpenSearch）vs 复用共享开发库+事务回滚 vs Mock 分层，逐条分析后推荐前者只覆盖真实 DB 语义、后两者不作为唯一路径 | **设计草案，未实施**，等用户拍板，死期 2026-11-27 |
 | `scripts/verify_account_lifecycle.py` | 账号体系真库冒烟（27 条：schema 迁移 / 激活 / 单次使用 / 停用 / 席位口径） | **可复现，活脚本** |
 | `scripts/verify_account_endpoints_e2e.py` | 账号体系 HTTP 端到端（30 条），验"端点真的调了规则吗" | **可复现，活脚本**（默认 8011） |
 | `docs/kb_permission_design.md` | 权限设计（截至 08-23） | 时点快照 |

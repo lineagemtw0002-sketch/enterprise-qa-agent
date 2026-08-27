@@ -85,6 +85,7 @@
 
 | 功能 | 文档 | 该不该信 |
 |---|---|---|
+| **`ragent_backend`+`tool_agent` 12,200+ 行零测试覆盖的 fixture 策略**（testcontainers vs 共享库+事务回滚 vs Mock 分层） | `test_fixture_strategy_design.md` | 🟡 设计草案，未实施，等用户拍板，死期 2026-11-27 |
 | 知识库问答测试题库 | `qa_test_questions.md` | ⚪️ 取材自 08-24 的 Chroma 实际内容，可用 |
 | **多租户人工测试数据集**（2 企业 × 2 员工，账号 / 角色 / 知识库权限 / 每库问题 / 越权与跨企业拒绝用例 / 跨账号对照表） | `manual_test_dataset.md` | 🟢 当前状态 · 由 `scripts/generate_demo_kb_dataset.py --stage doc` 自动生成，改语料改 `scripts/demo_kb_content/` 后重跑 |
 
