@@ -13,6 +13,18 @@ import pytest
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# Postgres 测试隔离 fixture（`postgres_test_db` / `clean_postgres`）。
+# 实现放在单独的 `tests/db_fixtures.py` 而不是直接写在这里，两个理由：
+# ① 它自带一份很长的"怎么用 / 为什么这么设计 / 什么情况下会 skip"文档，
+#    塞进 conftest 会把这个文件淹掉；
+# ② 它是个普通模块，`scripts/` 下那些"改 DSN + 清两层池缓存"的验证脚本
+#    将来可以直接 import 复用，conftest 做不到这一点。
+# 在这里 import 是为了让这两个 fixture 在整个 tests/ 树下都能直接用。
+# ⚠️ `db_fixtures` 顶层**不 import 任何 src.ragent_backend 模块**（那些
+#    import 都写在函数体里），所以 `tests/unit` 不会因此变慢，也不会因为
+#    本机 Postgres 不可达而受影响。
+from tests.db_fixtures import clean_postgres, postgres_test_db  # noqa: E402,F401
+
 
 @pytest.fixture
 def project_root() -> Path:
