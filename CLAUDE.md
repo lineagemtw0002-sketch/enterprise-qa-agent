@@ -43,7 +43,7 @@
 |---|---|---|
 | 1 | [项目定位](#1-项目定位) | 交付给谁 / 怎么用 / 什么算做完 / 功能边界 |
 | 2 | [架构速览](#2-架构速览) | 一屏看懂全貌，细节见 `docs/architecture.md` |
-| 3 | [权限与多租户](#3-权限与多租户) | 权限模型 · **账号生命周期 · 席位** · 隔离层次 · 已验证的保证 |
+| 3 | [权限与多租户](#3-权限与多租户) | 权限模型 · **账号生命周期 · 席位 · 运维权限** · 隔离层次 · 已验证的保证 |
 | 4 | [已知未闭环](#4-已知未闭环) | P0 / P1 清单 |
 | 5 | [已修复](#5-已修复防止重新引入) | 防止重新引入（含代码级约束） |
 | 6 | [已作废的设计](#6-已作废的设计) | 不要复活 |
@@ -182,6 +182,98 @@ generate 1.85s（65 字）/ 12.0s（354 字）· session/memory/archive ≈ 0。
 预演报告）、**重新启用**（最容易漏：它不建号却让占用数 +1）。
 `organizations.seat_limit` 为 NULL 表示不限；**不要给它设非空默认值**，
 那会在升级瞬间把已超过该值的存量企业全部锁死。
+
+### 3.1d 运维权限（`role_ops_systems`）
+
+*(2026-08-26 落地，设计 `docs/aiops_module_design.md` §10.6；本节 2026-08-27 回填)*
+
+上面 §3.1 讲的是**知识库**权限（`role_collections`）。智能运维模块另有一张
+`role_ops_systems`（`ops_store.py:266` 建表，主键 `(role_id, connection_id)`，
+两个布尔位 `can_view` / `can_approve`），回答的是
+**"这个角色能看/能批准哪个运维连接器上的修复动作"**。
+两张表**刻意复用同一套语义**（`ops_store.py:806-818` 类注释逐条写明），
+不是各判各的——同一个概念在两个地方判出不同结果是最难查的那类 bug。
+
+| | 知识库 `role_collections` | 运维 `role_ops_systems` |
+|---|---|---|
+| `org_admin` | 通配符，返回 `["*"]`，不看表 | 通配符，`can_view`+`can_approve` 全 True，不看表 |
+| `super_admin` | 从不出现在表里，无入口配置 | 同左，**且爆炸半径更大所以更不该放开** |
+| 授权粒度 | 角色 → collection | 角色 → connector |
+| 通配符怎么表达 | 列表里的 `"*"` 哨兵 | **返回 `None`**（见下方⚠️） |
+
+**⚠️ `org_admin` 的通配符是"企业内"的，不是全局的。**
+`get_ops_permission` 判的是 `ROLE_ORG_ADMIN in role_names 且 user_org_id ==
+连接器的 org_id`（`ops_store.py:844`）——Acme 的企业管理员对 Globex 的连接器
+不是通配符。这跟 `get_allowed_collections_for_user` 无条件返回 `["*"]`、
+把收窄推迟到 `query_knowledge_hub` 的 `_org_owned_collections` 那一层
+（`role_store.py:508-514`）**在写法上不同、在结果上一致**：知识库那条链路后面
+还有一道归属校验兜底，运维这条没有，所以归属判定直接写在权限函数里。
+
+**⚠️ `can_approve=True` 隐含 `can_view=True`，拉齐发生在写入时不是读取时。**
+`set_role_ops_permission` 在 INSERT 之前直接把 `can_view` 置 True
+（`ops_store.py:937-938`）。理由：能批准但看不见是矛盾状态，与其指望调用方
+（管理员的勾选界面）自己保证这条不变量，不如让存储层收口——库里从此不存在
+`can_approve=True, can_view=False` 这种行。前端跟着在勾 approve 时自动带上
+view 并置灰，是为了不让界面显示出一个后端马上会改掉的状态。
+
+**⚠️ 返回 `None` 和返回 `[]` 是两件完全相反的事，不许混。**
+`viewable_connection_ids_for_user`（`ops_store.py:897`）：
+
+| 返回 | 含义 | 调用方必须怎么做 |
+|---|---|---|
+| `None` | 该用户是这家企业的 org_admin，通配符覆盖全部 | **不过滤** |
+| `[...]` | 只有这些 `connection_id` 可见 | 按集合过滤 |
+| `[]` | **一条都看不到**（有角色但零授权 / 无任何角色） | **返回空结果** |
+
+`[]` 被误当成"没传参数=不过滤"就是把零权限用户变成全企业可见。
+`app.py:2205-2211` 那批端点因此统一写成"先判 `is not None and not viewable`
+直接 return []，再判 `is not None` 才过滤"，`compute_ops_metrics` /
+`list_postmortems` 则把 `viewable` 原样透传给 Store 层的 `connection_ids`
+参数——**同一套 `None` / `[]` 语义一路带到 SQL**（`ops_store.py:1078-1081`
+写明空列表让查询条件恒假、四个指标落到"没有样本"，不是聚合出全企业数字）。
+
+**这套权限管什么、不管什么** —— 边界是刻意划的，不要顺手放宽：
+
+| 动作 | 谁能做 | 依据 |
+|---|---|---|
+| 看修复动作列表 / 分析摘要 / 指标 / 触发分析 / 总览大屏 / 复盘 | `can_view`（org_admin 通配） | `app.py` 六处 `viewable_connection_ids_for_user`：`2205,2232,2253,2363,2416,2486` |
+| **批准 / 拒绝 / 执行 / 事后标注有效性** | `can_approve`（org_admin 通配） | `app.py::_require_can_approve`，四处调用 |
+| 连接器登记 / 删除、修复范围白名单、**授权本身** | 🔴 **仅 `org_admin`**，不进这张表 | `Depends(_require_org_admin)` |
+
+**拒绝跟批准同一档（`can_approve`），不是 `can_view`** —— 能看不代表能拍板，
+"只能看不能定"的用户不该有否决权。**执行也是同一档**：V1 刻意不区分"批准人"
+和"执行人"，设计文档没定义过第三档权限，凭空造一档不如等真实需求出现
+（`app.py:2551-2553`）。**授权这件事本身不可委托**——`org_admin` 不能通过给
+某个自定义角色发权限来把"发权限"这个能力传下去，否则细粒度权限就成了摆设。
+
+**写入口的三道校验**（`app.py::_require_grantable_role`，`:2021-2027`）：
+角色不存在 → 404；`is_system=True`（即 `super_admin`/`org_admin`）→ 403
+（配了也不生效，一并挡掉避免误导）；角色的 `org_id` 与操作者企业不符 → 403。
+
+**这一层之上还叠着模块开关**：全部运维端点先过 `_require_aiops_enabled_org`
+（`app.py:1688`），企业没开通 `organizations.aiops_module_enabled` 一律 403，
+再往下才轮到角色判定。跨企业访问一律 **404 不是 403**
+（`_get_owned_connector` / `_get_owned_action`），跟 `admin_delete_collection`
+的既有约定一致——不泄露"这个东西存在但不是你的"。
+
+**⚠️ `get_ops_permission` 自己不校验连接器归属**（连接器不存在时两个位都返回
+False，但不区分"不存在"和"没权限"，`ops_store.py:820-826`）。归属校验由调用
+端点先做（`_get_owned_action` 拿到 action 才去要它的 `connection_id`）。
+新写调用点时**不要只调它就当作完整鉴权**。
+
+**`/auth/me` 上的 `ops_can_view` / `ops_can_approve` 是聚合视图，不是某个连接器
+上的权限**（`get_ops_permission_summary`，`ops_store.py:860`）——语义是"在
+**任意**连接器上有没有这个位"，前端拿它决定导航入口显示与否，不用遍历连接器
+自己取并集。跟 `allowed_collections` 一样是后端算好并集交给前端。
+⚠️ **org_admin 在这里不要求企业名下已经有连接器**：通配符是身份性质，不该
+因为企业还没注册任何连接器就退化成 False——那是运营状态，不是权限声明。
+**所以这两个方法不能互相照抄**：`get_ops_permission` 要判归属所以必须先查
+连接器，`get_ops_permission_summary` 不查、只看角色。
+
+**为什么要有这两个字段**：后端放宽了门禁，前端的门还锁着——`TopNav` 原来纯按
+角色名判 `isAdmin`，被授予 `can_approve` 的非 org_admin 角色名不在那个集合里，
+永远看不到入口。跟 `aiops_module_enabled` 那次是同一个根因：**后端放宽权限时，
+必须同时问一句"前端凭什么知道这件事"**，否则新权限落地当天就等于没落地。
 
 ### 3.2 隔离层次
 
@@ -1446,12 +1538,11 @@ flowchart TB
   - ~~审批超时扫描任务未实现~~ ✅ **已接线，见 §5 下方对应条目**
   - 真实的 BYOC 连接器进程（客户环境里响应 `query_request`/`exec_request`
     帧的那一端）不在本项目范围内，本阶段只做平台侧协议
-  - `CLAUDE.md` §3 权限模型正文仍**没有**回填 `role_ops_systems`——§7.4
-    "§3 只描述已经实现的现状"这条现在满足了（`role_ops_systems` 已接线），
-    但本次判断暂缓回填：§3.1 的篇幅和结构是围绕"知识库权限"组织的，运维
-    权限的通配符/零权限规则虽然复用同一套语义，直接插进去会打断那节的
-    叙事，值得单独起一段而不是塞进现有段落，留到下次专门整理 §3 时一并做，
-    不是遗忘
+  - ~~`CLAUDE.md` §3 权限模型正文仍**没有**回填 `role_ops_systems`~~ ✅
+    **已回填（2026-08-27），见 §3.1d。** 当时暂缓的理由是"§3.1 的结构围绕
+    知识库权限组织，直接插进去会打断叙事，值得单独起一段"——回填时照这个
+    判断做了：单起 §3.1d，不动 §3.1 原文，用一张对照表说清跟
+    `role_collections` 哪里一致、哪里不同
   - `scripts/verify_aiops_endpoints.py` 只覆盖了粗粒度的 org_admin/
     super_admin 门禁；`reject` 端点没有单独测（跟 `approve` 共用同一段状态机
     校验，判别力已经在 `approve` 的 409 用例里验过）。
