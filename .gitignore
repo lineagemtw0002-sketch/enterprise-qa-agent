@@ -97,6 +97,16 @@ logs/
 *.log
 traces.jsonl
 
+# router LoRA (Phase 3, docs/chitchat_intent_design.md)：训练产物本身
+# （router_lora_data/adapters_v1/adapters.safetensors 等，~21MB）要提交，
+# 但这两样是构建管线里的中间大文件、完全可以用已提交的脚本 + adapter 重新
+# 生成，不值得进 git 历史（fused_hf_v1 反量化后 ~2.9GB，GGUF ~1.5GB）：
+router_lora_data/fused_hf_v1/
+router_lora_data/*.gguf
+# 训练过程中的中间 checkpoint（0000136_adapters.safetensors 等），只保留
+# 最终的 adapters.safetensors + adapter_config.json：
+router_lora_data/adapters_v1/0*_adapters.safetensors
+
 # Database / SQLite
 checkpoints.sqlite*
 *.db
