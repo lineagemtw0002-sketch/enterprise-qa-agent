@@ -1,0 +1,483 @@
+/* 运维塔台。视觉取自 docs/design_reference/aiops_console_mockup.html（深色 NOC 大屏）。
+ *
+ * ⚠️ **两条实现决定，跟设计稿有意不同：**
+ *
+ * 1. **所有 token 声明在 `.ops-console` 上，不在 `:root`。** 设计稿是一个独立
+ *    HTML 页，直接写 :root 没问题；这里是嵌在一个整体浅色的应用里的一个模块，
+ *    写 :root 会把变量泄漏给全站（`--accent` 这类名字跟 App.css 撞车）。
+ *
+ * 2. **不引 Google Fonts。** 设计稿用 <link> 拉 Titillium Web + JetBrains Mono，
+ *    但这是个企业内网部署的工具：外链字体在隔离网络里会静默失败，而且会向
+ *    fonts.googleapis.com 发请求——这跟本模块自己的 BYOC 原则（平台不向外泄漏
+ *    客户侧信息）是同一类考虑。这里只声明字体族并给足系统回退，装了字体的环境
+ *    自然会用上，没装的退化成系统字体，布局不受影响。
+ *
+ * antd 组件的深色化不靠这里的 CSS 覆盖，走 ConfigProvider 的 darkAlgorithm
+ * （见 OpsConsole.jsx）——手写覆盖 antd 内部类名在版本升级时必然碎掉。
+ */
+
+/* ⚠️ 这套深色 token 由 `.ops-console`（主应用里的 tab 版本）和 `.ops-page`
+   （独立页面的外壳）**共用**。第一版只挂在 `.ops-console` 上，结果独立页面的
+   顶栏在它外层，`var(--surface)` 一个都取不到，边框和底色直接变透明——
+   构建通过、控制台无报错，只有真跑一遍才看得见。 */
+.ops-console,
+.ops-page {
+  --ground: #12131a;
+  --surface: #191b25;
+  --surface-raised: #21232f;
+  --surface-inset: #0d0e13;
+  --ops-border: #2b2e3d;
+  --border-soft: #22242f;
+  --ink: #eef0f6;
+  --ink-muted: #8d90a3;
+  --ink-faint: #5c5f70;
+  --ops-accent: #8b7ffb;
+  --accent-dim: #4a4270;
+  --accent-glow: rgba(139, 127, 251, 0.18);
+  --good: #34d399;
+  --good-dim: #163a2d;
+  --warning: #fbbf24;
+  --warning-dim: #3d3316;
+  --critical: #f8717a;
+  --critical-dim: #3d1e22;
+  --pending: #7c8299;
+  --pending-dim: #24273a;
+  --font-display: "Titillium Web", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--font-display);
+}
+
+/* 盒子样式只属于**嵌在主应用里**的那个版本。
+   之前这几条写在共享块里，独立页面于是也拿到了 `border-radius: 12px`
+   ——一个铺满视口的页面带着圆角，边缘会露出下面的 body。 */
+.ops-console {
+  min-height: 100%;
+  padding: 16px;
+  border-radius: 12px;
+}
+
+/* ---------- 分段导航 ---------- */
+.ops-tabnav {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--ops-border);
+  margin-bottom: 14px;
+}
+.ops-tabbtn {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--ink-muted);
+  font-family: inherit;
+  font-size: 13px;
+  padding: 8px 14px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.ops-tabbtn:hover { color: var(--ink); }
+.ops-tabbtn.active { color: var(--ink); border-bottom-color: var(--ops-accent); }
+
+/* ---------- KPI ---------- */
+.kpi-strip {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);   /* 跟设计稿一致：5 张 */
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.kpi-card {
+  background: var(--surface);
+  border: 1px solid var(--ops-border);
+  border-radius: 14px;
+  padding: 14px 16px;
+}
+.kpi-label { font-size: 11.5px; color: var(--ink-muted); margin-bottom: 6px; }
+.kpi-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.kpi-value { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.kpi-value.placeholder {
+  font-size: 14px; font-weight: 500; color: var(--ink-faint); white-space: nowrap;
+}
+.kpi-value .kpi-unit { font-size: 13px; color: var(--ink-muted); font-weight: 500; }
+.kpi-delta { font-size: 11px; font-weight: 600; }
+.kpi-delta.good { color: var(--good); }
+.kpi-delta.bad { color: var(--critical); }
+.kpi-delta.flat { color: var(--ink-faint); }
+
+/* ---------- 面板 ---------- */
+.ops-grid { display: grid; grid-template-columns: 1.6fr 1fr; gap: 12px; align-items: start; }
+.ops-col { display: flex; flex-direction: column; gap: 12px; }
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--ops-border);
+  border-radius: 14px;
+  overflow: hidden;
+}
+.panel-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; border-bottom: 1px solid var(--border-soft);
+}
+.panel-title { font-size: 13.5px; font-weight: 600; }
+.panel-title .count { font-size: 11px; color: var(--ink-faint); font-weight: 400; margin-left: 6px; }
+.panel-note { font-size: 11px; color: var(--ink-faint); }
+.panel-body { padding: 12px 16px 14px; }
+.panel-empty { color: var(--ink-faint); font-size: 12px; padding: 18px 0; text-align: center; }
+
+/* ---------- 状态药丸 ---------- */
+.status-pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 10.5px; font-weight: 600; padding: 2.5px 8px 2.5px 6px;
+  border-radius: 20px; white-space: nowrap;
+}
+.status-pill .dot { width: 5px; height: 5px; border-radius: 50%; }
+.status-pill.good { color: var(--good); background: var(--good-dim); }
+.status-pill.good .dot { background: var(--good); }
+.status-pill.warning { color: var(--warning); background: var(--warning-dim); }
+.status-pill.warning .dot { background: var(--warning); }
+.status-pill.critical { color: var(--critical); background: var(--critical-dim); }
+.status-pill.critical .dot { background: var(--critical); }
+.status-pill.pending { color: var(--pending); background: var(--pending-dim); }
+.status-pill.pending .dot { background: var(--pending); }
+
+/* ---------- 时间线 ---------- */
+.tl-row {
+  display: grid; grid-template-columns: 64px 20px 1fr auto;
+  gap: 12px; align-items: start; padding: 10px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.tl-row:last-child { border-bottom: none; padding-bottom: 0; }
+.tl-time { font-family: var(--font-mono); font-size: 11px; color: var(--ink-faint); padding-top: 2px; font-variant-numeric: tabular-nums; }
+.tl-marker { display: flex; flex-direction: column; align-items: center; height: 100%; }
+.tl-dot { width: 9px; height: 9px; border-radius: 50%; margin-top: 3px; flex: none; }
+.tl-dot.critical { background: var(--critical); box-shadow: 0 0 0 3px var(--critical-dim); }
+.tl-dot.warning { background: var(--warning); box-shadow: 0 0 0 3px var(--warning-dim); }
+.tl-dot.good { background: var(--good); box-shadow: 0 0 0 3px var(--good-dim); }
+.tl-line { width: 1px; flex: 1; background: var(--ops-border); margin-top: 4px; }
+.tl-title { font-size: 13px; font-weight: 500; margin: 0 0 3px; }
+.tl-desc { font-size: 12px; color: var(--ink-muted); margin: 0; white-space: pre-wrap; }
+.tl-tag { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-faint); margin-top: 5px; display: flex; gap: 6px; flex-wrap: wrap; }
+.tl-count { font-family: var(--font-mono); font-size: 11px; color: var(--ink-faint); white-space: nowrap; }
+
+/* ---------- 审批卡片 ---------- */
+.approval-card {
+  background: var(--surface-inset);
+  border: 1px solid var(--ops-border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+.approval-card:last-child { margin-bottom: 0; }
+.ap-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.ap-type { font-size: 12px; font-weight: 600; color: var(--ops-accent); }
+.ap-intent { font-size: 13px; margin: 0 0 8px; }
+.ap-meta { display: flex; flex-wrap: wrap; gap: 10px; font-size: 11px; color: var(--ink-muted); margin-bottom: 8px; }
+.ap-meta b { color: var(--ink); font-weight: 600; }
+.ap-radius {
+  display: flex; gap: 6px; align-items: flex-start;
+  font-size: 10.5px; color: var(--ink-faint); line-height: 1.5;
+  background: var(--warning-dim); border-radius: 8px; padding: 7px 9px; margin-bottom: 10px;
+}
+.ap-actions { display: flex; gap: 8px; }
+
+/* ---------- 连接器行 ---------- */
+.conn-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 10px 0; border-bottom: 1px solid var(--border-soft);
+}
+.conn-row:last-child { border-bottom: none; padding-bottom: 0; }
+.conn-name { font-size: 13px; font-weight: 500; }
+.conn-meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-faint); margin-top: 2px; }
+
+/* ---------- 说明性提示 ---------- */
+.ops-note {
+  font-size: 11.5px; color: var(--ink-faint); line-height: 1.6;
+  border-left: 2px solid var(--ops-border); padding-left: 10px; margin: 10px 0 0;
+}
+
+@media (max-width: 1100px) {
+  .kpi-strip { grid-template-columns: 1fr; }
+  .ops-grid { grid-template-columns: 1fr; }
+}
+
+/* ---------- V1 效果指标 ---------- */
+.metric-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px 16px; }
+.metric-cell { padding: 6px 0; }
+.metric-label { font-size: 11.5px; color: var(--ink-muted); margin-bottom: 4px; }
+.metric-value { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+/* "暂无数据"要明显弱于真实数字——它不是一个成绩，是"还没得测" */
+.metric-value.empty { font-size: 13px; font-weight: 500; color: var(--ink-faint); }
+.metric-value.small { font-size: 14px; font-weight: 600; }
+.metric-value .good { color: var(--good); }
+.metric-value .bad { color: var(--critical); }
+.metric-sample { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-faint); margin-top: 3px; }
+
+/* ---------- 事后复盘 ---------- */
+.pm-card {
+  background: var(--surface-inset);
+  border: 1px solid var(--ops-border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+.pm-card:last-child { margin-bottom: 0; }
+.pm-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.pm-time { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-faint); }
+.pm-section-label { font-size: 10.5px; color: var(--ink-faint); margin-bottom: 3px; letter-spacing: 0.03em; }
+.pm-result { margin: 8px 0; }
+.pm-result code {
+  display: block; font-family: var(--font-mono); font-size: 11px;
+  color: var(--ink-muted); background: var(--surface); border-radius: 6px;
+  padding: 6px 8px; word-break: break-all;
+}
+.pm-analysis { margin: 8px 0; }
+.pm-summary { font-size: 12px; color: var(--ink-muted); margin: 0; white-space: pre-wrap; }
+/* 「没有关联分析」不是一句轻描淡写的"暂无"——它本身是复盘线索，要看得见 */
+.pm-none {
+  font-size: 12px; color: var(--ink-faint); margin: 0;
+  background: var(--pending-dim); border-radius: 6px; padding: 7px 9px;
+}
+.pm-none b { color: var(--ink-muted); }
+.pm-outcome { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-soft); }
+.pm-ask { font-size: 11.5px; color: var(--ink-muted); margin-right: 4px; }
+
+/* ⚠️ **必须是区间，不能只写上界。**
+   下面还有一条 `max-width: 1100px → 单列`，而这条排在它后面；只写上界的话
+   两条在窄屏上同时命中、后者胜出，手机上 KPI 就还是三列——卡片被挤到每个
+   字一行。真机 375px 上看出来的，桌面宽度完全正常。 */
+@media (max-width: 1180px) and (min-width: 1101px) {
+  .kpi-strip { grid-template-columns: repeat(3, 1fr); }
+}
+/* 平板一档：五张挤一行读不了，两行三+二比单列紧凑。 */
+@media (max-width: 1100px) and (min-width: 721px) {
+  .kpi-strip { grid-template-columns: repeat(3, 1fr); }
+}
+
+/* ---------- 服务健康网格 ---------- */
+/* 布局照搬设计稿（docs/design_reference/aiops_console_mockup.html）。 */
+.svc-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+@media (max-width: 900px) { .svc-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 620px) { .svc-grid { grid-template-columns: 1fr; } }
+
+.svc-card {
+  background: var(--surface-inset);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  padding: 12px 13px;
+  display: flex; flex-direction: column; gap: 9px;
+}
+.svc-card.critical { border-color: rgba(248, 113, 122, 0.35); }
+.svc-card.warning { border-color: rgba(251, 191, 36, 0.3); }
+/* 「数据中断」用中性描边，**不用绿色也不用黄色**——它既不是"没问题"，
+   也不是"发现了一个小问题"，我们对这个服务的状态根本一无所知。 */
+.svc-card.stale { border-color: var(--border-soft); opacity: 0.72; }
+
+.svc-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.svc-name { font-family: var(--font-mono); font-size: 12.5px; font-weight: 500; }
+.svc-metrics {
+  display: flex; justify-content: space-between; gap: 10px;
+  font-family: var(--font-mono); font-size: 11px; color: var(--ink-muted);
+}
+.svc-metrics b { color: var(--ink); font-weight: 500; }
+
+/* 后端的状态名是 ok/stale，设计稿的类名是 good/pending——两边都留着，
+   免得以后有人改了一侧就静默丢样式（这类"构建通过但界面不对"的问题
+   在这条产品线上已经出现过两次）。 */
+.status-pill.ok { color: var(--good); background: var(--good-dim); }
+.status-pill.ok .dot { background: var(--good); }
+.status-pill.stale { color: var(--ink-muted); background: rgba(148, 163, 184, 0.14); }
+.status-pill.stale .dot { background: var(--ink-muted); }
+
+/* ============================================================
+   独立页面外壳（/ops.html）—— 照设计稿的顶栏还原
+   主应用里那个 tab 版本没有这一段：它的顶栏由主应用提供。
+   ============================================================ */
+.ops-page {
+  /* 深色**只存在于这一页**。主应用一点没变——这正是把塔台拆成独立页面的原因：
+     整屏深色的监控大屏和浅色的办公界面塞在一个壳里，两种视觉语言互相打架。 */
+  min-height: 100vh;
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 20px 28px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+.ops-page-center { align-items: center; justify-content: center; }
+
+.ops-topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 24px; padding-bottom: 4px; flex-wrap: wrap;
+}
+.ops-brand { display: flex; align-items: center; gap: 12px; }
+.ops-brand-mark {
+  width: 34px; height: 34px; border-radius: 8px; flex: none;
+  background: linear-gradient(155deg, var(--ops-accent), #5b4fc4);
+  display: grid; place-items: center;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 8px 20px -6px rgba(139, 127, 251, 0.4);
+}
+.ops-brand-mark svg { width: 18px; height: 18px; }
+.ops-brand-text h1 { font-size: 17px; font-weight: 700; margin: 0; letter-spacing: 0.01em; }
+.ops-brand-text .sub {
+  font-size: 11.5px; color: var(--ink-muted); letter-spacing: 0.02em;
+  font-family: var(--font-mono);
+}
+
+.ops-topbar-right { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.ops-org {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 14px; background: var(--surface); border: 1px solid var(--ops-border);
+  border-radius: 8px; font-size: 13px;
+}
+.ops-org-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ops-accent); }
+.ops-backlink {
+  font-size: 12.5px; color: var(--ink-muted); text-decoration: none;
+  padding: 6px 11px; border: 1px solid var(--ops-border); border-radius: 20px;
+}
+.ops-backlink:hover { color: var(--ink); border-color: var(--ops-accent); }
+.ops-clock {
+  font-size: 12.5px; color: var(--ink-muted); font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+}
+
+.ops-empty-hint { text-align: center; color: var(--ink-muted); }
+.ops-empty-hint h1 { color: var(--ink); font-size: 20px; margin: 0 0 8px; }
+.ops-empty-hint a { color: var(--ops-accent); }
+
+/* 分段导航在窄屏上横向滚动。
+   ⚠️ 默认的 flex 会把六个按钮压到放不下、中文标签竖排成一列一个字
+   （真机 375px 上就是这样）。**宁可横向滚动也不要竖排**——竖排既读不了，
+   也把首屏推得很长，用户根本看不到下面的 KPI。 */
+@media (max-width: 720px) {
+  .ops-tabnav {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .ops-tabnav::-webkit-scrollbar { display: none; }
+  .ops-tabbtn { flex: none; white-space: nowrap; }
+  /* KPI 卡片里"数字 + 说明"在窄屏上换行显示，别硬挤在一行里各自竖排。 */
+  .kpi-row { flex-wrap: wrap; row-gap: 2px; }
+}
+
+@media (max-width: 720px) {
+  .ops-page { padding: 16px 14px 32px; }
+  .ops-topbar-right { gap: 8px; }
+}
+
+.ops-live-pill {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 11.5px; color: var(--ink-muted);
+  padding: 6px 11px; background: var(--surface);
+  border: 1px solid var(--ops-border); border-radius: 20px;
+  font-family: var(--font-mono);
+}
+.ops-live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ink-faint); }
+/* 呼吸动画只在**真的有连接器在线**时出现——一个一直在跳的指示灯，
+   在没有任何数据接入时是误导。 */
+.ops-live-pill.live { color: var(--good); border-color: rgba(52, 211, 153, 0.35); }
+.ops-live-pill.live .ops-live-dot { background: var(--good); animation: ops-live-pulse 2s ease-in-out infinite; }
+@keyframes ops-live-pulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.5); }
+  50% { opacity: 0.65; box-shadow: 0 0 0 4px rgba(52, 211, 153, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ops-live-pill.live .ops-live-dot { animation: none; }
+}
+
+/* 服务卡片上的「分析」按钮。刻意做得克制——它是一个随手可点的只读操作，
+   不该跟「执行」那种有后果的动作长得一样醒目。 */
+.svc-analyze {
+  align-self: flex-start;
+  background: transparent;
+  color: var(--ink-muted);
+  border: 1px solid var(--ops-border);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.svc-analyze:hover:not(:disabled) { color: var(--ops-accent); border-color: var(--ops-accent); }
+.svc-analyze:disabled { opacity: 0.5; cursor: progress; }
+
+/* ============================================================
+   窄屏卡片列表（≤720px 时代替 antd Table）
+   见 OpsConsole.jsx 的 `useNarrowScreen` / `OpsCards`。
+   ============================================================ */
+
+/* ⚠️ **这一段刻意不写在媒体查询里。** 窄宽两种形态由 JS 的 matchMedia 决定
+   渲染哪一份 DOM，卡片在宽屏上根本不会被渲染出来。写成 `@media (max-width:720px)`
+   反而会踩这个文件里已经踩过的坑：本文件有多个只写上界的断点，同名规则互相
+   覆盖，最后哪条生效取决于书写顺序。 */
+.ops-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ops-cards-loading { display: flex; justify-content: center; padding: 24px 0; }
+.ops-cards-pager { display: flex; justify-content: center; margin-top: 12px; }
+
+.ops-card {
+  background: var(--surface-inset);
+  border: 1px solid var(--ops-border);
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+
+.ops-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+/* 标题（审批的「意图」、连接器的「名称」）是这张卡的身份，允许换行占满——
+   截断成一行省略号等于逼用户点开才知道这是哪条记录。 */
+.ops-card-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.5;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* 状态标签不参与压缩：它比标题短得多，被挤掉一半反而更难认。 */
+.ops-card-extra { flex: none; }
+
+.ops-card-fields {
+  display: grid;
+  /* 标签列固定宽度，让多张卡的值左边缘对齐——竖排字段最容易读的就是这条对齐线。
+     78px 够放最长的标签「事后有效性」（5 个中文字 @11.5px）。 */
+  grid-template-columns: 78px minmax(0, 1fr);
+  gap: 7px 10px;
+  margin: 0;
+}
+.ops-card-field { display: contents; }
+.ops-card-fields dt {
+  font-size: 11.5px;
+  color: var(--ink-muted);
+  line-height: 1.7;
+}
+.ops-card-fields dd {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink);
+  line-height: 1.7;
+  min-width: 0;
+  /* 动作参数里会出现服务名/路径这类不带空格的长串，不给断行点会把整张卡撑宽、
+     让页面横向滚动——那正是这次要消掉的东西。 */
+  overflow-wrap: anywhere;
+}
+
+/* 操作按钮在卡片底部、跟字段区之间隔一条线：它们是有后果的动作
+  （执行 / 删除），不该看起来像又一个字段。 */
+.ops-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 11px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-soft);
+}

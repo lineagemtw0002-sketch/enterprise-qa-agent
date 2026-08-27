@@ -8,6 +8,7 @@ can be used by AI assistants for source attribution.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.core.types import RetrievalResult
@@ -109,9 +110,14 @@ class CitationGenerator:
             Citation object with extracted information.
         """
         metadata = result.metadata or {}
-        
-        # Extract source path
-        source = metadata.get("source_path", "unknown")
+
+        # Extract source path——摄入时 pipeline.py 把服务器本地的绝对文件系统路径
+        # 原样记进了 chunk metadata（见该文件 source_path 旁的说明），citation
+        # 直接透传给最终用户会暴露服务器目录结构；只展示文件名，不改变
+        # metadata 里存的原始值，排查问题时仍能从 result.metadata["source_path"]
+        # 拿到完整路径。
+        raw_source_path = metadata.get("source_path", "unknown")
+        source = Path(raw_source_path).name if raw_source_path != "unknown" else raw_source_path
         
         # Extract page number (may be int or string)
         page = metadata.get("page") or metadata.get("page_num")

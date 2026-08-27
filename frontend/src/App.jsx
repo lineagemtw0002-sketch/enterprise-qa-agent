@@ -9,15 +9,23 @@ import {
   Activity, Settings, User, Send, XCircle, Info, Lock, UserRound, Eye, EyeOff,
 } from 'lucide-react'
 import AppShell from './components/shell/AppShell.jsx'
-import { KbTag } from './components/shell/TopNav.jsx'
+import { KbTag, KbSourceIcon } from './components/shell/TopNav.jsx'
 import TracePanel from './components/TracePanel.jsx'
+import ActivateAccountForm from './components/shell/ActivateAccountForm.jsx'
 import AdminPanel from './components/admin/AdminPanel.jsx'
+import OperationsDashboard from './components/admin/OperationsDashboard.jsx'
 import WorkflowPanel from './components/workflow/WorkflowPanel.jsx'
 import WorkflowStatusPill from './components/workflow/WorkflowStatusPill.jsx'
-import OpsPlaceholder from './components/ops/OpsPlaceholder.jsx'
+import UploadToKbModal from './components/kb/UploadToKbModal.jsx'
 import './App.css'
 
-const ADMIN_ROLE_NAMES = new Set(['admin', 'super_admin', 'org_admin'])
+const ADMIN_ROLE_NAMES = new Set(['super_admin', 'org_admin'])
+// 「运营仪表盘」顶层模块专用——比 ADMIN_ROLE_NAMES 更严格，不包含 org_admin。
+// 平台整体运营指标（会话数/消息数/活跃用户/响应耗时）只对平台运营方开放，
+// 跟后端 admin_dashboard_overview/admin_dashboard_trend 的权限边界
+// （_require_platform_tier + require_platform_admin，见 app.py）保持一致。
+// 2026-08-24 起平台侧废弃 admin 角色，运营方只剩 super_admin 一个身份档位。
+const PLATFORM_ADMIN_ROLE_NAMES = new Set(['super_admin'])
 
 // 客服形象头像：用来替换 assistant 消息原来的 <Bot> 图标（线框机器人不太像
 // "在跟人对话"）。纯 SVG 画一个极简的女性客服半身像（发型+耳麦+肩膀），
@@ -135,8 +143,9 @@ export default function App() {
 
   // ==================== 个人信息 / 头像 ====================
   const [meProfile, setMeProfile] = useState(null)
-  const [view, setView] = useState('chat') // 'chat' | 'admin' | 'workflow'
+  const [view, setView] = useState('chat') // 'chat' | 'admin' | 'workflow' | 'dashboard'
   const isAdmin = meProfile?.roles?.some((r) => ADMIN_ROLE_NAMES.has(r.name)) ?? false
+  const isPlatformAdmin = meProfile?.roles?.some((r) => PLATFORM_ADMIN_ROLE_NAMES.has(r.name)) ?? false
 
   // ==================== 工作流 ====================
   // 工作流只靠自然语言触发（说"我想请假"这类），不再提供手动选类型的入口；
@@ -149,6 +158,7 @@ export default function App() {
   const [changePasswordForm, setChangePasswordForm] = useState({ old_password: '', new_password: '', confirm_password: '' })
 
   const [filesDrawerVisible, setFilesDrawerVisible] = useState(false)
+  const [kbUploadModalVisible, setKbUploadModalVisible] = useState(false)
 
   const [messages, setMessages] = useState([])
   const [inputMessage, setInputMessage] = useState('')
@@ -265,6 +275,11 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authToken])
 
+  // 首次激活（docs/account_lifecycle_design.md §4.1b）。登录页的一个分支，
+  // 不是独立路由——本应用没有路由库，而且激活是一次性的低频动作，
+  // 为它引入 react-router 不划算。
+  const [showActivate, setShowActivate] = useState(false)
+
   // ==================== 登录 / 登出 ====================
   async function login() {
     if (!loginForm.username || !loginForm.password) {
@@ -322,6 +337,16 @@ export default function App() {
       const response = await axios.get(`${settingsRef.current.apiBase}/auth/me`)
       setMeProfile(response.data)
     } catch (error) {
+      // /auth/me 是唯一一个专门查库确认"token 里这个 user_id 还存不存在"的端点
+      // （其它端点的 404 是"资源不存在"，跟这个不是一回事，不能套用同一处理）。
+      // 账号被管理员删掉后 token 本身还没过期，会一直是 401 拦截器管不到的
+      // 404——不强制登出的话，导航栏里"权限系统"这类依赖 meProfile 的模块会
+      // 静默消失，其余请求各自报 403，看起来像功能坏了，而不是"账号已失效"。
+      if (error.response?.status === 404) {
+        message.error('当前账号已不存在，请重新登录')
+        logout()
+        return
+      }
       console.error('加载个人信息失败:', error)
     }
   }
@@ -519,7 +544,10 @@ export default function App() {
     disconnectTraceWs()
     setTraceEvents([])
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = `${protocol}//${window.location.host}/ws/trace/${convId}`
+    // 2026-08-26：trace WS 现在要求鉴权，浏览器原生 WebSocket API 握手阶段不能带
+    // 自定义 header，token 走查询参数（后端用同一份 JWT 解码 + 校验会话归属）。
+    const wsToken = localStorage.getItem('ragent_token') || ''
+    const wsUrl = `${protocol}//${window.location.host}/ws/trace/${convId}?token=${encodeURIComponent(wsToken)}`
     const ws = new WebSocket(wsUrl)
     traceWsRef.current = ws
 
@@ -785,9 +813,22 @@ export default function App() {
             </div>
             <div>
               <h2>RAG Agent</h2>
-              <p className="login-subtitle">登录以继续</p>
+              <p className="login-subtitle">{showActivate ? '首次使用，请先激活账号' : '登录以继续'}</p>
             </div>
           </div>
+          {showActivate ? (
+            <ActivateAccountForm
+              onCancel={() => setShowActivate(false)}
+              onDone={(username) => {
+                // 激活成功后不自动登录：后端 /activate 只设密码、不签发 token
+                // （它是无鉴权端点，让它能签 token 会把攻击面从"改一个密码"
+                // 扩大成"直接拿到会话"）。这里把用户名带回登录表单，
+                // 员工只需要再输一次刚设的密码。
+                setShowActivate(false)
+                setLoginForm({ username, password: '' })
+              }}
+            />
+          ) : (
           <form className="login-form" onSubmit={(e) => { e.preventDefault(); login() }}>
             <div className="login-input-wrap">
               <UserRound size={16} className="login-input-icon" />
@@ -823,7 +864,18 @@ export default function App() {
             <button type="submit" className="login-submit-btn" disabled={loginLoading}>
               {loginLoading ? '登录中…' : '登录'}
             </button>
+            <button
+              type="button"
+              onClick={() => setShowActivate(true)}
+              style={{
+                background: 'none', border: 'none', cursor: 'pointer', marginTop: 4,
+                color: 'var(--accent)', fontSize: 13,
+              }}
+            >
+              收到激活码？首次激活账号
+            </button>
           </form>
+          )}
         </div>
       </div>
     )
@@ -835,6 +887,7 @@ export default function App() {
       view={view}
       onNavigate={setView}
       isAdmin={isAdmin}
+      isPlatformAdmin={isPlatformAdmin}
       currentUsername={currentUsername}
       meProfile={meProfile}
       onLogout={logout}
@@ -845,6 +898,8 @@ export default function App() {
       }}
     >
       {view === 'admin' && <AdminPanel meProfile={meProfile} />}
+
+      {view === 'dashboard' && <OperationsDashboard />}
 
       {view === 'workflow' && (
         <WorkflowPanel
@@ -859,7 +914,10 @@ export default function App() {
         />
       )}
 
-      {view === 'ops' && <OpsPlaceholder />}
+      {/* 运维塔台已经拆成独立页面（/ops.html，见 vite.config.js 的多页入口）。
+          主应用里**不再内嵌渲染**它——整屏深色的监控大屏嵌在浅色办公界面里，
+          顶栏、弹窗、侧栏全是浅色而中间一块深色，两种视觉语言互相打架。
+          顶部导航的「智能运维」现在是新开标签页，不切 view。 */}
 
       {view === 'chat' && (
       <>
@@ -951,6 +1009,15 @@ export default function App() {
             <ChevronDown size={14} className="collapse-icon" style={{ transform: 'rotate(-90deg)' }} />
           </div>
 
+          {/* 跟上面"知识库文件"不是一回事——那个是当前对话的私有临时文件；
+             这个是永久加入企业共享知识库，见 UploadToKbModal 顶部说明。 */}
+          <div className="file-section-entry" onClick={() => setKbUploadModalVisible(true)}>
+            <div className="section-title" style={{ marginBottom: 0 }}>
+              <UploadCloud size={14} />
+              <span>上传到企业知识库</span>
+            </div>
+          </div>
+
           <div className="system-info">
             <hr />
             <div className="info-item">
@@ -1034,10 +1101,11 @@ export default function App() {
                         </div>
                       </div>
                       <div className="message-content-wrapper">
-                        {/* 知识库来源角标临时隐藏——短回复时角标会跟正文遮挡，等想好新的展示方式再打开（保留 kbSources 数据和下面的渲染逻辑不动，去掉 `&& false` 即可恢复）。*/}
-                        {false && msg.role === 'assistant' && msg.kbSources && msg.kbSources.length > 0 && (
+                        {/* 知识库来源角标：回答实际用到了哪些知识库，就在气泡上方用图标提示；
+                            没有用到任何知识库（闲聊/未检索）就不展示。 */}
+                        {msg.role === 'assistant' && msg.kbSources && msg.kbSources.length > 0 && (
                           <div className="message-kb-badge">
-                            {msg.kbSources.map((slug) => <KbTag key={slug} slug={slug} />)}
+                            {msg.kbSources.map((slug) => <KbSourceIcon key={slug} slug={slug} />)}
                           </div>
                         )}
                         {msg.role === 'assistant' && msg.content === '' && isTyping ? (
@@ -1243,6 +1311,8 @@ export default function App() {
           )}
         </div>
       </Drawer>
+
+      <UploadToKbModal open={kbUploadModalVisible} onClose={() => setKbUploadModalVisible(false)} />
       </>
       )}
     </AppShell>

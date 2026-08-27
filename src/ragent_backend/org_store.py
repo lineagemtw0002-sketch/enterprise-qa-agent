@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 import uuid
@@ -24,6 +25,8 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import asyncpg
+
+from src.ragent_backend.db_pool import get_shared_pool
 
 # 种子平台组织：现有唯一部署里的所有历史用户都会被回填到这个组织，
 # is_platform=TRUE 意味着"能看到/管理所有企业的用户"——迁移前后行为完全
@@ -38,20 +41,30 @@ class Organization:
     name: str
     is_platform: bool
     created_at: float
+    # 2026-08-26 席位上限（docs/account_lifecycle_design.md §4.4）。
+    # None = 不限。有默认值放最后，不破坏既有的位置构造调用。
+    seat_limit: Optional[int] = None
 
 
 class OrgStore:
     """组织存储 (PostgreSQL)。"""
 
+    # 类级别共享连接池，见 store.py 同名字段的注释——调用方经常每次都 new 一个
+    # 新实例，池必须挂在类属性上才不会被重复创建、打满 Postgres 连接数。
+    _pool: Optional[asyncpg.Pool] = None
+    _pool_lock = asyncio.Lock()
+
     def __init__(self) -> None:
-        self._pool: Optional[asyncpg.Pool] = None
         self._dsn = os.getenv("RAGENT_POSTGRES_URL", "postgresql://postgres:postgres@localhost:5432/ragent")
 
     async def _get_pool(self) -> asyncpg.Pool:
         if self._pool is not None:
             return self._pool
-        self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
-        await self._ensure_schema()
+        async with self._pool_lock:
+            if self._pool is not None:
+                return self._pool
+            type(self)._pool = await get_shared_pool(self._dsn)
+            await self._ensure_schema()
         return self._pool
 
     async def _ensure_schema(self) -> None:
@@ -74,6 +87,12 @@ class OrgStore:
             await conn.execute(
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS org_id TEXT REFERENCES organizations(id)"
             )
+            # 2026-08-26 席位（docs/account_lifecycle_design.md §4.4）。
+            # NULL = 不限。存量企业迁移过来时就是 NULL——**不能默认成某个数字**，
+            # 那会在升级的瞬间把已经超过该数字的企业全部锁死。
+            await conn.execute(
+                "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS seat_limit INTEGER"
+            )
             await conn.execute(
                 """
                 INSERT INTO organizations (id, name, is_platform, created_at)
@@ -90,18 +109,56 @@ class OrgStore:
 
     @staticmethod
     def _row_to_org(row: asyncpg.Record) -> Organization:
+        # asyncpg 的 Record 对缺失 key 抛 KeyError 不返回 None，所以按 key
+        # 是否存在取值。
+        #
+        # ⚠️ **这个兜底会把"忘了改 SELECT"变成静默降级，加字段时务必连同
+        # 本文件所有 SELECT 一起改。** 2026-08-26 加 seat_limit 时就踩了：
+        # `get_seat_limit()` 读得对，但 `get_organization()` 的 SELECT 没带这一列，
+        # 于是 `org.seat_limit` 恒为 None ——**"有上限"被读成"不限"，
+        # 席位校验形同虚设，而且不报任何错**。单测和"app 能不能构造起来"
+        # 都抓不到它，是 `scripts/verify_account_lifecycle.py` 连真库才发现的。
         return Organization(
             org_id=row["id"],
             name=row["name"],
             is_platform=row["is_platform"],
             created_at=row["created_at"],
+            seat_limit=row["seat_limit"] if "seat_limit" in row.keys() else None,
         )
+
+    async def get_seat_limit(self, org_id: str) -> Optional[int]:
+        """企业的席位上限。NULL / 查不到都返回 None（= 不限）。
+
+        查不到也返回 None 而不是抛异常：`org_id` 来自已鉴权用户的归属，
+        走到这里说明这个企业刚被删掉——此时挡住建号没有意义，
+        真正该报的错在别处。
+        """
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT seat_limit FROM organizations WHERE id = $1", org_id)
+        return row["seat_limit"] if row else None
+
+    async def set_seat_limit(self, org_id: str, seat_limit: Optional[int]) -> bool:
+        """改席位上限。**调用方必须已经确认操作者是平台管理员。**
+
+        席位是合同条款不是配置项——企业管理员能改自己企业的上限，
+        这个功能就等于不存在。守卫在端点上（`require_platform_admin`），
+        这里只做数据校验：负数没有意义，0 是合法的（暂停一家企业的新建号）。
+        """
+        if seat_limit is not None and seat_limit < 0:
+            raise ValueError("seat_limit 不能为负数")
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE organizations SET seat_limit = $1 WHERE id = $2", seat_limit, org_id,
+            )
+        return result.split()[-1] != "0"
 
     async def list_organizations(self) -> List[Organization]:
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT id, name, is_platform, created_at FROM organizations ORDER BY created_at ASC"
+                "SELECT id, name, is_platform, created_at, seat_limit FROM organizations ORDER BY created_at ASC"
             )
         return [self._row_to_org(r) for r in rows]
 
@@ -109,7 +166,7 @@ class OrgStore:
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT id, name, is_platform, created_at FROM organizations WHERE id = $1", org_id,
+                "SELECT id, name, is_platform, created_at, seat_limit FROM organizations WHERE id = $1", org_id,
             )
         return self._row_to_org(row) if row else None
 
@@ -129,13 +186,33 @@ class OrgStore:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT o.id, o.name, o.is_platform, o.created_at
+                SELECT o.id, o.name, o.is_platform, o.created_at, o.seat_limit
                 FROM users u JOIN organizations o ON o.id = u.org_id
                 WHERE u.id = $1
                 """,
                 user_id,
             )
         return self._row_to_org(row) if row else None
+
+    async def get_orgs_for_users_batch(self, user_ids: List[str]) -> "dict[str, Organization]":
+        """`get_org_for_user` 的批量版——1 次查询覆盖任意多用户，不是 N 次。
+
+        2026-08-26 P1-14 修复：管理端 `/admin/users` 原来对每个用户单独调
+        `get_org_for_user`，是"50 用户约 300 次串行查询"里的一部分。
+        """
+        if not user_ids:
+            return {}
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT u.id AS user_id, o.id, o.name, o.is_platform, o.created_at, o.seat_limit
+                FROM users u JOIN organizations o ON o.id = u.org_id
+                WHERE u.id = ANY($1::text[])
+                """,
+                user_ids,
+            )
+        return {row["user_id"]: self._row_to_org(row) for row in rows}
 
     async def is_platform_admin(self, user_id: str) -> bool:
         org = await self.get_org_for_user(user_id)
@@ -147,6 +224,8 @@ class OrgStore:
             await conn.execute("UPDATE users SET org_id = $1 WHERE id = $2", org_id, user_id)
 
     async def close(self) -> None:
-        if self._pool is not None:
-            await self._pool.close()
-            self._pool = None
+        # 池现在是跨 14 个 Store 共享的（db_pool.py，P1-2），这里只清掉
+        # 本 Store 持有的引用，不触发真实关闭——那会把其它 Store 正在用的
+        # 连接一起关掉。真正关闭见 db_pool.close_shared_pools()，只在 app
+        # 关闭时调一次。
+        type(self)._pool = None

@@ -564,20 +564,27 @@
   max-width: calc(100% - 56px);
 }
 
-/* 知识库来源角标：贴在回复内容框右上角，标注这条回复检索自哪个知识库 */
+/* 知识库来源角标：正文气泡上方一行小图标，标注这条回复检索自哪个知识库
+   （悬停看名字）。放在正常文档流里（不用 position:absolute），短回复也不会
+   跟正文抢位置——之前贴在气泡右上角的图标+文字版本在窄气泡下会跟正文重叠，
+   见 TopNav.jsx KbSourceIcon 旁的说明。 */
 .message-kb-badge {
-  position: absolute;
-  top: -10px;
-  right: 10px;
-  z-index: 1;
   display: flex;
-  gap: 4px;
-  flex-wrap: wrap;
-  justify-content: flex-end;
+  gap: 6px;
+  margin-bottom: 6px;
 }
 
-.message-kb-badge .tag--kb {
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+.kb-source-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--kb-color, var(--text-tertiary)) 14%, var(--bg-surface));
+  border: 1px solid color-mix(in srgb, var(--kb-color, var(--text-tertiary)) 40%, transparent);
+  color: color-mix(in srgb, var(--kb-color, var(--text-tertiary)) 75%, var(--text-primary));
+  cursor: default;
 }
 
 .message-content {

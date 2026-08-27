@@ -9,7 +9,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -17,7 +19,13 @@ import uuid
 from typing import Any, List, Optional
 
 import asyncpg
+
+from src.ragent_backend.db_pool import get_shared_pool
 from langchain_core.messages import HumanMessage
+
+from src.observability.redact import sensitive_digest
+
+logger = logging.getLogger(__name__)
 
 
 class LTMStore:
@@ -30,15 +38,22 @@ class LTMStore:
     - extract_facts: 用 LLM 从一轮对话中自动提炼事实
     """
 
+    # 类级别共享连接池，见 store.py 同名字段的注释——调用方经常每次都 new 一个
+    # 新实例，池必须挂在类属性上才不会被重复创建、打满 Postgres 连接数。
+    _pool: Optional[asyncpg.Pool] = None
+    _pool_lock = asyncio.Lock()
+
     def __init__(self) -> None:
-        self._pool: Optional[asyncpg.Pool] = None
         self._dsn = os.getenv("RAGENT_POSTGRES_URL", "postgresql://postgres:postgres@localhost:5432/ragent")
 
     async def _get_pool(self) -> asyncpg.Pool:
         if self._pool is not None:
             return self._pool
-        self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=3)
-        await self._ensure_schema()
+        async with self._pool_lock:
+            if self._pool is not None:
+                return self._pool
+            type(self)._pool = await get_shared_pool(self._dsn)
+            await self._ensure_schema()
         return self._pool
 
     async def _ensure_schema(self) -> None:
@@ -217,7 +232,21 @@ class LTMStore:
             if isinstance(facts, list):
                 return [str(f).strip() for f in facts if str(f).strip()]
         except Exception as e:
-            print(f"[LTM] extract_facts failed: {e!r}; raw content={content!r}")
+            # ⚠️ 这里原本是 `print(f"... raw content={content!r}")`。
+            # `content` 是模型对用户对话抽取出的**长期记忆事实原文**——姓名、
+            # 职位、请假原因这类东西——直接进 stdout 就等于落盘一份用户画像。
+            # 现在只记长度 + sha256 前 12 位（S2）：足以判断"两次失败是不是同一个
+            # 坏输出"、也足以让用户把原文给你时你能 hash 一遍对上号，
+            # 但日志本身不再是内容泄露面。
+            logger.warning(
+                "[LTM] extract_facts failed, returning no facts",
+                extra={
+                    "event": "ltm.extract_facts.failed",
+                    "error_type": type(e).__name__,
+                    **sensitive_digest("raw_content", content),
+                },
+                exc_info=True,
+            )
         return []
 
     async def delete_facts_from_turn(
@@ -238,6 +267,8 @@ class LTMStore:
             return int(result.split()[-1]) if result.split()[-1].isdigit() else 0
 
     async def close(self) -> None:
-        if self._pool is not None:
-            await self._pool.close()
-            self._pool = None
+        # 池现在是跨 14 个 Store 共享的（db_pool.py，P1-2），这里只清掉
+        # 本 Store 持有的引用，不触发真实关闭——那会把其它 Store 正在用的
+        # 连接一起关掉。真正关闭见 db_pool.close_shared_pools()，只在 app
+        # 关闭时调一次。
+        type(self)._pool = None

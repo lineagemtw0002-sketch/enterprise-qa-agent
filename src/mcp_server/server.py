@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from typing import TYPE_CHECKING
 
@@ -29,8 +30,16 @@ def _redirect_all_loggers_to_stderr() -> None:
 
     原因：MCP stdio 协议把 stdout 作为通信信道，
     一旦日志写入 stdout，会直接破坏 JSON-RPC 报文边界。
+
+    ⚠️ 光"此刻摘掉 stdout handler"是不够的：本函数之后还会有
+    `_preload_heavy_imports()` 和 `get_logger()` 触发
+    `configure_logging()`，它默认往 **stdout** 写。所以这里先把
+    `RAGENT_LOG_DEST` 钉死成 `stderr`，让后续任何一次配置都落在 stderr 上，
+    不依赖调用顺序。
     """
     import logging as _logging
+
+    os.environ["RAGENT_LOG_DEST"] = "stderr"
 
     root = _logging.getLogger()
     stderr_handler = _logging.StreamHandler(sys.stderr)
@@ -47,17 +56,17 @@ def _redirect_all_loggers_to_stderr() -> None:
 
 
 def _preload_heavy_imports() -> None:
-        """在主线程中预加载重量级依赖。
+    """在主线程中预加载重量级依赖。
 
-        背景：
-        - MCP SDK 运行后会由 anyio 管理后台线程处理 stdio I/O。
-        - 工具处理器里若再通过 `asyncio.to_thread()` 触发首次重型 import，
-            可能与 I/O 线程争用 Python 全局 import 锁，极端情况下造成卡死。
+    背景：
+    - MCP SDK 运行后会由 anyio 管理后台线程处理 stdio I/O。
+    - 工具处理器里若再通过 `asyncio.to_thread()` 触发首次重型 import，
+        可能与 I/O 线程争用 Python 全局 import 锁，极端情况下造成卡死。
 
-        方案：
-        - 在服务正式进入 I/O 线程前，先在主线程完成重型模块导入。
-        - 后续线程中的 import 直接命中 `sys.modules`，避免阻塞。
-        """
+    方案：
+    - 在服务正式进入 I/O 线程前，先在主线程完成重型模块导入。
+    - 后续线程中的 import 直接命中 `sys.modules`，避免阻塞。
+    """
     # chromadb is the heaviest culprit (onnxruntime, numpy, …)
     try:
         import chromadb  # noqa: F401

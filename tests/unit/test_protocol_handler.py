@@ -474,7 +474,13 @@ class TestServerProtocolHandlerIntegration:
             handler=search_handler,
         )
 
-        server = create_mcp_server("test-server", "1.0.0", protocol_handler=handler)
+        # register_tools=False: this test supplies its own fake "query_knowledge_hub"
+        # handler above and only wants to verify it flows through get_tool_schemas();
+        # letting create_mcp_server also register the real default tools would collide
+        # on the same name (see ProtocolHandler.register_tool's duplicate-name guard).
+        server = create_mcp_server(
+            "test-server", "1.0.0", protocol_handler=handler, register_tools=False
+        )
 
         # Verify tools are accessible through protocol handler
         tools = handler.get_tool_schemas()

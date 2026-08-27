@@ -61,6 +61,7 @@ class FileIntegrityChecker(ABC):
         file_hash: str,
         file_path: str,
         collection: Optional[str] = None,
+        version_key: Optional[str] = None,
     ) -> None:
         """将文件标记为“处理成功”。
 
@@ -68,6 +69,10 @@ class FileIntegrityChecker(ABC):
             file_hash: SHA256 hash of the file.
             file_path: Original file path (for tracking).
             collection: Optional collection/namespace identifier.
+            version_key: 用于识别“同一份文档的不同版本”的标识——不一定等于
+                `file_path`（上传接口常给每次上传的物理文件加随机前缀，
+                此时调用方应传原始文件名）。默认等于 `file_path`，兼容
+                “物理路径本身就稳定”的调用方（CLI/仪表盘重复处理同一路径）。
 
         Raises:
             RuntimeError: If database operation fails.
@@ -121,6 +126,30 @@ class FileIntegrityChecker(ABC):
         Returns:
             List of dicts with keys: file_hash, file_path, collection,
             processed_at, updated_at.
+        """
+        pass
+
+    @abstractmethod
+    def find_other_versions(
+        self,
+        version_key: str,
+        collection: Optional[str],
+        exclude_hash: str,
+    ) -> List[Dict[str, str]]:
+        """找出同一个 `version_key` 下、哈希不同于 `exclude_hash` 的历史成功记录。
+
+        用于摄入新版本后清理旧版本片段（旧版本内容一变，`file_hash` 必然
+        不同，`ingestion_history` 以 `file_hash` 为主键，所以同一份文档的
+        历次版本各是独立一行，不会自动互相覆盖——找出来交给调用方级联删除）。
+
+        Args:
+            version_key: 文档版本标识，与 `mark_success` 里传入的一致。
+            collection: 按集合收窄（同一文件名在不同知识库里是不同文档）。
+            exclude_hash: 排除掉的哈希（通常是这次刚摄入成功的新版本）。
+
+        Returns:
+            按 `processed_at` 升序排列的 `{"file_hash":..., "file_path":...}` 列表，
+            可能为空、也可能不止一条（历史上多次未清理的旧版本会一起返回）。
         """
         pass
 
@@ -187,13 +216,25 @@ class SQLiteIntegrityChecker(FileIntegrityChecker):
                     updated_at TEXT NOT NULL
                 )
             """)
-            
+
             # status 上建索引，加速按状态筛选（如 list_processed）。
             conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_status 
+                CREATE INDEX IF NOT EXISTS idx_status
                 ON ingestion_history(status)
             """)
-            
+
+            # `version_key`：识别"同一份文档的不同版本"用（默认等于
+            # `file_path`，见 mark_success 说明）。SQLite 的 `ALTER TABLE
+            # ADD COLUMN` 不支持 `IF NOT EXISTS`（这是 Postgres 语法，两者
+            # 混用会直接语法错误）——用 `PRAGMA table_info` 先查列是否存在。
+            existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(ingestion_history)")}
+            if "version_key" not in existing_cols:
+                conn.execute("ALTER TABLE ingestion_history ADD COLUMN version_key TEXT")
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_version_key
+                ON ingestion_history(version_key, collection)
+            """)
+
             conn.commit()
         finally:
             conn.close()
@@ -266,26 +307,30 @@ class SQLiteIntegrityChecker(FileIntegrityChecker):
             conn.close()
     
     def mark_success(
-        self, 
-        file_hash: str, 
-        file_path: str, 
-        collection: Optional[str] = None
+        self,
+        file_hash: str,
+        file_path: str,
+        collection: Optional[str] = None,
+        version_key: Optional[str] = None,
     ) -> None:
         """记录文件成功处理状态。
-        
+
         Uses INSERT OR REPLACE for idempotent operation.
-        
+
         Args:
             file_hash: SHA256 hash of the file.
             file_path: Original file path (for tracking).
             collection: Optional collection/namespace identifier.
-            
+            version_key: 见 `FileIntegrityChecker.mark_success` 的说明；
+                默认等于 `file_path`。
+
         Raises:
             RuntimeError: If database operation fails.
         """
         # 统一使用 UTC ISO8601，便于跨时区与审计。
         now = datetime.now(timezone.utc).isoformat()
-        
+        version_key = version_key if version_key is not None else file_path
+
         conn = sqlite3.connect(self.db_path)
         try:
             # 为保留首次处理时间 processed_at，先判断是否已有记录。
@@ -294,26 +339,27 @@ class SQLiteIntegrityChecker(FileIntegrityChecker):
                 (file_hash,)
             )
             result = cursor.fetchone()
-            
+
             if result:
                 # 已存在：更新状态与更新时间，不改 processed_at。
                 conn.execute("""
-                    UPDATE ingestion_history 
+                    UPDATE ingestion_history
                     SET file_path = ?,
                         status = 'success',
                         collection = ?,
                         error_msg = NULL,
-                        updated_at = ?
+                        updated_at = ?,
+                        version_key = ?
                     WHERE file_hash = ?
-                """, (file_path, collection, now, file_hash))
+                """, (file_path, collection, now, version_key, file_hash))
             else:
                 # 不存在：插入新记录，processed_at 与 updated_at 同时写入 now。
                 conn.execute("""
-                    INSERT INTO ingestion_history 
-                    (file_hash, file_path, status, collection, error_msg, processed_at, updated_at)
-                    VALUES (?, ?, 'success', ?, NULL, ?, ?)
-                """, (file_hash, file_path, collection, now, now))
-            
+                    INSERT INTO ingestion_history
+                    (file_hash, file_path, status, collection, error_msg, processed_at, updated_at, version_key)
+                    VALUES (?, ?, 'success', ?, NULL, ?, ?, ?)
+                """, (file_hash, file_path, collection, now, now, version_key))
+
             conn.commit()
         except sqlite3.Error as e:
             raise RuntimeError(f"Failed to mark success for {file_path}: {e}")
@@ -423,6 +469,46 @@ class SQLiteIntegrityChecker(FileIntegrityChecker):
                 query += " AND collection = ?"
                 params.append(collection)
             # 旧记录在前，便于按时间回放摄取过程。
+            query += " ORDER BY processed_at ASC"
+
+            cursor = conn.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def find_other_versions(
+        self,
+        version_key: str,
+        collection: Optional[str],
+        exclude_hash: str,
+    ) -> List[Dict[str, str]]:
+        """找出同一 `version_key` 下、哈希不同于 `exclude_hash` 的历史成功记录。
+
+        Args:
+            version_key: 文档版本标识（见 `mark_success`）。
+            collection: 按集合收窄；传 `None` 时不按集合过滤（历史遗留记录
+                可能 collection 为空，调用方需要自行判断是否要收窄）。
+            exclude_hash: 排除掉的哈希，通常是本次刚成功摄入的新版本。
+
+        Returns:
+            按 `processed_at` 升序排列的 `{"file_hash":..., "file_path":...}` 列表。
+        """
+        if not version_key:
+            # 空字符串/None 不构成有效的版本标识，不查——避免意外匹配到
+            # 库里其它同样是空 version_key 的历史记录（迁移前的老数据）。
+            return []
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            query = (
+                "SELECT file_hash, file_path FROM ingestion_history "
+                "WHERE status = 'success' AND version_key = ? AND file_hash != ?"
+            )
+            params: list[str] = [version_key, exclude_hash]
+            if collection is not None:
+                query += " AND collection = ?"
+                params.append(collection)
             query += " ORDER BY processed_at ASC"
 
             cursor = conn.execute(query, params)

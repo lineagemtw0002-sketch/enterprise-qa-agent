@@ -128,10 +128,12 @@ class ChunkRefiner(BaseTransform):
                 else:
                     refined_text = rule_refined_text
                     refined_by = "rule"
+                    if chunk.metadata:
+                        chunk.metadata['refine_fallback_reason'] = "llm_failed"
             else:
                 refined_text = rule_refined_text
                 refined_by = "rule"
-            
+
             refined_chunk = Chunk(
                 id=chunk.id,
                 text=refined_text,

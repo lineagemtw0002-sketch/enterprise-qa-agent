@@ -1,0 +1,534 @@
+{
+  "generated_at": "2026-08-26T11:40:48.315947",
+  "script": "/Users/david/Documents/enterprise-qa-agent/scripts/benchmark_bm25_backends.py",
+  "code_state": {
+    "commit": "253654a",
+    "commit_full": "253654ad9b182daafcb5fe863f8ff62d0f9703ce",
+    "branch": "fix/p0-security-and-project-conventions",
+    "dirty_paths": [
+      "?? scripts/benchmark_bm25_backends.py",
+      "?? scripts/benchmark_results/bm25_backends_20260826_112806.json",
+      "?? scripts/benchmark_results/bm25_backends_20260826_113429.json",
+      "?? scripts/benchmark_results/bm25_backends_20260826_113552.json",
+      "?? scripts/benchmark_results/bm25_backends_20260826_113610.json",
+      "?? scripts/benchmark_results/bm25_seed_20260826_112414.json",
+      "?? scripts/benchmark_results/bm25_seed_20260826_112712.json",
+      "?? scripts/benchmark_results/bm25_seed_20260826_113739.json",
+      "?? scripts/benchmark_results/bm25_seed_20260826_113909.json",
+      "?? scripts/seed_large_bm25_corpus.py"
+    ],
+    "is_clean": false,
+    "warning": "工作区有未提交改动，这批数字对应「含未提交改动的工作区状态」，不能只靠 commit hash 复现"
+  },
+  "platform": {
+    "sys_platform": "darwin",
+    "python": "3.12.13"
+  },
+  "args": {
+    "sizes": "1000,10000,50000,143000",
+    "crossover_sizes": "10,20,50,100",
+    "parallel_size": 10000,
+    "parallel_libs": 6,
+    "repeat": 3,
+    "query_kind": "hot",
+    "only": "scale,parity,rss,threshold",
+    "out": ""
+  },
+  "corpus_kind": "synthetic",
+  "corpus_caveat": "语料由 scripts/seed_large_bm25_corpus.py 合成（Zipf 词频 + Heaps 词表增长）。结论覆盖体积/延迟/内存/打分一致性/并行行为；不可用于评价检索质量、召回率或答案正确性。",
+  "results": {
+    "scale": {
+      "rows": [
+        {
+          "chunks": 1000,
+          "collection": "synthetic_bm25_1000",
+          "terms": [
+            "一一",
+            "一丁",
+            "一丂",
+            "一七",
+            "一丄"
+          ],
+          "json_bytes": 5495776,
+          "sqlite_bytes": 3862528,
+          "size_ratio_sqlite_over_json": 0.703,
+          "json": {
+            "load_ms": 26.19,
+            "query_ms": 0.932,
+            "total_ms": 27.122,
+            "load_ms_all": [
+              26.19,
+              26.336,
+              26.125
+            ],
+            "query_ms_all": [
+              0.932,
+              0.936,
+              0.932
+            ],
+            "hits": 10
+          },
+          "sqlite": {
+            "load_ms": 0.403,
+            "query_ms": 2.769,
+            "total_ms": 3.172,
+            "load_ms_all": [
+              0.393,
+              0.403,
+              0.603
+            ],
+            "query_ms_all": [
+              2.764,
+              2.769,
+              2.773
+            ],
+            "hits": 10
+          },
+          "sqlite_speedup_x": 8.55
+        },
+        {
+          "chunks": 10000,
+          "collection": "synthetic_bm25_10000",
+          "terms": [
+            "一一",
+            "一丁",
+            "一丂",
+            "一七",
+            "一丄"
+          ],
+          "json_bytes": 51198626,
+          "sqlite_bytes": 37003264,
+          "size_ratio_sqlite_over_json": 0.723,
+          "json": {
+            "load_ms": 255.125,
+            "query_ms": 18.86,
+            "total_ms": 273.984,
+            "load_ms_all": [
+              255.203,
+              255.125,
+              250.714
+            ],
+            "query_ms_all": [
+              19.404,
+              10.365,
+              18.86
+            ],
+            "hits": 10
+          },
+          "sqlite": {
+            "load_ms": 0.384,
+            "query_ms": 25.755,
+            "total_ms": 26.14,
+            "load_ms_all": [
+              0.435,
+              0.384,
+              0.384
+            ],
+            "query_ms_all": [
+              25.637,
+              25.755,
+              25.836
+            ],
+            "hits": 10
+          },
+          "sqlite_speedup_x": 10.48
+        },
+        {
+          "chunks": 50000,
+          "collection": "synthetic_bm25_50000",
+          "terms": [
+            "一一",
+            "一丁",
+            "一丂",
+            "一七",
+            "一丄"
+          ],
+          "json_bytes": 249962238,
+          "sqlite_bytes": 183513088,
+          "size_ratio_sqlite_over_json": 0.734,
+          "json": {
+            "load_ms": 1334.304,
+            "query_ms": 166.837,
+            "total_ms": 1501.141,
+            "load_ms_all": [
+              1310.701,
+              1334.304,
+              1353.728
+            ],
+            "query_ms_all": [
+              163.163,
+              185.901,
+              166.837
+            ],
+            "hits": 10
+          },
+          "sqlite": {
+            "load_ms": 0.391,
+            "query_ms": 131.458,
+            "total_ms": 131.85,
+            "load_ms_all": [
+              0.412,
+              0.391,
+              0.371
+            ],
+            "query_ms_all": [
+              131.458,
+              132.786,
+              129.128
+            ],
+            "hits": 10
+          },
+          "sqlite_speedup_x": 11.39
+        },
+        {
+          "chunks": 143000,
+          "collection": "synthetic_bm25_143000",
+          "terms": [
+            "一一",
+            "一丁",
+            "一丂",
+            "一七",
+            "一丄"
+          ],
+          "json_bytes": 707871121,
+          "sqlite_bytes": 522326016,
+          "size_ratio_sqlite_over_json": 0.738,
+          "json": {
+            "load_ms": 5365.496,
+            "query_ms": 560.025,
+            "total_ms": 5925.521,
+            "load_ms_all": [
+              6063.211,
+              5365.496,
+              3967.321
+            ],
+            "query_ms_all": [
+              755.168,
+              369.889,
+              560.025
+            ],
+            "hits": 10
+          },
+          "sqlite": {
+            "load_ms": 0.466,
+            "query_ms": 388.33,
+            "total_ms": 388.796,
+            "load_ms_all": [
+              0.449,
+              0.516,
+              0.466
+            ],
+            "query_ms_all": [
+              387.983,
+              388.33,
+              389.576
+            ],
+            "hits": 10
+          },
+          "sqlite_speedup_x": 15.24
+        }
+      ],
+      "query_kind": "hot"
+    },
+    "parity": {
+      "rows": [
+        {
+          "chunks": 1000,
+          "collection": "synthetic_bm25_1000",
+          "checks": [
+            {
+              "query_kind": "hot",
+              "terms": [
+                "一一",
+                "一丁",
+                "一丂",
+                "一七",
+                "一丄"
+              ],
+              "n_results_json": 992,
+              "n_results_sqlite": 992,
+              "same_length": true,
+              "identical_ordered": true,
+              "identical_score_map": true,
+              "first_diff": null
+            },
+            {
+              "query_kind": "mixed",
+              "terms": [
+                "一凑",
+                "丁儉",
+                "七京",
+                "七亣",
+                "丅乄"
+              ],
+              "n_results_json": 12,
+              "n_results_sqlite": 12,
+              "same_length": true,
+              "identical_ordered": true,
+              "identical_score_map": true,
+              "first_diff": null
+            }
+          ]
+        },
+        {
+          "chunks": 10000,
+          "collection": "synthetic_bm25_10000",
+          "checks": [
+            {
+              "query_kind": "hot",
+              "terms": [
+                "一一",
+                "一丁",
+                "一丂",
+                "一七",
+                "一丄"
+              ],
+              "n_results_json": 9983,
+              "n_results_sqlite": 9983,
+              "same_length": true,
+              "identical_ordered": true,
+              "identical_score_map": true,
+              "first_diff": null
+            },
+            {
+              "query_kind": "mixed",
+              "terms": [
+                "丅凹",
+                "不乎",
+                "上修",
+                "丐免",
+                "专傁"
+              ],
+              "n_results_json": 24,
+              "n_results_sqlite": 24,
+              "same_length": true,
+              "identical_ordered": true,
+              "identical_score_map": true,
+              "first_diff": null
+            }
+          ]
+        },
+        {
+          "chunks": 50000,
+          "collection": "synthetic_bm25_50000",
+          "checks": [
+            {
+              "query_kind": "hot",
+              "terms": [
+                "一一",
+                "一丁",
+                "一丂",
+                "一七",
+                "一丄"
+              ],
+              "n_results_json": 49936,
+              "n_results_sqlite": 49936,
+              "same_length": true,
+              "identical_ordered": true,
+              "identical_score_map": true,
+              "first_diff": null
+            },
+            {
+              "query_kind": "mixed",
+              "terms": [
+                "不军",
+                "丝仠",
+                "丣偔",
+                "丯儌",
+                "乁儴"
+              ],
+              "n_results_json": 38,
+              "n_results_sqlite": 38,
+              "same_length": true,
+              "identical_ordered": true,
+              "identical_score_map": true,
+              "first_diff": null
+            }
+          ]
+        },
+        {
+          "chunks": 143000,
+          "collection": "synthetic_bm25_143000",
+          "checks": [
+            {
+              "query_kind": "hot",
+              "terms": [
+                "一一",
+                "一丁",
+                "一丂",
+                "一七",
+                "一丄"
+              ],
+              "n_results_json": 142789,
+              "n_results_sqlite": 142789,
+              "same_length": true,
+              "identical_ordered": true,
+              "identical_score_map": true,
+              "first_diff": null
+            },
+            {
+              "query_kind": "mixed",
+              "terms": [
+                "东丩",
+                "丳偺",
+                "乑僂",
+                "习例",
+                "乯兺"
+              ],
+              "n_results_json": 51,
+              "n_results_sqlite": 51,
+              "same_length": true,
+              "identical_ordered": true,
+              "identical_score_map": true,
+              "first_diff": null
+            }
+          ]
+        }
+      ],
+      "all_bit_identical": true
+    },
+    "rss": {
+      "baseline": {
+        "peak_rss_bytes": 78397440,
+        "rss_after_import_bytes": 78397440,
+        "hits": 0
+      },
+      "rows": [
+        {
+          "chunks": 1000,
+          "collection": "synthetic_bm25_1000",
+          "json_peak_mb": 114.0,
+          "sqlite_peak_mb": 76.5,
+          "json_over_baseline_mb": 39.2,
+          "sqlite_over_baseline_mb": 1.7,
+          "raw_json": {
+            "peak_rss_bytes": 119554048,
+            "rss_after_import_bytes": 78479360,
+            "hits": 10
+          },
+          "raw_sqlite": {
+            "peak_rss_bytes": 80216064,
+            "rss_after_import_bytes": 78381056,
+            "hits": 10
+          }
+        },
+        {
+          "chunks": 10000,
+          "collection": "synthetic_bm25_10000",
+          "json_peak_mb": 440.6,
+          "sqlite_peak_mb": 87.6,
+          "json_over_baseline_mb": 365.8,
+          "sqlite_over_baseline_mb": 12.8,
+          "raw_json": {
+            "peak_rss_bytes": 461996032,
+            "rss_after_import_bytes": 78561280,
+            "hits": 10
+          },
+          "raw_sqlite": {
+            "peak_rss_bytes": 91832320,
+            "rss_after_import_bytes": 78462976,
+            "hits": 10
+          }
+        },
+        {
+          "chunks": 50000,
+          "collection": "synthetic_bm25_50000",
+          "json_peak_mb": 1847.6,
+          "sqlite_peak_mb": 138.4,
+          "json_over_baseline_mb": 1772.9,
+          "sqlite_over_baseline_mb": 63.6,
+          "raw_json": {
+            "peak_rss_bytes": 1937375232,
+            "rss_after_import_bytes": 78446592,
+            "hits": 10
+          },
+          "raw_sqlite": {
+            "peak_rss_bytes": 145113088,
+            "rss_after_import_bytes": 78577664,
+            "hits": 10
+          }
+        },
+        {
+          "chunks": 143000,
+          "collection": "synthetic_bm25_143000",
+          "json_peak_mb": 2153.3,
+          "sqlite_peak_mb": 248.6,
+          "json_over_baseline_mb": 2078.5,
+          "sqlite_over_baseline_mb": 173.9,
+          "raw_json": {
+            "peak_rss_bytes": 2257911808,
+            "rss_after_import_bytes": 78446592,
+            "hits": 10
+          },
+          "raw_sqlite": {
+            "peak_rss_bytes": 260718592,
+            "rss_after_import_bytes": 78610432,
+            "hits": 10
+          }
+        }
+      ],
+      "note": "每个数字来自一个全新子进程的 ru_maxrss（峰值），不是主进程前后取差值"
+    },
+    "threshold": {
+      "threshold_bytes": 262144,
+      "rows": [
+        {
+          "chunks": 10,
+          "collection": "synthetic_bm25_10",
+          "json_bytes": 89117,
+          "auto_picks_sqlite": false
+        },
+        {
+          "chunks": 20,
+          "collection": "synthetic_bm25_20",
+          "json_bytes": 159553,
+          "auto_picks_sqlite": false
+        },
+        {
+          "chunks": 50,
+          "collection": "synthetic_bm25_50",
+          "json_bytes": 352986,
+          "auto_picks_sqlite": true
+        },
+        {
+          "chunks": 100,
+          "collection": "synthetic_bm25_100",
+          "json_bytes": 647429,
+          "auto_picks_sqlite": true
+        },
+        {
+          "chunks": 1000,
+          "collection": "synthetic_bm25_1000",
+          "json_bytes": 5495776,
+          "auto_picks_sqlite": true
+        },
+        {
+          "chunks": 10000,
+          "collection": "synthetic_bm25_10000",
+          "json_bytes": 51198626,
+          "auto_picks_sqlite": true
+        },
+        {
+          "chunks": 50000,
+          "collection": "synthetic_bm25_50000",
+          "json_bytes": 249962238,
+          "auto_picks_sqlite": true
+        },
+        {
+          "chunks": 143000,
+          "collection": "synthetic_bm25_143000",
+          "json_bytes": 707871121,
+          "auto_picks_sqlite": true
+        }
+      ]
+    }
+  },
+  "not_covered": [
+    "合成语料，非真实文档；不涉及检索质量/召回率",
+    "只测 BM25 这一层，不含 dense 检索、rerank、端到端 TTFT",
+    "只测单进程内的并发；未测多进程/多 worker 部署形态",
+    "未测写路径（add_documents / remove_document）在大规模下的耗时",
+    "未测索引更新与查询并发时的读写竞争",
+    "只在本机 macOS + APFS 上跑过；生产硬件与文件系统不同"
+  ]
+}

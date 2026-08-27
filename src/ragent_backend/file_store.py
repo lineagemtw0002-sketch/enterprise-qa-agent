@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import shutil
 import uuid
@@ -18,6 +20,10 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 import asyncpg
+
+from src.ragent_backend.db_pool import get_shared_pool
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -52,18 +58,25 @@ class ConversationFileStore:
             └── .meta/                   # 元数据（可选）
     """
 
+    # 类级别共享连接池，见 store.py 同名字段的注释——调用方经常每次都 new 一个
+    # 新实例，池必须挂在类属性上才不会被重复创建、打满 Postgres 连接数。
+    _pool: Optional[asyncpg.Pool] = None
+    _pool_lock = asyncio.Lock()
+
     def __init__(self, upload_dir: str = "./data/uploads") -> None:
         self._upload_dir = Path(upload_dir).resolve()
         self._upload_dir.mkdir(parents=True, exist_ok=True)
 
-        self._pool: Optional[asyncpg.Pool] = None
         self._dsn = os.getenv("RAGENT_POSTGRES_URL", "postgresql://postgres:postgres@localhost:5432/ragent")
 
     async def _get_pool(self) -> asyncpg.Pool:
         if self._pool is not None:
             return self._pool
-        self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
-        await self._ensure_schema()
+        async with self._pool_lock:
+            if self._pool is not None:
+                return self._pool
+            type(self)._pool = await get_shared_pool(self._dsn)
+            await self._ensure_schema()
         return self._pool
 
     async def _ensure_schema(self) -> None:
@@ -225,7 +238,19 @@ class ConversationFileStore:
         try:
             Path(file_info.file_path).unlink(missing_ok=True)
         except Exception as e:
-            print(f"[FileStore] Failed to delete file: {e}")
+            # error：磁盘文件删不掉但 DB 记录马上就删了 → 产生**孤儿文件**，
+            # 而且用户界面上看不到它了。这是静默失效，不是可用降级。
+            # 不记 file_path——上传文件名是用户内容（S2）；file_id 足够定位。
+            logger.error(
+                "[FileStore] Failed to delete file from disk",
+                extra={
+                    "event": "file_store.delete_file.failed",
+                    "error_type": type(e).__name__,
+                    "conversation_id": conversation_id,
+                    "file_id": file_id,
+                },
+                exc_info=True,
+            )
 
         pool = await self._get_pool()
         async with pool.acquire() as conn:
@@ -244,7 +269,17 @@ class ConversationFileStore:
             try:
                 shutil.rmtree(conv_dir)
             except Exception as e:
-                print(f"[FileStore] Failed to delete directory: {e}")
+                # 同上：整个会话目录留在盘上，DB 记录却清了。
+                logger.error(
+                    "[FileStore] Failed to delete conversation directory from disk",
+                    extra={
+                        "event": "file_store.delete_dir.failed",
+                        "error_type": type(e).__name__,
+                        "conversation_id": conversation_id,
+                        "file_count": len(files),
+                    },
+                    exc_info=True,
+                )
 
         pool = await self._get_pool()
         async with pool.acquire() as conn:
@@ -316,9 +351,11 @@ class ConversationFileStore:
         )
 
     async def close(self) -> None:
-        if self._pool is not None:
-            await self._pool.close()
-            self._pool = None
+        # 池现在是跨 14 个 Store 共享的（db_pool.py，P1-2），这里只清掉
+        # 本 Store 持有的引用，不触发真实关闭——那会把其它 Store 正在用的
+        # 连接一起关掉。真正关闭见 db_pool.close_shared_pools()，只在 app
+        # 关闭时调一次。
+        type(self)._pool = None
 
 
 def build_file_store() -> ConversationFileStore:

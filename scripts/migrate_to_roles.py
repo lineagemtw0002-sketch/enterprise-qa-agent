@@ -36,7 +36,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.ragent_backend.user_store import UserStore
-from src.ragent_backend.role_store import RoleStore, ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER
+from src.ragent_backend.role_store import RoleStore, ROLE_SUPER_ADMIN
 
 ALL_KB_ROLE_NAME = "all_kb"
 ALL_KB_ROLE_DISPLAY = "全部知识库"
@@ -51,7 +51,12 @@ DEPARTMENT_ROLE_MAP = {
     "legal_kb": ("legal_dept", "法务部"),
 }
 
-SYSTEM_ROLE_NAMES = {ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER}
+# 历史快照：这个脚本迁移时（role.md 阶段一）系统角色还是 super_admin/admin/
+# user 三个，"admin"/"user" 两个字符串直接写死在这里而不从 role_store 导入
+# ——2026-08-24 起平台侧已废弃这两个系统角色（见 role_store.py 顶部说明），
+# role_store 不再导出对应常量，但这个脚本描述的是执行迁移那一刻的历史状态，
+# 字符串值本身不受影响，无需跟着改。
+SYSTEM_ROLE_NAMES = {ROLE_SUPER_ADMIN, "admin", "user"}
 
 
 async def _role_for_collection(role_store: RoleStore, collection_name: str):

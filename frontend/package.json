@@ -9,6 +9,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@fontsource/jetbrains-mono": "^5.3.0",
+    "@fontsource/titillium-web": "^5.3.0",
     "antd": "^5.20.0",
     "axios": "^1.6.8",
     "dompurify": "^3.4.14",

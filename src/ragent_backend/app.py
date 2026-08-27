@@ -11,11 +11,14 @@ RAG Backend API - 会话级知识库版本
 from __future__ import annotations
 
 import asyncio
+import asyncpg
 import httpx
 import json
 import os
 import sys
-from typing import AsyncGenerator, FrozenSet, List, Optional
+import time
+import uuid
+from typing import Any, AsyncGenerator, Dict, FrozenSet, List, Optional
 from pathlib import Path
 
 # Windows: psycopg async 需要 SelectorEventLoop，而不是 ProactorEventLoop
@@ -31,10 +34,12 @@ except ImportError:
     pass  # python-dotenv 未安装
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+
+from langchain_core.messages import HumanMessage
 
 # LangGraph checkpointer
 from langgraph.checkpoint.postgres import PostgresSaver
@@ -45,35 +50,83 @@ from src.ragent_backend.schemas import (
     OrganizationSummary, AdminUserResponse, AdminCreateUserRequest,
     AdminOrganizationResponse, AdminCreateOrganizationRequest,
     TenantConnectorResponse, UpsertTenantConnectorRequest, GatewayConnectorResponse,
-    RoleResponse, CreateRoleRequest, UpdateRoleRequest,
-    SetRoleCollectionsRequest, SetUserRolesRequest,
+    RoleResponse, CreateRoleRequest, UpdateRoleRequest, SetUserRolesRequest,
+    SetRoleCollectionsRequest,
     CollectionResponse, CreateCollectionRequest,
+    CollectionCatalogEntry, UploadStartedResponse, UploadProgressResponse,
+    TenantKbUploadResponse,
+    DashboardOverviewResponse, DashboardTrendResponse, DashboardTrendPointResponse,
+    AuditLogResponse, AuditLogListResponse, CostOverviewResponse,
     WorkflowTemplateResponse, CreateWorkflowTemplateRequest, UpdateWorkflowTemplateRequest,
+    WorkflowApproverAssignmentResponse, SetWorkflowApproverRequest,
     WorkflowInstanceResponse, WorkflowActionRequest, WorkflowReturnRequest, WorkflowRejectRequest,
     NotificationResponse,
+    AdminKbChunkPreview,
+    AdminCreatedUserCredential, SetSeatLimitRequest, SetUserDisabledRequest,
+    ActivateAccountRequest, BulkImportRowResult, BulkImportResponse,
+    OpsConnectorResponse, RegisterOpsConnectorRequest, SetAiopsModuleEnabledRequest,
+    OpsConnectorRegisterTokenResponse,
+    RemediationScopeResponse, UpsertRemediationScopeRequest,
+    RemediationActionResponse, ProposeRemediationActionRequest,
+    RoleOpsPermissionResponse, SetRoleOpsPermissionRequest,
+    AnalysisSummaryResponse, SetOutcomeEffectiveRequest, OpsMetricsResponse,
+    OpsLiveOverviewResponse, ServiceHealthEntry,
+    ServiceThresholdsRequest, ServiceThresholdsEntry,
+    AnalyzeOpsIncidentRequest, AnalyzeOpsIncidentResponse,
+    PostmortemEntryResponse,
 )
+from src.ragent_backend import api_helpers
+from src.ragent_backend.api.kb_dashboard_router import build_kb_dashboard_router
+from src.ragent_backend.api.ops_router import build_ops_router
+from src.ragent_backend import account_import as _acct_import
+from src.ragent_backend import activation as _activation
 from src.ragent_backend.store import build_archive_store, ConversationArchiveStore
+from src.ragent_backend.db_pool import close_shared_pools
 from src.ragent_backend.workflow import RAGWorkflow
 from src.ragent_backend.ltm_store import LTMStore
 from src.ragent_backend.file_store import build_file_store, ConversationFileStore
 from src.ragent_backend.conversation_store import build_conversation_store, ConversationStore, Conversation
 from src.ragent_backend.user_store import UserStore, User
-from src.ragent_backend.role_store import RoleStore, ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_ORG_ADMIN, ROLE_USER
+from src.ragent_backend.role_store import Role, RoleStore, ROLE_SUPER_ADMIN, ROLE_ORG_ADMIN
 from src.ragent_backend.workflow_store import WorkflowStore, WorkflowTemplate, WorkflowInstance
 from src.ragent_backend.attendance_store import AttendanceStore
 from src.ragent_backend.org_store import OrgStore
 from src.ragent_backend.tenant_connector_store import TenantConnectorStore, CAPABILITY_KNOWLEDGE_BASE, CONNECTOR_TYPE_HTTP_API
 from src.ragent_backend.collection_store import OrgCollectionStore
+from src.ragent_backend.dashboard_stats import DashboardStatsService
 from src.ragent_backend.tenant_identity_store import TenantIdentityStore
+from src.ragent_backend.audit_store import AuditStore
+from src.ragent_backend.ops_store import (
+    OpsStore, IllegalStatusTransition,
+    STATUS_PENDING_APPROVAL, STATUS_REJECTED, STATUS_REJECTED_PRE,
+)
+from src.ragent_backend import aiops_scope
+from src.ops import connector_session, service_health
+from src.ops.measured_baseline import with_measured_baseline
+from src.ops.analysis import Alert, correlate_alerts
+from src.ops.types import QueryRequest, TimeRange
+from src.ops.connector_transport import WebSocketConnectorTransport, WebSocketRemediationDispatcher
+from src.ops.federation.engine import FederatedQueryEngine
+from src.ops.store_adapters import OpsStoreDirectory
+from src.ops.tools import OpsToolset
 from src.ragent_backend.auth import (
     AuthenticatedUser, create_access_token, get_current_user, require_role,
-    require_same_org_or_platform, require_platform_admin,
+    require_same_org_or_platform, require_platform_admin, get_jwt_secret,
+    _decode_token,
 )
 from src.ingestion.pipeline import IngestionPipeline
-from src.core.settings import load_settings
+from src.ingestion.delegated_compute import compute_chunks_for_delegation
+from src.security.prompt_guard import InjectionDetectedError
+from src.core.settings import load_settings, resolve_path
 from src.tool_agent.tool_registry import ToolRegistry
 from src.tool_agent.builtin_tools import register_builtin_tools
 from src.tool_agent.mcp_client import MCPClient
+from src.mcp_server.tools.query_knowledge_hub import QueryKnowledgeHubTool
+from src.observability.logger import get_logger
+from src.observability.context import bind_request_context, clear_request_context, get_request_context
+from src.observability.middleware import RequestContextMiddleware
+
+logger = get_logger(__name__)
 
 
 def create_checkpointer():
@@ -114,7 +167,7 @@ def create_checkpointer():
         future = executor.submit(_create)
         checkpointer = future.result()
 
-    print(f"[Checkpointer] Using PostgreSQL (Async)")
+    logger.info("using PostgreSQL checkpointer (async)")
     return checkpointer
 
 
@@ -134,7 +187,7 @@ async def _trim_checkpoints(checkpointer, thread_id: str, keep_checkpoint_id: Op
     """
     conn = getattr(checkpointer, "conn", None)
     if conn is None:
-        print(f"[TrimCheckpoint] checkpointer 没有可用连接，跳过 thread={thread_id}")
+        logger.warning("checkpointer has no available connection, skipping trim", extra={"thread_id": thread_id})
         return
 
     try:
@@ -150,16 +203,36 @@ async def _trim_checkpoints(checkpointer, thread_id: str, keep_checkpoint_id: Op
         else:
             await conn.execute("DELETE FROM checkpoints WHERE thread_id = %s", (thread_id,))
             await conn.execute("DELETE FROM checkpoint_writes WHERE thread_id = %s", (thread_id,))
-        print(f"[TrimCheckpoint] Postgres trimmed for thread={thread_id}, kept={keep_checkpoint_id}")
-    except Exception as e:
-        print(f"[TrimCheckpoint] Postgres trim failed: {e}")
+        logger.info(
+            "postgres checkpoint trimmed",
+            extra={"thread_id": thread_id, "kept_checkpoint_id": keep_checkpoint_id},
+        )
+    except Exception:
+        logger.exception("postgres checkpoint trim failed", extra={"thread_id": thread_id})
 
 
 # 全局并发控制：限制同时执行的 ingest 后台任务数量，防止 LLM API 配额和内存被打爆
 INGEST_SEMAPHORE = asyncio.Semaphore(2)
 
+# 一帧推送最多接收多少条告警。一次大面积故障可能瞬间产生几千条——
+# 超出部分丢弃并在 ack 里如实标 truncated，**不能因为告警太多把平台打挂**。
+_ALERT_PUSH_MAX_PER_FRAME = 500
+
 # WebSocket 连接管理：conversation_id -> list[WebSocket]
 active_trace_ws: dict[str, list[WebSocket]] = {}
+
+# 智能运维模块（docs/aiops_module_design.md §10.1）：connection_id -> 当前存活
+# 的 WebSocket 连接。进程内内存字典，不落库——"这个连接器现在是不是真的连着"
+# 这件事的最权威来源就是这个进程持不持有它的 socket，落库的
+# ops_system_connections.connector_status/last_heartbeat_at 是心跳驱动的
+# 派生状态，用于跨进程/重启后的展示，两者不是同一个概念，不要混用。
+active_ops_connector_ws: dict[str, WebSocket] = {}
+
+# `message id -> Future`：`WebSocketConnectorTransport`/`WebSocketRemediationDispatcher`
+# （src/ops/connector_transport.py）发出 query_request/exec_request 时在这里登记，
+# WS 接收循环收到关联的 query_result/exec_result 帧时按 id 找到对应的 Future 并
+# resolve 它——这是"请求-响应"语义叠加在"消息帧"这种发布/订阅式协议上的标准做法。
+active_ops_pending_requests: dict[str, "asyncio.Future"] = {}
 
 async def broadcast_trace(conversation_id: str, data: dict) -> None:
     """向该对话的所有 WebSocket 客户端广播 trace 事件"""
@@ -194,6 +267,8 @@ async def ingest_file_task(
     file_path: str,
     collection: str,
     settings: Settings,
+    org_id: Optional[str] = None,
+    owner_user_id: Optional[str] = None,
 ) -> None:
     """
     后台任务：将文件 ingest 到对话的 collection
@@ -205,7 +280,15 @@ async def ingest_file_task(
             await file_store.update_file_status(conversation_id, file_id, "ingesting")
             
             # 创建 ingestion pipeline，指定 target collection
-            pipeline = IngestionPipeline(settings, collection=collection)
+            # org_id / owner_user_id 供 OpenSearch 侧的对话私有库做企业内隔离过滤。
+            # 两者都来自端点里已校验的身份（_require_conversation_owner 已确认
+            # 当前用户就是该对话的所有者），不是请求体里的声明。
+            pipeline = IngestionPipeline(
+                settings,
+                collection=collection,
+                org_id=org_id,
+                owner_user_id=owner_user_id,
+            )
             
             # 执行 ingest（在线程池中运行，避免阻塞事件循环）
             result = await asyncio.to_thread(
@@ -230,7 +313,10 @@ async def ingest_file_task(
                     page_count=page_count,
                     word_count=word_count,
                 )
-                print(f"[Ingest] File {file_id} ingested successfully to {collection}, doc_id={doc_id}, method={extract_method}")
+                logger.info(
+                    "file ingested successfully",
+                    extra={"file_id": file_id, "collection": collection, "doc_id": doc_id, "extract_method": extract_method},
+                )
             else:
                 error_msg = result.error or "Unknown error"
                 await file_store.update_file_status(
@@ -239,10 +325,10 @@ async def ingest_file_task(
                     page_count=page_count,
                     word_count=word_count,
                 )
-                print(f"[Ingest] Failed to ingest file {file_id}: {error_msg}")
-            
+                logger.warning("failed to ingest file", extra={"file_id": file_id, "error": error_msg})
+
         except Exception as e:
-            print(f"[Ingest] Failed to ingest file {file_id}: {e}")
+            logger.exception("failed to ingest file", extra={"file_id": file_id})
             await file_store.update_file_status(
                 conversation_id, file_id, "error", error_message=str(e)
             )
@@ -262,14 +348,53 @@ def _build_active_workflow_summary(active_workflow: Optional[dict]) -> Optional[
     )
 
 
+def resolve_cors_origins(
+    raw: Optional[str] = None,
+    debug_mode: Optional[bool] = None,
+) -> List[str]:
+    """决定 CORS 允许的来源列表，不再使用通配符。
+
+    2026-08-26 P0：原本是 `allow_origins=["*"]` + `allow_credentials=True`——
+    这个组合允许任意网站携带用户凭证跨域调用本服务的 API，是明确的错误配置。
+    改为显式来源清单：`RAGENT_ALLOWED_ORIGINS`（逗号分隔）。未配置时，
+    只有 `RAGENT_DEBUG=true` 才回退到本地前端开发常见来源；生产环境未配置
+    则返回空列表——请求会被浏览器挡在 CORS 这一层，是"看得见的失败"，
+    不是"悄悄放行"，不需要像 JWT 密钥那样拒绝启动。
+
+    参数可注入是为了能直接单测，不依赖进程环境变量。
+
+    `*` 在这里永远不被当成合法来源——哪怕有人把它显式配进
+    `RAGENT_ALLOWED_ORIGINS`，也会被过滤掉，不会重新变回原缺陷那样的通配符。
+    """
+    if raw is None:
+        raw = os.getenv("RAGENT_ALLOWED_ORIGINS", "")
+    if debug_mode is None:
+        debug_mode = os.getenv("RAGENT_DEBUG", "false").strip().lower() == "true"
+
+    origins = [o.strip() for o in raw.split(",") if o.strip() and o.strip() != "*"]
+    if origins:
+        return origins
+    if debug_mode:
+        return ["http://localhost:5173", "http://127.0.0.1:5173"]
+    return []
+
+
 def create_app() -> FastAPI:
+    # 最先校验 JWT 密钥：配置不安全时在这里就崩掉，不要等到有人登录才发现。
+    # 密钥用了源码内置默认值意味着任何人都能伪造任意用户身份，下面这一整套
+    # 权限设计（require_role / 多租户 collection ACL / tenant_ 前缀拦截）
+    # 全部形同虚设，所以这属于"必须挡在启动阶段"的配置错误。
+    # 见 auth.py `resolve_jwt_secret` 与 2026-08-24 代码审计 P0-2。
+    get_jwt_secret()
+
     # 加载配置
     settings = load_settings()
 
     # user_store 先建好，因为 ToolRegistry 里的工具要用它做 ACL 校验
     user_store: UserStore = UserStore()
-    # role_store：角色 CRUD + 角色<->知识库/用户<->角色 关联；
-    # user_store.get_allowed_collections 内部会委托它算权限并集
+    # role_store：角色 CRUD + 用户<->角色关联 + 角色<->知识库关联（角色直接携带
+    # 知识库权限，见 role_store.py 顶部说明）；user_store.get_allowed_collections
+    # 内部会委托它算权限并集
     role_store: RoleStore = RoleStore()
     # workflow_store：流程模板 + 工作流实例 + 站内信（work-flow.md / work-flow-web.md）
     workflow_store: WorkflowStore = WorkflowStore()
@@ -283,56 +408,58 @@ def create_app() -> FastAPI:
     # org_collection_store：企业自建知识库的归属登记（只针对本地检索的企业，
     # 见 collection_store.py 顶部说明）
     org_collection_store: OrgCollectionStore = OrgCollectionStore()
+    # dashboard_stats_service：运营仪表盘只读聚合查询（见 dashboard_stats.py）
+    dashboard_stats_service: DashboardStatsService = DashboardStatsService()
     # tenant_identity_store：我方 user_id <-> 企业考勤系统工号的映射，只有委托考勤
     # 查询用得到（attendance-tenant-federation.md 第 3 节）
     tenant_identity_store: TenantIdentityStore = TenantIdentityStore()
-
-    # 初始化 ToolRegistry（内置工具 + MCP 外部工具）
-    tool_registry = ToolRegistry()
-    register_builtin_tools(
-        tool_registry,
-        user_store=user_store,
-        workflow_store=workflow_store,
-        attendance_store=attendance_store,
-        org_store=org_store,
-        tenant_connector_store=tenant_connector_store,
-        tenant_identity_store=tenant_identity_store,
+    # audit_store：治理与合规——管理后台变更操作 + 工具调用的审计记录（见
+    # audit_store.py）
+    audit_store: AuditStore = AuditStore()
+    # ops_store：智能运维模块（docs/aiops_module_design.md）——连接器/修复范围
+    # 白名单/审批状态机，阶段一存储层。BYOC 连接器的实际运行时（心跳/联邦查询/
+    # AI 分析）尚未实现，这里接的只是管理面的 CRUD 端点。
+    ops_store: OpsStore = OpsStore()
+    # 知识库管理工具：统计/查看/清空一家企业名下知识库的数据。
+    # 企业管理员在「知识库权限」页面自助删除知识库/分页查看数据（见下面
+    # admin_delete_collection / admin_list_collection_chunks，只传调用方自己的
+    # org_id，不会越权碰到别的企业）。
+    #
+    # 2026-08-26 已删除：曾经还有一组【测试专用，正式上线前删除】的
+    # admin_test_query_knowledge_base 等 debug 端点，额外调用这个实例上
+    # 绕过 ACL 的 execute_admin_bypass（允许调用方指定任意 org_id，不收窄到
+    # 自己的企业）。那组端点本身、其专属的 execute_admin_bypass /
+    # _build_empty_response_for_org、对应的 schemas、对应的前端页面已一并删除，
+    # 见 `CLAUDE.md` §5「已修复」。list_org_collection_stats/chunks/
+    # clear_org_collection 这几个方法继续保留，只服务上面这条正式路径。
+    _kb_management_tool: QueryKnowledgeHubTool = QueryKnowledgeHubTool(
+        org_store=org_store, tenant_connector_store=tenant_connector_store,
     )
-    print(f"[Init] Registered {tool_registry.tool_count} built-in tools")
 
-    # 初始化组件
-    checkpointer = create_checkpointer()
-    archive_store: ConversationArchiveStore = build_archive_store()
-    file_store: ConversationFileStore = build_file_store()
-    conversation_store: ConversationStore = build_conversation_store()
+    async def _audit_log(
+        user_id: Optional[str],
+        action: str,
+        resource_type: str,
+        resource_id: Optional[str],
+        detail: dict,
+        success: bool = True,
+    ) -> None:
+        """薄包装：把 Store 绑给 `api_helpers.audit_log`（批次 0 提取出去的公共层）。
+        **保留这层包装是刻意的**——93 个端点的调用点因此一个字都不用改，
+        本次是纯提取、零行为变化。"""
+        await api_helpers.audit_log(
+            audit_store=audit_store, org_store=org_store, user_store=user_store,
+            user_id=user_id, action=action, resource_type=resource_type,
+            resource_id=resource_id, detail=detail, success=success,
+        )
 
-    async def _require_conversation_owner(
-        conversation_id: str, current_user: AuthenticatedUser
-    ) -> Conversation:
-        """校验对话存在且属于当前登录用户；不存在 404，存在但不是自己的 403。"""
-        conv = await conversation_store.get_conversation(conversation_id)
-        if not conv:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        if conv.user_id != current_user.user_id:
-            raise HTTPException(status_code=403, detail="无权访问该对话")
-        return conv
-
-    async def _is_workflow_approver_for_conversation(conversation_id: str, user_id: str) -> bool:
-        """这个对话上有没有一条工作流实例，且当前用户持有它对应模板的审批角色。"""
-        instance = await workflow_store.get_latest_instance_by_conversation(conversation_id)
-        if instance is None:
-            return False
-        template = await workflow_store.get_template_by_type(instance.workflow_type)
-        if template is None or not template.approver_role_id:
-            return False
-        user_role_ids = {r.role_id for r in await role_store.get_user_roles(user_id)}
-        return template.approver_role_id in user_role_ids
-
-    # 初始化 LLM（配置完全来自 settings.yaml + 环境变量覆盖）
-    try:
+    # 初始化 LLM（配置完全来自 settings.yaml + 环境变量覆盖）——挪到工具注册
+    # 之前，因为下面的 OpsToolset（RCA 分析要用）需要在构造时就拿到这个实例，
+    # 不是原来"先注册工具、后建 LLM"的顺序。
+    def _build_llm(model: str):
         from langchain_openai import ChatOpenAI
         llm_kwargs = {
-            "model": settings.llm.model,
+            "model": model,
             "temperature": settings.llm.temperature,
             "max_tokens": settings.llm.max_tokens,
         }
@@ -348,10 +475,103 @@ def create_app() -> FastAPI:
                 llm_kwargs["base_url"] = base_url
             if api_key:
                 llm_kwargs["api_key"] = api_key
-        llm = ChatOpenAI(**llm_kwargs)
-    except Exception as e:
-        print(f"[Init] Failed to init LLM: {e}")
+        return ChatOpenAI(**llm_kwargs)
+
+    try:
+        llm = _build_llm(settings.llm.model)
+    except Exception:
+        logger.exception("failed to init main LLM")
         llm = None
+
+    # 初始化 ToolRegistry（内置工具 + MCP 外部工具）
+    tool_registry = ToolRegistry()
+    # 返回值是真正会被 ReAct 工具子图调用的 QueryKnowledgeHubTool 实例——
+    # 跟下面的 _kb_management_tool、RAGWorkflow 内部的 _retrieval_tool 是三个
+    # 各自独立的实例，启动阶段预热（见 lifespan 里的 _preload_retrieval_models）
+    # 需要拿到这个引用，见 register_builtin_tools 的 Returns 说明。
+    # 智能运维模块工具集（docs/aiops_module_design.md §3.5/§3.6）——
+    # WebSocketConnectorTransport/WebSocketRemediationDispatcher 复用
+    # ops_connector_register_ws 那个 WS 端点维护的两个模块级注册表
+    # （active_ops_connector_ws/active_ops_pending_requests），保证"谁在维护
+    # 活连接"只有一份权威来源，不会出现协议实现自己另建一套连接表。
+    _ops_transport = WebSocketConnectorTransport(active_ops_connector_ws, active_ops_pending_requests, ops_store)
+    _ops_dispatcher = WebSocketRemediationDispatcher(active_ops_connector_ws, active_ops_pending_requests, ops_store)
+    _ops_engine = FederatedQueryEngine(transport=_ops_transport, directory=OpsStoreDirectory(ops_store))
+    # `llm` 在这里已经建好（见下面"初始化 LLM"那段——为了让 OpsToolset 能拿到
+    # 它，那段被挪到了这一行之前，不再是原来"先注册工具、后建 LLM"的顺序）。
+    # 不传 llm 的话 RCA 分析会一直走降级路径（`src/ops/analysis/rca.py`），
+    # 功能仍可用但没有模型参与——复用主链路同一个生成模型实例，不新建、
+    # 不引入新的模型/提示词约定。
+    ops_toolset = OpsToolset(_ops_engine, ops_store, dispatcher=_ops_dispatcher, llm=llm)
+
+    # 工具注册表本身仍是全局的（这四个工具对每个 org 都注册进同一个
+    # `tool_registry`），但 2026-08-27 起 `RAGWorkflow._available_tools_for`
+    # 会在每次请求时按调用者的 `aiops_module_enabled` 状态过滤展示给 LLM 的
+    # 工具列表——注册层不区分租户，可见性层区分。见 CLAUDE.md §5。
+    chat_kb_tool = register_builtin_tools(
+        tool_registry,
+        user_store=user_store,
+        workflow_store=workflow_store,
+        attendance_store=attendance_store,
+        org_store=org_store,
+        tenant_connector_store=tenant_connector_store,
+        tenant_identity_store=tenant_identity_store,
+        ops_toolset=ops_toolset,
+    )
+    logger.info("registered built-in tools", extra={"tool_count": tool_registry.tool_count})
+
+    # 初始化组件
+    checkpointer = create_checkpointer()
+    archive_store: ConversationArchiveStore = build_archive_store()
+    file_store: ConversationFileStore = build_file_store()
+    conversation_store: ConversationStore = build_conversation_store()
+
+    async def _require_conversation_owner(
+        conversation_id: str, current_user: AuthenticatedUser
+    ) -> Conversation:
+        """薄包装，实现见 `api_helpers.require_conversation_owner`。"""
+        return await api_helpers.require_conversation_owner(
+            conversation_store=conversation_store,
+            conversation_id=conversation_id, current_user=current_user,
+        )
+
+    async def _is_workflow_approver_for_conversation(conversation_id: str, user_id: str) -> bool:
+        """这个对话上有没有一条工作流实例，且当前用户持有"申请人所在企业"给
+        这类流程配的审批角色——审批角色按企业配置（见 workflow_store.py 顶部
+        说明），要按申请人（不是当前查看者）所属企业去查，两者本来就该是
+        同一家企业，不然 mode="approver" 的权限检查通不过。"""
+        instance = await workflow_store.get_latest_instance_by_conversation(conversation_id)
+        if instance is None:
+            return False
+        requester_org = await org_store.get_org_for_user(instance.requester_user_id)
+        if requester_org is None:
+            return False
+        approver_role_id = await workflow_store.get_org_approver_role_id(requester_org.org_id, instance.workflow_type)
+        if not approver_role_id:
+            return False
+        user_role_ids = {r.role_id for r in await role_store.get_user_roles(user_id)}
+        return approver_role_id in user_role_ids
+
+    # 意图分类专用模型（docs/optimization_tracking.md 耗时优化任务）：LoRA 微调
+    # qwen2.5:1.5b（训练数据覆盖"指代消解 + 子查询拆分 + 四分类"合并任务
+    # analyze_and_route()，见 workflow.py RAGWorkflow._intent_llm 旁的说明）+
+    # 反量化转 GGUF 导入 Ollama 得到，准确率不输 7b 跑同一个合并任务（部分
+    # 边界案例反而更准），单次调用耗时约 3.2s，比 7b 的约 8.7s 快 2.7 倍左右。
+    # RAGENT_INTENT_MODEL 留空或者这个模型在当前环境没有被 `ollama create`
+    # 出来，直接退回主模型，不让意图节点因为模型不存在报错——这是"用哪个
+    # 模型做分类"的开关，不是"要不要做意图分类"的开关。
+    intent_model_name = os.getenv("RAGENT_INTENT_MODEL", "qwen2.5-1.5b-router")
+    if intent_model_name:
+        try:
+            intent_llm = _build_llm(intent_model_name)
+        except Exception:
+            logger.exception(
+                "failed to init intent-classification LLM, falling back to main LLM",
+                extra={"intent_model_name": intent_model_name},
+            )
+            intent_llm = llm
+    else:
+        intent_llm = llm
 
     # 创建工作流（传入 tool_registry）
     # LTMStore was never constructed here, so RAGWorkflow always received
@@ -363,17 +583,155 @@ def create_app() -> FastAPI:
     workflow = RAGWorkflow(
         store=archive_store,
         llm=llm,
+        intent_llm=intent_llm,
         checkpointer=checkpointer,
         max_messages=int(os.getenv("RAGENT_MAX_MESSAGES", "20")),
         keep_recent=int(os.getenv("RAGENT_KEEP_RECENT", "4")),
         tool_registry=tool_registry,
         ltm_store=ltm_store,
         workflow_store=workflow_store,
+        audit_log=_audit_log,
     )
+
+    _llms_to_keep_warm = [m for m in {id(llm): llm, id(intent_llm): intent_llm}.values() if m is not None]
+
+    # 跟 _llms_to_keep_warm 是同一个问题的另一半：三个 QueryKnowledgeHubTool
+    # 实例各自持有自己的 embedding_client（见 _preload_retrieval_models 的
+    # 说明，互不共享），启动时预热过一次，但之前没有被纳入下面的周期保活——
+    # embedding 模型走的也是 Ollama，同样受 5 分钟 keep_alive 支配，空闲超过
+    # 这个窗口后一样会被换出。实测（logs/traces.jsonl 的 narrow_detail:
+    # embed_query 分段计时）：间隔 81s 时 46ms，间隔 6分18秒 时 834ms——
+    # 跟 llm/intent_llm 同款问题，只是漏了这一层保活。
+    _retrieval_tools_to_keep_warm = {
+        "chat_kb_tool": chat_kb_tool,
+        "kb_management_tool": _kb_management_tool,
+        "workflow_retrieval_tool": workflow._retrieval_tool,
+    }
+
+    async def _ping_llm_once(ping_llm) -> None:
+        try:
+            await ping_llm.bind(max_tokens=1).ainvoke([HumanMessage(content="ping")])
+        except Exception:
+            logger.warning(
+                "keep-alive ping failed", extra={"model_name": getattr(ping_llm, "model_name", "?")}, exc_info=True,
+            )
+
+    async def _warm_llms_at_startup() -> None:
+        """启动阶段预热 llm/intent_llm 本身（本轮追加，`_keep_models_warm` 之前
+        遗漏的一层）——`_preload_retrieval_models` 只预热了 retrieval 侧的
+        reranker/embedding client，从没让 Ollama 真正把 `llm`（7b）/`intent_llm`
+        （1.5b-router）这两个模型的权重加载进内存。而 `_keep_models_warm` 的
+        保活循环第一次 ping 是在 `asyncio.sleep(240)` 之后才发生——也就是说
+        重启后头 4 分钟内，谁的请求第一个真正走到需要这两个模型的节点
+        （intent / 工具决策 think_node / generate），谁就要现付 Ollama
+        把权重从磁盘搬进内存的钱（用户反馈"工具调用这一步第一次很慢"就是
+        撞在这里）。在这里跟 retrieval 预热一起、在 `yield` 之前跑完，
+        对用户完全不可见；单个失败只打日志，不阻断启动。"""
+        for ping_llm in _llms_to_keep_warm:
+            await _ping_llm_once(ping_llm)
+
+    async def _keep_models_warm():
+        """后台模型保活探测（docs/optimization_tracking.md 耗时优化任务）——
+        Ollama 默认 keep_alive 是 5 分钟，空闲超时模型会被换出显存，下一次
+        真实用户请求撞上就要额外付出几秒到十几秒的冷启动加载耗时
+        （query_knowledge_hub.py 里已经有专门的 cold_start 检测逻辑，说明
+        这个问题真实发生过）。现在同时有生成用的 llm 和意图分类专用的
+        intent_llm 两个模型要保活，任何一个被换出都会让下一次请求平白多等。
+
+        每隔 4 分钟（小于 5 分钟的默认超时窗口）分别给两个模型发一个只要求
+        输出 1 个 token 的极短请求——Ollama 那边只要收到请求就会重置"最近
+        使用时间"、顺延保活窗口，不需要改 Ollama 服务本身的 keep_alive 配置
+        （那需要重启 Ollama daemon）。ping 失败只打日志，不影响正常请求
+        （下一次真实请求该走的重试/降级逻辑不受这里影响）。首次 ping 由
+        `_warm_llms_at_startup` 在启动阶段跑掉，这里的循环只负责之后的
+        周期性保活，避免重复预热一次。
+
+        同一个循环里顺带重跑一遍每个 QueryKnowledgeHubTool 的
+        `preload_models()`——理由见 `_retrieval_tools_to_keep_warm` 旁的
+        说明：embedding client 走的也是 Ollama，同样会被 5 分钟 keep_alive
+        换出，只在启动时预热一次不够。复用 `preload_models()` 而不是新写一次
+        embed 调用，跟"预热逻辑只有一份"的原则一致（`_ensure_shared_clients`
+        的说明），reranker 那部分重复调用是幂等的、warm 之后只有几十毫秒。"""
+        if not _llms_to_keep_warm and not _retrieval_tools_to_keep_warm:
+            return
+        while True:
+            try:
+                await asyncio.sleep(240)
+                for ping_llm in _llms_to_keep_warm:
+                    await _ping_llm_once(ping_llm)
+                for name, tool in _retrieval_tools_to_keep_warm.items():
+                    try:
+                        await tool.preload_models()
+                    except Exception:
+                        logger.warning("retrieval warm-up failed", extra={"tool_name": name}, exc_info=True)
+            except asyncio.CancelledError:
+                break
+
+    async def _scan_expired_ops_approvals():
+        """智能运维审批超时扫描（`docs/aiops_module_design.md` §10.4）——
+        `pending_approval` 状态的修复动作如果超过连接器配置的
+        `approval_timeout_minutes`（5～1440 分钟，见 `aiops_scope.
+        validate_approval_timeout_minutes`）还没人处理，转成 `expired`，
+        不能永远挂在待审批队列里。之前 `OpsStore` 只有查询方法
+        `list_pending_approval_older_than`（且接口设计本身有问题——接收单个
+        全局 cutoff，没法表达"不同连接器超时长度不同"），从未接过任何调用方，
+        这里是第一次真正接上定时任务，见 `CLAUDE.md` §5。
+
+        5 分钟扫一次：这是一个"最长可能多等 5 分钟才被标记过期"的宽限，不是
+        审批本身的时限——跟 `_keep_models_warm` 的保活扫描同一个数量级，
+        没有理由扫得比这更勤（`approval_timeout_minutes` 下限是 5 分钟，
+        扫描间隔跟下限相近很正常，不是巧合也不是问题：即使一次超时窗口只
+        5 分钟的连接器，最坏情况也只是多等一个扫描周期才被标记，不影响
+        "过期动作不能再被执行"这条硬约束本身——`STATUS_EXPIRED` 是终态，
+        审批/执行两个专用方法都会在状态机层面拒绝对一个已经不在
+        `pending_approval` 的动作起作用）。单次扫描异常只记日志，不影响下一轮。
+        """
+        while True:
+            try:
+                await asyncio.sleep(300)
+                expired_ids = await ops_store.expire_stale_pending_approvals()
+                if expired_ids:
+                    logger.info(
+                        "expired stale pending ops approvals",
+                        extra={"expired_count": len(expired_ids)},
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("ops approval timeout scan failed")
+
+    async def _preload_retrieval_models() -> None:
+        """启动阶段预热知识库检索用到的 reranker/embedding client（
+        docs/optimization_tracking.md 耗时优化任务，"知识库检索为什么要
+        7 秒"那次排查的结论）——`QueryKnowledgeHubTool._build_hybrid_search_for`
+        原来是"谁第一个真的查知识库，谁就现场付一次模型加载的钱"（本地
+        cross-encoder `BAAI/bge-reranker-base` 首次加载实测 6.4 秒），现在
+        挪到这里，在 `lifespan` 里 `yield`（开始真正接受请求）之前跑完，
+        对用户完全不可见。
+
+        `QueryKnowledgeHubTool` 在这个进程里被实例化了三处（这里、
+        `_kb_management_tool`、`RAGWorkflow._retrieval_tool`），各自的
+        `_embedding_client`/`_reranker` 是实例级缓存，互不共享——预热一个
+        不能省下另外两个的加载，所以三个都要单独调一次 `preload_models()`。
+        单个失败只打日志、不阻断启动：预热本身是优化手段，不是正确性前提，
+        真出问题时该走的懒加载兜底路径仍然生效，只是退化成没预热的效果。"""
+        for name, tool in _retrieval_tools_to_keep_warm.items():
+            try:
+                await tool.preload_models()
+                logger.info("reranker/embedding client warmed up", extra={"tool_name": name})
+            except Exception:
+                logger.warning(
+                    "preload failed (non-fatal, falls back to lazy load)", extra={"tool_name": name}, exc_info=True,
+                )
 
     # lifespan：异步连接 MCP Servers（必须在 FastAPI 构造函数之前定义）
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        await _preload_retrieval_models()
+        await _warm_llms_at_startup()
+        keep_warm_task = asyncio.create_task(_keep_models_warm())
+        ops_timeout_scan_task = asyncio.create_task(_scan_expired_ops_approvals())
+
         # 启动时连接配置的 MCP Servers
         if settings.mcp_servers:
             for name, cfg in settings.mcp_servers.items():
@@ -389,21 +747,33 @@ def create_app() -> FastAPI:
                     elif cfg.transport == "sse":
                         await client.connect_sse(url=cfg.url or "")
                     else:
-                        print(f"[MCP] Unknown transport '{cfg.transport}' for server '{name}'")
+                        logger.warning("unknown MCP transport", extra={"transport": cfg.transport, "server_name": name})
                         continue
-                    
+
                     await tool_registry.register_from_mcp_client(
                         client, name, timeout_seconds=cfg.timeout_seconds
                     )
-                    print(f"[MCP] Connected and registered server: {name}")
-                except Exception as e:
-                    print(f"[MCP] Failed to connect server '{name}': {e}")
-        
+                    logger.info("connected and registered MCP server", extra={"server_name": name})
+                except Exception:
+                    logger.exception("failed to connect MCP server", extra={"server_name": name})
+
         yield
-        
+
         # 关闭时断开所有 MCP 连接
         await tool_registry.disconnect_all_mcp()
-        print("[MCP] All MCP connections closed")
+        logger.info("all MCP connections closed")
+
+        keep_warm_task.cancel()
+        try:
+            await keep_warm_task
+        except asyncio.CancelledError:
+            pass
+
+        ops_timeout_scan_task.cancel()
+        try:
+            await ops_timeout_scan_task
+        except asyncio.CancelledError:
+            pass
 
     # 创建 FastAPI app
     app = FastAPI(
@@ -416,11 +786,16 @@ def create_app() -> FastAPI:
     # 添加 CORS 中间件
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # 允许所有来源
+        allow_origins=resolve_cors_origins(),
         allow_credentials=True,
         allow_methods=["*"],  # 允许所有方法
         allow_headers=["*"],  # 允许所有头
     )
+
+    # RequestContextMiddleware 必须在 CORSMiddleware 之后注册——Starlette 中间件是
+    # 洋葱模型，后注册的在更外层，这样连 CORS 预检失败的请求也能带上 request_id。
+    # 见 docs/observability_design.md §5「中间件顺序」。
+    app.add_middleware(RequestContextMiddleware)
 
     @app.get("/health")
     async def health() -> dict:
@@ -440,6 +815,70 @@ def create_app() -> FastAPI:
 
     # ==================== 鉴权 API ====================
 
+    @app.post("/api/v1/activate")
+    async def activate_account(request: ActivateAccountRequest) -> dict:
+        """凭一次性激活码设置初始密码。**全系统唯一不带鉴权的写端点。**
+
+        设计 `docs/account_lifecycle_design.md` §4.1b、风险 R-4。
+        用户已定不做邮件短信（O-1），所以凭证分发是人工的；既然如此就让被分发
+        的东西尽可能不值钱——码是 7 天一次性的，而任何形式的"初始密码"都长期有效。
+
+        ## 四条防护，这里落地了三条
+
+        1. **只存哈希** —— 库里是 SHA-256，`activation.hash_activation_code`。
+        2. **≥128 bit 熵** —— `secrets.token_urlsafe(16)`，有测试钉住熵值本身
+           （它是"用 SHA-256 而不是 bcrypt"这个选择成立的前提）。
+        3. **恒定时间比较 + 失败原因不可区分** —— 见下面的注释。
+        4. **限流** —— ⚠️ **没做。** 全仓没有任何限流基础设施可复用，
+           要么引入（如 slowapi）要么手写，属独立一项工作。
+           **在补上之前，这个端点可以被无限次尝试。** 128 bit 的码扛得住爆破，
+           但扛不住有人拿它当免费的 CPU 消耗入口。已在设计 §9 记为未覆盖。
+
+        ## 为什么失败一律同一句话
+
+        它无鉴权，任何人都能调。如果"用户不存在"和"码不对"返回不同的错误，
+        攻击者随便试一个 username，就能从差异里反推出这家企业的员工花名册。
+        `ActivationCheck.public_detail` 把四种失败塌缩成同一句，
+        内部原因只进审计日志。
+        """
+        state = await user_store.get_activation_state(request.username)
+        check = _activation.check_activation(
+            submitted_code=request.activation_code,
+            stored_hash=(state or {}).get("activation_code_hash"),
+            expires_at=(state or {}).get("activation_expires_at"),
+            activated_at=(state or {}).get("activated_at"),
+            now=time.time(),
+            user_exists=state is not None,
+        )
+
+        # 被停用的账号即使手里有有效的码也不能激活——否则"停用"就能被一张
+        # 旧的激活码清单绕过。这一条走跟其他失败完全相同的对外文案。
+        if check.ok and state and state.get("disabled_at") is not None:
+            check = _activation.ActivationCheck(
+                False, _activation.ActivationFailure.NO_SUCH_USER
+            )
+
+        if not check.ok:
+            # ⚠️ **审计日志里记内部原因，但绝不记提交上来的码。**
+            # 那串东西要么是有效凭证（记下来等于明文存凭证），要么是攻击载荷。
+            await _audit_log(
+                None, "activate_account_failed", "user", None,
+                {"username": request.username,
+                 "reason": check.failure.value if check.failure else "unknown"},
+                success=False,
+            )
+            raise HTTPException(status_code=400, detail=check.public_detail)
+
+        # 单次使用的最后一道闸在 SQL 里（`WHERE activated_at IS NULL`），
+        # 不是靠上面那次读——两个请求拿同一个码同时打进来，只有一条改得到行。
+        # 上面的检查是为了给出正确的错误信息，不是并发正确性的依据。
+        if not await user_store.complete_activation(state["id"], request.new_password):
+            raise HTTPException(status_code=400, detail=_activation.PUBLIC_FAILURE_DETAIL)
+
+        await _audit_log(state["id"], "activate_account", "user", state["id"],
+                         {"username": request.username})
+        return {"success": True}
+
     @app.post("/api/v1/auth/login", response_model=LoginResponse)
     async def login(request: LoginRequest) -> LoginResponse:
         user = await user_store.authenticate(request.username, request.password)
@@ -453,7 +892,10 @@ def create_app() -> FastAPI:
         org = await org_store.get_org_for_user(user_id)
         if org is None:
             return None
-        return OrganizationSummary(org_id=org.org_id, name=org.name, is_platform=org.is_platform)
+        return OrganizationSummary(
+            org_id=org.org_id, name=org.name, is_platform=org.is_platform,
+            aiops_module_enabled=await ops_store.is_module_enabled(org.org_id),
+        )
 
     @app.get("/api/v1/auth/me", response_model=MeResponse)
     async def get_me(current_user: AuthenticatedUser = Depends(get_current_user)) -> MeResponse:
@@ -461,6 +903,7 @@ def create_app() -> FastAPI:
         if user is None:
             raise HTTPException(status_code=404, detail="用户不存在")
         roles = await role_store.get_user_roles(user.user_id)
+        ops_perm = await ops_store.get_ops_permission_summary(user.user_id)
         return MeResponse(
             user_id=user.user_id,
             username=user.username,
@@ -468,6 +911,8 @@ def create_app() -> FastAPI:
             allowed_collections=await role_store.get_allowed_collections_for_user(user.user_id),
             organization=await _org_summary_for_user(user.user_id),
             created_at=user.created_at,
+            ops_can_view=ops_perm["can_view"],
+            ops_can_approve=ops_perm["can_approve"],
         )
 
     @app.post("/api/v1/auth/change-password")
@@ -483,16 +928,16 @@ def create_app() -> FastAPI:
         return {"success": True}
 
     # ==================== 管理后台 API ====================
-    # 三层角色模型：
-    #   super_admin / admin —— 平台运营方，管平台本身（建企业、配连接器、定义
-    #     角色……），但不了解客户企业内部的部门架构，所以对某个客户企业能做的
-    #     唯一一件事是"任命谁是这家企业的 org_admin"，不直接管理该企业内部的
-    #     员工角色/知识库权限。admin 由 super_admin 任命，权限跟 super_admin
-    #     在人员管理这块基本对等，唯一区别是不能再往外发 admin/super_admin。
+    # 两层角色模型（2026-08-24 起废弃平台侧的 admin/user 两个系统角色，运营方
+    # 只保留 super_admin 一个身份档位，见 role_store.py 顶部说明）：
+    #   super_admin —— 平台运营方，管平台本身（建企业、配连接器、定义角色……），
+    #     但不了解客户企业内部的部门架构，所以对某个客户企业能做的唯一一件事
+    #     是"任命谁是这家企业的 org_admin"，不直接管理该企业内部的员工角色/
+    #     知识库权限。
     #   org_admin（企业管理员）—— 客户企业侧，被平台层任命后，管理自己企业
     #     内部的员工（增/删/查/分配角色，含知识库权限角色），管不到别的企业，
     #     也不能任命新的 org_admin（那还是平台层的事）。
-    # 人员管理（增/查/删/分配角色）三层角色都能碰，具体边界由
+    # 人员管理（增/查/删/分配角色）两层角色都能碰，具体边界由
     # `_validate_role_assignment` 按"谁在给哪家企业的人分配什么角色"判断，不是
     # 简单的"有没有权限调这个接口"能表达清楚的，所以拆成单独的校验函数。
     # 组织管理、连接器配置、角色定义、工作流模板这类跨企业/平台级操作仍然只对
@@ -500,13 +945,17 @@ def create_app() -> FastAPI:
     # 角色判断是每次请求都现查数据库（见 auth.require_role），不是信 token。
 
     _require_super_admin = require_role(ROLE_SUPER_ADMIN)
-    _require_user_admin_tier = require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_ORG_ADMIN)
-    # 企业自建知识库（新增/列出）只对 org_admin 开放，platform 管理员（super_admin/
-    # admin）不在允许名单里——不是"看不全"，是这两个端点对他们直接 403，企业
-    # 内部的知识库归属信息平台运营方压根碰不到（跟"角色管理"页面不展示知识库、
+    _require_user_admin_tier = require_role(ROLE_SUPER_ADMIN, ROLE_ORG_ADMIN)
+    # 企业自建知识库（新增/列出）只对 org_admin 开放，平台管理员（super_admin）
+    # 不在允许名单里——不是"看不全"，是这两个端点对他们直接 403，企业内部的
+    # 知识库归属信息平台运营方压根碰不到（跟"角色管理"页面不展示知识库、
     # 「用户与角色分配」平台视角不展示"可访问知识库"列是同一个边界，见对应组件
     # 顶部注释）。
     _require_org_admin = require_role(ROLE_ORG_ADMIN)
+    # 运营仪表盘专用——平台侧只剩 super_admin 一个身份档位后，跟
+    # _require_super_admin 已无实质区别，单独保留是为了让这批"运营仪表盘"
+    # 端点的 Depends 读起来语义独立（不是随手复用了用户管理那档权限）。
+    _require_platform_tier = require_role(ROLE_SUPER_ADMIN)
 
     async def _validate_role_assignment(
         actor: AuthenticatedUser, target_org_id: Optional[str], role_ids: List[str],
@@ -515,49 +964,56 @@ def create_app() -> FastAPI:
         """校验 `actor` 能不能把 `role_ids` 这组角色发给 `target_org_id` 这家企业的
         某个用户，三条边界见本节顶部的角色模型说明：
 
-        1. admin/super_admin 这两个平台角色只有 super_admin 自己能授予——防止
-           admin 自我提权或互相提权。
-        2. org_admin（企业管理员）角色只有平台层（admin/super_admin）能授予——
-           这是"任命企业管理员"这个动作本身，企业管理员不能任命同事、不能给
-           自己续任。
-        3. 平台层账号（super_admin/admin）如果是在给客户企业（非平台组织）的
-           用户分配角色，只能分配 user/org_admin 这两种——不能替客户企业分配
-           具体的知识库/部门角色，因为他们不了解客户企业内部架构，那是该企业
+        1. super_admin 这个平台角色只有 super_admin 自己能授予——防止越权
+           互相提权。
+        2. org_admin（企业管理员）角色只有平台层（super_admin）能授予——这是
+           "任命企业管理员"这个动作本身，企业管理员不能任命同事、不能给自己
+           续任。
+        3. 平台层账号（super_admin）如果是在给客户企业（非平台组织）的用户
+           分配角色，只能分配 org_admin 这一种——不能替客户企业分配具体的
+           部门/知识库角色，因为他们不了解客户企业内部架构，那是该企业
            org_admin 被任命后自己的事。
+        4. 企业角色（`role.org_id` 非空，某家企业管理员自己建的、直接携带知识库
+           权限的角色）只能分配给同一家企业的员工——不能把 Acme 建的角色发给
+           测试新公司的员工，跨了会直接导致这个员工能看到 Acme 的知识库内容。
 
-        以上三条只审查"新授予"的角色（`role_ids` 里目标用户原本没有的部分，
+        以上四条只审查"新授予"的角色（`role_ids` 里目标用户原本没有的部分，
         由调用方通过 `existing_role_names` 传入目标用户当前已有的角色名）。
-        企业管理员/管理员在企业内本就是最高权限，编辑自己或同事时，Select
-        提交的是完整角色集合，必然带着自己已有的 org_admin/admin——如果连
-        "保留自己已有的角色"都按"新任命"的标准审查，企业管理员/管理员会
-        连自己的其他权限（比如加一个部门角色）都改不了，等于企业内最高权限
-        者反而管不了自己。只有目标用户原本没有、这次新加进来的角色，才真的
-        构成"任命"，才需要走上面三条边界。新建用户时 `existing_role_names`
-        传空集，等价于所有角色都是"新授予"，跟原来的校验强度一致。
+        企业管理员在企业内本就是最高权限，编辑自己或同事时，Select 提交的是
+        完整角色集合，必然带着自己已有的 org_admin——如果连"保留自己已有的
+        角色"都按"新任命"的标准审查，企业管理员会连自己的其他权限（比如换
+        一个部门角色）都改不了，等于企业内最高权限者反而管不了自己。只有目标
+        用户原本没有、这次新加进来的角色，才真的构成"任命"，才需要走上面
+        四条边界。新建用户时 `existing_role_names` 传空集，等价于所有角色都
+        是"新授予"，跟原来的校验强度一致。
         """
         actor_role_names = {r.name for r in await role_store.get_user_roles(actor.user_id)}
-        is_platform_tier = bool({ROLE_SUPER_ADMIN, ROLE_ADMIN} & actor_role_names)
+        is_platform_tier = ROLE_SUPER_ADMIN in actor_role_names
 
-        all_roles = {r.role_id: r for r in await role_store.list_roles()}
-        requested_names = {all_roles[rid].name for rid in role_ids if rid in all_roles}
-        newly_granted_names = requested_names - existing_role_names
+        requested_roles = [r for r in [await role_store.get_role_by_id(rid) for rid in role_ids] if r is not None]
+        newly_granted = [r for r in requested_roles if r.name not in existing_role_names]
+        newly_granted_names = {r.name for r in newly_granted}
 
-        if newly_granted_names & {ROLE_ADMIN, ROLE_SUPER_ADMIN} and ROLE_SUPER_ADMIN not in actor_role_names:
-            raise HTTPException(status_code=403, detail="只有超级管理员能授予管理员/超级管理员角色")
+        if ROLE_SUPER_ADMIN in newly_granted_names and ROLE_SUPER_ADMIN not in actor_role_names:
+            raise HTTPException(status_code=403, detail="只有超级管理员能授予超级管理员角色")
 
         if ROLE_ORG_ADMIN in newly_granted_names and not is_platform_tier:
-            raise HTTPException(status_code=403, detail="只有平台管理员（超级管理员/管理员）能任命企业管理员")
+            raise HTTPException(status_code=403, detail="只有平台管理员（超级管理员）能任命企业管理员")
 
         if is_platform_tier and target_org_id is not None:
             target_org = await org_store.get_organization(target_org_id)
             if target_org is not None and not target_org.is_platform:
-                disallowed = newly_granted_names - {ROLE_USER, ROLE_ORG_ADMIN}
+                disallowed = newly_granted_names - {ROLE_ORG_ADMIN}
                 if disallowed:
                     raise HTTPException(
                         status_code=403,
                         detail="平台管理员不了解客户企业内部架构，只能任命该企业的企业管理员，"
                                "具体的员工角色/知识库权限请由该企业的企业管理员分配",
                     )
+
+        cross_org = [r for r in newly_granted if r.org_id is not None and r.org_id != target_org_id]
+        if cross_org:
+            raise HTTPException(status_code=403, detail="不能分配其他企业创建的角色")
 
     async def _build_admin_user_response(user: User) -> AdminUserResponse:
         roles = await role_store.get_user_roles(user.user_id)
@@ -568,25 +1024,295 @@ def create_app() -> FastAPI:
             allowed_collections=await role_store.get_allowed_collections_for_user(user.user_id),
             organization=await _org_summary_for_user(user.user_id),
             created_at=user.created_at,
+            # ⚠️ AdminUserResponse 有**两个**构造点：这里（单个用户，建号/改角色/
+            # 停用的响应）和 `admin_list_users` 里的批量版。**加字段必须两处一起改。**
+            # 2026-08-26 就漏过一次：只改了批量版，于是列表页显示正常，
+            # 而停用接口返回的 disabled_at 恒为 null，前端开关点完不刷新状态。
+            # 单测和 create_app 都抓不到，是 HTTP 端到端跑出来的。
+            disabled_at=user.disabled_at,
+            activated_at=user.activated_at,
+            pending_activation=user.pending_activation,
         )
 
     @app.get("/api/v1/admin/users", response_model=List[AdminUserResponse])
     async def admin_list_users(
         current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
     ) -> List[AdminUserResponse]:
+        """2026-08-26 P1-14 修复：原来对每个用户单独查角色/知识库权限/所属企业
+        （`_build_admin_user_response` 逐个 await），50 用户约 300 次串行查询。
+        改为批量查询一次拿齐所有用户的数据，再在内存里拼装——查询数不再随
+        用户数线性增长（固定常数次，不含 `is_platform_admin`/`get_org_for_user`
+        这两次判断当前登录者身份的查询）。"""
         users = await user_store.list_users()
+        user_ids = [u.user_id for u in users]
+        orgs_by_user = await org_store.get_orgs_for_users_batch(user_ids)
+
         # 平台管理员看全部；普通企业管理员只看自己企业的——过滤发生在这里，
         # 不是前端拿到全量再自己藏几行（attendance-tenant-federation.md 图4）。
         if not await org_store.is_platform_admin(current_user.user_id):
             actor_org = await org_store.get_org_for_user(current_user.user_id)
             actor_org_id = actor_org.org_id if actor_org else None
-            filtered = []
-            for u in users:
-                user_org = await org_store.get_org_for_user(u.user_id)
-                if user_org is not None and user_org.org_id == actor_org_id:
-                    filtered.append(u)
-            users = filtered
-        return [await _build_admin_user_response(u) for u in users]
+            users = [
+                u for u in users
+                if (org := orgs_by_user.get(u.user_id)) is not None and org.org_id == actor_org_id
+            ]
+            user_ids = [u.user_id for u in users]
+
+        roles_by_user = await role_store.get_user_roles_batch(user_ids)
+        collections_by_user = await role_store.get_allowed_collections_for_users_batch(user_ids)
+        # OrganizationSummary 加了 aiops_module_enabled 字段后这里也得跟着填
+        # （见下面 organization= 那行旁边"加字段时两处必须一起改"的既有教训）——
+        # 按去重后的 org_id 批量查一次，不随 user 数线性增长。
+        aiops_enabled_by_org = await ops_store.is_module_enabled_batch(
+            list({org.org_id for org in orgs_by_user.values()})
+        )
+
+        return [
+            AdminUserResponse(
+                user_id=u.user_id,
+                username=u.username,
+                roles=[
+                    RoleSummary(role_id=r.role_id, name=r.name, display_name=r.display_name)
+                    for r in roles_by_user.get(u.user_id, [])
+                ],
+                allowed_collections=collections_by_user.get(u.user_id, []),
+                organization=(
+                    OrganizationSummary(
+                        org_id=org.org_id, name=org.name, is_platform=org.is_platform,
+                        aiops_module_enabled=aiops_enabled_by_org.get(org.org_id, False),
+                    )
+                    if (org := orgs_by_user.get(u.user_id)) is not None else None
+                ),
+                created_at=u.created_at,
+                # 账号生命周期三个字段（2026-08-26）。批量版和
+                # `_build_admin_user_response` 是同一个响应模型的两个构造点，
+                # **加字段时两处必须一起改** —— 漏掉这里的话，用户列表页
+                # （唯一真正用到它们的地方）会静默拿到默认值：所有人都显示
+                # "正常"，停用和待激活状态完全看不见，而且不报任何错。
+                disabled_at=u.disabled_at,
+                activated_at=u.activated_at,
+                pending_activation=u.pending_activation,
+            )
+            for u in users
+        ]
+
+    async def _enforce_seat_capacity(org_id: str, delta: int) -> None:
+        """席位校验的**唯一**入口。三个调用点共用：建号、批量导入、重新启用。
+
+        判定本身在 `account_import.check_seat_capacity`（纯函数、有单测），
+        这里只负责取数和翻译成 HTTP —— 跟 `activation` 那边同样的分工。
+
+        403 而不是 400：这不是请求写错了，是超出了这家企业的合同额度。
+        """
+        check = _acct_import.check_seat_capacity(
+            seats_used=await user_store.count_active_users(org_id),
+            seat_limit=await org_store.get_seat_limit(org_id),
+            delta=delta,
+        )
+        if not check.ok:
+            raise HTTPException(status_code=403, detail=check.detail)
+
+    async def _import_context(actor: AuthenticatedUser, org_id: str, usernames: list) -> "_acct_import.ImportContext":
+        """把批量导入要的库内事实一次性查好。
+
+        ⚠️ **`assignable_roles` 必须先按企业过滤再传进去。** 跨企业角色校验在
+        纯函数层退化成一次字典查找，"别家企业的角色"能不能被分配，
+        完全取决于这里放没放进去。这是 `_validate_role_assignment` 那四条边界
+        在导入路径上的等价物——不能因为走了新端点就漏掉（设计 §6 风险 R-2）。
+        """
+        # `list_roles_for_org` = 全局角色（部门身份）+ 这家企业自建的角色，
+        # 正好是企业管理员在「用户管理」下拉框里能选的那一组。
+        #
+        # ⚠️ **只再排除两个平台档位角色。** super_admin / org_admin 是"任命"
+        # 而不是"分配部门"，必须走 `admin_set_user_roles` 那条有
+        # `_validate_role_assignment` 四条边界把关的路径。让导入能发这两个，
+        # 等于给了一条"上传一个 CSV 就把自己提成超管"的近路。
+        #
+        # ⚠️ 用 `list_roles_for_org` 而不是自己写 `r.org_id == org_id` 过滤：
+        # 前者是"这个企业管理员能分配什么"的**权威定义**，「用户管理」下拉框
+        # 用的就是它，两处口径必须一致，否则会出现"界面上能选、导入却说角色
+        # 不存在"。它包含全局角色 + 本企业角色。
+        # （2026-08-26 实测本库里全局角色只有 super_admin / org_admin 两个，
+        # 部门角色全是企业级的——所以这两种写法当前结果相同。但依赖这个巧合
+        # 是错的：只要将来加一个全局部门角色，自己写的过滤就会漏掉它。）
+        assignable = {
+            r.name: r.role_id
+            for r in await role_store.list_roles_for_org(org_id)
+            if r.name not in (ROLE_SUPER_ADMIN, ROLE_ORG_ADMIN)
+        }
+        return _acct_import.ImportContext(
+            actor_org_id=org_id,
+            assignable_roles=assignable,
+            existing_users=await user_store.get_org_ids_for_usernames(usernames),
+            seat_limit=await org_store.get_seat_limit(org_id),
+            seats_used=await user_store.count_active_users(org_id),
+        )
+
+    @app.put("/api/v1/admin/users/{user_id}/disabled", response_model=AdminUserResponse)
+    async def admin_set_user_disabled(
+        user_id: str,
+        request: SetUserDisabledRequest,
+        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
+        _same_org: AuthenticatedUser = Depends(require_same_org_or_platform),
+    ) -> AdminUserResponse:
+        """停用 / 重新启用。企业管理员能做的"离职处理"就是这个（设计 §4.2）。
+
+        ⚠️ 生效时机不对称，见 `CLAUDE.md` §3.2：管理端 19 个端点立刻生效，
+        问答等 35 个端点最长 24 小时。新登录会被立刻拒（`authenticate`），
+        所以窗口有界。
+        """
+        if user_id == current_user.user_id and request.disabled:
+            # 停用自己会立刻把自己锁在管理后台外面，且没有第二个人能救
+            # （企业里可能只有一个管理员）。
+            raise HTTPException(status_code=400, detail="不能停用自己")
+
+        user = await user_store.get_user_by_id(user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+
+        # ⚠️ **重新启用也要过席位校验** —— 三个校验点里最容易漏的一个：
+        # 它不创建账号，却会让占用数 +1（设计 §4.4）。
+        if not request.disabled:
+            target_org = await org_store.get_org_for_user(user_id)
+            if target_org:
+                await _enforce_seat_capacity(target_org.org_id, delta=1)
+
+        await user_store.set_disabled(user_id, request.disabled)
+        await _audit_log(
+            current_user.user_id,
+            "disable_user" if request.disabled else "enable_user",
+            "user", user_id, {"username": user.username},
+        )
+        refreshed = await user_store.get_user_by_id(user_id)
+        return await _build_admin_user_response(refreshed or user)
+
+    @app.put("/api/v1/admin/organizations/{org_id}/seat-limit", response_model=AdminOrganizationResponse)
+    async def admin_set_seat_limit(
+        org_id: str,
+        request: SetSeatLimitRequest,
+        current_user: AuthenticatedUser = Depends(require_platform_admin),
+    ) -> AdminOrganizationResponse:
+        """⚠️ **仅平台管理员。** 席位是合同条款不是配置项——企业管理员能改
+        自己企业的上限，这个功能就等于不存在（设计 §4.4）。"""
+        try:
+            ok = await org_store.set_seat_limit(org_id, request.seat_limit)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if not ok:
+            raise HTTPException(status_code=404, detail="企业不存在")
+        await _audit_log(
+            current_user.user_id, "set_seat_limit", "organization", org_id,
+            {"seat_limit": request.seat_limit},
+        )
+        org = await org_store.get_organization(org_id)
+        return AdminOrganizationResponse(
+            org_id=org.org_id, name=org.name, is_platform=org.is_platform,
+            created_at=org.created_at, seat_limit=org.seat_limit,
+            seats_used=await user_store.count_active_users(org_id),
+            aiops_module_enabled=await ops_store.is_module_enabled(org_id),
+        )
+
+    @app.post("/api/v1/admin/users/bulk-import", response_model=BulkImportResponse)
+    async def admin_bulk_import_users(
+        file: UploadFile = File(...),
+        validate_only: bool = Form(default=True),
+        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
+    ) -> BulkImportResponse:
+        """CSV 批量导入（设计 §4.1）。
+
+        ⚠️ **`validate_only` 默认 True。** 这是一个能一次影响上万账号的操作，
+        默认值必须是"什么都不做"——前端漏传、curl 手敲、脚本写错，任何一种
+        意外都只会得到一份预演报告，而不是一万个账号。真跑必须显式说要真跑。
+
+        **预演和真跑走同一个 `plan_import`**，只是前者算完就返回。
+        如果两者走不同代码路径，预演就保证不了真跑会发生同样的事。
+
+        企业归属**强制用调用者自己的**，请求里没有任何地方能指定它 ——
+        跟 `admin_create_user` 同一条防护，批量导入是同一个越权面。
+        """
+        actor_org = await org_store.get_org_for_user(current_user.user_id)
+        if actor_org is None:
+            raise HTTPException(status_code=400, detail="当前账号没有所属企业，无法导入")
+
+        raw = await file.read()
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            try:
+                # Excel「另存为 CSV」在中文 Windows 上默认就是 GBK，
+                # 直接报"文件编码不对"等于把问题丢回给不懂编码的人事同事。
+                text = raw.decode("gbk")
+            except UnicodeDecodeError:
+                raise HTTPException(
+                    status_code=400,
+                    detail="文件编码无法识别，请另存为 UTF-8 或 GBK 编码的 CSV",
+                )
+
+        # 先扫一遍拿 username 列去查归属；解析失败时 rows 为空，
+        # plan_import 会把同一个 fatal 再报一次，这里不用重复处理。
+        pre_rows, _ = _acct_import.parse_csv(text)
+        usernames = [r.get("username", "").strip() for r in pre_rows]
+        ctx = await _import_context(current_user, actor_org.org_id, [u for u in usernames if u])
+        plan = _acct_import.plan_import(text, ctx)
+
+        def _resp(applied: bool, creds: list) -> BulkImportResponse:
+            return BulkImportResponse(
+                applied=applied,
+                summary=_acct_import.format_dry_run_summary(plan),
+                to_create=len(plan.to_create), to_update=len(plan.to_update),
+                errors=[
+                    BulkImportRowResult(
+                        line_no=e.line_no, username=e.username,
+                        action=e.action.value, reason=e.reason,
+                    ) for e in plan.errors
+                ],
+                seat_ok=plan.seat_check.ok, seats_used=plan.seat_check.seats_used,
+                seat_limit=plan.seat_check.seat_limit, fatal_error=plan.fatal_error,
+                credentials=creds,
+            )
+
+        if validate_only or not plan.applicable:
+            await _audit_log(
+                current_user.user_id, "bulk_import_users_dry_run", "organization",
+                actor_org.org_id,
+                {"to_create": len(plan.to_create), "to_update": len(plan.to_update),
+                 "errors": len(plan.errors), "seat_ok": plan.seat_check.ok},
+            )
+            return _resp(applied=False, creds=[])
+
+        now = time.time()
+        credentials: list = []
+        for row in plan.to_create:
+            code, code_hash, expires = _activation.issue_activation(now)
+            try:
+                user = await user_store.create_pending_user(
+                    username=row.username, activation_code_hash=code_hash,
+                    activation_expires_at=expires, org_id=actor_org.org_id,
+                )
+            except ValueError:
+                # 两次并发导入，或者 plan 算完到这里之间有人手工建了同名账号。
+                # 逐行隔离：跳过这一行，其余照做，不整体回滚。
+                continue
+            if row.role_id:
+                await role_store.assign_user_roles(user.user_id, [row.role_id])
+            credentials.append(AdminCreatedUserCredential(
+                username=row.username, activation_code=code, expires_at=expires,
+            ))
+
+        for row in plan.to_update:
+            # ⚠️ **更新只动角色，绝不碰密码/激活状态**（设计 T-5）。
+            # 幂等的意义就是"修正后重传整份文件是安全的"，如果重传会重置密码，
+            # 一次误传就能把全公司锁在外面。
+            existing = await user_store.get_user_by_username(row.username)
+            if existing and row.role_id:
+                await role_store.assign_user_roles(existing.user_id, [row.role_id])
+
+        await _audit_log(
+            current_user.user_id, "bulk_import_users", "organization", actor_org.org_id,
+            {"created": len(credentials), "updated": len(plan.to_update),
+             "errors": len(plan.errors)},
+        )
+        return _resp(applied=True, creds=credentials)
 
     @app.post("/api/v1/admin/users", response_model=AdminUserResponse)
     async def admin_create_user(
@@ -610,10 +1336,15 @@ def create_app() -> FastAPI:
 
         if request.role_ids:
             await _validate_role_assignment(current_user, target_org_id, request.role_ids)
-            all_role_ids = {r.role_id for r in await role_store.list_roles()}
-            unknown = set(request.role_ids) - all_role_ids
+            unknown = [rid for rid in request.role_ids if await role_store.get_role_by_id(rid) is None]
             if unknown:
                 raise HTTPException(status_code=400, detail=f"角色不存在: {sorted(unknown)}")
+
+        # 席位（docs/account_lifecycle_design.md §4.4）。三个校验点之一，
+        # 另两个是批量导入与「重新启用已停用用户」。口径由 count_active_users
+        # 保证：只数 disabled_at IS NULL 的，停用的人不占席位。
+        if target_org_id:
+            await _enforce_seat_capacity(target_org_id, delta=1)
 
         try:
             user = await user_store.create_user(request.username, request.password)
@@ -625,19 +1356,35 @@ def create_app() -> FastAPI:
         if target_org_id:
             await org_store.set_user_organization(user.user_id, target_org_id)
 
+        await _audit_log(
+            current_user.user_id, "create_user", "user", user.user_id,
+            {"username": user.username, "role_ids": request.role_ids, "org_id": target_org_id},
+        )
         return await _build_admin_user_response(user)
 
     @app.delete("/api/v1/admin/users/{user_id}")
     async def admin_delete_user(
         user_id: str,
-        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
-        _same_org: AuthenticatedUser = Depends(require_same_org_or_platform),
+        current_user: AuthenticatedUser = Depends(require_platform_admin),
     ) -> dict:
+        """⚠️ **2026-08-26 起仅平台管理员可用**（设计 §4.2，O-3 已拍板）。
+
+        原来挂的是 `_require_user_admin_tier`，企业管理员能删自己企业的员工。
+        改掉的理由是这两件事性质不同：停用是**人事操作**，企业自己天天要做；
+        删除是**不可逆的数据销毁**——`conversations.user_id` 会一起失去归属，
+        "离职员工做过什么"就再也追溯不到了。企业管理员现在只能停用
+        （`admin_set_user_disabled`），删除只保留给真正的数据清除请求
+        （如 GDPR 删除权），需要一次跨组织的确认。
+
+        `require_same_org_or_platform` 一并去掉：平台管理员本来就跨企业，
+        那个依赖对他恒真，留着只是多两次查询。
+        """
         if user_id == current_user.user_id:
             raise HTTPException(status_code=400, detail="不能删除自己")
         found = await user_store.delete_user(user_id)
         if not found:
             raise HTTPException(status_code=404, detail="用户不存在")
+        await _audit_log(current_user.user_id, "delete_user", "user", user_id, {})
         return {"success": True}
 
     @app.put("/api/v1/admin/users/{user_id}/roles", response_model=AdminUserResponse)
@@ -657,8 +1404,7 @@ def create_app() -> FastAPI:
         if user is None:
             raise HTTPException(status_code=404, detail="用户不存在")
 
-        all_roles = {r.role_id: r for r in await role_store.list_roles()}
-        unknown = set(request.role_ids) - set(all_roles)
+        unknown = [rid for rid in request.role_ids if await role_store.get_role_by_id(rid) is None]
         if unknown:
             raise HTTPException(status_code=400, detail=f"角色不存在: {sorted(unknown)}")
 
@@ -673,18 +1419,65 @@ def create_app() -> FastAPI:
 
         if user_id == current_user.user_id:
             # 防止超级管理员误操作把自己的 super_admin 角色摘掉，导致管理后台再也进不去
-            super_admin_role_id = next(
-                (rid for rid, r in all_roles.items() if r.name == ROLE_SUPER_ADMIN), None
-            )
+            super_admin_role = await role_store.get_role_by_name(ROLE_SUPER_ADMIN)
             if (
-                super_admin_role_id
-                and super_admin_role_id in current_role_ids
-                and super_admin_role_id not in request.role_ids
+                super_admin_role
+                and super_admin_role.role_id in current_role_ids
+                and super_admin_role.role_id not in request.role_ids
             ):
                 raise HTTPException(status_code=400, detail="不能取消自己的超级管理员角色")
 
         await role_store.assign_user_roles(user_id, request.role_ids)
+        await _audit_log(
+            current_user.user_id, "set_user_roles", "user", user_id,
+            {"role_ids": request.role_ids},
+        )
         return await _build_admin_user_response(user)
+
+    # ==================== 审计日志 API（治理与合规） ====================
+    # 记录谁在何时对哪个资源做了什么——管理后台变更操作（见上面各端点里的
+    # `_audit_log(...)` 调用）+ 工具调用（知识库检索/考勤查询/工作流操作，
+    # 见 RAGWorkflow 构造时传入的 audit_log 回调 -> subgraph.py tool_node）。
+    # 权限跟"用户管理"同一档（_require_user_admin_tier）：平台管理员能看
+    # 全平台记录（可选 org_id 过滤某一家企业），企业管理员只能看自己企业的
+    # ——不管请求里传了什么 org_id，一律强制用自己的，跟 admin_create_user
+    # 里"企业管理员不管请求体传了什么 org_id，一律用自己的"同一个模式。
+
+    @app.get("/api/v1/admin/audit-logs", response_model=AuditLogListResponse)
+    async def admin_list_audit_logs(
+        org_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        action: Optional[str] = None,
+        start: Optional[float] = None,
+        end: Optional[float] = None,
+        limit: int = 50,
+        offset: int = 0,
+        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
+    ) -> AuditLogListResponse:
+        if limit < 1 or limit > 200:
+            raise HTTPException(status_code=400, detail="limit 必须在 1-200 之间")
+
+        is_platform = await org_store.is_platform_admin(current_user.user_id)
+        effective_org_id = org_id
+        if not is_platform:
+            actor_org = await org_store.get_org_for_user(current_user.user_id)
+            effective_org_id = actor_org.org_id if actor_org else None
+
+        entries, total = await audit_store.list_logs(
+            org_id=effective_org_id, user_id=user_id, action=action,
+            start=start, end=end, limit=limit, offset=offset,
+        )
+        org_names = {o.org_id: o.name for o in await org_store.list_organizations()} if is_platform else {}
+        items = [
+            AuditLogResponse(
+                audit_id=e.audit_id, org_id=e.org_id, org_name=org_names.get(e.org_id),
+                user_id=e.user_id, username=e.username, action=e.action,
+                resource_type=e.resource_type, resource_id=e.resource_id,
+                detail=e.detail, success=e.success, created_at=e.created_at,
+            )
+            for e in entries
+        ]
+        return AuditLogListResponse(items=items, total=total)
 
     # 注意：没有"改派用户所属企业"的端点——员工的企业归属只在创建时确定一次
     # （见 admin_create_user），创建之后任何管理员（包括平台管理员）都不能再
@@ -694,9 +1487,25 @@ def create_app() -> FastAPI:
 
     # ==================== 组织管理 API（仅平台管理员） ====================
 
-    def _org_response(org) -> AdminOrganizationResponse:
+    def _org_response(org, aiops_module_enabled: bool = False) -> AdminOrganizationResponse:
+        """⚠️ **刻意不填 `seats_used`。**
+
+        它要 `await user_store.count_active_users(org_id)`，而这个函数被企业
+        列表逐个调用——填进去就是一个 N+1，正是 2026-08-26 刚在
+        `admin_list_users` 上修掉的那类问题（P1-14，约 300 次串行查询）。
+        列表页只给上限，用量在单个企业的详情/改上限响应里给。
+        真要在列表上显示用量，得先写一个 `count_active_users_batch`。
+
+        `aiops_module_enabled` 反过来——**特意作为参数传入，不在这里查**，
+        因为调用方有的是"批量列表"场景（`admin_list_organizations`，需要
+        批量查询避免 N+1）、有的是"我刚写完这个值，不需要再读一次"场景
+        （`admin_set_aiops_module_enabled`），两种取值方式不一样，硬塞进
+        这个纯同步的映射函数里反而两头都不讨好。
+        """
         return AdminOrganizationResponse(
-            org_id=org.org_id, name=org.name, is_platform=org.is_platform, created_at=org.created_at,
+            org_id=org.org_id, name=org.name, is_platform=org.is_platform,
+            created_at=org.created_at, seat_limit=org.seat_limit,
+            aiops_module_enabled=aiops_module_enabled,
         )
 
     @app.get("/api/v1/admin/organizations", response_model=List[AdminOrganizationResponse])
@@ -714,15 +1523,17 @@ def create_app() -> FastAPI:
         else:
             own_org = await org_store.get_org_for_user(current_user.user_id)
             orgs = [own_org] if own_org else []
-        return [_org_response(o) for o in orgs]
+        aiops_enabled_by_org = await ops_store.is_module_enabled_batch([o.org_id for o in orgs])
+        return [_org_response(o, aiops_enabled_by_org.get(o.org_id, False)) for o in orgs]
 
     @app.post("/api/v1/admin/organizations", response_model=AdminOrganizationResponse)
     async def admin_create_organization(
         request: AdminCreateOrganizationRequest,
-        _: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_super_admin),
         __: AuthenticatedUser = Depends(require_platform_admin),
     ) -> AdminOrganizationResponse:
         org = await org_store.create_organization(request.name)
+        await _audit_log(current_user.user_id, "create_organization", "organization", org.org_id, {"name": org.name})
         return _org_response(org)
 
     # ==================== 租户连接器 API（仅平台管理员） ====================
@@ -766,7 +1577,10 @@ def create_app() -> FastAPI:
         if await org_store.get_organization(org_id) is None:
             raise HTTPException(status_code=404, detail="组织不存在")
         connectors = await tenant_connector_store.list_for_org(org_id)
-        return [await _connector_response(c) for c in connectors]
+        # P1-14 同类问题（N 次串行 await，这里是 HTTP 探活不是 SQL 查询）：
+        # 逐个 await _connector_response 会让每个连接器的 2s 超时探活排队
+        # 累加，改成并发发起。
+        return list(await asyncio.gather(*[_connector_response(c) for c in connectors]))
 
     @app.put(
         "/api/v1/admin/organizations/{org_id}/connectors/{capability}",
@@ -776,7 +1590,7 @@ def create_app() -> FastAPI:
         org_id: str,
         capability: str,
         request: UpsertTenantConnectorRequest,
-        _: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_super_admin),
         __: AuthenticatedUser = Depends(require_platform_admin),
     ) -> TenantConnectorResponse:
         org = await org_store.get_organization(org_id)
@@ -821,6 +1635,10 @@ def create_app() -> FastAPI:
             field_mapping=request.field_mapping,
             is_active=request.is_active,
         )
+        await _audit_log(
+            current_user.user_id, "upsert_connector", "connector", connector.connector_id,
+            {"org_id": org_id, "capability": capability, "connector_type": request.connector_type, "is_active": request.is_active},
+        )
         return await _connector_response(connector)
 
     # ==================== 网关监控 API（仅平台管理员） ====================
@@ -840,220 +1658,722 @@ def create_app() -> FastAPI:
         connectors = [c for c in connectors if not c.connector_type.startswith("internal")]
         org_names = {o.org_id: o.name for o in await org_store.list_organizations()}
 
-        results = []
-        for c in connectors:
-            results.append(GatewayConnectorResponse(
+        # P1-14 同类问题：这是全平台所有外部连接器一起探活，逐个串行 await
+        # 会让总耗时随连接器数量线性叠加（每个最多 2s 超时）。并发发起。
+        health_statuses = await asyncio.gather(*[_check_connector_health(c) for c in connectors])
+        results = [
+            GatewayConnectorResponse(
                 connector_id=c.connector_id, org_id=c.org_id,
                 org_name=org_names.get(c.org_id, c.org_id),
                 capability=c.capability, connector_type=c.connector_type, endpoint=c.endpoint,
-                is_active=c.is_active, health_status=await _check_connector_health(c),
+                is_active=c.is_active, health_status=health,
                 call_count=c.call_count, failure_count=c.failure_count,
                 last_called_at=c.last_called_at, last_latency_ms=c.last_latency_ms, last_error=c.last_error,
-            ))
+            )
+            for c, health in zip(connectors, health_statuses)
+        ]
         return results
 
-    # ==================== 角色管理 API ====================
-    # 角色的新建/重命名/删除仍然只对 super_admin 开放（角色是全平台共享的词表，
-    # 没有按企业隔离，交给企业管理员建/删会有跨企业改到别人角色、name 唯一约束
-    # 互相冲突等问题，这次不做，见需求确认时选定的"轻量版"）。企业管理员能碰的
-    # 只有"给本企业员工已经持有的角色配置关联知识库"这一件事——见下面
-    # admin_list_company_roles / admin_set_role_collections 里的权限边界。
+    # ==================== 智能运维模块 API（docs/aiops_module_design.md） ====================
+    # 阶段二：管理面 CRUD 端点，接的是 ops_store.py 的存储层（阶段一）。
+    # BYOC 连接器的实际运行时（WebSocket 心跳/联邦查询/AI 分析）、审批工作流、
+    # LangGraph 接入均未实现——这里注册的连接器目前只是"元数据存在"，还不会
+    # 真的连上任何客户系统。见 CLAUDE.md §5 该条"什么没做"。
 
-    def _role_response(role_obj) -> RoleResponse:
+    # ==================== 智能运维（batch 1：已搬到 api/ops_router.py） ====================
+    # 23 个 `/admin/ops` 端点 + `admin/roles` 下两个 ops-permissions 端点，连同
+    # 10 个 admin/ops 专属辅助函数，已整体搬进 `src/ragent_backend/api/ops_router.py`。
+    # 见 docs/app_layering_design.md 批次 1。
+    #
+    # `_audit_log` 没有跟着搬——它被 9 个域共用（批次 0 已提取到 api_helpers），
+    # 这里把 create_app 里那层薄包装注入过去。
+    app.include_router(build_ops_router(
+        ops_store=ops_store,
+        ops_toolset=ops_toolset,
+        ops_engine=_ops_engine,
+        role_store=role_store,
+        org_store=org_store,
+        get_current_user=get_current_user,
+        require_org_admin=_require_org_admin,
+        audit_log=_audit_log,
+    ))
+
+
+
+
+
+
+
+
+    async def _handle_alert_push(connection_id: str, org_id: str, frame: dict, websocket) -> None:
+        """处理一批推送进来的告警：关联 → 落事件 → 必要时触发分析。
+
+        ⚠️ **分析绝不能在这里 await 完成。** 一次 RCA 实测 7–10 秒，而这个函数
+        跑在 WebSocket 的接收循环里——卡住它，心跳和后续告警全都堵在后面，
+        连接器会因为收不到心跳回执而判定平台失联。所以分析走
+        `asyncio.create_task` 甩出去，这里只负责把事件落库并立刻回 ack。
+
+        ⚠️ **回 ack 是协议要求的**：推送丢了等于故障没被发现，连接器需要靠 ack
+        决定要不要重发。查询丢了顶多是这次没数据，推送丢了是真的漏掉一次故障。
+        """
+        from src.ops.analysis import Alert, correlate_alerts
+        from src.ops.incident_identity import fingerprint_of_incident
+
+        raw = (frame.get("payload") or {}).get("alerts") or []
+        # ⚠️ 上限保护：一次大面积故障可能瞬间产生几千条告警。**不能因为告警太多
+        # 把平台自己打挂**——超出部分丢弃并如实标注，而不是假装全收了。
+        capped = raw[:_ALERT_PUSH_MAX_PER_FRAME]
+        truncated = len(raw) > len(capped)
+
+        alerts = [
+            Alert(alert_id=f"{connection_id}:{i}", ts=float(a.get("ts") or time.time()),
+                  target=(a.get("labels") or {}).get("target", ""),
+                  labels=a.get("labels") or {}, text=a.get("text") or "",
+                  severity=(a.get("labels") or {}).get("severity", "warning"))
+            for i, a in enumerate(capped)
+        ]
+        now = time.time()
+        opened = []
+        if alerts:
+            # 复用既有的关联降噪：推送进来的告警跟查询回来的走**同一套代码**，
+            # 不为推送另写一份分组逻辑。
+            for incident in correlate_alerts(alerts).incidents:
+                try:
+                    applied = await ops_store.apply_alert_batch(
+                        org_id, connection_id,
+                        fingerprint=fingerprint_of_incident(incident),
+                        targets=list(incident.targets), labels=dict(incident.shared_labels),
+                        alert_count=incident.alert_count, now=now,
+                    )
+                except Exception:
+                    logger.exception("failed to apply pushed alert batch",
+                                     extra={"connection_id_len": len(connection_id)})
+                    continue
+                decision = applied["decision"]
+                logger.info("alert push applied", extra={
+                    "action": decision.action, "should_analyze": decision.should_analyze,
+                    "flap_count": decision.flap_count, "alert_count": incident.alert_count,
+                })
+                if decision.should_analyze and incident.targets:
+                    opened.append((applied["incident"], incident, decision))
+
+        for stored, incident, decision in opened:
+            # 甩出去异步跑，不阻塞接收循环。
+            asyncio.create_task(_auto_analyze_incident(org_id, connection_id, stored, incident, decision))
+
+        await websocket.send_json({
+            "type": "ack", "id": frame.get("id"), "connector_id": connection_id,
+            "ts": now,
+            "payload": {"accepted": len(capped), "truncated": truncated,
+                        "analyzing": len(opened)},
+        })
+
+    async def _auto_analyze_incident(org_id: str, connection_id: str, stored: dict,
+                                     incident, decision) -> None:
+        """事件首次打开（或越过 flapping 阈值）时自动分析一次。
+
+        ⚠️ 异常一律吞掉只记日志：**分析失败不能影响告警接收**。告警已经落库了，
+        少一条结论比丢一次故障轻得多；人还可以在界面上手动点分析补上。
+        """
+        target = (incident.targets or [None])[0]
+        if not target:
+            return
+        try:
+            outcome = await ops_toolset.analyze_ops_incident(
+                org_id, target, connection_ids=[connection_id],
+                trigger_source="auto",
+            )
+            summary_id = (outcome.data or {}).get("summary_id")
+            if summary_id:
+                await ops_store.attach_summary_to_incident(stored["id"], summary_id)
+        except Exception:
+            logger.exception("auto analysis failed", extra={"target_len": len(target)})
+
+    @app.websocket("/ws/ops/connector/register")
+    async def ops_connector_register_ws(
+        websocket: WebSocket,
+        connection_id: str = Query(...),
+        token: str = Query(...),
+    ):
+        """§10.1 的 WebSocket 注册握手 + 心跳 + refresh 循环。
+
+        浏览器/客户端原生 WebSocket API 握手阶段不能带自定义 header，所以
+        `connection_id` 与一次性 `register_token` 都走查询参数——跟
+        `trace_websocket` 的 `?token=` 是同一个约定。**握手校验在
+        `accept()` 之前完成**，不满足直接 `close()`，不建立连接（同一条
+        既有安全教训：trace WebSocket 那次 P0 就是"先 accept 再鉴权"）。
+
+        成功后连接进入长连接状态，处理两类帧：`heartbeat`（更新
+        `last_heartbeat_at`）、`refresh`（refresh_token 轮换，检测到重放会
+        撤销该连接器全部会话并断开，逼它重新走一遍这个握手）。
+
+        ⚠️ **这里还没有 `query_request`/`exec_request` 帧的处理**——那需要
+        `ConnectorTransport.query()` 把请求路由到这个活连接、等待关联的
+        `query_result` 帧返回，是下一步要做的事，本次只做到"连接器能连上、
+        能被判断在线"，见 `CLAUDE.md` §5 该条"未做的"。
+        """
+        conn = await ops_store.get_connector(connection_id)
+        if conn is None:
+            await websocket.close(code=4404)
+            return
+        if not await ops_store.is_module_enabled(conn.org_id):
+            await websocket.close(code=4403)
+            return
+
+        token_state = await ops_store.get_register_token_state(connection_id)
+        check = connector_session.check_register_token(
+            stored_hash=token_state["token_hash"] if token_state else None,
+            provided_token=token, used=token_state["used"] if token_state else False,
+            expires_at=token_state["expires_at"] if token_state else None,
+        )
+        if not check.ok:
+            await websocket.close(code=4401)
+            return
+
+        await websocket.accept()
+        await ops_store.mark_register_token_used(connection_id)
+
+        secret = connector_session.derive_connector_jwt_secret(get_jwt_secret())
+        session_token = connector_session.create_connector_session_jwt(connection_id, conn.org_id, secret)
+        refresh_token = connector_session.generate_refresh_token()
+        await ops_store.issue_refresh_token(
+            connection_id, connector_session.hash_token(refresh_token),
+            ttl_seconds=connector_session.REFRESH_TOKEN_TTL_SECONDS,
+        )
+        await ops_store.record_heartbeat(connection_id)
+        active_ops_connector_ws[connection_id] = websocket
+
+        await websocket.send_json({
+            "type": "registered", "id": str(uuid.uuid4()), "connector_id": connection_id,
+            "ts": time.time(),
+            "payload": {"session_token": session_token, "refresh_token": refresh_token},
+        })
+
+        try:
+            while True:
+                frame = await websocket.receive_json()
+                frame_type = frame.get("type")
+
+                if frame_type == "heartbeat":
+                    await ops_store.record_heartbeat(connection_id)
+                    await websocket.send_json({
+                        "type": "heartbeat", "id": frame.get("id"), "connector_id": connection_id,
+                        "ts": time.time(), "payload": {},
+                    })
+
+                elif frame_type == "alert_push":
+                    # 连接器主动推告警——这是"平台怎么知道出事了"那一环
+                    # （docs/alert_push_design.md）。**它是协议里唯一由连接器
+                    # 发起的业务帧**，其余都是平台问、连接器答。
+                    await _handle_alert_push(connection_id, conn.org_id, frame, websocket)
+
+                elif frame_type == "refresh":
+                    provided = (frame.get("payload") or {}).get("refresh_token", "")
+                    provided_hash = connector_session.hash_token(provided)
+                    rt_state = await ops_store.get_refresh_token_state(connection_id, provided_hash)
+                    rcheck = connector_session.check_refresh_token(
+                        stored_hash=rt_state["token_hash"] if rt_state else None,
+                        provided_token=provided,
+                        consumed_at=rt_state["consumed_at"] if rt_state else None,
+                        expires_at=rt_state["expires_at"] if rt_state else None,
+                    )
+                    if rcheck.is_replay:
+                        # §10.1：视为泄露信号，强制该连接器重新走注册流程——
+                        # 撤销全部会话令牌并断开，不只是拒绝这一次刷新。
+                        await ops_store.revoke_all_refresh_tokens(connection_id)
+                        await websocket.send_json({
+                            "type": "error", "id": frame.get("id"), "connector_id": connection_id,
+                            "ts": time.time(),
+                            "payload": {"reason": "refresh_token_replayed", "detail": "检测到已消费的 refresh_token 被重复使用，视为泄露信号，请重新注册"},
+                        })
+                        await websocket.close(code=4409)
+                        break
+                    if not rcheck.ok:
+                        await websocket.send_json({
+                            "type": "error", "id": frame.get("id"), "connector_id": connection_id,
+                            "ts": time.time(), "payload": {"reason": "refresh_token_invalid"},
+                        })
+                        continue
+
+                    await ops_store.consume_refresh_token(connection_id, provided_hash)
+                    new_session_token = connector_session.create_connector_session_jwt(
+                        connection_id, conn.org_id, secret,
+                    )
+                    new_refresh_token = connector_session.generate_refresh_token()
+                    await ops_store.issue_refresh_token(
+                        connection_id, connector_session.hash_token(new_refresh_token),
+                        ttl_seconds=connector_session.REFRESH_TOKEN_TTL_SECONDS,
+                    )
+                    await websocket.send_json({
+                        "type": "refresh", "id": frame.get("id"), "connector_id": connection_id,
+                        "ts": time.time(),
+                        "payload": {"session_token": new_session_token, "refresh_token": new_refresh_token},
+                    })
+
+                elif frame_type in ("query_result", "exec_result", "error"):
+                    # 这些帧是连接器对之前 query_request/exec_request 的响应，
+                    # 找到对应的等待中 Future 并 resolve——真正解析 payload 的
+                    # 逻辑在 WebSocketConnectorTransport/WebSocketRemediationDispatcher
+                    # 里（src/ops/connector_transport.py），这里不关心内容，
+                    # 只按 id 转发。**没有匹配的 pending 项就静默丢弃**，不是
+                    # bug：调用方可能已经超时放弃了这次等待（`_send_and_await_response`
+                    # 的 finally 会清理 pending），连接器晚到的响应不该让整个
+                    # WS 连接报错。
+                    msg_id = frame.get("id")
+                    fut = active_ops_pending_requests.get(msg_id) if msg_id else None
+                    if fut is not None and not fut.done():
+                        fut.set_result(frame)
+
+                else:
+                    await websocket.send_json({
+                        "type": "error", "id": frame.get("id"), "connector_id": connection_id,
+                        "ts": time.time(),
+                        "payload": {"reason": "unsupported_frame_type", "detail": f"暂不支持的帧类型：{frame_type}"},
+                    })
+        except WebSocketDisconnect:
+            pass
+        finally:
+            active_ops_connector_ws.pop(connection_id, None)
+            await ops_store.mark_offline(connection_id)
+
+    @app.put(
+        "/api/v1/admin/organizations/{org_id}/aiops-module-enabled",
+        response_model=AdminOrganizationResponse,
+    )
+    async def admin_set_aiops_module_enabled(
+        org_id: str,
+        request: SetAiopsModuleEnabledRequest,
+        current_user: AuthenticatedUser = Depends(_require_super_admin),
+        __: AuthenticatedUser = Depends(require_platform_admin),
+    ) -> AdminOrganizationResponse:
+        """§4.1：只有 super_admin 能切换，企业管理员看不到、改不了——跟连接器
+        配置（§4 那张对照表）同一套边界，双重网关（超级管理员 + 平台管理员）
+        跟 `admin_upsert_tenant_connector` 一致。"""
+        org = await org_store.get_organization(org_id)
+        if org is None:
+            raise HTTPException(status_code=404, detail="组织不存在")
+        await ops_store.set_module_enabled(org_id, request.enabled)
+        await _audit_log(
+            current_user.user_id, "set_aiops_module_enabled", "organization", org_id,
+            {"enabled": request.enabled},
+        )
+        # 用刚写入的值直接回，不用再读一次数据库——我们本来就知道自己刚设的是
+        # 什么，读回反而多一次可以省掉的查询（也顺带避免了理论上的"写后读到
+        # 旧值"疑虑，虽然同一个连接内不会真的发生）。这是「刘德华」摸底运维
+        # 塔台时发现的真实阻塞：这个端点原来的响应里压根没有这个字段，
+        # PUT 之后前端没有任何办法确认这次点击是否真的生效。
+        return _org_response(org, request.enabled)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # ⚠️ 未实现：mark_executing / mark_result 没有对应端点——真正执行需要
+    # BYOC 连接器的运行时（§10.1 WebSocket 协议）把"已批准的执行计划"发给
+    # 客户环境本地执行，那部分完全没做，approved 状态目前是终点，走不到
+    # executing。见 CLAUDE.md §5 该条"未做的"。
+
+    # ==================== 运营仪表盘 API（仅平台管理员，见 dashboard_stats.py） ====================
+    # _require_platform_tier 目前只剩 super_admin 一档（2026-08-24 起平台侧
+    # 废弃 admin 角色，见文件顶部说明），单独保留这个 Depends 只是为了语义
+    # 独立；require_platform_admin 是第二层校验（组织归属，双重校验同一套
+    # 模式），确保只有 org.is_platform=True 的账号能进来。这是平台整体的运营
+    # 指标（会话数/消息数/活跃用户/响应延迟），不是任何企业的知识库内容，跟
+    # "平台运营方不该看到企业内部知识库数据"这条边界不冲突，但仍然只暴露给
+    # 平台管理员，企业管理员（org_admin）看不到跨企业的平台整体数据。前端
+    # 对应的可见性判断见 App.jsx 的 PLATFORM_ADMIN_ROLE_NAMES。
+
+
+
+
+
+    # ==================== 成本与质量可观测性 API（仅平台管理员） ====================
+    # token 用量来自 conversation_archive（_generate_node 每轮写入，见
+    # workflow.py _extract_token_usage 旁的说明），工具调用成功率来自
+    # audit_logs（治理与合规那组端点/回调顺手落的审计记录，见上面
+    # `_audit_log`）——两类数据本来就是为各自的需求（成本追踪/审计）落库的，
+    # 这里只是复用，没有为了这块仪表盘新增埋点。权限跟运营仪表盘概览同一档
+    # （_require_platform_tier + require_platform_admin），企业管理员看不到
+    # 跨企业的平台整体数据。
+
+    # 单价参考自各家官网公开报价（USD / 1M tokens，(输入单价, 输出单价)），
+    # 不是实时价格、也不代表任何合同折扣——只用于给运营方一个数量级参考。
+    # key 用小写子串匹配 settings.llm.model，匹配不到就不显示成本（不编一个
+    # 不知道对不对的数字），比如本地跑的 qwen2.5:7b 不在表里，只展示 token
+    # 用量，不展示"预估成本"。
+    _MODEL_PRICE_PER_1M_USD: Dict[str, tuple] = {
+        "gpt-4o-mini": (0.15, 0.6),
+        "gpt-4o": (2.5, 10.0),
+        "gpt-4-turbo": (10.0, 30.0),
+        "gpt-3.5-turbo": (0.5, 1.5),
+        "deepseek-chat": (0.27, 1.1),
+        "deepseek-reasoner": (0.55, 2.19),
+    }
+
+
+
+
+    # ==================== 角色管理 API ====================
+    # 角色直接携带知识库权限（role_store.py 顶部说明），分两类，用 org_id 是否
+    # 为空区分：
+    #   全局角色（org_id=None）：系统权限档位，固定只有 super_admin/org_admin
+    #     两个内置角色，super_admin 只能改展示名，不能新建/删除——运营商的
+    #     角色（super_admin）本身就没有配置知识库的入口，"无知识库权限"是
+    #     天然结果，不是额外拦出来的。全局角色曾经还支持"新建一个跨企业共用
+    #     的部门身份"（设想给工作流审批用），但 2026-08-23 工作流审批人分配
+    #     改成按企业独立配置（见 workflow_store.py 顶部说明），全局角色不再
+    #     服务这个用途，也没有别的消费方，新建入口已经去掉（`admin_create_role`
+    #     现在只接受企业角色）。
+    #   企业角色（org_id 非空）：某家企业管理员自己建的、可以配置知识库关联的
+    #     角色，只能操作自己企业的，只有该企业的 org_admin 能建/改名/删/配置
+    #     知识库——是原来「知识库分组 API」的直接延续。
+    # 列表读取对两层都开放（谁能不能真的把某个角色分配出去，由
+    # admin_set_user_roles / admin_create_user 里的 _validate_role_assignment
+    # 负责拦，这里只是读，读了不代表能用）。
+
+    async def _actor_role_names(current_user: AuthenticatedUser) -> set:
+        return {r.name for r in await role_store.get_user_roles(current_user.user_id)}
+
+    def _role_response(role_obj: Role) -> RoleResponse:
         return RoleResponse(
             role_id=role_obj.role_id,
             name=role_obj.name,
             display_name=role_obj.display_name,
             is_system=role_obj.is_system,
-            collection_names=getattr(role_obj, "collection_names", []),
+            org_id=role_obj.org_id,
+            collection_names=list(getattr(role_obj, "collection_names", [])),
             created_at=role_obj.created_at,
         )
 
     @app.get("/api/v1/admin/roles", response_model=List[RoleResponse])
     async def admin_list_roles(
-        # 企业管理员给自己企业员工分配角色时，前端要拿完整角色列表填多选框的选项
-        # （谁能不能真的把某个角色发出去，由 admin_set_user_roles /
-        # admin_create_user 里的 _validate_role_assignment 负责拦，这里只是读
-        # 列表，读了不代表能用）。角色的增/删/改（下面几个端点）仍然只对
-        # super_admin 开放。
-        _: AuthenticatedUser = Depends(_require_user_admin_tier),
-    ) -> List[RoleResponse]:
-        roles = await role_store.list_roles()
-        return [_role_response(r) for r in roles]
-
-    @app.get("/api/v1/admin/roles/company", response_model=List[RoleResponse])
-    async def admin_list_company_roles(
         current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
     ) -> List[RoleResponse]:
-        """企业管理员「知识库权限」页面专用：只列出本企业员工实际持有的部门角色。
-        跟上面 `GET /admin/roles` 的区别——那个端点是给"用户与角色分配"页面的
-        角色多选框用的，要看到全平台角色目录（哪怕本企业员工还没人持有过），
-        职责不同，不能合并成一个端点两种截断逻辑。"""
+        if await org_store.is_platform_admin(current_user.user_id):
+            roles = await role_store.list_roles()
+            return [_role_response(r) for r in roles]
         org = await org_store.get_org_for_user(current_user.user_id)
         if org is None:
             return []
-        roles = await role_store.list_roles_used_by_org(org.org_id)
+        roles = await role_store.list_roles_for_org(org.org_id)
         return [_role_response(r) for r in roles]
+
+    async def _authorize_role_mutation(current_user: AuthenticatedUser, role: Role) -> None:
+        """全局角色只有 super_admin 能改/删；企业角色只有该企业的 org_admin 能改/删。"""
+        if role.org_id is None:
+            if ROLE_SUPER_ADMIN not in await _actor_role_names(current_user):
+                raise HTTPException(status_code=403, detail="只有超级管理员能修改平台角色")
+            return
+        actor_org = await org_store.get_org_for_user(current_user.user_id)
+        if actor_org is None or actor_org.org_id != role.org_id:
+            raise HTTPException(status_code=403, detail="只能操作本企业的角色")
+        if ROLE_ORG_ADMIN not in await _actor_role_names(current_user):
+            raise HTTPException(status_code=403, detail="只有企业管理员能修改本企业角色")
 
     @app.post("/api/v1/admin/roles", response_model=RoleResponse)
     async def admin_create_role(
         request: CreateRoleRequest,
-        _: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
     ) -> RoleResponse:
+        """只建企业角色——建全局角色的入口已经去掉（见本节顶部说明），
+        `_require_org_admin` 已经挡掉了平台管理员，这里不用再判断"是不是
+        平台管理员"这个分支。"""
+        actor_org = await org_store.get_org_for_user(current_user.user_id)
+        if actor_org is None:
+            raise HTTPException(status_code=403, detail="只有企业管理员能新建本企业角色")
+        org_id = actor_org.org_id
         try:
-            role = await role_store.create_role(request.name, request.display_name)
+            role = await role_store.create_role(org_id, request.name, request.display_name)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        await _audit_log(current_user.user_id, "create_role", "role", role.role_id, {"name": role.name, "org_id": org_id})
         return _role_response(role)
 
     @app.patch("/api/v1/admin/roles/{role_id}", response_model=RoleResponse)
     async def admin_update_role(
         role_id: str,
         request: UpdateRoleRequest,
-        _: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
     ) -> RoleResponse:
-        role = await role_store.update_role(role_id, request.display_name)
-        if role is None:
+        existing = await role_store.get_role_by_id(role_id)
+        if existing is None:
             raise HTTPException(status_code=404, detail="角色不存在")
-        # update_role 返回的是不带 collection_names 的 Role；重新从 list_roles()
-        # 取一次带关联知识库的完整视图，避免响应把已有的知识库关联显示成空。
-        roles = await role_store.list_roles()
-        return _role_response(next(r for r in roles if r.role_id == role_id))
+        await _authorize_role_mutation(current_user, existing)
+        role = await role_store.update_role(role_id, request.display_name)
+        await _audit_log(current_user.user_id, "update_role", "role", role_id, {"display_name": request.display_name})
+        # role_store.update_role 返回的是不带 collection_names 的裸 Role（改名
+        # 不影响知识库关联，没必要每次都重新算），这里按角色自己的 org_id
+        # 补一次查询，响应体里不要让"重命名"看起来把知识库关联清空了。
+        if role.org_id is not None:
+            roles = await role_store.list_roles_for_org(role.org_id)
+            role = next((r for r in roles if r.role_id == role_id), role)
+        return _role_response(role)
 
     @app.delete("/api/v1/admin/roles/{role_id}")
     async def admin_delete_role(
         role_id: str,
-        _: AuthenticatedUser = Depends(_require_super_admin),
+        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
     ) -> dict:
+        existing = await role_store.get_role_by_id(role_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="角色不存在")
+        await _authorize_role_mutation(current_user, existing)
         try:
             found = await role_store.delete_role(role_id)
         except ValueError as e:
             raise HTTPException(status_code=403, detail=str(e))
         if not found:
             raise HTTPException(status_code=404, detail="角色不存在")
+        await _audit_log(current_user.user_id, "delete_role", "role", role_id, {})
         return {"success": True}
 
     @app.put("/api/v1/admin/roles/{role_id}/collections", response_model=RoleResponse)
     async def admin_set_role_collections(
         role_id: str,
         request: SetRoleCollectionsRequest,
-        current_user: AuthenticatedUser = Depends(_require_user_admin_tier),
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
     ) -> RoleResponse:
+        """给角色配置知识库关联——只有 org_admin 能碰（运营商的角色没有这个
+        入口，见文件顶部说明），且只按调用方自己的企业写 role_collections：
+        企业角色只能配自己的；全局共用的部门角色（如 IT部）也能配，但只影响
+        "调用方企业名下持有这个角色的人"，不会波及其他企业（role_collections
+        按 (role_id, org_id) 隔离，见 role_store.py）。两个内置系统角色
+        （super_admin/org_admin）不允许配置——"运营商的角色没有知识库权限"
+        是业务规则本身，不是遗漏；org_admin 虽然不是运营商，但已经隐式拥有
+        企业内全部知识库，配置了也不会生效，一并挡掉避免误导。"""
         role = await role_store.get_role_by_id(role_id)
         if role is None:
             raise HTTPException(status_code=404, detail="角色不存在")
-
-        # 不管调用方是哪一层管理员，一律只能配置"自己所属企业的员工实际持有"的
-        # 角色（role_store.py list_roles_used_by_org 的判定标准，跟
-        # admin_list_company_roles 用的是同一个方法，读/写口径必须一致）——
-        # 之前平台管理员（super_admin/admin）有特殊豁免，能不受这层限制改任意
-        # 企业的角色知识库关联，这跟"平台运营方不该碰任何企业内部知识库配置"
-        # 的边界矛盾，这次去掉这个豁免。平台管理员自己所属 org_platform 也会走
-        # 这同一套逻辑——list_roles_used_by_org(org_platform) 天然包含平台自己
-        # 那几个部门角色，所以平台管理员管理自己组织的知识库关联不受影响，只是
-        # 不能再碰别的企业的。
-        org = await org_store.get_org_for_user(current_user.user_id)
-        allowed_role_ids = (
-            {r.role_id for r in await role_store.list_roles_used_by_org(org.org_id)} if org else set()
+        if role.is_system:
+            raise HTTPException(status_code=403, detail="系统内置角色不支持配置知识库")
+        actor_org = await org_store.get_org_for_user(current_user.user_id)
+        if actor_org is None:
+            raise HTTPException(status_code=403, detail="账号未关联任何企业")
+        if role.org_id is not None and role.org_id != actor_org.org_id:
+            raise HTTPException(status_code=403, detail="只能给本企业的角色配置知识库")
+        await role_store.set_role_collections(role_id, actor_org.org_id, request.collection_names)
+        await _audit_log(
+            current_user.user_id, "set_role_collections", "role", role_id,
+            {"collection_names": request.collection_names},
         )
-        if role_id not in allowed_role_ids:
-            raise HTTPException(status_code=403, detail="只能配置本企业员工持有的角色的知识库关联")
-
-        await role_store.set_role_collections(role_id, request.collection_names)
-        roles = await role_store.list_roles()
+        roles = await role_store.list_roles_for_org(actor_org.org_id)
         return _role_response(next(r for r in roles if r.role_id == role_id))
 
-    async def _require_local_retrieval_org(current_user: AuthenticatedUser):
-        """企业自建知识库只对"走本地 Chroma 检索"的企业开放（跟平台自己的 6 个
-        部门库同一套检索机制）——像 Acme/Globex 这类把 knowledge_base 能力委托
-        给自己微服务的企业（`tenant_connectors` 里配了 http_api 连接器），本地
-        新建/关联的 collection 对它们的实际问答毫无意义（`query_knowledge_hub.py`
-        的 `is_remote` 分支完全绕开本地检索，见该模块说明），所以在这里就地
-        拒绝，报出清楚的原因，而不是让管理员建了一堆库、配了半天角色，结果
-        员工提问永远用不上，自己也不知道为什么。返回调用方所属的 Organization，
-        避免调用方再查一次。"""
+
+
+
+
+
+    # 知识库文档上传的进度状态——按 upload_id 存，供前端轮询进度条用。放内存
+    # 里就够了（不需要跨进程/重启存活）：单进程 dev/demo 部署，且这本来就是
+    # "这次上传现在到哪一步了"这种转瞬即逝的状态，不是需要审计追溯的持久数据
+    # （持久的那份是 audit_log 里落库的最终结果）。
+    _upload_progress: Dict[str, Dict[str, Any]] = {}
+
+    # ⚠️ 挂载点必须排在 `_MODEL_PRICE_PER_1M_USD` / `_upload_progress` 之后——
+    # 它们是 `create_app()` 的局部变量，在定义之前引用会 UnboundLocalError。
+    # 搬迁时挂载点默认插在被删代码的原位置，而这两个变量定义在那之后。
+    # ============ 知识库 / 仪表盘 / 通知（batch 2：已搬到 api/kb_dashboard_router.py）============
+    # 15 个端点 + 5 个专属辅助函数。见 docs/app_layering_design.md 批次 2。
+    #
+    # ⚠️ `INGEST_SEMAPHORE` 和 `_upload_progress` 是**共享可变状态**，
+    # 必须把这里这一份传过去——router 里另建一份会让并发摄入上限悄悄翻倍、
+    # 让上传进度的读写两半看不见彼此，而且都不会报错。
+    app.include_router(build_kb_dashboard_router(
+        org_store=org_store, user_store=user_store, role_store=role_store,
+        workflow_store=workflow_store, org_collection_store=org_collection_store,
+        tenant_connector_store=tenant_connector_store,
+        dashboard_stats_service=dashboard_stats_service,
+        kb_management_tool=_kb_management_tool, settings=settings,
+        model_price_per_1m_usd=_MODEL_PRICE_PER_1M_USD,
+        ingest_semaphore=INGEST_SEMAPHORE, upload_progress=_upload_progress,
+        allowed_extensions=ALLOWED_EXTENSIONS,
+        get_current_user=get_current_user, require_org_admin=_require_org_admin,
+        require_platform_tier=_require_platform_tier, audit_log=_audit_log,
+    ))
+
+    # ==================== 知识库目录 + 文档上传 API（任意登录员工） ====================
+    # 跟上面「企业自建知识库 API」的区别：那组是 org_admin 专属的管理入口；这组是
+    # 给普通员工上传资料用的自助入口——列出自己企业的全部知识库（不管有没有
+    # 权限都列出来，用 accessible 字段配合前端把没权限的选项置灰，而不是直接
+    # 从列表里拿掉；这样员工至少知道"这个库存在，只是我看不了，得找管理员要
+    # 权限"，而不是一头雾水地以为公司压根没建过这个库）。委托模式企业
+    # （Acme/Globex）复用 `_require_local_retrieval_org` 直接拒绝——道理跟企业
+    # 自建知识库那组端点一样：本地上传对它们的实际问答没有意义。
+
+
+
+
+
+
+    # ==================== 委托模式企业知识库上传（方案 2："平台代算，企业只存储"，
+    # 见 knowledge-base-tenant-federation.md 第 4.4 节） ====================
+    # 跟上面 upload_collection_document（本地模式，按 org_collections 登记的
+    # collection_name 路由）是两条独立入口，不共用同一个端点：委托模式的
+    # "知识库"是整个企业一份，没有 collection 可选；本地模式的员工也不会走到
+    # 这里——两条路径靠企业的连接器类型（internal_chroma vs http_api）互斥。
+    #
+    # 权限：委托模式下没有知识库分组那套细粒度 ACL（5.2 节"权限职责
+    # 转移"——本来就没有比"是不是这家企业的人"更细的粒度可以在平台侧判断），
+    # 所以只要求"属于这家企业"，不额外校验角色。
+
+    REMOTE_INGEST_TIMEOUT_SECONDS = 60.0  # 写入比查询耗时更长，比 8s 的查询超时更宽松
+
+    async def _require_delegated_retrieval_org(current_user: AuthenticatedUser):
+        """委托模式上传的前置校验，跟 `_require_local_retrieval_org` 互斥对称：
+        必须是配置了 http_api 连接器的企业才能走这条入口。返回 (org, connector)。"""
         org = await org_store.get_org_for_user(current_user.user_id)
         if org is None:
             raise HTTPException(status_code=403, detail="账号未关联任何企业")
         connector = await tenant_connector_store.get(org.org_id, CAPABILITY_KNOWLEDGE_BASE)
-        if connector is not None and connector.connector_type == CONNECTOR_TYPE_HTTP_API:
+        if connector is None or connector.connector_type != CONNECTOR_TYPE_HTTP_API:
             raise HTTPException(
                 status_code=400,
-                detail="该企业的知识库检索已委托给企业自己的系统管理，不支持在平台内新增/配置知识库",
+                detail="该企业的知识库检索没有委托给外部系统，请使用「新增知识库」里的本地上传入口",
             )
-        return org
+        return org, connector
 
-    @app.get("/api/v1/admin/collections", response_model=List[CollectionResponse])
-    async def admin_list_collections(
-        current_user: AuthenticatedUser = Depends(_require_org_admin),
-    ) -> List[CollectionResponse]:
-        """列出本企业自建的知识库，供「知识库权限」页面"配置知识库"多选框、以及
-        「新增知识库」页面的已有列表用。只对 org_admin 开放，且只返回调用方
-        自己企业名下登记过的 collection（org_collections 表，见 collection_store.py）
-        ——平台的 6 个固定部门库不在这张表里，也不会出现在这个列表中；别的
-        企业自建的知识库同理看不到。委托模式企业（Acme/Globex）调这个端点会
-        被 `_require_local_retrieval_org` 拒绝，报出清楚原因。"""
-        org = await _require_local_retrieval_org(current_user)
-        owned = await org_collection_store.list_for_org(org.org_id)
-        return [
-            CollectionResponse(collection_name=c.collection_name, display_name=c.display_name, created_at=c.created_at)
-            for c in owned
-        ]
+    @app.post("/api/v1/tenant-kb/documents", response_model=TenantKbUploadResponse)
+    async def upload_tenant_kb_document(
+        file: UploadFile = File(...),
+        category: Optional[str] = Form(default=None),
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> TenantKbUploadResponse:
+        """委托模式企业的员工上传文档：平台切块 + embedding（复用
+        `IngestionPipeline` 里无状态的那几个组件，见
+        src/ingestion/delegated_compute.py），推给企业自己的知识库微服务
+        存储——平台这边不落任何本地向量/索引。同步等待整个链路完成才返回，
+        大文件会比本地模式的异步轮询上传慢，这是当前版本的已知取舍，不是
+        本地模式那套 upload_id 轮询进度条。
 
-    @app.post("/api/v1/admin/collections", response_model=CollectionResponse)
-    async def admin_create_collection(
-        request: CreateCollectionRequest,
-        current_user: AuthenticatedUser = Depends(_require_org_admin),
-    ) -> CollectionResponse:
-        """企业管理员新增一个知识库——只登记名字和归属企业，不做物理摄入（见
-        collection_store.py 顶部说明，文档摄入仍走现有的摄入脚本/流程）。"""
-        org = await _require_local_retrieval_org(current_user)
+        `category`：这份文档归属企业内部哪个子库/分类，可选，原样透传给
+        委托契约 `/v1/vectors`（4.4 节）——平台不校验取值范围，是不是合法
+        类目、企业服务要不要认这个字段完全由对方决定，跟查询侧
+        `DEPARTMENT_KB_GROUP_TO_REMOTE_CATEGORIES` 用的是同一份约定，但那是
+        权限过滤用的映射，不是这里的校验依据。"""
+        org, connector = await _require_delegated_retrieval_org(current_user)
 
-        # 内部标识不能撞平台自己的保留名——DEPARTMENT_KB_COLLECTIONS 那 6 个
-        # 固定部门库、`tenant_*_kb`（委托模式企业专属命名约定）、`default`
-        # （历史遗留、不该有人再摄入内容的库，见 query_knowledge_hub.py 顶部
-        # 说明）、`conv_*`（每个对话私有）。这里不查 org_collections 表里存不存在
-        # ——存在的话下面 create() 的唯一约束自然会报错，不用在这里重复判断。
-        from src.mcp_server.tools.query_knowledge_hub import DEPARTMENT_KB_COLLECTIONS
-        name = request.collection_name.strip()
-        reserved = (
-            name in DEPARTMENT_KB_COLLECTIONS
-            or name == "default"
-            or name.startswith("conv_")
-            or (name.startswith("tenant_") and name.endswith("_kb"))
-        )
-        if reserved:
-            raise HTTPException(status_code=400, detail=f"'{name}' 是平台保留的知识库标识，换一个试试")
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        original_name = file.filename or ""
+        file_ext = Path(original_name).suffix.lower()
+        if file_ext == '.doc':
+            raise HTTPException(status_code=400, detail="旧版 .doc 格式暂不支持，请先转换为 .docx 后上传")
+        if file_ext not in ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"不支持的文件格式: {file_ext}。支持: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+            )
+
+        upload_dir = resolve_path(f"data/kb_uploads/tenant_{org.org_id}")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = upload_dir / f"{uuid.uuid4().hex}_{original_name}"
+        dest_path.write_bytes(content)
 
         try:
-            created = await org_collection_store.create(
-                org_id=org.org_id,
-                collection_name=request.collection_name.strip(),
-                display_name=request.display_name.strip(),
-                created_by=current_user.user_id,
+            # 切块 + embedding 是阻塞/CPU 密集操作，扔进线程池，不卡住事件循环
+            # （跟 query_knowledge_hub.py `_ensure_initialized` 的做法一致）。
+            computed = await asyncio.to_thread(compute_chunks_for_delegation, load_settings(), str(dest_path))
+        except InjectionDetectedError as e:
+            # 内容被判定为疑似提示词注入而拒绝摄入，是预期内的业务判定，
+            # 不是系统故障——必须在通用的 except Exception 之前单独捕获，
+            # 否则会被兜底成 500"文档解析/编码失败"，把"我们主动拒绝了这份
+            # 文档"误报成"系统出错了"（CLAUDE.md §4 P0 第 6 条）。
+            await _audit_log(
+                current_user.user_id, "upload_tenant_kb_document", "tenant_kb", org.org_id,
+                {"filename": original_name, "org_id": org.org_id, "error": str(e), "reason": "injection_detected"},
+                success=False,
             )
-        except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
-        return CollectionResponse(
-            collection_name=created.collection_name, display_name=created.display_name, created_at=created.created_at,
+        except Exception as e:
+            await _audit_log(
+                current_user.user_id, "upload_tenant_kb_document", "tenant_kb", org.org_id,
+                {"filename": original_name, "org_id": org.org_id, "error": str(e)}, success=False,
+            )
+            raise HTTPException(status_code=500, detail=f"文档解析/编码失败: {e}")
+
+        if not computed["chunks"]:
+            return TenantKbUploadResponse(
+                chunk_count=0, message="文档没有可摄入的内容（可能是空文件，或格式虽支持但提取不出正文）",
+            )
+
+        token = connector.auth_config.get("token", "")
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=REMOTE_INGEST_TIMEOUT_SECONDS) as client:
+                resp = await client.post(
+                    f"{connector.endpoint.rstrip('/')}/v1/vectors",
+                    json={"doc_id": computed["doc_id"], "chunks": computed["chunks"], "category": category},
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "X-Organization-Id": org.org_id,
+                        "Content-Type": "application/json",
+                    },
+                )
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            resp.raise_for_status()
+            result = resp.json()
+        except httpx.HTTPStatusError as e:
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            await tenant_connector_store.record_call(connector.connector_id, False, elapsed_ms, str(e))
+            await _audit_log(
+                current_user.user_id, "upload_tenant_kb_document", "tenant_kb", org.org_id,
+                {"filename": original_name, "org_id": org.org_id, "error": str(e)}, success=False,
+            )
+            raise HTTPException(status_code=502, detail="企业知识库暂时无法写入，请稍后再试")
+        except (httpx.TimeoutException, httpx.ConnectError):
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            await tenant_connector_store.record_call(connector.connector_id, False, elapsed_ms, "timeout_or_unreachable")
+            await _audit_log(
+                current_user.user_id, "upload_tenant_kb_document", "tenant_kb", org.org_id,
+                {"filename": original_name, "org_id": org.org_id, "error": "timeout_or_unreachable"}, success=False,
+            )
+            raise HTTPException(status_code=502, detail="企业知识库暂时无法访问，请稍后再试")
+
+        await tenant_connector_store.record_call(connector.connector_id, True, elapsed_ms, None)
+        await _audit_log(
+            current_user.user_id, "upload_tenant_kb_document", "tenant_kb", org.org_id,
+            {
+                "filename": original_name, "org_id": org.org_id,
+                "chunk_count": result.get("chunk_count", 0), "category": category,
+            },
         )
+        return TenantKbUploadResponse(chunk_count=result.get("chunk_count", 0))
 
     # ==================== 工作流模板管理 API（仅超级管理员） ====================
     # work-flow.md 第 7 节：模板定义"某类流程需要哪些结构化字段"，附件材料只有
-    # 一句提醒文案（attachments_note），不逐条建模校验。
+    # 一句提醒文案（attachments_note），不逐条建模校验——这是跨企业共用的表单
+    # 结构，不含审批人信息。"这类流程谁来批"2026-08-23 起改成企业内部的事，
+    # 由各企业管理员在自己的「审批设置」页面配置（见下面「工作流审批人分配
+    # API」），平台这里不再管。
 
     def _workflow_template_response(template: WorkflowTemplate) -> WorkflowTemplateResponse:
-        return WorkflowTemplateResponse(
-            template_id=template.template_id,
-            workflow_type=template.workflow_type,
-            display_name=template.display_name,
-            description=template.description,
-            required_fields=template.required_fields,
-            attachments_note=template.attachments_note,
-            approver_role_id=template.approver_role_id,
-            is_system=template.is_system,
-            created_at=template.created_at,
-        )
+        """薄包装，实现见 `api_helpers.workflow_template_response`（纯函数）。"""
+        return api_helpers.workflow_template_response(template)
 
     @app.get("/api/v1/admin/workflow-templates", response_model=List[WorkflowTemplateResponse])
     async def admin_list_workflow_templates(
@@ -1085,8 +2405,6 @@ def create_app() -> FastAPI:
         request: UpdateWorkflowTemplateRequest,
         _: AuthenticatedUser = Depends(_require_super_admin),
     ) -> WorkflowTemplateResponse:
-        # exclude_unset：区分"这次 PATCH 没传这个字段"和"显式传了 null"，
-        # approver_role_id 本身允许为 null（表示暂无审批人），两种情况不能混淆。
         updates = request.model_dump(exclude_unset=True)
         kwargs: dict = {}
         if "display_name" in updates:
@@ -1097,12 +2415,6 @@ def create_app() -> FastAPI:
             kwargs["required_fields"] = updates["required_fields"]
         if "attachments_note" in updates:
             kwargs["attachments_note"] = updates["attachments_note"]
-        if "approver_role_id" in updates:
-            if updates["approver_role_id"] is not None:
-                role = await role_store.get_role_by_id(updates["approver_role_id"])
-                if role is None:
-                    raise HTTPException(status_code=400, detail="审批角色不存在")
-            kwargs["approver_role_id"] = updates["approver_role_id"]
 
         template = await workflow_store.update_template(template_id, **kwargs)
         if template is None:
@@ -1122,6 +2434,74 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="流程模板不存在")
         return {"success": True}
 
+    # ==================== 工作流审批人分配 API（仅 org_admin，按企业隔离） ====================
+    # "这类流程谁来批"是企业内部的事——同一个 workflow_type（比如"请假申请"）
+    # 在不同企业应该能配不同的审批角色，只能由该企业自己的管理员配置，见
+    # workflow_store.py 顶部说明。平台管理员不管这个（工作流模板本身的表单
+    # 结构才归平台管，见上面「工作流模板管理 API」）。
+
+    @app.get("/api/v1/admin/workflow-approvers", response_model=List[WorkflowApproverAssignmentResponse])
+    async def admin_list_workflow_approvers(
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> List[WorkflowApproverAssignmentResponse]:
+        """列出全部流程类型 + 本企业当前给每个类型配的审批角色（没配就是
+        null）——前端拿这份列表渲染"每类流程选一个审批角色"的表单。"""
+        org = await org_store.get_org_for_user(current_user.user_id)
+        if org is None:
+            raise HTTPException(status_code=403, detail="账号未关联任何企业")
+        templates = await workflow_store.list_templates()
+        assignments = await workflow_store.list_org_approver_roles(org.org_id)
+        role_ids = list({rid for rid in assignments.values() if rid})
+        # N+1 审计发现（P1-14 同类问题）：原来对每个不重复 role_id 单独查一次。
+        roles_by_id = await role_store.get_roles_by_ids_batch(role_ids)
+        result = []
+        for t in templates:
+            approver_role_id = assignments.get(t.workflow_type)
+            approver_role = roles_by_id.get(approver_role_id) if approver_role_id else None
+            result.append(WorkflowApproverAssignmentResponse(
+                workflow_type=t.workflow_type,
+                display_name=t.display_name,
+                approver_role_id=approver_role_id,
+                approver_role_display_name=approver_role.display_name if approver_role else None,
+            ))
+        return result
+
+    @app.put("/api/v1/admin/workflow-approvers/{workflow_type}", response_model=WorkflowApproverAssignmentResponse)
+    async def admin_set_workflow_approver(
+        workflow_type: str,
+        request: SetWorkflowApproverRequest,
+        current_user: AuthenticatedUser = Depends(_require_org_admin),
+    ) -> WorkflowApproverAssignmentResponse:
+        org = await org_store.get_org_for_user(current_user.user_id)
+        if org is None:
+            raise HTTPException(status_code=403, detail="账号未关联任何企业")
+        template = await workflow_store.get_template_by_type(workflow_type)
+        if template is None:
+            raise HTTPException(status_code=404, detail="流程模板不存在")
+
+        approver_role = None
+        if request.approver_role_id is not None:
+            approver_role = await role_store.get_role_by_id(request.approver_role_id)
+            if approver_role is None:
+                raise HTTPException(status_code=400, detail="审批角色不存在")
+            # 只能指定本企业自己的角色——全局角色（部门身份、系统角色）不再
+            # 作为审批人来源，工作流跟角色/知识库一样是"企业内部的事"，见
+            # workflow_store.py 顶部说明。
+            if approver_role.org_id != org.org_id:
+                raise HTTPException(status_code=403, detail="只能指定本企业自己的角色作为审批人")
+
+        await workflow_store.set_org_approver_role(org.org_id, workflow_type, request.approver_role_id)
+        await _audit_log(
+            current_user.user_id, "set_workflow_approver", "workflow_template", workflow_type,
+            {"approver_role_id": request.approver_role_id},
+        )
+        return WorkflowApproverAssignmentResponse(
+            workflow_type=workflow_type,
+            display_name=template.display_name,
+            approver_role_id=request.approver_role_id,
+            approver_role_display_name=approver_role.display_name if approver_role else None,
+        )
+
     # ==================== 工作流 API ====================
     # work-flow.md 第 7 节 + work-flow-web.md 第 3/6.2 节
 
@@ -1140,8 +2520,11 @@ def create_app() -> FastAPI:
     ) -> List[WorkflowTemplateResponse]:
         """登录用户可调，只返回当前用户角色能审批的流程类型，用于"待我审批"
         Tab 的可见性判断，不要求 super_admin。"""
+        org = await org_store.get_org_for_user(current_user.user_id)
+        if org is None:
+            return []
         role_ids = [r.role_id for r in await role_store.get_user_roles(current_user.user_id)]
-        templates = await workflow_store.approvable_templates_for_role_ids(role_ids)
+        templates = await workflow_store.approvable_templates_for_org_and_role_ids(org.org_id, role_ids)
         return [_workflow_template_response(t) for t in templates]
 
     async def _build_workflow_instance_response(instance: WorkflowInstance) -> WorkflowInstanceResponse:
@@ -1172,10 +2555,10 @@ def create_app() -> FastAPI:
     async def _require_workflow_access(
         instance_id: str, current_user: AuthenticatedUser, mode: str,
     ) -> WorkflowInstance:
-        """`mode`: "owner" 必须是发起人；"approver" 必须持有该实例所属模板的审批
-        角色；"owner_or_approver" 满足其一即可。审批角色是 per-模板动态的，不能
-        用静态的 `require_role(*names)` 工厂，运行期查模板后再判断（work-flow.md
-        第 7 节）。"""
+        """`mode`: "owner" 必须是发起人；"approver" 必须持有"申请人所在企业"给
+        该实例对应流程类型配的审批角色；"owner_or_approver" 满足其一即可。
+        审批角色现在按企业配置（见 workflow_store.py 顶部说明），不能用静态的
+        `require_role(*names)` 工厂，运行期按申请人所属企业现查后再判断。"""
         instance = await workflow_store.get_instance(instance_id)
         if instance is None:
             raise HTTPException(status_code=404, detail="工作流不存在")
@@ -1186,11 +2569,15 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=403, detail="无权访问该工作流")
             return instance
 
-        template = await workflow_store.get_template_by_type(instance.workflow_type)
+        requester_org = await org_store.get_org_for_user(instance.requester_user_id)
         is_approver = False
-        if template is not None and template.approver_role_id:
-            role_ids = {r.role_id for r in await role_store.get_user_roles(current_user.user_id)}
-            is_approver = template.approver_role_id in role_ids
+        if requester_org is not None:
+            approver_role_id = await workflow_store.get_org_approver_role_id(
+                requester_org.org_id, instance.workflow_type,
+            )
+            if approver_role_id:
+                role_ids = {r.role_id for r in await role_store.get_user_roles(current_user.user_id)}
+                is_approver = approver_role_id in role_ids
 
         if mode == "approver":
             if not is_approver:
@@ -1227,9 +2614,13 @@ def create_app() -> FastAPI:
     async def list_pending_approval_workflows(
         current_user: AuthenticatedUser = Depends(get_current_user),
     ) -> List[WorkflowInstanceResponse]:
-        """我（按角色）能审批的待处理列表。"""
+        """我（按角色）能审批的待处理列表——按我自己所在的企业过滤，见
+        workflow_store.list_pending_for_org_and_role_ids 旁的说明。"""
+        org = await org_store.get_org_for_user(current_user.user_id)
+        if org is None:
+            return []
         role_ids = [r.role_id for r in await role_store.get_user_roles(current_user.user_id)]
-        instances = await workflow_store.list_pending_for_role_ids(role_ids)
+        instances = await workflow_store.list_pending_for_org_and_role_ids(org.org_id, role_ids)
         return [await _build_workflow_instance_response(i) for i in instances]
 
     @app.get("/api/v1/workflows/{instance_id}", response_model=WorkflowInstanceResponse)
@@ -1311,47 +2702,9 @@ def create_app() -> FastAPI:
     # work-flow-web.md 第 6.2 节：通用的"事件 -> 提醒"投递，目前只有工作流状态
     # 变化会触发（见 workflow_store.py 的 notify_requester/notify_approvers）。
 
-    @app.get("/api/v1/notifications", response_model=List[NotificationResponse])
-    async def list_notifications(
-        unread_only: bool = False,
-        limit: int = 20,
-        offset: int = 0,
-        current_user: AuthenticatedUser = Depends(get_current_user),
-    ) -> List[NotificationResponse]:
-        notifications = await workflow_store.list_notifications(
-            current_user.user_id, unread_only=unread_only, limit=limit, offset=offset,
-        )
-        return [
-            NotificationResponse(
-                notification_id=n.notification_id, type=n.type, title=n.title, body=n.body,
-                link=n.link, is_read=n.is_read, created_at=n.created_at,
-            )
-            for n in notifications
-        ]
 
-    @app.get("/api/v1/notifications/unread-count")
-    async def get_unread_notification_count(
-        current_user: AuthenticatedUser = Depends(get_current_user),
-    ) -> dict:
-        count = await workflow_store.unread_count(current_user.user_id)
-        return {"count": count}
 
-    @app.post("/api/v1/notifications/{notification_id}/read")
-    async def mark_notification_read(
-        notification_id: str,
-        current_user: AuthenticatedUser = Depends(get_current_user),
-    ) -> dict:
-        found = await workflow_store.mark_read(notification_id, current_user.user_id)
-        if not found:
-            raise HTTPException(status_code=404, detail="通知不存在")
-        return {"success": True}
 
-    @app.post("/api/v1/notifications/mark-all-read")
-    async def mark_all_notifications_read(
-        current_user: AuthenticatedUser = Depends(get_current_user),
-    ) -> dict:
-        count = await workflow_store.mark_all_read(current_user.user_id)
-        return {"success": True, "count": count}
 
     # ==================== 文件管理 API ====================
 
@@ -1411,6 +2764,8 @@ def create_app() -> FastAPI:
                     file_path=file_info.file_path,
                     collection=collection,
                     settings=settings,
+                    org_id=(actor_org.org_id if (actor_org := await org_store.get_org_for_user(current_user.user_id)) else None),
+                    owner_user_id=current_user.user_id,
                 )
             )
             
@@ -1680,8 +3035,14 @@ def create_app() -> FastAPI:
         current_user: AuthenticatedUser = Depends(get_current_user),
     ) -> StreamingResponse:
         """真流式对话接口：token-by-token 输出，客户端断开时自动回滚脏 checkpoint"""
-        
+        # `RequestContextMiddleware` 设的 contextvar 能否透传进下面这个生成器体，
+        # 未实测（docs/observability_design.md R1）——这里不依赖那条假设，
+        # 在中间件已确定的上下文里先取一次 request_id，显式传进生成器，
+        # 保证跟响应头里的 X-Request-Id 一致，不会因为透传与否而生成两个不同的 id。
+        _mw_request_id = (get_request_context() or bind_request_context()).request_id
+
         async def event_stream() -> AsyncGenerator[str, None]:
+            bind_request_context(request_id=_mw_request_id, user_id=current_user.user_id)
             # 1. 确定 thread / conversation
             if request.conversation_id:
                 thread_id = request.conversation_id
@@ -1696,11 +3057,14 @@ def create_app() -> FastAPI:
                 conv = await conversation_store.create_conversation(user_id=current_user.user_id)
                 thread_id = conv.conversation_id
             
+            _task_id = request.task_id or os.urandom(8).hex()
+            bind_request_context(conversation_id=thread_id, task_id=_task_id)
+
             initial_state = {
                 "query": request.query,
                 "user_id": current_user.user_id,
                 "conversation_id": thread_id,
-                "task_id": request.task_id or os.urandom(8).hex(),
+                "task_id": _task_id,
                 "top_k": request.top_k,
                 "workflow_type_hint": request.workflow_type,
             }
@@ -1723,9 +3087,9 @@ def create_app() -> FastAPI:
                         clean_checkpoint_id = cp.config.configurable.get('checkpoint_id')
                     elif isinstance(cp, dict):
                         clean_checkpoint_id = cp.get('checkpoint_id') or cp.get('id')
-            except Exception as e:
-                print(f"[ChatStream] Failed to get clean checkpoint: {e}")
-            
+            except Exception:
+                logger.exception("failed to get clean checkpoint", extra={"thread_id": thread_id})
+
             interrupted = False
             final_state = {}
             
@@ -1806,19 +3170,41 @@ def create_app() -> FastAPI:
                     
             except asyncio.CancelledError:
                 interrupted = True
-                print(f"[ChatStream] Stream cancelled, thread={thread_id}")
+                logger.info("stream cancelled", extra={"thread_id": thread_id})
             except Exception as e:
+                logger.exception("chat stream failed", extra={"thread_id": thread_id})
                 yield f"data: {json.dumps({'type': 'error', 'error': str(e)}, ensure_ascii=False)}\n\n"
             finally:
                 # 5. 中断时回滚脏 checkpoint
                 if interrupted and clean_checkpoint_id:
                     await _trim_checkpoints(checkpointer, thread_id, clean_checkpoint_id)
-        
+                # 生成器体是显式再绑的一份上下文（见函数开头注释），用完显式清理，
+                # 不依赖中间件那份 finally 一定覆盖到这里。
+                clear_request_context()
+
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     @app.websocket("/ws/trace/{conversation_id}")
-    async def trace_websocket(websocket: WebSocket, conversation_id: str):
-        """LangGraph 实时追踪 WebSocket：推送节点级执行进度"""
+    async def trace_websocket(
+        websocket: WebSocket, conversation_id: str, token: str = Query(default=""),
+    ):
+        """LangGraph 实时追踪 WebSocket：推送节点级执行进度。
+
+        2026-08-26 P0：原来握手即 accept，零鉴权——trace 里含检索片段与 prompt，
+        等同于旁路读取该会话的完整问答内容。浏览器原生 WebSocket API 握手阶段
+        不能带自定义 header，所以约定 token 走查询参数 `?token=`（跟 Authorization
+        header 里那份是同一张 JWT，解码逻辑复用 `_decode_token`）。鉴权要求跟同一份
+        对话的 REST 接口一致：token 需要解出真实用户，且该用户必须是这条
+        conversation 的所有者（复用 `_require_conversation_owner` 的同一判断），
+        不满足则在 `accept()` 之前拒绝，不建立连接。
+        """
+        try:
+            current_user = _decode_token(token)
+            await _require_conversation_owner(conversation_id, current_user)
+        except HTTPException:
+            await websocket.close(code=4401)
+            return
+
         await websocket.accept()
         active_trace_ws.setdefault(conversation_id, []).append(websocket)
         try:
@@ -1878,8 +3264,8 @@ def create_app() -> FastAPI:
                 target_idx = turn_order.index(target_turn_id)
                 if target_idx > 0:
                     previous_turn_id = turn_order[target_idx - 1]
-        except Exception as e:
-            print(f"[Rollback] Failed to determine previous turn: {e}")
+        except Exception:
+            logger.exception("rollback: failed to determine previous turn", extra={"conversation_id": conversation_id})
         
         try:
             if hasattr(checkpointer, 'alist') and previous_turn_id:
@@ -1904,8 +3290,8 @@ def create_app() -> FastAPI:
                     # 取时间戳最大的（即最新的）一个前一 turn 的 checkpoint
                     candidates.sort(key=lambda x: x[0])
                     keep_checkpoint_id = candidates[-1][1]
-        except Exception as e:
-            print(f"[Rollback] Failed to list checkpoints: {e}")
+        except Exception:
+            logger.exception("rollback: failed to list checkpoints", extra={"conversation_id": conversation_id})
         
         # 3. 执行三层回滚（互不阻断）
         trimmed = {"checkpoint": False, "messages": 0, "ltm": 0}
@@ -1913,19 +3299,19 @@ def create_app() -> FastAPI:
         try:
             await _trim_checkpoints(checkpointer, conversation_id, keep_checkpoint_id)
             trimmed["checkpoint"] = True
-        except Exception as e:
-            print(f"[Rollback] Checkpoint trim failed: {e}")
+        except Exception:
+            logger.exception("rollback: checkpoint trim failed", extra={"conversation_id": conversation_id})
         
         try:
             trimmed["messages"] = await archive_store.delete_messages_from_turn(conversation_id, target_turn_id)
-        except Exception as e:
-            print(f"[Rollback] Message delete failed: {e}")
+        except Exception:
+            logger.exception("rollback: message delete failed", extra={"conversation_id": conversation_id})
         
         try:
             if workflow._ltm_store:
                 trimmed["ltm"] = await workflow._ltm_store.delete_facts_from_turn(conversation_id, target_turn_id)
-        except Exception as e:
-            print(f"[Rollback] LTM delete failed: {e}")
+        except Exception:
+            logger.exception("rollback: LTM delete failed", extra={"conversation_id": conversation_id})
         
         # 4. 更新 conversation 的 message_count
         try:
@@ -1935,8 +3321,8 @@ def create_app() -> FastAPI:
                 message_count=len(history),
                 metadata={"last_rollback_turn_id": target_turn_id}
             )
-        except Exception as e:
-            print(f"[Rollback] Failed to update conversation stats: {e}")
+        except Exception:
+            logger.exception("rollback: failed to update conversation stats", extra={"conversation_id": conversation_id})
         
         return {
             "success": True,
@@ -1984,8 +3370,8 @@ def create_app() -> FastAPI:
                 checkpoint = checkpointer.get(config)
             else:
                 checkpoint = None
-        except Exception as e:
-            print(f"[MemoryStats] Failed to load checkpoint: {e}")
+        except Exception:
+            logger.warning("failed to load checkpoint for memory stats", extra={"conversation_id": conversation_id}, exc_info=True)
             checkpoint = None
         
         if not checkpoint:
@@ -2015,17 +3401,13 @@ def create_app() -> FastAPI:
 
     @app.on_event("shutdown")
     async def shutdown():
-        """关闭时清理资源"""
-        await archive_store.close()
-        await file_store.close()
-        await conversation_store.close()
-        await user_store.close()
-        await role_store.close()
-        await workflow_store.close()
-        await attendance_store.close()
-        await org_store.close()
-        await tenant_connector_store.close()
-        await tenant_identity_store.close()
+        """关闭时清理资源。
+
+        14 个 Store 现在共享同一批连接池（db_pool.py，P1-2），逐个调用各
+        Store 的 close() 不再有意义（那只清引用，不做真实关闭，见各 Store
+        close() 方法的注释）——真正的关闭只需要调一次共享池的关闭入口。
+        """
+        await close_shared_pools()
 
     return app
 

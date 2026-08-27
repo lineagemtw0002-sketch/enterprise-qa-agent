@@ -12,10 +12,8 @@ Design Principles:
 
 from typing import List, Dict, Optional, Any
 from collections import Counter
-import re
 
-import jieba
-
+from src.core.tokenization import index_tokens
 from src.core.types import Chunk
 
 
@@ -35,8 +33,11 @@ class SparseEncoder:
         }
     
     Design:
-    - Tokenization: Simple whitespace + lowercasing (can be enhanced later)
-    - Stop Words: None by default (can add in future iterations)
+    - Tokenization: 转发给 `src.core.tokenization.index_tokens`（jieba 搜索
+      引擎模式 + 小写化 + 最小词长 1）。**索引侧与查询侧的契约写在那个模块**，
+      不要在这里另写一份。
+    - Stop Words: 索引侧刻意不过滤（理由见 `index_tokens` 的 docstring：
+      过滤会把索引内容和查询侧的停用词表绑死）
     - Deterministic: Same chunk text always produces same statistics
     
     Example:
@@ -51,15 +52,21 @@ class SparseEncoder:
     
     def __init__(
         self,
-        min_term_length: int = 2,
+        min_term_length: int = 1,
         lowercase: bool = True,
     ):
         """Initialize SparseEncoder.
-        
+
         Args:
-            min_term_length: Minimum character length for a term (default: 2)
+            min_term_length: Minimum character length for a term (default: 1)
+                ⚠️ 默认值 2026-08-26 从 2 改成 1。旧值会把中文单字整个丢掉，
+                而查询侧保留单字 —— jieba 词典里没有「年假」，文档里的
+                「年假」被切成 `年`/`假` 两个单字后双双落地不了索引，
+                于是"专门讲年假的库搜不到年假"。详见
+                `src.core.tokenization` 模块 docstring。
+                改回 2 会重新引入该缺陷，有测试拦着。
             lowercase: Whether to convert terms to lowercase (default: True)
-        
+
         Raises:
             ValueError: If min_term_length < 1
         """
@@ -133,40 +140,27 @@ class SparseEncoder:
     
     def _tokenize(self, text: str) -> List[str]:
         """Tokenize text into terms.
-        
-        Uses jieba for Chinese text segmentation and regex for English.
-        This ensures consistent tokenization with the query-side
-        (QueryProcessor), which is required for BM25 matching.
-        
+
+        实现在 `src.core.tokenization.index_tokens` —— **这里刻意只做转发，
+        不留任何自己的分词逻辑**。
+
+        这个方法从前自己写了一份 jieba 调用，注释声称"与查询侧
+        （QueryProcessor）一致，这是 BM25 匹配的前提"。**那句话是错的**：
+        两侧的 min_len / 大小写 / 切分模式都不同，而且没有任何机制拦着它们
+        继续分叉（`CLAUDE.md` §4 第 9b 条，2026-08-26 修复）。
+
+        现在两侧共用一个模块，契约写在那里：**索引侧词条是查询侧的超集**。
+        要改分词请改那个模块，并按它 docstring 里的说明重建存量索引。
+
         Args:
             text: Input text to tokenize
-        
+
         Returns:
             List of valid terms
         """
-        tokens: List[str] = []
-
-        # Use jieba to segment the text (handles both Chinese and English)
-        raw_tokens = jieba.lcut(text)
-
-        # Clean tokens: keep only alphanumeric and Chinese characters
-        for token in raw_tokens:
-            token = token.strip()
-            if not token:
-                continue
-            # Skip pure punctuation / whitespace
-            if re.fullmatch(r'[\s\W]+', token, re.UNICODE):
-                continue
-            tokens.append(token)
-        
-        # Apply lowercase if configured
-        if self.lowercase:
-            tokens = [t.lower() for t in tokens]
-        
-        # Filter by minimum length
-        terms = [t for t in tokens if len(t) >= self.min_term_length]
-        
-        return terms
+        return index_tokens(
+            text, min_len=self.min_term_length, lowercase=self.lowercase
+        )
     
     def get_corpus_stats(
         self,

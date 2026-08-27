@@ -136,13 +136,20 @@ class ToolRegistry:
     # LLM 层兼容
     # ------------------------------------------------------------------
     
-    def to_openai_tools(self) -> List[Dict[str, Any]]:
+    def to_openai_tools(self, exclude_names: Optional[set] = None) -> List[Dict[str, Any]]:
         """生成 OpenAI function calling schema 列表。
-        
+
+        Args:
+            exclude_names: 按名称排除的工具集合，用于按调用者（如 org 是否开通
+                某个可选模块）动态收窄可见工具列表。默认 None = 不过滤，保持
+                原有行为不变。
+
         Returns:
             [{"type": "function", "function": {...}}, ...]
         """
-        return [t.to_openai_schema() for t in self._tools.values()]
+        if not exclude_names:
+            return [t.to_openai_schema() for t in self._tools.values()]
+        return [t.to_openai_schema() for t in self._tools.values() if t.name not in exclude_names]
     
     def to_anthropic_tools(self) -> List[Dict[str, Any]]:
         """生成 Anthropic tool_use schema 列表。"""

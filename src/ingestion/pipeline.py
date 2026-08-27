@@ -5,8 +5,10 @@
 2. 文档加载（PDF -> Document）。
 3. 文本切块（Document -> Chunk 列表）。
 4. 变换处理（精炼 + 元数据增强 + 图片描述）。
-5. 编码向量化（Dense + Sparse）。
-6. 存储落盘（向量库 + BM25 索引 + 图片索引）。
+5. 片段级去重（基于内容指纹，跳过库里已存在的重复片段）。
+6. 编码向量化（Dense + Sparse）。
+7. 存储落盘（向量库 + BM25 索引 + 图片索引）。
+8. 层次化索引（生成文档级摘要，供检索时先粗筛文档再精排片段）。
 
 设计原则：
 - 配置驱动：核心参数来自 settings.yaml。
@@ -16,13 +18,15 @@
 """
 
 from pathlib import Path
-from typing import Callable, List, Optional, Dict, Any
+import os
+from typing import Callable, List, Optional, Dict, Any, Tuple
 import time
 
 from src.core.settings import Settings, load_settings, resolve_path
 from src.core.types import Document, Chunk
 from src.core.trace.trace_context import TraceContext
 from src.observability.logger import get_logger
+from src.security.prompt_guard import detect_document_injection
 
 # Libs layer imports
 from src.libs.loader.file_integrity import SQLiteIntegrityChecker
@@ -31,10 +35,13 @@ from src.libs.embedding.embedding_factory import EmbeddingFactory
 from src.libs.vector_store.vector_store_factory import VectorStoreFactory
 
 # Ingestion layer imports
+from src.ingestion.document_manager import DocumentManager
 from src.ingestion.chunking.document_chunker import DocumentChunker
 from src.ingestion.transform.chunk_refiner import ChunkRefiner
 from src.ingestion.transform.metadata_enricher import MetadataEnricher
 from src.ingestion.transform.image_captioner import ImageCaptioner
+from src.ingestion.dedup.chunk_dedup import ChunkDedupIndex, compute_content_hash
+from src.ingestion.hierarchy.doc_summary import DocumentSummarizer, summary_collection_name
 from src.ingestion.embedding.dense_encoder import DenseEncoder
 from src.ingestion.embedding.sparse_encoder import SparseEncoder
 from src.ingestion.embedding.batch_processor import BatchProcessor
@@ -70,6 +77,7 @@ class PipelineResult:
         error: Optional[str] = None,
         stages: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        duplicate_chunk_count: int = 0,
     ):
         self.success = success
         self.file_path = file_path
@@ -80,7 +88,11 @@ class PipelineResult:
         self.error = error
         self.stages = stages or {}
         self.metadata = metadata or {}
-    
+        # 跟 chunk_count 不是一回事：chunk_count 是"最终真正入库的片段数"，
+        # 这个是"切完之后发现内容跟库里已有片段重复、被跳过没入库的片段数"
+        # （见 dedup/chunk_dedup.py）——两者相加才是切分阶段产出的总片段数。
+        self.duplicate_chunk_count = duplicate_chunk_count
+
     def to_dict(self) -> Dict[str, Any]:
         """转换为可序列化字典（用于 API 返回或日志输出）。"""
         return {
@@ -88,6 +100,7 @@ class PipelineResult:
             "file_path": self.file_path,
             "doc_id": self.doc_id,
             "chunk_count": self.chunk_count,
+            "duplicate_chunk_count": self.duplicate_chunk_count,
             "image_count": self.image_count,
             "vector_ids_count": len(self.vector_ids),
             "error": self.error,
@@ -117,7 +130,9 @@ class IngestionPipeline:
         self,
         settings: Settings,
         collection: str = "default",
-        force: bool = False
+        force: bool = False,
+        org_id: Optional[str] = None,
+        owner_user_id: Optional[str] = None,
     ):
         """初始化流水线及其所有组件。
 
@@ -125,10 +140,18 @@ class IngestionPipeline:
         - settings: 应用配置对象。
         - collection: 文档集合名，用于逻辑隔离存储。
         - force: 为 True 时强制重跑，忽略增量跳过判断。
+        - org_id / owner_user_id: **仅 `conv_*` 对话私有库需要**。
+          OpenSearch 侧对话私有库是"每企业一个 index + 按所有者过滤"
+          （见 opensearch_store 顶部说明），没有这两个值就无法做企业内隔离，
+          影子写会显式失败而不是写一份查询时过滤不了的数据进去。
+          业务知识库不需要，保持 None。
+          值必须来自已校验的身份（JWT / 已校验的对话归属），**不要从请求体取**。
         """
         self.settings = settings
         self.collection = collection
         self.force = force
+        self.org_id = org_id
+        self.owner_user_id = owner_user_id
         
         # 统一在构造期初始化组件，降低运行期首次调用抖动。
         # 这样做的好处：
@@ -140,6 +163,12 @@ class IngestionPipeline:
         # 阶段 1：文件完整性检查
         self.integrity_checker = SQLiteIntegrityChecker(db_path=str(resolve_path("data/db/ingestion_history.db")))
         logger.info("  ✓ FileIntegrityChecker initialized")
+
+        # 片段级去重——跟上面的文件级完整性检查共用同一个 SQLite 文件，表不同
+        # （见 dedup/chunk_dedup.py 顶部说明：文件级去重管不到"两份不同文件里
+        # 切出内容相同的 chunk"这种情况）。
+        self.chunk_dedup = ChunkDedupIndex(db_path=str(resolve_path("data/db/ingestion_history.db")))
+        logger.info("  ✓ ChunkDedupIndex initialized")
         
         # 阶段 2：文档加载（通用 loader，支持 PDF/DOCX/XLSX/PPTX/TXT/MD/HTML 等）
         self.loader = UniversalLoader(
@@ -189,7 +218,7 @@ class IngestionPipeline:
         )
         logger.info(f"  ✓ BatchProcessor initialized (batch_size={batch_size})")
         
-        # 阶段 6：存储
+        # 阶段 7：存储
         # - vector_upserter: 将 dense 向量写入向量库（用于语义检索）
         # - bm25_indexer: 写入稀疏索引（用于关键词检索）
         # - image_storage: 维护图片索引（用于图片资产追踪与后续引用）
@@ -204,7 +233,17 @@ class IngestionPipeline:
             images_root=str(resolve_path("data/images"))
         )
         logger.info("  ✓ ImageStorage initialized")
-        
+
+        # 阶段 8：层次化索引——文档级摘要单独存一个 collection（跟正文
+        # chunk 物理分开，见 hierarchy/doc_summary.py 顶部说明），复用同一个
+        # DenseEncoder（跟正文用同一个 embedding 模型/维度，检索时才能互相
+        # 比较分数）。
+        self.doc_summarizer = DocumentSummarizer(settings)
+        self.summary_vector_store = VectorStoreFactory.create(
+            settings, collection_name=summary_collection_name(collection)
+        )
+        logger.info(f"  ✓ DocumentSummarizer initialized (use_llm={self.doc_summarizer.use_llm})")
+
         logger.info("Pipeline initialization complete!")
     
     def run(
@@ -212,6 +251,7 @@ class IngestionPipeline:
         file_path: str,
         trace: Optional[TraceContext] = None,
         on_progress: Optional[Callable[[str, int, int], None]] = None,
+        version_key: Optional[str] = None,
     ) -> PipelineResult:
         """执行单文件完整摄取流程。
 
@@ -220,14 +260,25 @@ class IngestionPipeline:
         - trace: 可选链路追踪上下文。
         - on_progress: 可选进度回调，签名为
           `(stage_name, current, total)`。
+        - version_key: 用于识别"这次上传是哪份旧文档的新版本"的标识
+          （CLAUDE.md §4 P0 第 1 条：文档更新后旧版本片段永久残留）。
+          默认等于 `file_path`——对 CLI/仪表盘这类"物理路径本身就稳定"
+          的调用方是对的默认值；`/api/v1/collections/{name}/upload` 这类
+          会给每次上传的物理文件加随机前缀的调用方，必须显式传原始文件名，
+          否则每次上传都会被当成全新文档，旧版本永远不会被替换。
+          按文件路径/文件名识别版本是刻意选择的简化方案：不做内容相似度
+          比对，两份内容完全不相关的文档只要 version_key 撞了就会被当成
+          "新旧版本"处理，旧的会被删——这个前提由上传方保证（不复用别人的
+          文件名指代不同文档），不在这一层做防护。
 
         返回：
         - `PipelineResult`，包含成功状态、统计信息与分阶段结果。
         """
         # 统一转 Path，避免后续重复做字符串/路径转换。
         file_path = Path(file_path)
+        version_key = version_key if version_key is not None else str(file_path)
         stages: Dict[str, Any] = {}
-        _total_stages = 6
+        _total_stages = 8
 
         def _notify(stage_name: str, step: int) -> None:
             # 将阶段完成事件回调给上层（CLI / UI / WebSocket 等）。
@@ -302,7 +353,24 @@ class IngestionPipeline:
                     "image_count": image_count,
                     "text_preview": document.text,
                 }, elapsed_ms=_elapsed)
-            
+
+            # 提示词注入防护（docs/prompt_injection_remediation_plan.md 问题2，
+            # P0）：任何持有 collection 上传权限的员工上传的文档，摄入后都会
+            # 原样作为检索上下文喂给模型——投毒文档在这一步之前拒绝掉，比事后
+            # 在生成阶段做输出过滤更彻底（压根不进入可检索状态，也就不会被
+            # 混合检索跨话题带出去，见测试报告案例2"完全不相关问题也会触发
+            # 注入"的现象）。只挡"[SYSTEM INSTRUCTION]"这类伪装成系统级声明的
+            # 显眼手法，更隐蔽的自然语言包装挡不住，需要跟 Prompt 模板侧的
+            # 防注入包装（_build_prompt 的 <retrieved_context> 声明）配合。
+            injection_hit = detect_document_injection(document.text)
+            if injection_hit:
+                raise ValueError(
+                    f"检测到疑似提示词注入内容，已拒绝摄入：文档中包含类似"
+                    f"「{injection_hit}」的可疑文本，这类内容常被用来伪装成"
+                    f"系统指令诱导 AI 泄露信息或执行非预期操作。如果这是正常"
+                    f"业务内容的误判，请联系管理员人工复核。"
+                )
+
             # ─────────────────────────────────────────────────────────────
             # 阶段 3：文本切块
             # ─────────────────────────────────────────────────────────────
@@ -403,12 +471,74 @@ class IngestionPipeline:
                         for c in chunks
                     ],
                 }, elapsed_ms=_elapsed_transform)
-            
+
             # ─────────────────────────────────────────────────────────────
-            # 阶段 5：编码
+            # 阶段 5：片段级去重
             # ─────────────────────────────────────────────────────────────
-            logger.info("\n🔢 Stage 5: Encoding")
-            _notify("embed", 5)
+            # 放在精炼/增强之后、embedding 之前——用的是最终会入库的文本算指纹，
+            # 且在最耗资源的 embedding 调用之前就把重复片段筛掉，不浪费 API 调用
+            # （见 dedup/chunk_dedup.py 顶部说明：跟文件级去重是两个粒度）。
+            logger.info("\n🧹 Stage 5: Chunk Dedup")
+            _notify("dedup", 5)
+
+            _t0_dedup = time.monotonic()
+            _unique_chunks: List[Chunk] = []
+            _duplicate_of: List[Tuple[Chunk, str]] = []  # 记录被跳过的 chunk 和它重复的对象
+            _seen_hashes: set = set()
+            for c in chunks:
+                content_hash = compute_content_hash(c.text)
+                # force=True 时不查库里已有记录——跟阶段 1 文件级去重的
+                # `if not self.force` 是同一个语义：force 就是"我明确要求这份
+                # 文件的内容重新走一遍摄入（比如换了 embedding 模型要重新编码），
+                # 不该被"内容其实没变"拦下来"。同一批内部的重复（比如每页都有
+                # 的页脚）不受 force 影响，任何时候都该去重——这跟"要不要重新
+                # 处理这份文件"无关，纯粹是同一次摄入里不该把同一段内容存两份。
+                existing = None if self.force else self.chunk_dedup.find_existing(content_hash, self.collection)
+                if existing is not None or content_hash in _seen_hashes:
+                    _duplicate_of.append((c, existing or "(本次摄入内部重复)"))
+                    continue
+                _seen_hashes.add(content_hash)
+                c.metadata["content_hash"] = content_hash
+                _unique_chunks.append(c)
+            duplicate_chunk_count = len(_duplicate_of)
+            chunks = _unique_chunks
+            _elapsed_dedup = (time.monotonic() - _t0_dedup) * 1000.0
+
+            logger.info(f"  Unique chunks: {len(chunks)}, duplicates skipped: {duplicate_chunk_count}")
+            stages["dedup"] = {"unique_count": len(chunks), "duplicate_count": duplicate_chunk_count}
+            if trace is not None:
+                trace.record_stage("dedup", {
+                    "method": "content_hash",
+                    "unique_count": len(chunks),
+                    "duplicate_count": duplicate_chunk_count,
+                    "duplicates": [
+                        {"chunk_id": c.id, "text_preview": c.text[:80], "duplicate_of": ref}
+                        for c, ref in _duplicate_of
+                    ],
+                }, elapsed_ms=_elapsed_dedup)
+
+            if not chunks:
+                # 切出来的片段全部跟库里已有内容重复——这份文件对这个 collection
+                # 来说没有新增任何东西，不算失败，跟"整份文件之前摄入过"
+                # （文件级去重那条 early return）是同一个语义，直接判定成功收尾。
+                logger.info("  ⏭️  All chunks are duplicates, nothing new to store")
+                self.integrity_checker.mark_success(file_hash, str(file_path), self.collection, version_key)
+                self._replace_old_versions(file_hash, version_key, stages)
+                return PipelineResult(
+                    success=True,
+                    file_path=str(file_path),
+                    doc_id=document.id,
+                    chunk_count=0,
+                    duplicate_chunk_count=duplicate_chunk_count,
+                    stages=stages,
+                    metadata=document.metadata,
+                )
+
+            # ─────────────────────────────────────────────────────────────
+            # 阶段 6：编码
+            # ─────────────────────────────────────────────────────────────
+            logger.info("\n🔢 Stage 6: Encoding")
+            _notify("embed", 6)
             
             # 通过 BatchProcessor 统一调度 dense/sparse 编码，
             # 以批处理方式降低请求开销并提升吞吐。
@@ -468,10 +598,10 @@ class IngestionPipeline:
                 }, elapsed_ms=_elapsed)
             
             # ─────────────────────────────────────────────────────────────
-            # 阶段 6：存储
+            # 阶段 7：存储
             # ─────────────────────────────────────────────────────────────
-            logger.info("\n💾 Stage 6: Storage")
-            _notify("upsert", 6)
+            logger.info("\n💾 Stage 7: Storage")
+            _notify("upsert", 7)
             
             # 6a: 向量入库（ChromaDB）
             logger.info("  6a. Vector Storage (ChromaDB)...")
@@ -487,15 +617,45 @@ class IngestionPipeline:
                 stat["chunk_id"] = vid
 
             # 6b: BM25 索引构建
-            logger.info("  6b. BM25 Index...")
+            #
+            # ⚠️ 2026-08-27 修复：`doc_id` 这里必须是 `file_hash`（完整 64 位
+            # 内容哈希），不能是 `document.id`——两者是完全不同的标识：
+            # `document.id = f"doc_{sha256[:16]}"`（`UniversalLoader.load`
+            # 里定义的短前缀形式，只截了 16 位），而 `document_manager.py::
+            # delete_document` 传给 `bm25.remove_document()` 的、以及 Chroma/
+            # 图片索引 `doc_hash` 元数据用的，全部是完整哈希。原来这里传
+            # `document.id`，导致 `chunk_doc_hash` 映射里存的是短前缀值，
+            # 任何按完整哈希发起的删除（管理员删单个文档、下面的版本替换）
+            # 在 BM25 侧永远找不到匹配、`bm25_removed` 恒为 False——
+            # 是本次实现"文档更新后旧版本片段永久残留"修复时，真机验证
+            # 上传同名文件两次才现出原形的一个独立的真实 bug，不是新逻辑
+            # 引入的，仅在这次真正跑通端到端删除路径时才会暴露。
             self.bm25_indexer.add_documents(
                 sparse_stats,
                 collection=self.collection,
-                doc_id=document.id,
+                doc_id=file_hash,
                 trace=trace,
             )
             logger.info(f"      Index built for {len(sparse_stats)} documents")
-            
+
+            # 6b-2: OpenSearch 影子写（docs/opensearch_migration_design.md 阶段 2）
+            # 读路径完全不受影响，仍走 BM25 + Chroma。
+            from src.libs.search.opensearch_store import (
+                mirror_ingestion_to_opensearch,
+            )
+
+            mirror_ingestion_to_opensearch(
+                collection=self.collection,
+                chunks=chunks,
+                sparse_stats=sparse_stats,
+                document=document,
+                dense_vectors=dense_vectors,
+                # conv_* 私有库需要这两个做企业内隔离过滤；业务库不需要。
+                # 由 IngestionPipeline 的构造方传入（见 app.py::ingest_file_task）。
+                org_id=getattr(self, "org_id", None),
+                owner_user_id=getattr(self, "owner_user_id", None),
+            )
+
             # 6c: 图片索引登记
             # 注意：PdfLoader 已负责落盘图片文件，这里只登记“可检索索引”。
             logger.info("  6c. Image Storage Index...")
@@ -542,6 +702,7 @@ class IngestionPipeline:
                     for img in images
                 ]
                 trace.record_stage("upsert", {
+                    "method": "chroma+bm25+image_index",
                     "dense_store": {
                         "backend": "ChromaDB",
                         "collection": self.collection,
@@ -561,25 +722,78 @@ class IngestionPipeline:
                     },
                     "chunk_mapping": chunk_storage,
                 }, elapsed_ms=_elapsed_storage)
-            
+
+            # ─────────────────────────────────────────────────────────────
+            # 阶段 8：层次化索引（文档级摘要）
+            # ─────────────────────────────────────────────────────────────
+            # 见 src/ingestion/hierarchy/doc_summary.py 顶部说明：给这份文档单独
+            # 生成一条摘要，存进 `{collection}__summary` 专属 collection，供
+            # query_knowledge_hub.py 检索时先做"文档级粗筛"再进 chunk 精排。
+            # 这一步失败不该拖垮整次摄入——摘要层是检索优化，不是正文数据，
+            # 缺了它退化成之前的纯平铺检索，不影响本次摄入的成败判定。
+            logger.info("\n🗂️  Stage 8: Hierarchical Index (Document Summary)")
+            _notify("hierarchy", 8)
+            _t0_hierarchy = time.monotonic()
+            try:
+                summary_text = self.doc_summarizer.summarize(document, chunks)
+                summary_vector = self.dense_encoder.encode([
+                    Chunk(
+                        id=f"{document.id}_summary", text=summary_text,
+                        metadata={"source_path": document.metadata.get("source_path", str(file_path))},
+                    )
+                ])[0]
+                self.summary_vector_store.upsert([{
+                    "id": document.id,
+                    "vector": summary_vector,
+                    "metadata": {
+                        "text": summary_text,
+                        "doc_id": document.id,
+                        "source_path": document.metadata.get("source_path", str(file_path)),
+                        "title": chunks[0].metadata.get("title", ""),
+                    },
+                }])
+                stages["hierarchy"] = {"summary_stored": True, "summary_length": len(summary_text)}
+                logger.info(f"  Summary stored ({len(summary_text)} chars) -> {summary_collection_name(self.collection)}")
+            except Exception as e:
+                # 降级：摘要层出问题只记日志，不影响本次摄入判定成功——见上面的说明。
+                logger.warning(f"  ⚠️  Document summary indexing failed (non-fatal): {e}")
+                stages["hierarchy"] = {"summary_stored": False, "error": str(e)}
+            _elapsed_hierarchy = (time.monotonic() - _t0_hierarchy) * 1000.0
+            if trace is not None:
+                trace.record_stage("hierarchy", stages["hierarchy"], elapsed_ms=_elapsed_hierarchy)
+
             # ─────────────────────────────────────────────────────────────
             # 成功收尾
             # ─────────────────────────────────────────────────────────────
-            # 只有当全部阶段完成后才标记成功，避免出现“部分成功但状态已提交”。
-            self.integrity_checker.mark_success(file_hash, str(file_path), self.collection)
-            
+            # 只有当全部阶段完成后才标记成功，避免出现"部分成功但状态已提交"。
+            self.integrity_checker.mark_success(file_hash, str(file_path), self.collection, version_key)
+
+            # 新版本已经落地成功，才轮到清理旧版本——如果反过来先删再摄入，
+            # 新版本这边任何一步失败都会让这份文档在旧版本被删、新版本没写
+            # 成功的空窗期里完全从知识库消失，比"暂时新旧并存"更糟。
+            self._replace_old_versions(file_hash, version_key, stages)
+
+            # 去重指纹也在这里才登记，不在阶段 5 筛完就登记——道理跟上面文件级
+            # 完整性检查一致：真正写入向量库/BM25 之前，这几个片段还谈不上
+            # "已经存在于这个 collection 里"，万一后面 embedding/存储阶段失败，
+            # 不该把它们当成"已收录"记下来，否则重跑这份文件时会被误判成重复
+            # 而漏摄入。
+            for c in chunks:
+                self.chunk_dedup.register(c.metadata["content_hash"], self.collection, c.id, document.id)
+
             logger.info("\n" + "=" * 60)
             logger.info("✅ Pipeline completed successfully!")
-            logger.info(f"   Chunks: {len(chunks)}")
+            logger.info(f"   Chunks: {len(chunks)} (duplicates skipped: {duplicate_chunk_count})")
             logger.info(f"   Vectors: {len(vector_ids)}")
             logger.info(f"   Images: {len(images)}")
             logger.info("=" * 60)
-            
+
             return PipelineResult(
                 success=True,
                 file_path=str(file_path),
                 doc_id=file_hash,
                 chunk_count=len(chunks),
+                duplicate_chunk_count=duplicate_chunk_count,
                 image_count=len(images),
                 vector_ids=vector_ids,
                 stages=stages,
@@ -592,8 +806,11 @@ class IngestionPipeline:
 
             # 安全地提取可能已生成的数据用于回滚
             _vector_ids = locals().get("vector_ids")
-            _doc_id = locals().get("document")
-            _doc_id = _doc_id.id if _doc_id else None
+            # 必须用 file_hash（完整哈希），不是 document.id（短前缀）——
+            # 跟上面 add_documents() 那处修复是同一个标识不一致 bug：
+            # BM25 索引里 chunk_doc_hash 存的就是 file_hash，用 document.id
+            # 回滚永远找不到要删的 postings。
+            _doc_id = file_hash if 'file_hash' in locals() else None
             _registered_images = locals().get("registered_image_ids")
             self._rollback_storage(_vector_ids, _doc_id, _registered_images)
 
@@ -613,16 +830,72 @@ class IngestionPipeline:
         file_path: str,
         trace: Optional[TraceContext] = None,
         on_progress: Optional[Callable[[str, int, int], None]] = None,
+        version_key: Optional[str] = None,
     ) -> PipelineResult:
         """异步执行单文件完整摄取流程。
-        
+
         内部通过 asyncio.to_thread 将同步的 run() 放到线程池中执行，
         避免阻塞调用方的事件循环。Transform 阶段各组件内部仍使用
         ThreadPoolExecutor 并发处理 chunks。
         """
         import asyncio
-        return await asyncio.to_thread(self.run, file_path, trace, on_progress)
-    
+        return await asyncio.to_thread(self.run, file_path, trace, on_progress, version_key)
+
+    def _replace_old_versions(
+        self, new_hash: str, version_key: str, stages: Dict[str, Any]
+    ) -> None:
+        """新版本摄入成功后，删除同一 `version_key` 下的旧版本片段。
+
+        对应 CLAUDE.md §4 P0 第 1 条"文档更新后旧版本片段永久残留"——`doc_id`
+        即内容哈希，内容一变就是全新文档，此前全仓没有任何地方知道"这次
+        上传是哪份旧文档的新版本"，旧片段永久留在库里，与新内容一起被检索
+        返回，模型无法判断哪个是当前版本。
+
+        跟摄入失败时的 `_rollback_storage` 是同一个"非致命清理，失败只记日志
+        不影响本次摄入成败判定"的原则——旧版本没清干净不该让这次本来已经
+        成功的新版本摄入被判失败，那样反而两个版本都没有一个是"确定摄入
+        成功"的状态，比"新版本已生效、旧版本清理有残留待人工排查"更糟。
+        """
+        try:
+            old_versions = self.integrity_checker.find_other_versions(
+                version_key, self.collection, exclude_hash=new_hash
+            )
+        except Exception as e:
+            logger.warning(f"  ⚠️  Failed to look up old versions for {version_key!r}: {e}")
+            stages["version_replace"] = {"error": str(e)}
+            return
+
+        if not old_versions:
+            stages["version_replace"] = {"old_versions_removed": 0}
+            return
+
+        manager = DocumentManager(
+            self.vector_upserter.vector_store, self.bm25_indexer,
+            self.image_storage, self.integrity_checker,
+        )
+        removed = 0
+        errors: List[str] = []
+        for old in old_versions:
+            old_hash = old["file_hash"]
+            result = manager.delete_document(
+                old["file_path"], collection=self.collection, source_hash=old_hash
+            )
+            if result.success:
+                removed += 1
+                logger.info(
+                    f"  🔄 Replaced old version {old_hash[:16]}... of {version_key!r} "
+                    f"({result.chunks_deleted} chunks, bm25_removed={result.bm25_removed})"
+                )
+            else:
+                errors.append(f"{old_hash[:16]}...: {'; '.join(result.errors)}")
+                logger.warning(f"  ⚠️  Failed to fully remove old version {old_hash[:16]}...: {result.errors}")
+
+        stages["version_replace"] = {
+            "old_versions_found": len(old_versions),
+            "old_versions_removed": removed,
+            "errors": errors,
+        }
+
     def _rollback_storage(
         self,
         vector_ids: Optional[List[str]] = None,

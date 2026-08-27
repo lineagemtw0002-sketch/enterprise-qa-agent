@@ -1,0 +1,122 @@
+{
+  "short_no_context": {
+    "ollama": [
+      {
+        "wall_s": 2.758,
+        "ttft_s": 0.291,
+        "decode_s": 2.363,
+        "prompt_tokens": 55,
+        "gen_tokens": 52,
+        "decode_tps": 22.0,
+        "answer_preview": "应尽快联系财务部门说明情况，并提供相关合同、邮件往来等能证明支出的材料。同时补办必要的手续和重新获取单据。若无法补办，需按公司规定申请特殊审批或走其他流程完成报"
+      },
+      {
+        "wall_s": 2.689,
+        "ttft_s": 0.28,
+        "decode_s": 2.326,
+        "prompt_tokens": 56,
+        "gen_tokens": 52,
+        "decode_tps": 22.4,
+        "answer_preview": "应尽快联系财务部门说明情况，并提供相关合同、邮件往来等能证明支出的材料。同时补办必要的手续和重新获取单据。若无法补办，需按公司规定申请特殊审批或走其他流程完成报"
+      },
+      {
+        "wall_s": 2.013,
+        "ttft_s": 0.28,
+        "decode_s": 1.648,
+        "prompt_tokens": 56,
+        "gen_tokens": 37,
+        "decode_tps": 22.4,
+        "answer_preview": "应尽快联系财务部门说明情况，并提供相关合同、邮件等能证明支出的材料。同时补全电子记录或申请补开票据，以便完成报销流程。"
+      }
+    ],
+    "mlx": [
+      {
+        "wall_s": 1.395,
+        "ttft_s": 0.269,
+        "decode_s": 1.126,
+        "prompt_tokens": 32,
+        "gen_tokens": 28,
+        "decode_tps": 25.7,
+        "answer_preview": ""
+      },
+      {
+        "wall_s": 1.391,
+        "ttft_s": 0.268,
+        "decode_s": 1.124,
+        "prompt_tokens": 32,
+        "gen_tokens": 28,
+        "decode_tps": 25.7,
+        "answer_preview": ""
+      },
+      {
+        "wall_s": 1.392,
+        "ttft_s": 0.269,
+        "decode_s": 1.123,
+        "prompt_tokens": 32,
+        "gen_tokens": 28,
+        "decode_tps": 25.8,
+        "answer_preview": ""
+      }
+    ]
+  },
+  "rag_with_context": {
+    "ollama": [
+      {
+        "wall_s": 6.431,
+        "ttft_s": 2.922,
+        "decode_s": 3.418,
+        "prompt_tokens": 689,
+        "gen_tokens": 75,
+        "decode_tps": 21.9,
+        "answer_preview": "根据【参考资料】中的【差旅报销制度 第4条】，员工因公出差产生的交通、住宿、餐饮费用须在出差结束后5个工作日内通过财务系统提交电子报销单，并附上原始发票或电子发"
+      },
+      {
+        "wall_s": 6.907,
+        "ttft_s": 2.922,
+        "decode_s": 3.893,
+        "prompt_tokens": 690,
+        "gen_tokens": 75,
+        "decode_tps": 19.3,
+        "answer_preview": "根据【参考资料】中的【差旅报销制度 第4条】，员工因公出差产生的交通、住宿、餐饮费用须在出差结束后5个工作日内通过财务系统提交电子报销单，并附上原始发票或电子发"
+      },
+      {
+        "wall_s": 6.561,
+        "ttft_s": 2.952,
+        "decode_s": 3.519,
+        "prompt_tokens": 689,
+        "gen_tokens": 75,
+        "decode_tps": 21.3,
+        "answer_preview": "根据【参考资料】中的【差旅报销制度 第4条】，员工因公出差产生的交通、住宿、餐饮费用须在出差结束后5个工作日内通过财务系统提交电子报销单，并附上原始发票或电子发"
+      }
+    ],
+    "mlx": [
+      {
+        "wall_s": 6.338,
+        "ttft_s": 2.743,
+        "decode_s": 3.595,
+        "prompt_tokens": 665,
+        "gen_tokens": 88,
+        "decode_tps": 24.8,
+        "answer_preview": ""
+      },
+      {
+        "wall_s": 6.341,
+        "ttft_s": 2.723,
+        "decode_s": 3.618,
+        "prompt_tokens": 665,
+        "gen_tokens": 88,
+        "decode_tps": 24.5,
+        "answer_preview": ""
+      },
+      {
+        "wall_s": 6.312,
+        "ttft_s": 2.715,
+        "decode_s": 3.598,
+        "prompt_tokens": 665,
+        "gen_tokens": 88,
+        "decode_tps": 24.7,
+        "answer_preview": ""
+      }
+    ]
+  }
+}

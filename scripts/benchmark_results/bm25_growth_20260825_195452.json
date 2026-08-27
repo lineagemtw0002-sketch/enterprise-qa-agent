@@ -1,0 +1,93 @@
+{
+  "generated_at": "2026-08-25T19:54:52.392462",
+  "script": "/Users/david/Documents/enterprise-qa-agent/scripts/measure_bm25_index_growth.py",
+  "code_state": "8f2aa5d",
+  "real_corpus_chunks": 936,
+  "growth_exponent_alpha": 0.9966,
+  "load_rate_mb_per_s": 133.5,
+  "measurements": [
+    {
+      "chunks": 1000,
+      "real_chunk_count": 334,
+      "index_bytes": 5376521,
+      "index_mb": 5.13,
+      "vocab_terms": 6123,
+      "avg_doc_length": 47.425,
+      "total_terms": 6123,
+      "bytes_per_chunk": 5376.5,
+      "encode_s": 0.41,
+      "build_s": 0.33,
+      "json_load_s_median": 0.0293,
+      "json_load_s_first": 0.0293,
+      "_index_dir": "/Users/david/Documents/enterprise-qa-agent/data/db/bm25/_bm25growth_1000"
+    },
+    {
+      "chunks": 4000,
+      "real_chunk_count": 1334,
+      "index_bytes": 20275851,
+      "index_mb": 19.34,
+      "vocab_terms": 10089,
+      "avg_doc_length": 47.905,
+      "total_terms": 10089,
+      "bytes_per_chunk": 5069.0,
+      "encode_s": 0.64,
+      "build_s": 2.0,
+      "json_load_s_median": 0.1025,
+      "json_load_s_first": 0.1142,
+      "_index_dir": "/Users/david/Documents/enterprise-qa-agent/data/db/bm25/_bm25growth_4000"
+    },
+    {
+      "chunks": 16000,
+      "real_chunk_count": 5334,
+      "index_bytes": 79473797,
+      "index_mb": 75.79,
+      "vocab_terms": 26015,
+      "avg_doc_length": 47.7138125,
+      "total_terms": 26015,
+      "bytes_per_chunk": 4967.1,
+      "encode_s": 2.6,
+      "build_s": 37.49,
+      "json_load_s_median": 0.43,
+      "json_load_s_first": 0.6218,
+      "_index_dir": "/Users/david/Documents/enterprise-qa-agent/data/db/bm25/_bm25growth_16000"
+    },
+    {
+      "chunks": 50000,
+      "real_chunk_count": 16667,
+      "index_bytes": 247398592,
+      "index_mb": 235.94,
+      "vocab_terms": 70830,
+      "avg_doc_length": 47.70656,
+      "total_terms": 70830,
+      "bytes_per_chunk": 4948.0,
+      "encode_s": 8.59,
+      "build_s": 488.68,
+      "json_load_s_median": 1.7676,
+      "json_load_s_first": 1.7619,
+      "_index_dir": "/Users/david/Documents/enterprise-qa-agent/data/db/bm25/_bm25growth_50000"
+    }
+  ],
+  "projections": [
+    {
+      "chunks": 143000,
+      "est_mb": 672.4,
+      "est_load_s": 5.04
+    },
+    {
+      "chunks": 358000,
+      "est_mb": 1678.1,
+      "est_load_s": 12.57
+    },
+    {
+      "chunks": 716000,
+      "est_mb": 3348.3,
+      "est_load_s": 25.08
+    }
+  ],
+  "not_covered": [
+    "只测 BM25 索引，未测向量库体积与端到端检索延迟",
+    "语料约 1/3 为仓库真实中文文本、2/3 为模板扩充；真实企业文档的词表更丰富，实际索引可能更大",
+    "未测多库并行加载的叠加效应",
+    "未测索引写入/更新耗时随规模的变化"
+  ]
+}

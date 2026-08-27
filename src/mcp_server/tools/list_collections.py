@@ -306,7 +306,7 @@ class ListCollectionsTool:
             # Run blocking ChromaDB I/O in a thread to avoid blocking
             # the async event loop / MCP stdio transport
             collections = await asyncio.to_thread(
-                self.list_collections, include_stats,
+                self.list_collections, include_stats=include_stats,
             )
 
             if user_id is not None:

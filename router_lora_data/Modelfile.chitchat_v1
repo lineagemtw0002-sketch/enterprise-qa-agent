@@ -1,0 +1,2 @@
+FROM /tmp/wt-lora-train/router_lora_data/router_chitchat_v1.q8_0.gguf
+PARAMETER temperature 0

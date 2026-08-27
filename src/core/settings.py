@@ -90,6 +90,10 @@ class RerankSettings(_Section):
     provider: str
     model: str
     top_k: int
+    # 进 cross-encoder 的候选池上限，见 src/core/query_engine/rerank_pool.py。
+    # 可选字段：老配置文件没有这两行时用这里的默认值（等价于 6 库截到 30 条）。
+    pool_per_collection: int = 5
+    pool_min: int = 20
 
 
 class EvaluationSettings(_Section):
@@ -124,6 +128,7 @@ class IngestionSettings(_Section):
     batch_size: int
     chunk_refiner: Optional[Dict[str, Any]] = None  # 动态配置，直接透传
     metadata_enricher: Optional[Dict[str, Any]] = None  # 动态配置，直接透传
+    doc_summary: Optional[Dict[str, Any]] = None  # 动态配置，直接透传
 
 
 class MCPServerConfig(_Section):

@@ -28,7 +28,17 @@ class ToolSubgraphState(TypedDict, total=False):
     user_id: str                         # 调用者身份，仅用于 tool_node 内部的 ACL 校验，
                                           # 不会出现在 available_tools 的 schema 里，
                                           # LLM 看不到也改不了这个值（见 tool_node）
-    
+    intent_confidence: float             # 主图意图分类的置信度——supervisor_node 用它
+                                          # 判断"要不要跳过第一次 think"（见该函数旁的
+                                          # 说明），跟 target_tool 一样直接从主图 RAGState
+                                          # 透传进来，本状态类没有单独的字段校验/默认值。
+    rewritten_query: str                 # 主图 analyze_query 产出的改写后查询——直接路由
+                                          # 跳过 think_node 时，拿这个当工具调用的 query
+                                          # 参数，不需要 think_node 再重新措辞一遍。
+
+    # === 多智能体协作编排（supervisor_node 写入，见 subgraph.py） ===
+    active_agent: Optional[str]          # "retrieval_agent" / "action_agent" / "general_agent"
+
     # === 内部状态（子图内部循环，不返回主图）===
     internal_messages: Annotated[List[AnyMessage], add_messages]
     tool_calls: List[Dict[str, Any]]     # LLM 决定的 tool calls [{name, arguments}]

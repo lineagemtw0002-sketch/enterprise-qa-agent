@@ -2,8 +2,10 @@
 
 Covers:
 - JSONFormatter output structure
-- get_trace_logger file handler setup
-- write_trace convenience function
+- get_trace_logger file handler setup（现已按天轮转）
+
+2026-08-25：`write_trace` 随可观测性阶段一删除（D-10，全仓零生产调用点），
+对应的 5 条用例一并移除。JSONL 追加改用 `get_trace_logger`。
 """
 
 import json
@@ -12,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from src.observability.logger import JSONFormatter, get_trace_logger, write_trace
+from src.observability.logger import JSONFormatter, get_trace_logger
 
 
 # ── JSONFormatter ────────────────────────────────────────────────────
@@ -115,47 +117,111 @@ class TestGetTraceLogger:
         assert len(lgr2.handlers) == 1
 
 
-# ── write_trace ─────────────────────────────────────────────────────
+    def test_handler_rotates(self, tmp_path: Path) -> None:
+        """T-10 配套：trace 文件必须**轮转**。
 
+        判别力：旧实现用的是 `logging.FileHandler`——不轮转、无保留期，
+        这正是 `logs/traces.jsonl` 12 天涨到 3.2 MB、按万人企业外推
+        约 48 GB/年/客户 的直接成因。这条断言在旧实现下必然失败。
+        """
+        import logging.handlers
 
-class TestWriteTrace:
-    """Verify write_trace convenience function."""
-
-    def test_creates_file(self, tmp_path: Path) -> None:
         p = tmp_path / "traces.jsonl"
-        write_trace({"trace_type": "ingestion", "stages": []}, p)
-        assert p.exists()
+        lgr = get_trace_logger(p, name="test.trace.rotate", retention_days=7)
+        handler = lgr.handlers[0]
+        assert isinstance(handler, logging.handlers.TimedRotatingFileHandler)
+        assert handler.backupCount == 7  # 保留期 = D-3 的 7 天
 
-    def test_appends_valid_json(self, tmp_path: Path) -> None:
+    def test_trace_logger_redacts_content(self, tmp_path: Path) -> None:
+        """trace 文件曾是最大的原文落盘点，必须走脱敏。"""
         p = tmp_path / "traces.jsonl"
-        write_trace({"trace_type": "query", "id": 1}, p)
-        write_trace({"trace_type": "ingestion", "id": 2}, p)
-        lines = p.read_text().strip().split("\n")
-        assert len(lines) == 2
-        assert json.loads(lines[0])["id"] == 1
-        assert json.loads(lines[1])["id"] == 2
+        lgr = get_trace_logger(p, name="test.trace.redact")
+        lgr.info("retrieval", extra={"query": "董事长的薪酬是多少"})
+        content = p.read_text()
+        assert "董事长的薪酬是多少" not in content
+        obj = json.loads(content.strip().split("\n")[-1])
+        assert obj["query_len"] == 9
+        assert len(obj["query_sha256"]) == 12
 
-    def test_trace_type_field_preserved(self, tmp_path: Path) -> None:
-        p = tmp_path / "traces.jsonl"
-        write_trace({"trace_type": "ingestion", "stages": [{"stage": "load"}]}, p)
-        obj = json.loads(p.read_text().strip())
-        assert obj["trace_type"] == "ingestion"
-        assert len(obj["stages"]) == 1
 
-    def test_creates_parent_dirs(self, tmp_path: Path) -> None:
-        p = tmp_path / "a" / "b" / "traces.jsonl"
-        write_trace({"ok": True}, p)
-        assert p.exists()
+# ── configure_logging / get_logger ──────────────────────────────────
 
-    def test_round_trip_with_trace_context(self, tmp_path: Path) -> None:
-        """write_trace + TraceContext.to_dict() round-trip."""
-        from src.core.trace.trace_context import TraceContext
 
-        tc = TraceContext(trace_type="query")
-        tc.record_stage("dense", {"provider": "openai"}, elapsed_ms=12.0)
-        tc.finish()
-        p = tmp_path / "traces.jsonl"
-        write_trace(tc.to_dict(), p)
-        obj = json.loads(p.read_text().strip())
-        assert obj["trace_type"] == "query"
-        assert obj["stages"][0]["stage"] == "dense"
+class TestConfigureLogging:
+    """T-10：`get_logger` 从 `basicConfig` 改为 `configure_logging` 的回归保护。"""
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self):
+        """每条用例前后都把本模块装的 handler 摘干净，避免污染其他测试。"""
+        from src.observability.logger import reset_logging
+
+        reset_logging()
+        yield
+        reset_logging()
+
+    def test_second_call_with_different_level_takes_effect(self) -> None:
+        """**这条在旧实现下会失败。**
+
+        旧代码走 `logging.basicConfig`，而 basicConfig 只在 root 无 handler
+        时生效——第一个调用者决定全进程 level，后来者的 `log_level` 参数
+        静默失效（不报错、不告警，只是不生效）。
+        """
+        from src.observability.logger import get_logger
+
+        get_logger("t.a", log_level="DEBUG")
+        assert logging.getLogger().level == logging.DEBUG
+
+        get_logger("t.b", log_level="WARNING")
+        assert logging.getLogger().level == logging.WARNING
+
+    def test_repeated_calls_do_not_stack_handlers(self) -> None:
+        """幂等：同参数重复调用不应该让每条日志被打印 N 遍。"""
+        from src.observability.logger import _MANAGED_ATTR, get_logger
+
+        for _ in range(5):
+            get_logger("t.c", log_level="INFO")
+        managed = [
+            h for h in logging.getLogger().handlers if getattr(h, _MANAGED_ATTR, False)
+        ]
+        assert len(managed) == 1
+
+    def test_does_not_remove_foreign_handlers(self) -> None:
+        """绝不摘别人挂的 handler（pytest caplog、宿主应用都会挂）。"""
+        from src.observability.logger import configure_logging
+
+        foreign = logging.NullHandler()
+        root = logging.getLogger()
+        root.addHandler(foreign)
+        try:
+            configure_logging(level="INFO")
+            configure_logging(level="ERROR")
+            assert foreign in root.handlers
+        finally:
+            root.removeHandler(foreign)
+
+    def test_file_sink_degrades_instead_of_crashing(self, tmp_path: Path) -> None:
+        """容器里不假设进程有写文件权限：失败要降级到 stdout，不能崩。"""
+        from src.observability.logger import _MANAGED_ATTR, configure_logging
+
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("i am a file")  # mkdir 会因此失败
+
+        configure_logging(level="INFO", dest="file", log_dir=blocker / "sub")
+
+        managed = [
+            h for h in logging.getLogger().handlers if getattr(h, _MANAGED_ATTR, False)
+        ]
+        assert len(managed) == 1
+        assert isinstance(managed[0], logging.StreamHandler)
+
+    def test_file_dest_rotates_with_retention(self, tmp_path: Path) -> None:
+        import logging.handlers
+
+        from src.observability.logger import _MANAGED_ATTR, configure_logging
+
+        configure_logging(level="INFO", dest="file", log_dir=tmp_path, retention_days=7)
+        managed = [
+            h for h in logging.getLogger().handlers if getattr(h, _MANAGED_ATTR, False)
+        ]
+        assert isinstance(managed[0], logging.handlers.TimedRotatingFileHandler)
+        assert managed[0].backupCount == 7

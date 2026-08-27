@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import { Table, Button, Modal, Drawer, Input, Select, Switch, Tag, Space, message, Empty } from 'antd'
-import { Plus, Plug } from 'lucide-react'
+import { Table, Button, Modal, Drawer, Input, InputNumber, Select, Switch, Tag, Space, message, Empty, Tooltip } from 'antd'
+import { Plus, Plug, Users } from 'lucide-react'
 import * as adminApi from '../../api/admin.js'
 import { HealthBadge } from './connectorHealth.jsx'
 
@@ -221,6 +221,26 @@ export default function OrganizationManagement() {
   const [createLoading, setCreateLoading] = useState(false)
 
   const [connectorOrg, setConnectorOrg] = useState(null)
+  // 席位（docs/account_lifecycle_design.md §4.4）。仅平台管理员可改——
+  // 席位是合同条款不是配置项，企业管理员能改自己的上限，这个功能就不存在了。
+  // 这个页面本来就只有平台管理员能进（组织管理），所以这里不再额外判身份。
+  const [seatOrg, setSeatOrg] = useState(null)
+  const [seatValue, setSeatValue] = useState(null)
+  const [seatSaving, setSeatSaving] = useState(false)
+
+  async function submitSeatLimit() {
+    setSeatSaving(true)
+    try {
+      await adminApi.setSeatLimit(seatOrg.org_id, seatValue)
+      message.success(seatValue === null ? '已设为不限席位' : `席位上限已设为 ${seatValue}`)
+      setSeatOrg(null)
+      await loadOrganizations()
+    } catch (error) {
+      message.error('设置失败: ' + (error.response?.data?.detail || error.message))
+    } finally {
+      setSeatSaving(false)
+    }
+  }
 
   async function loadAll() {
     setLoading(true)
@@ -275,14 +295,37 @@ export default function OrganizationManagement() {
       render: (ts) => new Date(ts * 1000).toLocaleString('zh-CN'),
     },
     {
+      title: '席位上限',
+      key: 'seat_limit',
+      width: 120,
+      // 列表上刻意只显示上限、不显示当前用量：用量要按企业逐个查一次
+      // （count_active_users），在列表上就是一个 N+1，正是 2026-08-26 刚在
+      // /admin/users 上修掉的那类问题。用量在改上限的弹窗里给。
+      render: (_, org) =>
+        org.seat_limit === null || org.seat_limit === undefined
+          ? <Tag>不限</Tag>
+          : <Tag color="blue">{org.seat_limit}</Tag>,
+    },
+    {
       title: '操作',
       key: 'actions',
-      width: 140,
+      width: 220,
       render: (_, org) =>
         org.is_platform ? null : (
-          <Button icon={<Plug size={14} />} size="small" onClick={() => setConnectorOrg(org)}>
-            连接器
-          </Button>
+          <Space size={4}>
+            <Tooltip title="席位上限是合同额度，只有平台方能改">
+              <Button
+                icon={<Users size={14} />}
+                size="small"
+                onClick={() => { setSeatOrg(org); setSeatValue(org.seat_limit ?? null) }}
+              >
+                席位
+              </Button>
+            </Tooltip>
+            <Button icon={<Plug size={14} />} size="small" onClick={() => setConnectorOrg(org)}>
+              连接器
+            </Button>
+          </Space>
         ),
     },
   ]
@@ -296,6 +339,37 @@ export default function OrganizationManagement() {
         </p>
         <Button type="primary" icon={<Plus size={16} />} onClick={openCreate}>新建企业</Button>
       </div>
+
+      <Modal
+        title={`席位上限 — ${seatOrg?.name ?? ''}`}
+        open={!!seatOrg}
+        onCancel={() => setSeatOrg(null)}
+        onOk={submitSeatLimit}
+        confirmLoading={seatSaving}
+        okText="保存"
+        cancelText="取消"
+        destroyOnClose
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <p style={{ margin: 0, color: 'var(--text-tertiary, #888)' }}>
+            席位占用只统计<b>未停用</b>的账号——停用的员工不占席位，所以离职处理应该用
+            「停用」而不是删除（删除会一并失去历史会话的归属与审计追溯）。
+          </p>
+          <div>
+            <div style={{ marginBottom: 4 }}>上限（留空表示不限，0 表示暂停该企业新建账号）</div>
+            <InputNumber
+              min={0}
+              style={{ width: '100%' }}
+              value={seatValue}
+              onChange={setSeatValue}
+              placeholder="不限"
+            />
+          </div>
+          <p style={{ margin: 0, fontSize: 12, color: 'var(--text-tertiary, #999)' }}>
+            调低到低于当前用量不会停用任何人，只会挡住之后的新建与重新启用。
+          </p>
+        </div>
+      </Modal>
 
       <Table
         rowKey="org_id"

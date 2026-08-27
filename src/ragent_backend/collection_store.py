@@ -2,8 +2,8 @@
 企业自建知识库存储 (Org Collection Store) — PostgreSQL 版
 
 职责：
-1. 记录"哪个 collection 归属哪家企业"——`role_collections`（role_store.py）只存
-   role_id <-> collection_name 的关联，从不知道一个 collection 本身归属哪家企业；
+1. 记录"哪个 collection 归属哪家企业"——`role_collections`（role_store.py）
+   只存 role_id/org_id <-> collection_name 的关联，从不知道一个 collection 本身归属哪家企业；
    在这张表之前，`GET /admin/collections` 只能不加区分地列出 ChromaDB 里现存的
    全部 collection（见 app.py `admin_list_collections` 改造前的实现），任何一家
    企业的管理员都能看到、并把其他企业甚至平台自己的部门知识库配置给自己企业的
@@ -17,9 +17,10 @@
    就去初始化一个真正的向量库连接。
 
 不负责：
-- 6 个固定部门知识库（`hr_admin_kb` 等）——那是平台自己组织（org_platform）的
-  专属概念，硬编码在 `query_knowledge_hub.py` 的 `DEPARTMENT_KB_COLLECTIONS`
-  里，不登记进这张表（见该常量旁的说明）。
+- 平台自己组织（org_platform）——它不代表任何具体企业，2026-08-22 起不再有
+  任何本地业务知识库（原来硬编码的 6 个固定部门库已经下线，见
+  `query_knowledge_hub.py` `_org_owned_collections` 顶部说明），自然也不会
+  出现在这张表里。
 - 委托模式企业（Acme/Globex 这类，`tenant_connectors` 里配了 `http_api` 连接器）
   的"知识库"——那些库物理上在企业自己的微服务里，平台这边创建/管理任何本地
   collection 对它们都没有意义（`query_knowledge_hub.py` 的 `is_remote` 分支
@@ -29,6 +30,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import time
@@ -37,9 +39,11 @@ from typing import List, Optional
 
 import asyncpg
 
-# 跟 query_knowledge_hub.py 的 DEPARTMENT_KB_COLLECTIONS 保持独立引用（不在这里
-# import 那个模块——那边反过来会 import 本模块判断 org 归属，避免循环导入），
-# 校验时直接从调用方（app.py）传入完整的保留名集合。
+from src.ragent_backend.db_pool import get_shared_pool
+
+# 保留名单（tenant_*_kb / 6 个部门角色名等）不在这个模块里判断——直接 import
+# query_knowledge_hub.py 会形成循环引用（那边反过来会 import 本模块判断 org
+# 归属），校验逻辑放在调用方 app.py `admin_create_collection` 里做。
 _NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
 
 
@@ -65,15 +69,22 @@ class OrgCollection:
 class OrgCollectionStore:
     """企业自建知识库归属存储 (PostgreSQL)。"""
 
+    # 类级别共享连接池，见 store.py 同名字段的注释——调用方经常每次都 new 一个
+    # 新实例，池必须挂在类属性上才不会被重复创建、打满 Postgres 连接数。
+    _pool: Optional[asyncpg.Pool] = None
+    _pool_lock = asyncio.Lock()
+
     def __init__(self) -> None:
-        self._pool: Optional[asyncpg.Pool] = None
         self._dsn = os.getenv("RAGENT_POSTGRES_URL", "postgresql://postgres:postgres@localhost:5432/ragent")
 
     async def _get_pool(self) -> asyncpg.Pool:
         if self._pool is not None:
             return self._pool
-        self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
-        await self._ensure_schema()
+        async with self._pool_lock:
+            if self._pool is not None:
+                return self._pool
+            type(self)._pool = await get_shared_pool(self._dsn)
+            await self._ensure_schema()
         return self._pool
 
     async def _ensure_schema(self) -> None:
@@ -146,7 +157,19 @@ class OrgCollectionStore:
             created_at=now, created_by=created_by,
         )
 
+    async def delete(self, collection_name: str) -> bool:
+        """只删登记信息本身；物理数据（向量库/BM25/摄入历史）由调用方（app.py
+        `admin_delete_collection`）通过 query_knowledge_hub.py 的
+        `clear_org_collection` 先清掉，这里只负责"这个 collection 还归不归
+        某家企业"这条记录——职责跟 create() 对称。"""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute("DELETE FROM org_collections WHERE collection_name = $1", collection_name)
+        return result.split()[-1] != "0"
+
     async def close(self) -> None:
-        if self._pool is not None:
-            await self._pool.close()
-            self._pool = None
+        # 池现在是跨 14 个 Store 共享的（db_pool.py，P1-2），这里只清掉
+        # 本 Store 持有的引用，不触发真实关闭——那会把其它 Store 正在用的
+        # 连接一起关掉。真正关闭见 db_pool.close_shared_pools()，只在 app
+        # 关闭时调一次。
+        type(self)._pool = None

@@ -415,10 +415,78 @@ class TestErrorHandling:
         
         try:
             file_hash = checker.compute_sha256(temp_file)
-            
+
             # Should raise RuntimeError on write
             with pytest.raises(RuntimeError, match="Failed to mark success"):
                 checker.mark_success(file_hash, temp_file)
         finally:
             # Restore permissions for cleanup
             Path(temp_db).chmod(0o644)
+
+
+class TestVersionKey:
+    """CLAUDE.md §4 P0 第 1 条：文档更新后旧版本片段永久残留。
+
+    `find_other_versions` 是让调用方（`IngestionPipeline`）能找到"同一份
+    文档的旧版本"的唯一入口，这里独立验证它的查询语义，不依赖完整的
+    摄入流水线。
+    """
+
+    def test_version_key_defaults_to_file_path(self, checker):
+        """不传 version_key 时退化成旧行为——CLI/仪表盘这类路径本身稳定
+        的调用方不受影响。"""
+        checker.mark_success("hash_a", "/docs/report.pdf", "kb1")
+
+        # 同一路径、新内容（新哈希）视为新版本，应该能查到旧的那条。
+        others = checker.find_other_versions("/docs/report.pdf", "kb1", exclude_hash="hash_b")
+        assert [o["file_hash"] for o in others] == ["hash_a"]
+
+    def test_explicit_version_key_used_instead_of_path(self, checker):
+        """上传接口给物理路径加随机前缀时，必须靠显式 version_key 而不是
+        物理路径本身找到旧版本——这是这次修复要解决的真实场景。"""
+        checker.mark_success(
+            "hash_a", "/uploads/aaaa1111_report.pdf", "kb1", version_key="report.pdf"
+        )
+
+        # 物理路径不同（每次上传都换一个随机前缀），但 version_key 相同。
+        others = checker.find_other_versions("report.pdf", "kb1", exclude_hash="hash_b")
+        assert len(others) == 1
+        assert others[0]["file_hash"] == "hash_a"
+        assert others[0]["file_path"] == "/uploads/aaaa1111_report.pdf"
+
+        # 反过来，物理路径查不到任何东西——证明确实是按 version_key 查，
+        # 不是碰巧退化回按路径查。
+        assert checker.find_other_versions("/uploads/aaaa1111_report.pdf", "kb1", exclude_hash="hash_b") == []
+
+    def test_excludes_current_hash(self, checker):
+        """摄入成功后查自己刚写的哈希不该把自己当成"旧版本"。"""
+        checker.mark_success("hash_a", "/docs/report.pdf", "kb1")
+
+        assert checker.find_other_versions("/docs/report.pdf", "kb1", exclude_hash="hash_a") == []
+
+    def test_accumulates_multiple_stale_versions(self, checker):
+        """这条 P0 存在的时间够长，同一份文档可能已经积累了两次以上没被
+        清理的旧版本——修复必须把它们全部找出来，不能只处理"最近一次"。"""
+        checker.mark_success("hash_v1", "/docs/report.pdf", "kb1")
+        checker.mark_success("hash_v2", "/docs/report.pdf", "kb1")
+
+        others = checker.find_other_versions("/docs/report.pdf", "kb1", exclude_hash="hash_v3")
+        assert {o["file_hash"] for o in others} == {"hash_v1", "hash_v2"}
+
+    def test_scoped_by_collection(self, checker):
+        """两个不同知识库里恰好同名的文档是完全不相关的两份文档，不能
+        跨库互相当成"旧版本"删掉。"""
+        checker.mark_success("hash_a", "/docs/report.pdf", "kb1", version_key="report.pdf")
+        checker.mark_success("hash_b", "/docs/report.pdf", "kb2", version_key="report.pdf")
+
+        assert checker.find_other_versions("report.pdf", "kb1", exclude_hash="hash_c") == \
+            [{"file_hash": "hash_a", "file_path": "/docs/report.pdf"}]
+        assert checker.find_other_versions("report.pdf", "kb2", exclude_hash="hash_c") == \
+            [{"file_hash": "hash_b", "file_path": "/docs/report.pdf"}]
+
+    def test_empty_version_key_matches_nothing(self, checker):
+        """空 version_key 不构成有效标识，不该意外匹配到库里其它同样是
+        空 version_key 的历史记录（迁移前的老数据）。"""
+        checker.mark_success("hash_a", "", "kb1", version_key="")
+
+        assert checker.find_other_versions("", "kb1", exclude_hash="hash_b") == []

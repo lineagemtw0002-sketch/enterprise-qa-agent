@@ -1,19 +1,28 @@
 import { useEffect, useState } from 'react'
 import { Table, Button, Modal, Input, Tag, Space, Popconfirm, message, Empty } from 'antd'
-import { Plus, Pencil, Trash2 } from 'lucide-react'
+import { Pencil, Trash2 } from 'lucide-react'
 import * as adminApi from '../../api/admin.js'
 
-// 平台运营方不管理任何企业的知识库内容（跟 UserRoleAssignment.jsx"可访问
-// 知识库"列同一个结论），所以这个页面只管角色目录本身（建/改名/删），不出现
-// 知识库的选择和展示——"给角色配知识库"是企业管理员在自己的「知识库权限」
-// 页面（CompanyKbPermissions.jsx）做的事，两边职责不重叠。
+// 角色直接携带知识库权限（2026-08-23 起"身份"和"角色"合并成一个概念，见
+// role_store.py 顶部说明），分两类：全局角色（这个页面管的，org_id 为空）
+// 和企业角色（org_id 非空，各企业管理员自己建的、能配置知识库关联的角色，
+// 在企业管理员自己的「角色管理」tab 里管，CompanyRoleManagement.jsx，只在
+// 自己企业内可见）。
+//
+// 全局角色目前固定只有 super_admin/org_admin 两个系统内置角色（2026-08-24
+// 起平台侧废弃 admin/user，见 role_store.py 顶部说明），且都不可删除。这个
+// 页面原本还带"新建角色"——建一个全局共享的部门身份（如"IT部"），设想是
+// 让不同企业的员工都能挂到同一个角色上，工作流模板挂这个全局角色当审批人，
+// 实现"角色名字跨企业统一"。但 2026-08-23 工作流审批人分配改成了按企业
+// 独立配置（workflow_approver_roles 表按 (workflow_type, org_id) 存，
+// app.py 的 PUT /admin/workflow-approvers/{workflow_type} 端点显式要求
+// `approver_role.org_id == org.org_id`，全局角色永远过不了这道校验）——
+// 工作流是"企业内部的事"，只能用该企业自己建的角色，平台管理员不参与。
+// 这条路径没有别的消费方，"新建全局角色"这个功能连同按钮已经一并去掉，
+// 平台管理员现在能做的只有给这两个系统角色改展示名。
 export default function RoleManagement() {
   const [roles, setRoles] = useState([])
   const [loading, setLoading] = useState(false)
-
-  const [createVisible, setCreateVisible] = useState(false)
-  const [createForm, setCreateForm] = useState({ name: '', display_name: '' })
-  const [createLoading, setCreateLoading] = useState(false)
 
   const [renameVisible, setRenameVisible] = useState(false)
   const [renameTarget, setRenameTarget] = useState(null)
@@ -24,12 +33,7 @@ export default function RoleManagement() {
     setLoading(true)
     try {
       const roleList = await adminApi.listRoles()
-      // "全部知识库"（内部标识 all_kb）不是一个真正的角色——它是老数据模型
-      // 迁移时为了把 allowed_collections=["*"] 的用户接到新角色表上，临时
-      // 造的一个系统角色壳子（见 scripts/migrate_to_roles.py），本质是
-      // "知识库通配符权限"，不是一个有身份含义的角色，不该跟 IT部/法务部
-      // 这类真正的角色混在一张表里管理。
-      setRoles(roleList.filter((r) => r.name !== 'all_kb'))
+      setRoles(roleList)
     } catch (error) {
       message.error('加载角色列表失败: ' + (error.response?.data?.detail || error.message))
     } finally {
@@ -38,29 +42,6 @@ export default function RoleManagement() {
   }
 
   useEffect(() => { loadAll() }, [])
-
-  function openCreate() {
-    setCreateForm({ name: '', display_name: '' })
-    setCreateVisible(true)
-  }
-
-  async function submitCreate() {
-    if (!createForm.name.trim() || !createForm.display_name.trim()) {
-      message.warning('请填写完整')
-      return
-    }
-    setCreateLoading(true)
-    try {
-      await adminApi.createRole({ name: createForm.name.trim(), display_name: createForm.display_name.trim() })
-      message.success('角色创建成功')
-      setCreateVisible(false)
-      await loadAll()
-    } catch (error) {
-      message.error('创建失败: ' + (error.response?.data?.detail || error.message))
-    } finally {
-      setCreateLoading(false)
-    }
-  }
 
   function openRename(role) {
     setRenameTarget(role)
@@ -134,11 +115,10 @@ export default function RoleManagement() {
 
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+      <div style={{ marginBottom: 16 }}>
         <p style={{ margin: 0, color: 'var(--text-tertiary, #888)' }}>
-          角色目录：新建/重命名/删除角色。角色关联哪些知识库，由各企业的企业管理员在自己的「知识库权限」页面配置，平台不管理知识库内容。
+          全局角色目录：超级管理员/企业管理员两个系统内置角色，只能改展示名，不可删除、不可新建——工作流审批人现在由各企业管理员在自己的「审批设置」页面配置，全局角色不再服务这个用途；知识库权限相关的角色由各企业管理员在自己的「角色管理」页面管理。
         </p>
-        <Button type="primary" icon={<Plus size={16} />} onClick={openCreate}>新建角色</Button>
       </div>
 
       <Table
@@ -151,36 +131,7 @@ export default function RoleManagement() {
       />
 
       <Modal
-        title="新建角色"
-        open={createVisible}
-        onCancel={() => setCreateVisible(false)}
-        onOk={submitCreate}
-        confirmLoading={createLoading}
-        okText="创建"
-        cancelText="取消"
-      >
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <div>
-            <div style={{ marginBottom: 4 }}>展示名</div>
-            <Input
-              placeholder="如：IT部"
-              value={createForm.display_name}
-              onChange={(e) => setCreateForm((prev) => ({ ...prev, display_name: e.target.value }))}
-            />
-          </div>
-          <div>
-            <div style={{ marginBottom: 4 }}>内部标识（英文，创建后不可修改）</div>
-            <Input
-              placeholder="如：it_dept"
-              value={createForm.name}
-              onChange={(e) => setCreateForm((prev) => ({ ...prev, name: e.target.value }))}
-            />
-          </div>
-        </div>
-      </Modal>
-
-      <Modal
-        title={`重命名角色`}
+        title="重命名角色"
         open={renameVisible}
         onCancel={() => setRenameVisible(false)}
         onOk={submitRename}

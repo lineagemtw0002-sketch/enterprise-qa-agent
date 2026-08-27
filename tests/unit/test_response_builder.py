@@ -94,7 +94,9 @@ class TestCitationGenerator:
         # Check first citation
         assert citations[0].index == 1
         assert citations[0].chunk_id == "doc1_chunk_001"
-        assert citations[0].source == "docs/azure-guide.pdf"
+        # 只展示文件名，不展示完整路径——避免把摄入时记录的服务器本地绝对路径
+        # 透传给最终用户（见 citation_generator.py source_path 旁的说明）。
+        assert citations[0].source == "azure-guide.pdf"
         assert citations[0].score == 0.95
         assert citations[0].page == 5
         
@@ -123,7 +125,7 @@ class TestCitationGenerator:
         
         assert citation_dict["index"] == 1
         assert citation_dict["chunk_id"] == "doc1_chunk_001"
-        assert citation_dict["source"] == "docs/azure-guide.pdf"
+        assert citation_dict["source"] == "azure-guide.pdf"
         assert citation_dict["score"] == 0.95
         assert citation_dict["page"] == 5
         assert "text_snippet" in citation_dict

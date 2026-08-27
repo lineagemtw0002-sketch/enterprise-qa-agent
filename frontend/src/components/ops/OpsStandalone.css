@@ -1,0 +1,26 @@
+/* 独立页面（/ops.html）**只属于这一页**的全局覆盖。
+ *
+ * 为什么需要单独一个文件：`index.css` 是主应用的全局样式，
+ * 里面 `body { background: var(--bg-base) }` 是浅色的。塔台这一页也要用它的
+ * 重置（box-sizing、滚动条等），但**必须把 body 的浅色底盖掉**——
+ * `.ops-page` 有 1440px 宽度上限，宽屏下两侧露出来的正是 body 的底色，
+ * 于是整屏变成"中间深、两边白"，而不是用户要的整体黑。
+ *
+ * ⚠️ 这些规则绝不能写进 `OpsConsole.css`：那个文件同时被主应用里的嵌入版本
+ * 引用，在那里改 body 会把整个主应用染黑。
+ */
+html,
+body {
+  margin: 0;
+  padding: 0;
+  /* 跟设计稿 :root 的 --ground 完全一致。 */
+  background: #12131a;
+  color: #eef0f6;
+  font-family: "Titillium Web", "Segoe UI", system-ui, sans-serif;
+}
+
+/* 滚动条也跟着深色化——浅色滚动条挂在整屏深色页面右侧非常突兀。 */
+body::-webkit-scrollbar { width: 10px; height: 10px; }
+body::-webkit-scrollbar-track { background: #12131a; }
+body::-webkit-scrollbar-thumb { background: #2b2e3d; border-radius: 6px; }
+body::-webkit-scrollbar-thumb:hover { background: #3a3e51; }

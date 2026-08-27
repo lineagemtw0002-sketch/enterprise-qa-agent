@@ -2,11 +2,17 @@
 工作流存储 (Workflow Store) — PostgreSQL 版
 
 对应 work-flow.md 的数据模型/状态机设计。职责：
-1. 流程模板（workflow_templates）：管理员配置的"某类流程需要哪些结构化字段"，
-   附件材料不建模，只存一句提醒文案（attachments_note），齐不齐由审批人判断
-   （见 work-flow.md 第 6.2 节）。
-2. 工作流实例（workflow_instances）：一条申请/工单，状态机见 work-flow.md 4.4 节。
-3. 站内信（notifications）：通用的"事件 -> 提醒"投递表（work-flow-web.md 第 6 节），
+1. 流程模板（workflow_templates）：平台管理员配置的"某类流程需要哪些结构化
+   字段"，附件材料不建模，只存一句提醒文案（attachments_note），齐不齐由
+   审批人判断（见 work-flow.md 第 6.2 节）——这部分是跨企业共用的表单结构，
+   不含审批人信息。
+2. 审批人分配（workflow_approver_roles）：2026-08-23 起，"这类流程谁来批"
+   改成按企业独立配置——工作流跟角色/知识库一样是"企业内部的事"，同一个
+   workflow_type（比如"请假申请"）在不同企业应该能配不同的审批角色，且只能
+   由该企业自己的管理员配置，不再是模板上挂一个全平台唯一的 approver_role_id。
+   `(workflow_type, org_id) -> approver_role_id` 是这张表的全部内容。
+3. 工作流实例（workflow_instances）：一条申请/工单，状态机见 work-flow.md 4.4 节。
+4. 站内信（notifications）：通用的"事件 -> 提醒"投递表（work-flow-web.md 第 6 节），
    目前只有工作流状态变化会触发，但表结构不专属于工作流。
 
 不负责：
@@ -16,6 +22,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 import uuid
@@ -24,6 +31,8 @@ from datetime import date
 from typing import Any, Dict, List, Optional
 
 import asyncpg
+
+from src.ragent_backend.db_pool import get_shared_pool
 
 # ============== 状态常量 ==============
 
@@ -112,7 +121,6 @@ class WorkflowTemplate:
     description: str
     required_fields: List[Dict[str, Any]]
     attachments_note: str
-    approver_role_id: Optional[str]
     is_system: bool
     created_at: float
 
@@ -144,27 +152,25 @@ class Notification:
     created_at: float
 
 
-class _Unset:
-    """哨兵值，区分"调用方没传这个参数"和"显式传了 None"（用于 approver_role_id
-    这种本身就允许为 NULL 的可选字段，仿 user_store.py 里 Optional[...]=None 表示
-    "不改"的既有写法，但那套写法没法表达"显式清空"，这里多加一个哨兵解决这一点）。"""
-
-
-_UNSET = _Unset()
-
-
 class WorkflowStore:
     """工作流存储 (PostgreSQL)。"""
 
+    # 类级别共享连接池，见 store.py 同名字段的注释——调用方经常每次都 new 一个
+    # 新实例，池必须挂在类属性上才不会被重复创建、打满 Postgres 连接数。
+    _pool: Optional[asyncpg.Pool] = None
+    _pool_lock = asyncio.Lock()
+
     def __init__(self) -> None:
-        self._pool: Optional[asyncpg.Pool] = None
         self._dsn = os.getenv("RAGENT_POSTGRES_URL", "postgresql://postgres:postgres@localhost:5432/ragent")
 
     async def _get_pool(self) -> asyncpg.Pool:
         if self._pool is not None:
             return self._pool
-        self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
-        await self._ensure_schema()
+        async with self._pool_lock:
+            if self._pool is not None:
+                return self._pool
+            type(self)._pool = await get_shared_pool(self._dsn)
+            await self._ensure_schema()
         return self._pool
 
     async def _ensure_schema(self) -> None:
@@ -181,6 +187,22 @@ class WorkflowStore:
                     approver_role_id  TEXT,
                     is_system         BOOLEAN NOT NULL DEFAULT FALSE,
                     created_at        DOUBLE PRECISION NOT NULL
+                )
+                """
+            )
+            # 审批人分配：按企业独立配置，见文件顶部说明。旧的
+            # workflow_templates.approver_role_id 列保留在表里但从
+            # 2026-08-23 起不再读写（历史遗留，不做 DROP COLUMN 迁移，
+            # 只是彻底不用了）——全平台共用一个审批角色这件事本身就是要
+            # 改掉的设计问题，不能只是换个新列名换汤不换药。
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS workflow_approver_roles (
+                    workflow_type     VARCHAR(64) NOT NULL,
+                    org_id            TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+                    approver_role_id  TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+                    updated_at        DOUBLE PRECISION NOT NULL,
+                    PRIMARY KEY (workflow_type, org_id)
                 )
                 """
             )
@@ -260,7 +282,6 @@ class WorkflowStore:
             description=row["description"],
             required_fields=_from_json(row["required_fields"]),
             attachments_note=row["attachments_note"],
-            approver_role_id=row["approver_role_id"],
             is_system=row["is_system"],
             created_at=row["created_at"],
         )
@@ -320,7 +341,7 @@ class WorkflowStore:
         return WorkflowTemplate(
             template_id=template_id, workflow_type=workflow_type, display_name=display_name,
             description=description, required_fields=required_fields,
-            attachments_note=attachments_note, approver_role_id=None, is_system=False,
+            attachments_note=attachments_note, is_system=False,
             created_at=now,
         )
 
@@ -350,7 +371,6 @@ class WorkflowStore:
         description: Optional[str] = None,
         required_fields: Optional[List[Dict[str, Any]]] = None,
         attachments_note: Optional[str] = None,
-        approver_role_id: Any = _UNSET,
     ) -> Optional[WorkflowTemplate]:
         pool = await self._get_pool()
         async with pool.acquire() as conn:
@@ -372,11 +392,6 @@ class WorkflowStore:
                     "UPDATE workflow_templates SET attachments_note = $1 WHERE id = $2",
                     attachments_note, template_id,
                 )
-            if approver_role_id is not _UNSET:
-                await conn.execute(
-                    "UPDATE workflow_templates SET approver_role_id = $1 WHERE id = $2",
-                    approver_role_id, template_id,
-                )
         return await self.get_template_by_id(template_id)
 
     async def delete_template(self, template_id: str) -> bool:
@@ -390,16 +405,69 @@ class WorkflowStore:
             result = await conn.execute("DELETE FROM workflow_templates WHERE id = $1", template_id)
         return result.split()[-1] != "0"
 
-    async def approvable_templates_for_role_ids(self, role_ids: List[str]) -> List[WorkflowTemplate]:
-        """管理员未配置审批角色前 approver_role_id 为 NULL，NULL 永远不会出现在
-        角色 id 集合里，天然不会被误判为"可审批"，不需要额外判空。"""
+    # ------------------------------------------------------------------
+    # 审批人分配（按企业独立配置，见文件顶部说明）
+    # ------------------------------------------------------------------
+
+    async def set_org_approver_role(
+        self, org_id: str, workflow_type: str, approver_role_id: Optional[str],
+    ) -> None:
+        """`approver_role_id=None` 表示这家企业还没给这类流程配审批人（清空/
+        取消分配），删掉这一行而不是存一个 NULL——列本身是 NOT NULL，"没配置"
+        用"这一行压根不存在"表达，跟 get_org_approver_role_id 查不到返回 None
+        的语义天然一致。"""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            if approver_role_id is None:
+                await conn.execute(
+                    "DELETE FROM workflow_approver_roles WHERE org_id = $1 AND workflow_type = $2",
+                    org_id, workflow_type,
+                )
+            else:
+                await conn.execute(
+                    """INSERT INTO workflow_approver_roles (workflow_type, org_id, approver_role_id, updated_at)
+                       VALUES ($1, $2, $3, $4)
+                       ON CONFLICT (workflow_type, org_id)
+                       DO UPDATE SET approver_role_id = EXCLUDED.approver_role_id, updated_at = EXCLUDED.updated_at""",
+                    workflow_type, org_id, approver_role_id, time.time(),
+                )
+
+    async def get_org_approver_role_id(self, org_id: str, workflow_type: str) -> Optional[str]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT approver_role_id FROM workflow_approver_roles WHERE org_id = $1 AND workflow_type = $2",
+                org_id, workflow_type,
+            )
+        return row["approver_role_id"] if row else None
+
+    async def list_org_approver_roles(self, org_id: str) -> Dict[str, str]:
+        """这家企业当前给哪些 workflow_type 配了审批角色，`{workflow_type: approver_role_id}`。
+        供企业管理员的「审批设置」页面用，跟 list_templates() 的结果拼在一起
+        展示"每类流程 + 当前配的审批角色"。"""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT workflow_type, approver_role_id FROM workflow_approver_roles WHERE org_id = $1",
+                org_id,
+            )
+        return {row["workflow_type"]: row["approver_role_id"] for row in rows}
+
+    async def approvable_templates_for_org_and_role_ids(
+        self, org_id: str, role_ids: List[str],
+    ) -> List[WorkflowTemplate]:
+        """当前用户在自己企业内，凭手头的角色能审批哪些流程类型。"""
         if not role_ids:
             return []
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM workflow_templates WHERE approver_role_id = ANY($1::text[])",
-                role_ids,
+                """
+                SELECT wt.* FROM workflow_templates wt
+                JOIN workflow_approver_roles war ON war.workflow_type = wt.workflow_type
+                WHERE war.org_id = $1 AND war.approver_role_id = ANY($2::text[])
+                """,
+                org_id, role_ids,
             )
         return [self._row_to_template(r) for r in rows]
 
@@ -421,7 +489,7 @@ class WorkflowStore:
     async def create_instance(
         self, workflow_type: str, requester_user_id: str,
         conversation_id: Optional[str], fields: Dict[str, Any],
-        role_store: Optional[Any] = None,
+        role_store: Optional[Any] = None, org_id: Optional[str] = None,
     ) -> WorkflowInstance:
         """提交一条新申请，直接进入 pending_approval。事务内先校验"同类型只能一条
         在途"（work-flow-web.md 7.1 节），避免竞态下重复创建。"""
@@ -457,10 +525,11 @@ class WorkflowStore:
             approval_comment=None, history=history, created_at=now, updated_at=now,
         )
 
-        if role_store is not None:
+        if role_store is not None and org_id is not None:
             template = await self.get_template_by_type(workflow_type)
-            if template is not None:
-                await self.notify_approvers(instance, template, role_store, event="submitted")
+            approver_role_id = await self.get_org_approver_role_id(org_id, workflow_type)
+            if template is not None and approver_role_id:
+                await self.notify_approvers(instance, template, role_store, approver_role_id, event="submitted")
         return instance
 
     async def get_instance(self, instance_id: str) -> Optional[WorkflowInstance]:
@@ -498,19 +567,23 @@ class WorkflowStore:
                 )
         return [self._row_to_instance(r) for r in rows]
 
-    async def list_pending_for_role_ids(self, role_ids: List[str]) -> List[WorkflowInstance]:
-        """待审批列表：状态是 pending_approval，且实例的 workflow_type 对应模板的
-        approver_role_id 落在当前用户持有的角色集合里。"""
+    async def list_pending_for_org_and_role_ids(self, org_id: str, role_ids: List[str]) -> List[WorkflowInstance]:
+        """待审批列表：状态是 pending_approval，且实例的 workflow_type 在
+        「当前用户所在企业」配置的审批角色落在当前用户持有的角色集合里。
+        额外 JOIN users 卡一遍申请人所属企业，双重保险（虽然角色分配本身已经
+        按企业隔离，理论上 role_id 不会跨企业撞车，但审批列表这种直接暴露
+        别家企业申请内容的地方多一层显式校验不亏）。"""
         if not role_ids:
             return []
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """SELECT wi.* FROM workflow_instances wi
-                   JOIN workflow_templates wt ON wt.workflow_type = wi.workflow_type
-                   WHERE wi.status = $1 AND wt.approver_role_id = ANY($2::text[])
+                   JOIN workflow_approver_roles war ON war.workflow_type = wi.workflow_type AND war.org_id = $1
+                   JOIN users u ON u.id = wi.requester_user_id AND u.org_id = $1
+                   WHERE wi.status = $2 AND war.approver_role_id = ANY($3::text[])
                    ORDER BY wi.created_at ASC""",
-                STATUS_PENDING_APPROVAL, role_ids,
+                org_id, STATUS_PENDING_APPROVAL, role_ids,
             )
         return [self._row_to_instance(r) for r in rows]
 
@@ -566,8 +639,19 @@ class WorkflowStore:
         template = await self.get_template_by_type(updated.workflow_type)
         if template is not None:
             if new_status == STATUS_PENDING_APPROVAL and role_store is not None:
-                # resubmit：重新通知审批人
-                await self.notify_approvers(updated, template, role_store, event="resubmitted")
+                # resubmit：重新通知审批人——审批角色现在按企业配置（见文件
+                # 顶部说明），要先查一下申请人所属企业才能知道该通知哪个角色。
+                async with pool.acquire() as conn:
+                    org_row = await conn.fetchrow(
+                        "SELECT org_id FROM users WHERE id = $1", updated.requester_user_id,
+                    )
+                requester_org_id = org_row["org_id"] if org_row else None
+                approver_role_id = (
+                    await self.get_org_approver_role_id(requester_org_id, updated.workflow_type)
+                    if requester_org_id else None
+                )
+                if approver_role_id:
+                    await self.notify_approvers(updated, template, role_store, approver_role_id, event="resubmitted")
             elif new_status != STATUS_PENDING_APPROVAL:
                 await self.notify_requester(updated, template, event=event_name)
 
@@ -664,11 +748,12 @@ class WorkflowStore:
         )
 
     async def notify_approvers(
-        self, instance: WorkflowInstance, template: WorkflowTemplate, role_store: Any, event: str = "submitted",
+        self, instance: WorkflowInstance, template: WorkflowTemplate, role_store: Any,
+        approver_role_id: Optional[str], event: str = "submitted",
     ) -> None:
-        if not template.approver_role_id:
+        if not approver_role_id:
             return
-        approver_user_ids = await role_store.get_user_ids_by_role(template.approver_role_id)
+        approver_user_ids = await role_store.get_user_ids_by_role(approver_role_id)
         short_id = instance.instance_id[:8]
         title = "申请已重新提交" if event == "resubmitted" else "新的待审批申请"
         body = (
@@ -683,9 +768,11 @@ class WorkflowStore:
             )
 
     async def close(self) -> None:
-        if self._pool is not None:
-            await self._pool.close()
-            self._pool = None
+        # 池现在是跨 14 个 Store 共享的（db_pool.py，P1-2），这里只清掉
+        # 本 Store 持有的引用，不触发真实关闭——那会把其它 Store 正在用的
+        # 连接一起关掉。真正关闭见 db_pool.close_shared_pools()，只在 app
+        # 关闭时调一次。
+        type(self)._pool = None
 
 
 def _to_json(value: Any) -> str:

@@ -1,0 +1,57 @@
+{
+  "generated_at": "2026-08-26T11:47:44.667803",
+  "script": "/Users/david/Documents/enterprise-qa-agent/scripts/seed_large_bm25_corpus.py",
+  "code_state": {
+    "commit": "253654a",
+    "commit_full": "253654ad9b182daafcb5fe863f8ff62d0f9703ce",
+    "branch": "fix/p0-security-and-project-conventions",
+    "dirty_paths": [
+      "?? scripts/benchmark_bm25_backends.py",
+      "?? scripts/benchmark_results/bm25_backends_20260826_112806.json",
+      "?? scripts/benchmark_results/bm25_backends_20260826_113429.json",
+      "?? scripts/benchmark_results/bm25_backends_20260826_113552.json",
+      "?? scripts/benchmark_results/bm25_backends_20260826_113610.json",
+      "?? scripts/benchmark_results/bm25_backends_20260826_114048.json",
+      "?? scripts/benchmark_results/bm25_backends_20260826_114114.json",
+      "?? scripts/benchmark_results/bm25_backends_20260826_114125.json",
+      "?? scripts/benchmark_results/bm25_backends_20260826_114150.json",
+      "?? scripts/benchmark_results/bm25_backends_20260826_114417.json",
+      "?? scripts/benchmark_results/bm25_seed_20260826_112414.json",
+      "?? scripts/benchmark_results/bm25_seed_20260826_112712.json",
+      "?? scripts/benchmark_results/bm25_seed_20260826_113739.json",
+      "?? scripts/benchmark_results/bm25_seed_20260826_113909.json",
+      "?? scripts/seed_large_bm25_corpus.py"
+    ],
+    "is_clean": false,
+    "warning": "工作区有未提交改动，这批数字对应「含未提交改动的工作区状态」，不能只靠 commit hash 复现"
+  },
+  "corpus_params": {
+    "seed": 20260826,
+    "heaps_k": 6388.0,
+    "heaps_alpha": 0.616,
+    "zipf_s": 1.0,
+    "doc_length": 48.0,
+    "unique_ratio": 0.88
+  },
+  "corpus_kind": "synthetic",
+  "corpus_caveat": "合成 term_stats，非真实文本。可用于体积/延迟/内存/一致性测量；不可用于评价检索质量、召回率或答案正确性。",
+  "collections": [
+    {
+      "chunks": 10000,
+      "collection": "synthetic_bm25_10000",
+      "skipped": false,
+      "index_dir": "/Users/david/Documents/enterprise-qa-agent/data/db/bm25/synthetic_bm25_10000",
+      "json_path": "/Users/david/Documents/enterprise-qa-agent/data/db/bm25/synthetic_bm25_10000/synthetic_bm25_10000_bm25.json",
+      "sqlite_path": "/Users/david/Documents/enterprise-qa-agent/data/db/bm25/synthetic_bm25_10000/synthetic_bm25_10000_bm25.sqlite",
+      "json_bytes": 51198626,
+      "sqlite_bytes": 37003264,
+      "vocab_target": 26385,
+      "vocab_realized": 26385,
+      "postings_total": 422901,
+      "postings_per_chunk": 42.29,
+      "avg_doc_length": 48.057,
+      "generate_s": 0.2,
+      "build_s": 1.72
+    }
+  ]
+}

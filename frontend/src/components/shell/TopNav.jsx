@@ -1,8 +1,7 @@
-import { Popover } from 'antd'
+import { Popover, Tooltip } from 'antd'
 import {
   Sparkles, ChevronDown, MessageSquare, ListChecks, ShieldCheck, Activity,
-  Cpu, Clock, Package, Scale, BookOpen, Sparkle, Files as FilesIcon, Building2,
-  Users, Wallet, Wrench, Megaphone, Code2, HeartHandshake,
+  Sparkle, Files as FilesIcon, Building2, LayoutDashboard, ExternalLink,
 } from 'lucide-react'
 import NotificationBell from '../workflow/NotificationBell.jsx'
 import './TopNav.css'
@@ -10,24 +9,13 @@ import './TopNav.css'
 // 知识库 slug -> 中文展示名 + 图标 + 主题色（从 App.jsx 挪过来，只有个人信息卡
 // 里的"可访问知识库"用得到，搬到顶部导航就不用在 App.jsx 里保留一份了）。
 //
-// it_kb/attendance_kb/logistics_kb/legal_kb 是老的单文档部门库（迁移遗留，
-// 见 role.md 迁移记录），hr_admin_kb 起下面这 6 个才是"全库混合召回"改造后
-// 固定下来的部门知识库清单（跟 query_knowledge_hub.py 的 DEPARTMENT_KB_COLLECTIONS
-// 一一对应，图标/颜色只是前端展示用，不影响检索）。两组并存，没有互相替代，
-// 老的 4 个目前还没清理掉。
-const KB_META = {
-  default: { label: '通用知识库', icon: BookOpen, color: '#6b7280' },
-  it_kb: { label: 'IT 知识库', icon: Cpu, color: '#3b82f6' },
-  attendance_kb: { label: '考勤知识库', icon: Clock, color: '#f59e0b' },
-  logistics_kb: { label: '后勤知识库', icon: Package, color: '#10b981' },
-  legal_kb: { label: '法务知识库', icon: Scale, color: '#ef4444' },
-  hr_admin_kb: { label: '人力资源与行政知识库', icon: Users, color: '#8b5cf6' },
-  finance_kb: { label: '财务与报销制度知识库', icon: Wallet, color: '#059669' },
-  it_support_kb: { label: 'IT 支持与技术运维知识库', icon: Wrench, color: '#2563eb' },
-  sales_marketing_kb: { label: '销售话术与市场知识库', icon: Megaphone, color: '#f97316' },
-  rd_product_kb: { label: '研发与产品代码知识库', icon: Code2, color: '#6366f1' },
-  customer_success_kb: { label: '客户成功与售后服务知识库', icon: HeartHandshake, color: '#ec4899' },
-}
+// 平台自己（org_platform）2026-08-22 起不再有任何本地业务知识库——原来这里
+// 固定写死的 6 个部门库（hr_admin_kb 等，对应 query_knowledge_hub.py 曾经的
+// DEPARTMENT_KB_COLLECTIONS）连同更早下线的 4 个老部门库 + default 一起删掉
+// 了，这张表暂时是空的。企业自建知识库的 slug（比如 product_req_kb）本来就
+// 没在这张表里登记过，一直是走下面的 KB_META_FALLBACK 展示成通用文件图标 +
+// 原始 slug 文本——不需要为了平台这次下线特意改动它们的展示逻辑。
+const KB_META = {}
 const KB_META_FALLBACK = { icon: FilesIcon, color: '#6b7280' }
 const KB_META_UNLIMITED = { label: '不限', icon: Sparkle, color: '#8b5cf6' }
 
@@ -65,6 +53,24 @@ export function KbTag({ slug }) {
   )
 }
 
+// 聊天回复来源知识库角标用的紧凑版本——只露一个小圆点图标，鼠标悬停才展开
+// 知识库名字。之前 App.jsx 里那版 KbTag（图标+完整文字）用 position:absolute
+// 贴在回复气泡右上角，短回复气泡本身很窄，文字标签会伸到气泡外面跟正文视觉
+// 冲突，所以一直被 `&& false` 关闭；换成纯图标 + Tooltip 之后天然不会有这个
+// 宽度问题，改用正常文档流（不再绝对定位）放在气泡上方即可，见 App.css
+// .message-kb-badge。
+export function KbSourceIcon({ slug }) {
+  const meta = slug === '*' ? KB_META_UNLIMITED : kbMeta(slug)
+  const Icon = meta.icon
+  return (
+    <Tooltip title={`来源知识库：${meta.label}`}>
+      <span className="kb-source-icon" style={{ '--kb-color': meta.color }}>
+        <Icon size={12} strokeWidth={2.25} />
+      </span>
+    </Tooltip>
+  )
+}
+
 // 用户名 hash 出一个稳定的颜色，同一个用户名每次颜色都一样，不用后端存头像
 function avatarColor(username) {
   if (!username) return '#94a3b8'
@@ -88,8 +94,36 @@ function formatDate(timestamp) {
 const MODULES = [
   { key: 'chat', label: '智能问答', icon: MessageSquare },
   { key: 'workflow', label: '工作流', icon: ListChecks },
+  // 只对平台运营方的超级管理员/管理员开放（platformOnly，比 adminOnly 更严格——
+  // 后者连企业管理员 org_admin 也算，这个不算），是独立的顶层模块，不挂在
+  // 「权限系统」下面：运营指标（会话数/消息数/活跃用户/响应耗时）是平台整体
+  // 运维数据，跟"权限系统"里角色/用户/知识库这类权限配置性质不同，混在一起
+  // 会让企业管理员以为这也是权限相关的东西（见 App.jsx isPlatformAdmin 的说明）。
+  { key: 'dashboard', label: '运营仪表盘', icon: LayoutDashboard, platformOnly: true },
   { key: 'admin', label: '权限系统', icon: ShieldCheck, adminOnly: true },
-  { key: 'ops', label: '智能运维', icon: Activity, soon: true },
+  // 智能运维（运维塔台）：连接器 / 修复动作允许范围 / 审批队列。
+  // 跟「权限系统」里那几个企业页面同一个道理——平台运营方不代表任何一家具体企业，
+  // 也不该去批准别人环境里的修复动作，所以 hideForPlatform（模块的**开关**才是
+  // 平台的事，那个在运营仪表盘的组织管理里）。
+  // 企业没开通这个模块时，这个入口**本身就不出现**（needsAiops），而不是让人点进去
+  // 撞一个 403——跟上面平台级页面"不是权限拒绝页、是压根不给入口"是同一个原则。
+  // 依据是 /auth/me 里的 organization.aiops_module_enabled（后端 2026-08-26 补的字段，
+  // 在那之前前端无从提前知道，只能等点进去才发现）。
+  // OpsConsole 内部那层 403 探测保留当兜底：开关是别人（平台管理员）在改的，
+  // 用户这一侧的 meProfile 可能是开关变更之前拉的，入口藏不藏得住不能只靠它。
+  // ⚠️ 门禁**不是** adminOnly：`role_ops_systems` 落地后，审批人可以是被授权的普通
+  // 员工（那正是这套权限的核心场景——审批范围应该比管理员更窄/不同）。用角色名判断
+  // 的 isAdmin 会把他们全挡在外面，等于后端放宽了、前端的门还锁着。
+  // 依据 /auth/me 的 ops_can_view（后端已把 org_admin 通配符和显式授权算成并集，
+  // 前端不重复实现权限逻辑——跟 allowed_collections 是同一个思路）。
+  // ⚠️ **这一项不切 view，而是新开一个标签页**（externalHref）。
+  // 运维塔台是整屏深色的监控大屏，主应用是浅色的办公界面——塞在同一个壳里，
+  // 浅色顶栏配深色内容区，两种视觉语言互相打架。监控大屏本来就是"独占一屏
+  // 盯着看"的用法，单开一页也更贴合。页面本身是 vite 的第二个入口，不是路由。
+  {
+    key: 'ops', label: '智能运维', icon: Activity, externalHref: '/ops.html',
+    hideForPlatform: true, needsAiops: true, needsOpsView: true,
+  },
 ]
 
 // 顶部导航：登录后所有界面共用的壳——模块切换 + 通知 + 个人信息，替代原来
@@ -98,6 +132,7 @@ export default function TopNav({
   view,
   onNavigate,
   isAdmin,
+  isPlatformAdmin,
   currentUsername,
   meProfile,
   onLogout,
@@ -124,13 +159,16 @@ export default function TopNav({
       <div className="profile-section">
         <div className="profile-section-label">角色</div>
         <div className="profile-collections">
-          {meProfile?.roles?.length ? (
-            meProfile.roles.map((r) => (
-              <span key={r.role_id} className="tag tag--primary">{r.display_name}</span>
-            ))
-          ) : (
-            <span className="profile-empty-hint">未分配角色</span>
-          )}
+          {(() => {
+            const displayRoles = meProfile?.roles ?? []
+            return displayRoles.length ? (
+              displayRoles.map((r) => (
+                <span key={r.role_id} className="tag tag--primary">{r.display_name}</span>
+              ))
+            ) : (
+              <span className="profile-empty-hint">未分配角色</span>
+            )
+          })()}
         </div>
       </div>
 
@@ -139,12 +177,12 @@ export default function TopNav({
         <div className="profile-collections">
           {(() => {
             // 跟 UserRoleAssignment.jsx 的知识库列用同一套口径：org_admin 对
-            // 自己企业的知识库是隐式全权限（不是靠 role_collections 表里挂了
-            // 通配符），allowed_collections 字段对它来说本来就是空数组——
+            // 自己企业的知识库是隐式全权限（不是靠某个角色挂了通配符），
+            // allowed_collections 字段对它来说本来就是空数组——
             // 这里不特判就会跟"仅自己的对话"（无知识库权限）撞成一个显示，
             // 企业管理员会误以为自己看不了知识库。
             const roleNames = meProfile?.roles?.map((r) => r.name) ?? []
-            if (roleNames.includes('super_admin') || roleNames.includes('admin')) {
+            if (roleNames.includes('super_admin')) {
               return <span className="profile-empty-hint">无（平台管理员不管理知识库）</span>
             }
             if (roleNames.includes('org_admin')) {
@@ -182,18 +220,29 @@ export default function TopNav({
       </div>
 
       <div className="nav-modules">
-        {MODULES.filter((m) => !m.adminOnly || isAdmin).map((m) => (
+        {MODULES.filter((m) => (!m.adminOnly || isAdmin) && (!m.platformOnly || isPlatformAdmin)
+          && (!m.hideForPlatform || !isPlatformAdmin)
+          && (!m.needsAiops || !!meProfile?.organization?.aiops_module_enabled)
+          && (!m.needsOpsView || isAdmin || !!meProfile?.ops_can_view)).map((m) => (
           <div
             key={m.key}
             className={[
               'nav-item',
-              view === m.key ? 'active' : '',
+              // 外链项永远不高亮：当前页面根本没切过去，高亮它是在说谎。
+              (view === m.key && !m.externalHref) ? 'active' : '',
               m.soon ? 'soon' : '',
             ].filter(Boolean).join(' ')}
-            onClick={() => onNavigate(m.key)}
+            onClick={() => {
+              // 新标签页打开，不 replace 当前页——用户多半是"边用主应用边盯大屏"，
+              // 把他手上的对话顶掉是最不该干的事。
+              if (m.externalHref) window.open(m.externalHref, '_blank', 'noopener')
+              else onNavigate(m.key)
+            }}
+            title={m.externalHref ? '在新标签页打开运维塔台' : undefined}
           >
             <m.icon size={16} />
             {m.label}
+            {m.externalHref && <ExternalLink size={12} className="nav-external-icon" />}
             {m.soon && <span className="nav-soon">即将上线</span>}
           </div>
         ))}

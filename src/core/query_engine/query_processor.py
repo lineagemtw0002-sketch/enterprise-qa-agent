@@ -17,8 +17,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Pattern, Set
 
-import jieba
-
+from src.core.tokenization import query_tokens
 from src.core.types import ProcessedQuery
 
 
@@ -199,26 +198,19 @@ class QueryProcessor:
     def _tokenize(self, text: str) -> List[str]:
         """将文本切分为词/项。
 
-        使用 `jieba` 做中文分词，这样与索引端（例如 SparseEncoder）保持一致，
-        有利于 BM25 等稀疏检索的匹配。英文会被保留为整体词项。
+        实现在 `src.core.tokenization.query_tokens` —— **这里刻意只做转发**。
+
+        从前这里自己写了一份 jieba 调用，索引侧（`SparseEncoder._tokenize`）
+        也自己写了一份，两份的字面相似纯属巧合，没有任何东西拦着它们分叉。
+        实测它们确实已经分叉了（`CLAUDE.md` §4 第 9b 条）。
+        现在两侧共用一个模块，契约（索引侧 ⊇ 查询侧）写在那里。
+
+        ⚠️ 本方法返回的是**原始大小写**。拿去查索引之前必须再过一次
+        `src.core.tokenization.match_terms()` 做匹配层归一化。
 
         返回分词后的 token 列表。
         """
-        tokens: List[str] = []
-
-        # Use jieba to segment (handles Chinese + keeps English intact)
-        raw_tokens = jieba.lcut(text)
-
-        for token in raw_tokens:
-            token = token.strip()
-            if not token:
-                continue
-            # Skip pure punctuation / whitespace
-            if re.fullmatch(r'[\s\W]+', token, re.UNICODE):
-                continue
-            tokens.append(token)
-        
-        return tokens
+        return query_tokens(text)
     
     def _filter_keywords(self, tokens: List[str]) -> List[str]:
         """从 token 中过滤并提取有意义的关键词。

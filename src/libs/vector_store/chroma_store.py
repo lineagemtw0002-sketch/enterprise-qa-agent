@@ -7,6 +7,7 @@ a lightweight, open-source embedding database designed for local-first deploymen
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -24,6 +25,34 @@ if TYPE_CHECKING:
     from src.core.settings import Settings
 
 logger = logging.getLogger(__name__)
+
+# P1-8: query_knowledge_hub.py calls VectorStoreFactory.create(...) — and thus
+# ChromaStore.__init__ — on every single query, which used to construct a brand
+# new chromadb.PersistentClient each time even when many instances point at the
+# same on-disk path (a 6-collection enterprise re-bootstraps Chroma 6x per
+# question). tests/unit/test_chroma_shared_client_concurrency.py verified a
+# shared client is safe under real multi-threaded concurrent read/write across
+# collections (the production access pattern, via asyncio.to_thread), so
+# clients are now cached and reused per resolved persist_directory instead of
+# being torn down and rebuilt on every instantiation.
+_CLIENT_CACHE: Dict[str, "chromadb.ClientAPI"] = {}
+_CLIENT_CACHE_LOCK = threading.Lock()
+
+
+def _get_or_create_client(persist_directory: str) -> "chromadb.ClientAPI":
+    """Return the shared PersistentClient for *persist_directory*, creating it once."""
+    with _CLIENT_CACHE_LOCK:
+        client = _CLIENT_CACHE.get(persist_directory)
+        if client is None:
+            client = chromadb.PersistentClient(
+                path=persist_directory,
+                settings=ChromaSettings(
+                    anonymized_telemetry=False,
+                    allow_reset=True,
+                ),
+            )
+            _CLIENT_CACHE[persist_directory] = client
+        return client
 
 
 class ChromaStore(BaseVectorStore):
@@ -107,15 +136,9 @@ class ChromaStore(BaseVectorStore):
             f"persist_directory='{self.persist_directory}'"
         )
         
-        # Initialize ChromaDB client with persistent storage
+        # Get (or lazily create) the shared client for this persist_directory
         try:
-            self.client = chromadb.PersistentClient(
-                path=str(self.persist_directory),
-                settings=ChromaSettings(
-                    anonymized_telemetry=False,
-                    allow_reset=True,
-                )
-            )
+            self.client = _get_or_create_client(str(self.persist_directory))
         except Exception as e:
             raise RuntimeError(
                 f"Failed to initialize ChromaDB client at '{self.persist_directory}': {e}"
@@ -420,17 +443,25 @@ class ChromaStore(BaseVectorStore):
             For simplicity, we currently support only exact equality matches.
             Future enhancement: support complex filters.
         """
-        # Simple implementation: exact equality matches only
-        # For complex filters (e.g., {'score': {'$gt': 0.5}}), extend this method
+        # Simple implementation: exact equality matches, plus list -> $in.
+        # For other complex filters (e.g., {'score': {'$gt': 0.5}}), extend this method.
         where = {}
         for key, value in filters.items():
             if isinstance(value, dict):
                 # Already in ChromaDB operator format (e.g., {'$eq': 'value'})
                 where[key] = value
+            elif isinstance(value, list):
+                # ChromaDB rejects a bare list as a where-value (raises
+                # "Expected where value to be a str, int, float, or operator
+                # expression") — membership needs the explicit $in operator.
+                # Real case this fixes: query_knowledge_hub.py's hierarchical
+                # retrieval narrowing passes {"source_ref": [doc_id, ...]} to
+                # scope a search to a handful of documents.
+                where[key] = {"$in": value}
             else:
                 # Simple equality
                 where[key] = value
-        
+
         return where
     
     def get_collection_stats(self) -> Dict[str, Any]:

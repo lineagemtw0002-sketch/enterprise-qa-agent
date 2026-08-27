@@ -1,0 +1,550 @@
+"""智能运维模块目标越界判定 —— 边界与越界侧补充覆盖。
+
+配套 `tests/unit/test_aiops_scope.py`（正常路径 + 每类动作一条越界用例）。
+本文件只补那份没覆盖的部分，不重复它已经测过的用例：
+
+1. **边界值两侧成对**（等于上界/上界+1、等于下界/下界-1），而不是只测"明显越界"；
+2. **管理员配置本身畸形**（缺字段、类型不对、空列表）时的 fail-open / fail-closed 方向；
+3. **`docs/aiops_module_design.md` §10.3 点名的"排除规则优先"**，从"能不能被绕过"
+   这个角度再压一遍，而不是只测"正常写法下排除确实优先"。
+
+## 判别力自查（`CLAUDE.md` §7.2：写完测试问"它在旧实现下会失败吗"）
+
+这是新代码，没有"旧实现"可比，所以判别力按"**把被测那行删掉/写反，这条测试会不会
+变红**"来自查。逐条标注在每个类的 docstring 里，分两档：
+
+- **判别式**：能钉死一个具体的实现选择（`is None` vs `not`、`>` vs `>=`、
+  排除/允许两个循环的先后顺序、isinstance 校验在不在）。改掉那行就变红。
+- **回归保护**：当前行为的快照，改实现不一定变红（比如"缺字段返回 allowed=False
+  而不是抛异常"这种契约），价值在于防止将来无意改变契约。
+
+## 已确认缺陷的处置（2026-08-26 更新）
+
+原始版本用 `xfail(strict=True)` 记录了 8 条已确认的实现与设计不符
+（详见提交 `0ea692e`）。同一天，归属会话（张学友）修复了其中 **7 条**
+（`aiops_scope.py::_check_clean_disk` 补路径穿越防护 + 排除侧 isinstance
+校验，`_check_scale_instances`/`_check_rollback_deployment` 补数值类型
+校验，`validate_approval_timeout_minutes` 补 bool/非 int 拒绝），XPASS
+后已摘除对应 xfail 标记（就地保留原有断言，改成纯粹的回归保护）。
+
+~~剩 1 条仍是 xfail，未修~~ **2026-08-27 已修复并摘除标记**：`TestScaleInstancesBoundaries::
+test_self_reported_baseline_cannot_inflate_the_ceiling`——baseline
+自指问题是设计层缺口（scope schema 没规定 baseline 该从哪来，不是单纯的
+实现手滑），需要先过设计评审再动代码，本次未擅自决定修法，见 `CLAUDE.md` §5。
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from src.ragent_backend.aiops_scope import (
+    MAX_APPROVAL_TIMEOUT_MINUTES,
+    MIN_APPROVAL_TIMEOUT_MINUTES,
+    InvalidApprovalTimeout,
+    InvalidScopeConfig,
+    check_target_in_scope,
+    validate_approval_timeout_minutes,
+)
+
+
+# ==================== clean_disk：排除规则优先（§10.3） ====================
+
+
+class TestExclusionRuleCannotBeBypassed:
+    """§10.3 那条"排除规则优先生效，不是先匹配到哪条算哪条"。
+
+    判别力：`test_exclusion_wins_when_exclusion_listed_after_allow` 和
+    `test_exclusion_wins_regardless_of_pattern_order` 是**判别式**——把
+    `_check_clean_disk` 里两个 for 循环的顺序对调（这正是 §10.3 警告的
+    "凭直觉搞错"的写法），这两条立刻变红。
+
+    `test_path_traversal_defeats_exclusion_rule` 是**已确认的 bug**，见类内注释。
+    """
+
+    SCOPE = {
+        "allowed_path_patterns": ["/var/lib/*"],
+        "excluded_path_patterns": ["/var/lib/postgresql/*"],
+    }
+
+    def test_exclusion_wins_when_exclusion_listed_after_allow(self):
+        # 允许模式 `/var/lib/*` 先命中，排除模式 `/var/lib/postgresql/*` 后命中，
+        # "先匹配到哪条算哪条"的实现会放行 —— 必须拒绝。
+        result = check_target_in_scope(
+            "clean_disk", self.SCOPE, {"path": "/var/lib/postgresql/data/base.dat"}
+        )
+        assert result.allowed is False
+        assert "排除" in result.reason
+
+    def test_exclusion_wins_regardless_of_pattern_order(self):
+        """把排除模式写在允许模式"前面"还是"后面"都不该影响结论——
+        优先级来自代码里两个循环的顺序，不来自管理员配置的书写顺序。"""
+        scope_a = {
+            "allowed_path_patterns": ["/data/*", "/data/prod/*"],
+            "excluded_path_patterns": ["/data/prod/*"],
+        }
+        scope_b = {
+            "allowed_path_patterns": ["/data/prod/*", "/data/*"],
+            "excluded_path_patterns": ["/data/prod/*"],
+        }
+        for scope in (scope_a, scope_b):
+            result = check_target_in_scope("clean_disk", scope, {"path": "/data/prod/x.dat"})
+            assert result.allowed is False, f"排除规则未生效：{scope}"
+
+    def test_exclusion_wins_even_when_allow_pattern_is_wildcard_all(self):
+        # 管理员把允许模式配成 `*`（全放开）时，排除规则是唯一的闸门。
+        scope = {"allowed_path_patterns": ["*"], "excluded_path_patterns": ["/etc/*"]}
+        result = check_target_in_scope("clean_disk", scope, {"path": "/etc/shadow"})
+        assert result.allowed is False
+
+    def test_path_traversal_defeats_exclusion_rule(self):
+        """`/var/log/app/../../lib/postgresql/data/base.dat` 实际指向被排除的
+        postgres 数据目录——**已于 2026-08-26 修复**（`aiops_scope.py::_check_clean_disk`
+        新增 `if ".." in path.split("/")` 拒绝 + `posixpath.normpath` 规范化）。
+        本条曾以 `xfail(strict=True)` 记录该 bug，XPASS 后已摘除标记，见 `CLAUDE.md` §5。
+        """
+        scope = {
+            "allowed_path_patterns": ["/var/log/app/*"],
+            "excluded_path_patterns": ["/var/lib/postgresql/*"],
+        }
+        result = check_target_in_scope(
+            "clean_disk", scope, {"path": "/var/log/app/../../lib/postgresql/data/base.dat"}
+        )
+        assert result.allowed is False
+
+    def test_star_currently_crosses_directory_separator(self):
+        """回归保护（不是判别式）：`fnmatch` 的 `*` 会跨越 `/`，所以
+        `/var/log/app/*.log` 也匹配任意深度的子目录。
+
+        这是上面那条穿越 bug 的同一个根因（字面串 glob，没有路径语义）。
+        单独钉住当前行为：如果将来改成路径语义的匹配（`*` 不跨 `/`），
+        这条会变红，提醒那次改动**同时改变了允许侧的宽窄**，不只是修穿越。
+        """
+        scope = {"allowed_path_patterns": ["/var/log/app/*.log"], "excluded_path_patterns": []}
+        result = check_target_in_scope(
+            "clean_disk", scope, {"path": "/var/log/app/a/b/c/deep.log"}
+        )
+        assert result.allowed is True
+
+
+class TestCleanDiskPathBoundaries:
+    """判别力：`test_missing_exclusion_key_defaults_to_no_exclusion` 是**判别式**
+    （`scope_config.get("excluded_path_patterns", [])` 的默认值一旦改成 `None`
+    就会抛 TypeError）；其余是**回归保护**，钉住"缺字段/空列表时往哪边倒"。
+    """
+
+    def test_empty_allowlist_denies_everything(self):
+        # fail-closed：空白名单 = 什么都不许清，不是"没配就是不限制"。
+        result = check_target_in_scope(
+            "clean_disk",
+            {"allowed_path_patterns": [], "excluded_path_patterns": []},
+            {"path": "/var/log/app/x.log"},
+        )
+        assert result.allowed is False
+
+    def test_missing_exclusion_key_defaults_to_no_exclusion(self):
+        # excluded_path_patterns 是可选字段，缺失时不应炸，也不应变成"全排除"。
+        result = check_target_in_scope(
+            "clean_disk", {"allowed_path_patterns": ["/var/log/*"]}, {"path": "/var/log/x.log"}
+        )
+        assert result.allowed is True
+
+    @pytest.mark.parametrize("path", ["", None])
+    def test_missing_or_empty_path_is_denied_not_raised(self, path):
+        # 提议缺 path 是"提议不合法"（allowed=False），不是"管理员配置错"（抛异常），
+        # 这两种失败必须能被调用方区分 —— 见 check_target_in_scope 的 docstring。
+        result = check_target_in_scope(
+            "clean_disk", {"allowed_path_patterns": ["*"]}, {"path": path}
+        )
+        assert result.allowed is False
+
+    def test_matching_is_case_sensitive_on_posix(self):
+        # 回归保护：大小写不同的路径不该被当成同一个路径放行。
+        result = check_target_in_scope(
+            "clean_disk",
+            {"allowed_path_patterns": ["/var/log/app/*.log"], "excluded_path_patterns": []},
+            {"path": "/VAR/LOG/APP/x.LOG"},
+        )
+        assert result.allowed is False
+
+
+class TestMalformedScopeConfigFailsClosed:
+    """管理员把 scope_config 配错时，往哪边倒。
+
+    判别力：`test_allowlist_as_bare_string_is_rejected` 是**判别式**——去掉
+    `isinstance(allowed_patterns, list)` 这行，字符串会被逐字符迭代，测试变红。
+
+    `test_exclusion_as_bare_string_silently_disables_exclusion` 是**已确认 bug**：
+    允许侧有 isinstance 校验、排除侧没有，两侧不对称，而排除侧才是安全侧。
+    """
+
+    def test_allowlist_as_bare_string_is_rejected(self):
+        with pytest.raises(InvalidScopeConfig):
+            check_target_in_scope(
+                "clean_disk",
+                {"allowed_path_patterns": "/var/log/app/*.log"},
+                {"path": "/var/log/app/x.log"},
+            )
+
+    def test_restart_allowlist_as_bare_string_is_rejected(self):
+        # 如果没有 isinstance 校验，`"order" in "order-service"` 这个子串判断
+        # 会让一个根本不在清单里的服务名通过。
+        with pytest.raises(InvalidScopeConfig):
+            check_target_in_scope(
+                "restart_service", {"allowed_targets": "order-service"}, {"target": "order"}
+            )
+
+    def test_exclusion_as_bare_string_silently_disables_exclusion(self):
+        """管理员漏了方括号，把排除列表写成一个字符串——**已于 2026-08-26 修复**
+        （`_check_clean_disk` 新增与 allowed 侧对称的 isinstance 校验）。
+        本条曾以 `xfail(strict=True)` 记录该 bug，XPASS 后已摘除标记。
+        """
+        with pytest.raises(InvalidScopeConfig):
+            check_target_in_scope(
+                "clean_disk",
+                {
+                    "allowed_path_patterns": ["/var/lib/*"],
+                    "excluded_path_patterns": "/var/lib/postgresql",
+                },
+                {"path": "/var/lib/postgresql/data/base.dat"},
+            )
+
+    def test_exclusion_as_none_is_rejected_as_config_error(self):
+        # 同上，excluded_path_patterns=None 曾漏出裸 TypeError，已随上一条一并修复。
+        with pytest.raises(InvalidScopeConfig):
+            check_target_in_scope(
+                "clean_disk",
+                {"allowed_path_patterns": ["/var/lib/*"], "excluded_path_patterns": None},
+                {"path": "/var/lib/postgresql/data/base.dat"},
+            )
+
+
+# ==================== restart_service：allowed_targets ====================
+
+
+class TestRestartServiceTargetMatching:
+    """判别力：`test_substring_of_allowed_target_is_denied` 和
+    `test_empty_allowlist_denies_everything` 是**判别式**——把精确匹配换成
+    前缀/子串匹配、或者给空清单加"没配就放行"的捷径，都会变红。
+    """
+
+    SCOPE = {"allowed_targets": ["order-service", "payment-gateway"]}
+
+    def test_substring_of_allowed_target_is_denied(self):
+        # order-service-canary 是另一个服务，不能因为前缀相同就被放行。
+        result = check_target_in_scope(
+            "restart_service", self.SCOPE, {"target": "order-service-canary"}
+        )
+        assert result.allowed is False
+
+    def test_prefix_of_allowed_target_is_denied(self):
+        result = check_target_in_scope("restart_service", self.SCOPE, {"target": "order"})
+        assert result.allowed is False
+
+    def test_case_variant_is_denied(self):
+        result = check_target_in_scope("restart_service", self.SCOPE, {"target": "Order-Service"})
+        assert result.allowed is False
+
+    def test_empty_allowlist_denies_everything(self):
+        result = check_target_in_scope(
+            "restart_service", {"allowed_targets": []}, {"target": "order-service"}
+        )
+        assert result.allowed is False
+
+    def test_missing_target_key_is_denied_not_raised(self):
+        result = check_target_in_scope("restart_service", self.SCOPE, {})
+        assert result.allowed is False
+
+    def test_every_listed_target_is_allowed(self):
+        for target in self.SCOPE["allowed_targets"]:
+            assert check_target_in_scope("restart_service", self.SCOPE, {"target": target}).allowed
+
+
+# ==================== scale_instances：上下界 ====================
+
+
+class TestScaleInstancesBoundaries:
+    """判别力：`test_zero_min_instances_is_honoured_not_treated_as_missing` 是
+    **判别式**——把 `min_instances is None` 写成 `not min_instances`（一个很常见的
+    手滑），这条立刻变红，而现有 test_aiops_scope.py 里的用例全都发现不了。
+
+    `test_at_lower_bound_allowed` / `test_one_below_lower_bound_denied` 成对，钉死
+    `<` vs `<=`；`test_fractional_upper_bound_*` 成对，钉死非整数上界的取整行为
+    （当前是不取整，4.5 就是 4.5）。
+    """
+
+    SCOPE = {"min_instances": 2, "max_multiplier_of_baseline": 2.0}
+
+    def test_at_lower_bound_allowed(self):
+        result = check_target_in_scope(
+            "scale_instances", self.SCOPE, {"target_instances": 2, "measured_baseline_instances": 4}
+        )
+        assert result.allowed is True
+
+    def test_one_below_lower_bound_denied(self):
+        result = check_target_in_scope(
+            "scale_instances", self.SCOPE, {"target_instances": 1, "measured_baseline_instances": 4}
+        )
+        assert result.allowed is False
+
+    def test_one_above_upper_bound_denied(self):
+        # 基线 4 × 2.0 = 8，9 越界。
+        result = check_target_in_scope(
+            "scale_instances", self.SCOPE, {"target_instances": 9, "measured_baseline_instances": 4}
+        )
+        assert result.allowed is False
+
+    def test_fractional_upper_bound_at_floor_allowed(self):
+        # 基线 3 × 1.5 = 4.5，4 <= 4.5 放行。
+        scope = {"min_instances": 1, "max_multiplier_of_baseline": 1.5}
+        result = check_target_in_scope(
+            "scale_instances", scope, {"target_instances": 4, "measured_baseline_instances": 3}
+        )
+        assert result.allowed is True
+
+    def test_fractional_upper_bound_above_ceiling_denied(self):
+        scope = {"min_instances": 1, "max_multiplier_of_baseline": 1.5}
+        result = check_target_in_scope(
+            "scale_instances", scope, {"target_instances": 5, "measured_baseline_instances": 3}
+        )
+        assert result.allowed is False
+
+    def test_zero_min_instances_is_honoured_not_treated_as_missing(self):
+        """`min_instances: 0`（允许缩容到 0，即完全下线）是一个合法配置，
+        0 是 falsy 但不是"没配"——实现必须用 `is None` 判断存在性。"""
+        scope = {"min_instances": 0, "max_multiplier_of_baseline": 2.0}
+        result = check_target_in_scope(
+            "scale_instances", scope, {"target_instances": 0, "measured_baseline_instances": 4}
+        )
+        assert result.allowed is True
+
+    def test_zero_multiplier_is_honoured_not_treated_as_missing(self):
+        # max_multiplier_of_baseline: 0 = "只许缩不许扩"，同样是 falsy 但合法。
+        scope = {"min_instances": 0, "max_multiplier_of_baseline": 0}
+        assert (
+            check_target_in_scope(
+                "scale_instances", scope, {"target_instances": 1, "measured_baseline_instances": 4}
+            ).allowed
+            is False
+        )
+
+    @pytest.mark.parametrize(
+        "proposed",
+        [
+            {"target_instances": 3},
+            {"baseline_instances": 4},
+            {},
+        ],
+    )
+    def test_missing_proposal_fields_denied_not_raised(self, proposed):
+        # 回归保护：提议缺字段是"提议不合法"，不是"管理员配置错"。
+        result = check_target_in_scope("scale_instances", self.SCOPE, proposed)
+        assert result.allowed is False
+
+    @pytest.mark.parametrize(
+        "scope",
+        [
+            {"min_instances": 1},
+            {"max_multiplier_of_baseline": 2.0},
+            {},
+        ],
+    )
+    def test_missing_config_fields_raise_config_error(self, scope):
+        with pytest.raises(InvalidScopeConfig):
+            check_target_in_scope(
+                "scale_instances", scope, {"target_instances": 3, "baseline_instances": 4}
+            )
+
+    def test_self_reported_baseline_cannot_inflate_the_ceiling(self):
+        """AI 自报"基线 5000、扩容到 10000"（倍数刚好 2.0），必须拒绝。
+
+        §3.3.1 举的反例正是"拒绝明显异常值（如『扩容到 10000』）"。
+        这条曾以 `xfail(strict=True)` 记录该缺陷（2026-08-26 变异测试发现），
+        **2026-08-27 用户拍板修复后摘除标记**：基线改为只认平台实测值。
+
+        **它在旧实现下会失败吗**：会。旧实现读的是 `baseline_instances`，
+        5000 × 2.0 = 10000，`target_instances=10000` 恰好落在上界上被判合法。
+        """
+        result = check_target_in_scope(
+            "scale_instances",
+            {"min_instances": 1, "max_multiplier_of_baseline": 2.0},
+            {"target_instances": 10000, "baseline_instances": 5000},
+        )
+        assert result.allowed is False
+
+    def test_measured_baseline_overrides_the_self_reported_one(self):
+        """同时给出自报值和实测值时，**以实测值为准**。
+
+        这是这次修复的核心断言：模型可以继续在提议里写它以为的基线
+        （那是个有用的信号），但判定一个字都不看它。
+        """
+        result = check_target_in_scope(
+            "scale_instances",
+            {"min_instances": 1, "max_multiplier_of_baseline": 2.0},
+            {"target_instances": 10000, "baseline_instances": 5000,
+             "measured_baseline_instances": 3},
+        )
+        assert result.allowed is False
+        assert "实测基线 3" in (result.reason or "")
+
+    def test_missing_measured_baseline_denies_instead_of_falling_back(self):
+        """**测不到基线时拒绝，不回退到自报值。**
+
+        回退等于让这个防护在最需要它的时候（连接器离线、不支持上报实例数）
+        自动失效——而那恰恰是攻击者/幻觉最容易赶上的时机。
+        跟白名单"没配置 = 一律不允许"是同一个默认。
+        """
+        result = check_target_in_scope(
+            "scale_instances",
+            {"min_instances": 1, "max_multiplier_of_baseline": 2.0},
+            {"target_instances": 4, "baseline_instances": 3},   # 自报值本来"合法"
+        )
+        assert result.allowed is False
+        assert "实测基线" in (result.reason or "") or "无法确认" in (result.reason or "")
+
+    def test_measured_baseline_allows_a_reasonable_scale_up(self):
+        """别把正常扩容也拦了——实测基线 3、扩到 6、倍数 2.0，应放行。"""
+        result = check_target_in_scope(
+            "scale_instances",
+            {"min_instances": 1, "max_multiplier_of_baseline": 2.0},
+            {"target_instances": 6, "measured_baseline_instances": 3},
+        )
+        assert result.allowed is True
+
+    @pytest.mark.parametrize("bad", [0, -1])
+    def test_non_positive_measured_baseline_is_refused(self, bad):
+        """实测到 0 个实例（服务已经全挂了？）时不能据此算上界——
+        0 × 任何倍数都是 0，会把所有扩容都拦下并给出一个看不懂的理由。
+        显式拒绝并说明原因，比算出一个荒谬的上界强。"""
+        result = check_target_in_scope(
+            "scale_instances",
+            {"min_instances": 1, "max_multiplier_of_baseline": 2.0},
+            {"target_instances": 4, "measured_baseline_instances": bad},
+        )
+        assert result.allowed is False
+
+
+# ==================== rollback_deployment：max_versions_back ====================
+
+
+class TestRollbackDeploymentBoundaries:
+    """判别力：`test_zero_max_versions_back_denies_everything` 是**判别式**
+    （同样钉 `is None` vs `not`）；上下界成对的两条钉 `>` vs `>=`。
+    其余为回归保护。
+    """
+
+    SCOPE = {"max_versions_back": 5}
+
+    def test_one_above_bound_denied(self):
+        assert (
+            check_target_in_scope(
+                "rollback_deployment", self.SCOPE, {"target_version_offset": 6}
+            ).allowed
+            is False
+        )
+
+    def test_minimum_valid_offset_allowed(self):
+        # 回滚 1 个版本是最小的合法回滚。
+        assert (
+            check_target_in_scope(
+                "rollback_deployment", self.SCOPE, {"target_version_offset": 1}
+            ).allowed
+            is True
+        )
+
+    def test_negative_offset_denied(self):
+        # 负 offset = "回滚到未来的版本"，无意义，必须拒绝而不是当成 0 处理。
+        assert (
+            check_target_in_scope(
+                "rollback_deployment", self.SCOPE, {"target_version_offset": -3}
+            ).allowed
+            is False
+        )
+
+    def test_zero_max_versions_back_denies_everything(self):
+        """`max_versions_back: 0` = "这个连接器不允许回滚"，是合法配置，
+        不能因为 0 是 falsy 就被当成"没配置"抛 InvalidScopeConfig。"""
+        result = check_target_in_scope(
+            "rollback_deployment", {"max_versions_back": 0}, {"target_version_offset": 1}
+        )
+        assert result.allowed is False
+        assert "上限 0" in result.reason
+
+    def test_missing_offset_denied_not_raised(self):
+        assert (
+            check_target_in_scope("rollback_deployment", self.SCOPE, {}).allowed is False
+        )
+
+
+# ==================== 数值型配置的类型契约 ====================
+
+
+class TestNumericScopeConfigTypeContract:
+    """`check_target_in_scope` 的 docstring 承诺调用方能区分两种失败：
+    `InvalidScopeConfig`（管理员配错）和 `allowed=False`（AI 提议越界）。
+    数值字段被配成字符串时，当前实现两种都不是——漏出裸 `TypeError`。
+
+    这三条都是**已确认 bug**（契约被打破），以 xfail(strict=True) 记录。
+    """
+
+    def test_string_multiplier_raises_config_error(self):
+        # 已于 2026-08-26 修复（新增 `_require_config_number` 数值类型校验）。
+        with pytest.raises(InvalidScopeConfig):
+            check_target_in_scope(
+                "scale_instances",
+                {"min_instances": 1, "max_multiplier_of_baseline": "2.0"},
+                {"target_instances": 10, "baseline_instances": 4},
+            )
+
+    def test_string_max_versions_back_raises_config_error(self):
+        # 已于 2026-08-26 修复（同一个 `_require_config_number` 校验覆盖）。
+        with pytest.raises(InvalidScopeConfig):
+            check_target_in_scope(
+                "rollback_deployment", {"max_versions_back": "5"}, {"target_version_offset": 6}
+            )
+
+
+# ==================== approval_timeout_minutes（§10.4） ====================
+
+
+class TestApprovalTimeoutBoundaryEdges:
+    """现有 test_aiops_scope.py 已覆盖 5 / 1440 / 4 / 1441 / 0 / 负数。
+    这里补的是**类型侧**和**常量本身**，不重复数值边界。
+
+    判别力：`test_bounds_match_design_document` 是判别式（改常量即变红）；
+    `test_returns_the_same_value_it_validated` 是回归保护（钉住"校验通过就原值返回，
+    不静默夹紧"这条 docstring 里写明的契约 —— 一旦有人改成 clamp 就变红）。
+    """
+
+    def test_bounds_match_design_document(self):
+        # §10.4：默认 30 分钟，可配置范围 5 分钟 – 24 小时。
+        assert MIN_APPROVAL_TIMEOUT_MINUTES == 5
+        assert MAX_APPROVAL_TIMEOUT_MINUTES == 24 * 60
+
+    @pytest.mark.parametrize("minutes", [5, 30, 60, 1439, 1440])
+    def test_returns_the_same_value_it_validated(self, minutes):
+        assert validate_approval_timeout_minutes(minutes) == minutes
+
+    @pytest.mark.parametrize("minutes", [4, 1441, 10**9, -1])
+    def test_out_of_range_rejected_not_clamped(self, minutes):
+        # 静默夹紧会让管理员以为自己配的值生效了 —— 必须抛。
+        with pytest.raises(InvalidApprovalTimeout):
+            validate_approval_timeout_minutes(minutes)
+
+    def test_boolean_is_rejected(self):
+        # True/False 在 Python 里是 int 子类；恰好都落在范围外所以会被拒，
+        # 回归保护：万一将来下界改到 0 或 1，这条会提醒 bool 不该被当成合法分钟数。
+        with pytest.raises(InvalidApprovalTimeout):
+            validate_approval_timeout_minutes(True)
+        with pytest.raises(InvalidApprovalTimeout):
+            validate_approval_timeout_minutes(False)
+
+    def test_string_minutes_raises_domain_error(self):
+        # 已于 2026-08-26 修复：`validate_approval_timeout_minutes` 新增
+        # `isinstance(minutes, bool) or not isinstance(minutes, int)` 校验。
+        with pytest.raises(InvalidApprovalTimeout):
+            validate_approval_timeout_minutes("30")
+
+    def test_fractional_minutes_rejected(self):
+        # 同上一条修复覆盖：非 int（含 float）一律拒绝，不再原样接受 30.5。
+        with pytest.raises(InvalidApprovalTimeout):
+            validate_approval_timeout_minutes(30.5)

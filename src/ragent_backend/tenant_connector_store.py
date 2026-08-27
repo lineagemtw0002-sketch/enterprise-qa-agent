@@ -17,10 +17,16 @@
 - 具体怎么发起委托请求（那是 `query_knowledge_hub.py` 的事，这里只管"查连接器
   配置"这一件事）。
 - 组织归属（`org_store.py` 的事）。
+
+安全（2026-08-26 P0 修复）：
+- `auth_config` 落库前会被加密，密钥/存储格式/新旧数据兼容策略见
+  `connector_crypto.py` 模块 docstring。存量明文数据的一次性迁移见
+  `scripts/migrate_connector_auth_config_encryption.py`。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -29,6 +35,14 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import asyncpg
+
+from src.ragent_backend.db_pool import get_shared_pool
+
+from src.ragent_backend.connector_crypto import (
+    build_fernet,
+    decrypt_auth_config,
+    encrypt_auth_config,
+)
 
 CAPABILITY_KNOWLEDGE_BASE = "knowledge_base"
 CAPABILITY_ATTENDANCE = "attendance"
@@ -70,15 +84,29 @@ class TenantConnector:
 class TenantConnectorStore:
     """租户连接器存储 (PostgreSQL)。"""
 
-    def __init__(self) -> None:
-        self._pool: Optional[asyncpg.Pool] = None
+    # 类级别共享连接池，见 store.py 同名字段的注释——调用方经常每次都 new 一个
+    # 新实例，池必须挂在类属性上才不会被重复创建、打满 Postgres 连接数。
+    _pool: Optional[asyncpg.Pool] = None
+    _pool_lock = asyncio.Lock()
+
+    def __init__(self, encryption_key: Optional[str] = None) -> None:
         self._dsn = os.getenv("RAGENT_POSTGRES_URL", "postgresql://postgres:postgres@localhost:5432/ragent")
+        # 密钥缺失/不安全在这里就会 raise RuntimeError 拒绝构造——`app.py::create_app`
+        # 第一批语句里就 `TenantConnectorStore()`，而 `create_app()` 是进程启动时
+        # 调一次的入口，效果等价于"进程启动即 fail-fast"，跟 `auth.py` 的
+        # `resolve_jwt_secret` 是同一种模式，只是触发时机是"启动时构造这个 store"
+        # 而不是"导入模块"。`encryption_key` 参数仅供单测注入，生产路径一律走
+        # 环境变量 `RAGENT_CONNECTOR_ENCRYPTION_KEY`。
+        self._fernet = build_fernet(key=encryption_key)
 
     async def _get_pool(self) -> asyncpg.Pool:
         if self._pool is not None:
             return self._pool
-        self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
-        await self._ensure_schema()
+        async with self._pool_lock:
+            if self._pool is not None:
+                return self._pool
+            type(self)._pool = await get_shared_pool(self._dsn)
+            await self._ensure_schema()
         return self._pool
 
     async def _ensure_schema(self) -> None:
@@ -115,9 +143,14 @@ class TenantConnectorStore:
         "last_latency_ms, last_error"
     )
 
-    @staticmethod
-    def _row_to_connector(row: asyncpg.Record) -> TenantConnector:
-        auth_config = row["auth_config"]
+    def _row_to_connector(self, row: asyncpg.Record) -> TenantConnector:
+        auth_config_raw = row["auth_config"]
+        auth_config_stored = (
+            json.loads(auth_config_raw) if isinstance(auth_config_raw, str) else dict(auth_config_raw)
+        )
+        # decrypt_auth_config 自己会分流：新数据是密文包装就解密，存量明文数据
+        # （迁移脚本跑之前）原样透传——见 connector_crypto.py 模块 docstring。
+        auth_config = decrypt_auth_config(auth_config_stored, self._fernet)
         field_mapping = row["field_mapping"]
         return TenantConnector(
             connector_id=row["id"],
@@ -125,7 +158,7 @@ class TenantConnectorStore:
             capability=row["capability"],
             connector_type=row["connector_type"],
             endpoint=row["endpoint"],
-            auth_config=json.loads(auth_config) if isinstance(auth_config, str) else dict(auth_config),
+            auth_config=auth_config,
             remote_tool_name=row["remote_tool_name"],
             field_mapping=json.loads(field_mapping) if isinstance(field_mapping, str) else dict(field_mapping),
             is_active=row["is_active"],
@@ -202,6 +235,9 @@ class TenantConnectorStore:
         now = time.time()
         auth_config = auth_config or {}
         field_mapping = field_mapping or {}
+        # 落库前一律加密——调用方（app.py 的管理端点、种子脚本）传进来的还是明文
+        # dict，这里是唯一的加密点，跟"唯一的解密点在 _row_to_connector"对称。
+        encrypted_auth_config = encrypt_auth_config(auth_config, self._fernet)
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 f"""
@@ -219,11 +255,13 @@ class TenantConnectorStore:
                 RETURNING {self._COLUMNS}
                 """,
                 connector_id, org_id, capability, connector_type, endpoint,
-                json.dumps(auth_config), remote_tool_name, json.dumps(field_mapping), is_active, now,
+                json.dumps(encrypted_auth_config), remote_tool_name, json.dumps(field_mapping), is_active, now,
             )
         return self._row_to_connector(row)
 
     async def close(self) -> None:
-        if self._pool is not None:
-            await self._pool.close()
-            self._pool = None
+        # 池现在是跨 14 个 Store 共享的（db_pool.py，P1-2），这里只清掉
+        # 本 Store 持有的引用，不触发真实关闭——那会把其它 Store 正在用的
+        # 连接一起关掉。真正关闭见 db_pool.close_shared_pools()，只在 app
+        # 关闭时调一次。
+        type(self)._pool = None

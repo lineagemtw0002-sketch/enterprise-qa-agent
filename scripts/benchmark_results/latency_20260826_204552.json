@@ -1,0 +1,281 @@
+{
+  "generated_at": "2026-08-26T20:45:52",
+  "script": "scripts/benchmark_latency.py",
+  "repeat_per_scenario": 3,
+  "backend_startup_s": 29.223,
+  "code_state": {
+    "commit": "a328627",
+    "commit_full": "a328627bb79690ea8501d3b75f15d7ccd47b4a0f",
+    "branch": "claude/vigilant-bartik-d8e279",
+    "dirty_paths": [],
+    "is_clean": true,
+    "warning": "工作区干净，可由 commit hash 复现"
+  },
+  "runtime_env": {
+    "python": "3.12.13",
+    "platform": "darwin",
+    "llm_model": "<settings.yaml>",
+    "intent_model": "qwen2.5-1.5b-router",
+    "generate_max_tokens": "<default>",
+    "ragent_debug": "true"
+  },
+  "baseline_source": "docs/latency_report.md (2026-08-23)",
+  "not_covered": [
+    "并发 / 多用户 / 排队行为——全部为串行单用户测量",
+    "真实数据量（几个 G 文档）下的表现——每库仅约 20 块测试数据",
+    "非本机硬件（Apple M4 16GB + 本地 Ollama）",
+    "前端渲染耗时——只测到 SSE 事件，不含浏览器侧",
+    "网络往返——ASGI 进程内调用，没有真实 HTTP/TLS 开销"
+  ],
+  "overall_percentiles": {
+    "caveat": "6 场景等权重合成分布，非真实流量分布；串行单用户，无并发",
+    "sample_size": 6,
+    "total_s": {
+      "p50": 9.856,
+      "p95": 24.778,
+      "max": 28.104
+    },
+    "total_s_warm_only": {
+      "p50": 9.655,
+      "p95": 9.91
+    },
+    "ttft_s": {
+      "p50": 6.444,
+      "p95": 21.156,
+      "max": 24.41
+    },
+    "ttft_s_warm_only": {
+      "p50": 6.144,
+      "p95": 6.585
+    }
+  },
+  "scenarios": [
+    {
+      "scenario_id": "kb_hit",
+      "label": "检索命中",
+      "username": "bob_acme",
+      "query": "远程办公每个月最多几天",
+      "note": "单知识库（acme_hr_admin_kb，22 块）命中",
+      "runs_total": 3,
+      "runs_ok": 3,
+      "errors": [],
+      "legacy_2026_08_23": {
+        "total_s": 20.4,
+        "ttft_s": 16.0
+      },
+      "cold": {
+        "ttft_s": 24.41,
+        "total_s": 28.104,
+        "stages": {
+          "archive": 0.0,
+          "generate": 13.56,
+          "intent": 3.693,
+          "memory_manage": 0.001,
+          "session": 0.005,
+          "tool_subgraph": 10.464
+        }
+      },
+      "warm_median": {
+        "ttft_s": 5.596,
+        "total_s": 8.906,
+        "stages": {
+          "archive": 0.0,
+          "generate": 5.432,
+          "intent": 2.395,
+          "memory_manage": 0.0,
+          "session": 0.001,
+          "tool_subgraph": 1.042
+        },
+        "answer_chars": 169.0
+      },
+      "all_median": {
+        "ttft_s": 6.645,
+        "total_s": 9.933,
+        "answer_chars": 169.0
+      },
+      "raw_runs": [
+        {
+          "run_index": 0,
+          "phase": "cold",
+          "ttft_s": 24.41,
+          "total_s": 28.104,
+          "answer_chars": 169,
+          "token_count": 66,
+          "answer_preview": "根据企业知识库中的信息，Acme 有限公司正式员工每月远程办公天数不超过 8 天。试用期员工不适用远程办公。\n\n具体规定如下：\n- **文档来源**：`ACME-HR-006_远程办公管理规定.txt`\n- **相关规定**：正式员工每月远程办公天数上限为 8 天，试用期员工暂不适用远程办公。\n\n因此，远程办公每个月最",
+          "model_id": "qwen2.5:7b",
+          "kb_sources": [
+            "acme_hr_admin_kb"
+          ],
+          "stages": {
+            "session": 0.005,
+            "intent": 3.693,
+            "tool_subgraph": 10.464,
+            "generate": 13.56,
+            "memory_manage": 0.001,
+            "archive": 0.0
+          },
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "phase": "warm",
+          "ttft_s": 6.645,
+          "total_s": 9.933,
+          "answer_chars": 169,
+          "token_count": 66,
+          "answer_preview": "根据企业知识库中的信息，Acme 有限公司正式员工每月远程办公天数不超过 8 天。试用期员工不适用远程办公。\n\n具体规定如下：\n- **文档来源**：`ACME-HR-006_远程办公管理规定.txt`\n- **相关规定**：正式员工每月远程办公天数上限为 8 天，试用期员工暂不适用远程办公。\n\n因此，远程办公每个月最",
+          "model_id": "qwen2.5:7b",
+          "kb_sources": [
+            "acme_hr_admin_kb"
+          ],
+          "stages": {
+            "session": 0.001,
+            "intent": 3.183,
+            "tool_subgraph": 1.206,
+            "generate": 5.504,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "phase": "warm",
+          "ttft_s": 4.548,
+          "total_s": 7.88,
+          "answer_chars": 169,
+          "token_count": 66,
+          "answer_preview": "根据企业知识库中的信息，Acme 有限公司正式员工每月远程办公天数不超过 8 天。试用期员工不适用远程办公。\n\n具体规定如下：\n- **文档来源**：`ACME-HR-006_远程办公管理规定.txt`\n- **相关规定**：正式员工每月远程办公天数上限为 8 天，试用期员工暂不适用远程办公。\n\n因此，远程办公每个月最",
+          "model_id": "qwen2.5:7b",
+          "kb_sources": [
+            "acme_hr_admin_kb"
+          ],
+          "stages": {
+            "session": 0.001,
+            "intent": 1.607,
+            "tool_subgraph": 0.877,
+            "generate": 5.36,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        }
+      ]
+    },
+    {
+      "scenario_id": "multi_kb",
+      "label": "多知识库并行检索",
+      "username": "alice_acme",
+      "query": "远程办公每个月最多几天",
+      "note": "org_admin 隐式通配 Acme 全部 6 个知识库，与 kb_hit 同一个问题，用于单库 vs 6 库对比",
+      "runs_total": 3,
+      "runs_ok": 3,
+      "errors": [],
+      "legacy_2026_08_23": {
+        "total_s": 17.9,
+        "ttft_s": 13.5
+      },
+      "cold": {
+        "ttft_s": 11.395,
+        "total_s": 14.799,
+        "stages": {
+          "archive": 0.0,
+          "generate": 10.808,
+          "intent": 1.595,
+          "memory_manage": 0.0,
+          "session": 0.003,
+          "tool_subgraph": 2.362
+        }
+      },
+      "warm_median": {
+        "ttft_s": 6.144,
+        "total_s": 9.655,
+        "stages": {
+          "archive": 0.0,
+          "generate": 5.578,
+          "intent": 1.74,
+          "memory_manage": 0.0,
+          "session": 0.001,
+          "tool_subgraph": 2.133
+        },
+        "answer_chars": 169.0
+      },
+      "all_median": {
+        "ttft_s": 6.242,
+        "total_s": 9.779,
+        "answer_chars": 169.0
+      },
+      "raw_runs": [
+        {
+          "run_index": 0,
+          "phase": "cold",
+          "ttft_s": 11.395,
+          "total_s": 14.799,
+          "answer_chars": 169,
+          "token_count": 66,
+          "answer_preview": "根据企业知识库中的信息，Acme 有限公司正式员工每月远程办公天数不超过 8 天。试用期员工不适用远程办公。\n\n具体规定如下：\n- **文档来源**：`ACME-HR-006_远程办公管理规定.txt`\n- **相关规定**：正式员工每月远程办公天数上限为 8 天，试用期员工暂不适用远程办公。\n\n因此，远程办公每个月最",
+          "model_id": "qwen2.5:7b",
+          "kb_sources": [
+            "acme_hr_admin_kb",
+            "acme_it_support_kb"
+          ],
+          "stages": {
+            "session": 0.003,
+            "intent": 1.595,
+            "tool_subgraph": 2.362,
+            "generate": 10.808,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "phase": "warm",
+          "ttft_s": 6.046,
+          "total_s": 9.531,
+          "answer_chars": 169,
+          "token_count": 66,
+          "answer_preview": "根据企业知识库中的信息，Acme 有限公司正式员工每月远程办公天数不超过 8 天。试用期员工不适用远程办公。\n\n具体规定如下：\n- **文档来源**：`ACME-HR-006_远程办公管理规定.txt`\n- **相关规定**：正式员工每月远程办公天数上限为 8 天，试用期员工暂不适用远程办公。\n\n因此，远程办公每个月最",
+          "model_id": "qwen2.5:7b",
+          "kb_sources": [
+            "acme_hr_admin_kb",
+            "acme_it_support_kb"
+          ],
+          "stages": {
+            "session": 0.001,
+            "intent": 1.654,
+            "tool_subgraph": 2.072,
+            "generate": 5.612,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "phase": "warm",
+          "ttft_s": 6.242,
+          "total_s": 9.779,
+          "answer_chars": 169,
+          "token_count": 66,
+          "answer_preview": "根据企业知识库中的信息，Acme 有限公司正式员工每月远程办公天数不超过 8 天。试用期员工不适用远程办公。\n\n具体规定如下：\n- **文档来源**：`ACME-HR-006_远程办公管理规定.txt`\n- **相关规定**：正式员工每月远程办公天数上限为 8 天，试用期员工暂不适用远程办公。\n\n因此，远程办公每个月最",
+          "model_id": "qwen2.5:7b",
+          "kb_sources": [
+            "acme_hr_admin_kb",
+            "acme_it_support_kb"
+          ],
+          "stages": {
+            "session": 0.001,
+            "intent": 1.826,
+            "tool_subgraph": 2.193,
+            "generate": 5.543,
+            "memory_manage": 0.0,
+            "archive": 0.0
+          },
+          "error": null
+        }
+      ]
+    }
+  ]
+}
