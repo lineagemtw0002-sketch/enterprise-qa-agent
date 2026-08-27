@@ -353,7 +353,10 @@ flowchart TB
 
    **阶段 4（停写 JSON）未做，且现在不该做** —— JSON 仍是多数库的主力读路径。
 
-2e. 🔴 **新发现的 P0：目标规模下 6 库并发查询会触发 GIL convoy，SQLite 比 JSON 还慢**
+2e. 🟢 **已修复并验证通过（2026-08-27）：目标规模下 6 库并发查询会触发 GIL convoy，
+   SQLite 比 JSON 还慢** —— 修法（打分下推进 SQL）已从"实测过但不能直接上"
+   变成生产代码的默认路径，判据放宽为容差比较，详见 §5 对应条目。
+   以下保留 2026-08-26 首次发现时的原始记录：
    （2026-08-26 实测，`scripts/benchmark_bm25_backends.py`；已独立复现两次）
 
    `sqlite3` 在**每一次 `sqlite3_step()`（即每返回一行）**前后释放/重取 GIL。
@@ -835,6 +838,112 @@ flowchart TB
 ---
 
 ## 5. 已修复（防止重新引入）
+
+- ✅ **2026-08-27　P0 第 2e 条：BM25 SQLite 查询打分下推进 SQL，GIL convoy 修复
+  并已切换为生产默认实现**（用户当日明确拍板要做，且同意判据放宽为容差比较；
+  `src/ingestion/storage/bm25_sqlite_store.py::BM25SQLiteStore.query()`）
+
+  背景：§4 第 2e 条记录的 P0 在 2026-08-26 诊断阶段就已经验证过修法
+  （打分下推进 SQL），但**没有直接上**——判据从"完整分数映射逐 bit 相同"
+  变成"带容差"是设计变更，按 §7.1 要先经用户确认。本条就是那次确认后的
+  落地。
+
+  **实现**：`query()` 原来是"Python 侧逐行取数、按 `for term in
+  query_terms` 原序在内存里累加"，改成整段打分逻辑下推进 SQL——
+  `WITH q(term, mult) AS (VALUES ...)` 把「每个查询词在本次查询里出现
+  几次」当乘数、`SUM(q.mult * 单行贡献) ... GROUP BY chunk_id ORDER BY
+  score DESC, chunk_id ASC LIMIT top_k` 一次性交给 SQLite。
+
+  ⚠️ **没有照抄诊断脚本 `_sql_side_query`（`scripts/
+  benchmark_bm25_backends.py`）**——那是它自己 docstring 承认的诊断变体，
+  用 `WHERE term IN (...)`，这是**去重语义**：同一个查询词出现两次只贡献
+  一次分数，与 `BM25Indexer.query`「`for term in query_terms` 不去重，
+  重复词条要重复累加」的既有生产语义不等价。这正是本次要解决的核心问题——
+  `WITH q(term, mult) AS (VALUES ...)` 的 `mult` 乘数把这份"重复几次"的
+  信息带进 SQL，既不去重、也不需要对同一个词重复 JOIN/扫描一遍 postings。
+
+  单行打分表达式（`numerator = tf*(k1+1)`、`denominator = tf +
+  k1*((1-b) + b*(dl/avgdl))`、`idf * (numerator/denominator)`）与
+  `BM25Indexer._calculate_bm25_score` 逐项对应，含 `avg_doc_length==0`
+  时代入 1.0 的边界处理，因此单条 posting 的贡献值本身仍与 JSON 侧位级
+  相同。
+
+  **判据为什么放宽、放宽到多少**：跨词条/跨 posting 的最终求和顺序现在由
+  SQLite 的查询计划决定，不再是 `for term in terms` 的确定原序，浮点加法
+  不满足结合律，`SUM()` 聚合出的分数不再保证逐 bit 相同。实测（本仓库
+  `tests/unit/test_bm25_sqlite_store.py`，随机语料 12 轮 × 6 次查询，
+  751 次比对）**最大相对误差 2.02e-16、最大绝对误差 8.88e-16**——量级
+  正好卡在 IEEE754 double 机器精度（约 2.22e-16）附近，是纯浮点舍入、不是
+  公式算错的证据。判据因此改为 `math.isclose(rel_tol=1e-9, abs_tol=1e-12)`
+  逐项比较分数，**候选集合（哪些 chunk_id 命中）与 top-k 排序不放宽**——
+  容差只用于比较同一个 chunk_id 的分数数值。1e-9 留了近 7 个数量级的
+  余量，如果哪天差值涨到接近这个量级，说明是打分逻辑本身错了，不能靠
+  继续调大容差掩盖。
+
+  **判别力已实测验证**（不是理论推断）：临时把 `term_counts` 改回去重
+  语义（`term_counts[t] = 1`，模拟诊断脚本那种 bug）后重跑测试，
+  `test_duplicate_query_terms_are_counted_twice_on_both_sides` 与新增的
+  `test_duplicate_query_terms_three_times_still_matches_json` 两条应声
+  失败（`-1.23... == -2.46... ± 2.5e-06` 之类的断言错误），确认这两条
+  测试真的在盯"重复计数"这件事，而不是碰巧总是通过；验证完已恢复正确实现，
+  32 条测试（现为 35 条，见下）全绿。
+
+  **新增测试**（`tests/unit/test_bm25_sqlite_store.py`，32→35 条）：
+  `test_duplicate_query_terms_three_times_still_matches_json`（奇数次
+  重复——`x+x` 与 `2*x` 在 IEEE754 下总是位级相同，但 `x+x+x` 与 `3*x`
+  不保证相同，专门盯这个不能靠"乘 2 精确"侥幸过关的场景）、
+  `test_avg_doc_length_zero_falls_back_to_one`（`avg_doc_length==0` 边界，
+  真实生产路径理论上不可达——`num_docs==0` 时也不会有 postings——但直接
+  用 `replace_all` 构造这个不常见的库状态钉住 SQL 侧的边界处理与 Python
+  侧逐字一致）、`test_topk_truncation_boundary_with_many_ties_at_scale`
+  （200 候选、大量同分/近分，在真正跨过 SQL 结果窗口的规模下验证截断
+  边界，而不是碰巧已经很小的结果集）。原有 `TestScoreParity` 全组测试与
+  `TestReadBackendSwitch::test_results_identical_across_backends` 的
+  比较逻辑从 `==` 改为容差比较，新增 `_assert_score_maps_close` 辅助函数。
+
+  **性能验证走的是生产代码本身，不是诊断脚本**：`scripts/
+  benchmark_bm25_backends.py --only parallel` 的 "sqlite" 一栏本来就是
+  通过 `BM25Indexer.load()+query()` 走真实读路径（`RAGENT_BM25_READ_
+  BACKEND=sqlite` 只是强制后端选择，不是另一条代码路径），改完后重新
+  实测两档规模：
+
+  | 规模 | 跨 GIL 边界行数 | 1 线程 | 6 线程 | 6 线程/1 线程 |
+  |---|---|---|---|---|
+  | 10K 块（新，生产代码下推） | 39,237 | 11.97ms | 23.34ms | 1.95x |
+  | 50K 块（新，生产代码下推） | 190,699 | 55.98ms | 93.95ms | 1.68x |
+
+  10K 档与 §4 第 2e 条原始记录的旧表（Python 逐行循环，1 线程 25ms /
+  6 线程 2633ms，103.4x）对比：6 线程绝对值降到 23.34ms（约 **113 倍**），
+  1 线程本身也快了一倍。50K 档原始记录只有一句"更糟（796ms → 13000ms）"、
+  未逐档给出 1/6 线程明细，按同一份诊断脚本的输出格式推断这对应的就是
+  1 线程/6 线程，则 6 线程绝对值从约 13000ms 降到 93.95ms（约 **138 倍**）。
+  两档规模下新实现的 6 线程/1 线程比值都回落到 2x 以内（1.95x / 1.68x），
+  不再是"6 线程比 1 线程还慢"的超线性恶化，convoy 消失，与诊断阶段
+  "跨边界行数 → GIL convoy" 的因果判断一致。进程并行（无共享 GIL）对照组
+  两档下 sqlite 均明显快于 json（10K：1022ms vs 2252ms；50K：3473ms vs
+  21785ms），排除"提速只是少算了什么"的可能。原始数据：
+  `scripts/benchmark_results/bm25_backends_20260827_120158.json`（10K）、
+  `..._121032.json`（50K），语料由 `scripts/seed_large_bm25_corpus.py`
+  现造（`bm25_seed_20260827_120105.json`/`..._120221.json`）。
+
+  **回归**：`tests/unit/test_bm25_sqlite_store.py` 35 条全绿；全量
+  `tests/unit` 2413 passed（较改动前基线 2410 多 3 条，即本次新增的 3 条
+  边界测试；1 skipped/2 xfailed 属已知 flaky 并发竞态测试的正常波动，
+  与本次改动无关）。
+
+  **本次未覆盖的范围**：
+  - 语料是合成的（Zipf 分布），只覆盖延迟/一致性/并行行为，不涉及真实
+    企业停用词表下的检索质量或召回率；
+  - 只在本机测过（macOS，CPython 3.12），未覆盖目标部署硬件；
+  - 没有跑一次真实 HTTP 端到端（用户提问 → 6 库并发检索 → 观察 TTFT），
+    只测到 `BM25Indexer.query()` 这一层；
+  - `avg_doc_length==0` 分支在真实生产数据下理论上不可达，测试是用
+    `replace_all` 直接构造的非常规库状态，不是端到端摄入产生的；
+  - 写路径（`add_documents`/`remove_document`/`replace_all`）本次未改动，
+    仍然逐条镜像写 JSON+SQLite 双份，也没有重新验证；
+  - 没有测多进程部署下多个 worker 各自查询同一份 SQLite 文件的场景
+    （本次验证的"进程并行"对照组是同一批合成语料的独立副本，不是共享
+    同一个 `.sqlite` 文件的多进程读）。
 
 - ✅ **2026-08-27　P0 第 6 条：委托模式链路的提示词注入防护零覆盖 —— 摄入侧+检索侧均已补齐**
 

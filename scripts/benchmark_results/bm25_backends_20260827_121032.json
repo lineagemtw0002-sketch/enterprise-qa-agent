@@ -1,0 +1,178 @@
+{
+  "generated_at": "2026-08-27T12:10:32.288607",
+  "script": "/private/tmp/wt-bm25-pushdown/scripts/benchmark_bm25_backends.py",
+  "code_state": {
+    "commit": "23269a9",
+    "commit_full": "23269a91d1482f504be540cbbae512cb256b4eb6",
+    "branch": "task/bm25-sql-pushdown",
+    "dirty_paths": [
+      "M src/ingestion/storage/bm25_sqlite_store.py",
+      "M tests/unit/test_bm25_sqlite_store.py",
+      "?? scripts/benchmark_results/bm25_backends_20260827_120158.json",
+      "?? scripts/benchmark_results/bm25_seed_20260827_120105.json",
+      "?? scripts/benchmark_results/bm25_seed_20260827_120221.json"
+    ],
+    "is_clean": false,
+    "warning": "工作区有未提交改动，这批数字对应「含未提交改动的工作区状态」，不能只靠 commit hash 复现"
+  },
+  "platform": {
+    "sys_platform": "darwin",
+    "python": "3.12.13"
+  },
+  "args": {
+    "sizes": "1000,10000,50000",
+    "crossover_sizes": "10,20,50,100,200,500,1000,2000",
+    "parallel_size": 50000,
+    "parallel_libs": 6,
+    "repeat": 3,
+    "query_kind": "hot",
+    "only": "parallel",
+    "out": ""
+  },
+  "corpus_kind": "synthetic",
+  "corpus_caveat": "语料由 scripts/seed_large_bm25_corpus.py 合成（Zipf 词频 + Heaps 词表增长）。结论覆盖体积/延迟/内存/打分一致性/并行行为；不可用于评价检索质量、召回率或答案正确性。",
+  "results": {
+    "parallel": {
+      "chunks": 50000,
+      "n_libs": 6,
+      "thread_counts": [
+        1,
+        2,
+        3,
+        6
+      ],
+      "by_query_kind": {
+        "hot": {
+          "terms": [
+            "一一",
+            "一丁",
+            "一丂",
+            "一七",
+            "一丄"
+          ],
+          "sqlite_boundary_rows_per_query": 190699,
+          "backends": {
+            "json": {
+              "serial_ms": 12070.32,
+              "parallel_ms": 30753.26,
+              "speedup_x": 0.392,
+              "ideal_speedup_x": 6,
+              "parallel_efficiency": 0.065,
+              "thread_sweep_ms": {
+                "1": 2150.09,
+                "2": 4249.24,
+                "3": 7575.44,
+                "6": 30753.26
+              },
+              "wall_ratio_vs_1_thread": 14.3,
+              "serial_ms_all": [
+                11866.54,
+                13099.83,
+                12070.32
+              ]
+            },
+            "sqlite": {
+              "serial_ms": 338.95,
+              "parallel_ms": 93.95,
+              "speedup_x": 3.608,
+              "ideal_speedup_x": 6,
+              "parallel_efficiency": 0.601,
+              "thread_sweep_ms": {
+                "1": 55.98,
+                "2": 60.62,
+                "3": 62.55,
+                "6": 93.95
+              },
+              "wall_ratio_vs_1_thread": 1.68,
+              "serial_ms_all": [
+                332.85,
+                339.62,
+                338.95
+              ]
+            }
+          },
+          "process_parallel_ms": {
+            "json": 21784.98,
+            "sqlite": 3473.04
+          },
+          "sqlite_sql_side_agg_sweep_ms": {
+            "1": 87.34,
+            "2": 80.86,
+            "3": 81.64,
+            "6": 122.99
+          },
+          "sqlite_sql_side_agg_note": "诊断变体，非生产实现：打分下推进 SQL 后跨边界行数降到 top_k。它与 BM25Indexer.query 的语义不完全等价（IN 去重了重复查询词），只用于验证「跨边界行数 → GIL convoy」这一因果。"
+        },
+        "mixed": {
+          "terms": [
+            "不军",
+            "丝仠",
+            "丣偔",
+            "丯儌",
+            "乁儴"
+          ],
+          "sqlite_boundary_rows_per_query": 38,
+          "backends": {
+            "json": {
+              "serial_ms": 15178.71,
+              "parallel_ms": 37157.65,
+              "speedup_x": 0.408,
+              "ideal_speedup_x": 6,
+              "parallel_efficiency": 0.068,
+              "thread_sweep_ms": {
+                "1": 2673.35,
+                "2": 4332.4,
+                "3": 7171.88,
+                "6": 37157.65
+              },
+              "wall_ratio_vs_1_thread": 13.9,
+              "serial_ms_all": [
+                13745.47,
+                15178.71,
+                18150.27
+              ]
+            },
+            "sqlite": {
+              "serial_ms": 54.79,
+              "parallel_ms": 43.79,
+              "speedup_x": 1.251,
+              "ideal_speedup_x": 6,
+              "parallel_efficiency": 0.209,
+              "thread_sweep_ms": {
+                "1": 5.61,
+                "2": 17.3,
+                "3": 37.16,
+                "6": 43.79
+              },
+              "wall_ratio_vs_1_thread": 7.81,
+              "serial_ms_all": [
+                54.79,
+                72.38,
+                37.32
+              ]
+            }
+          },
+          "process_parallel_ms": {
+            "json": 33178.42,
+            "sqlite": 1902.1
+          },
+          "sqlite_sql_side_agg_sweep_ms": {
+            "1": 0.63,
+            "2": 0.94,
+            "3": 0.89,
+            "6": 1.83
+          },
+          "sqlite_sql_side_agg_note": "诊断变体，非生产实现：打分下推进 SQL 后跨边界行数降到 top_k。它与 BM25Indexer.query 的语义不完全等价（IN 去重了重复查询词），只用于验证「跨边界行数 → GIL convoy」这一因果。"
+        }
+      }
+    }
+  },
+  "not_covered": [
+    "合成语料，非真实文档；不涉及检索质量/召回率",
+    "只测 BM25 这一层，不含 dense 检索、rerank、端到端 TTFT",
+    "只测单进程内的并发；未测多进程/多 worker 部署形态",
+    "未测写路径（add_documents / remove_document）在大规模下的耗时",
+    "未测索引更新与查询并发时的读写竞争",
+    "只在本机 macOS + APFS 上跑过；生产硬件与文件系统不同"
+  ]
+}
