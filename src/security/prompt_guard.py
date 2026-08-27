@@ -49,6 +49,15 @@ def detect_document_injection(text: str) -> Optional[str]:
     return None
 
 
+class InjectionDetectedError(ValueError):
+    """摄入文档被 `detect_document_injection` 判定为疑似提示词注入内容、
+    因而拒绝摄入时抛出（CLAUDE.md §4 P0 第 6 条：委托模式摄入侧补齐这道
+    防护时新增）。继承 `ValueError` 是为了兼容调用方原有的
+    `except ValueError` 兜底路径；但调用方应当优先捕获这个更具体的类型，
+    返回一个说明"内容被拒绝"的 4xx 响应，而不是被通用的 `except Exception`
+    兜底成 500——内容被拒绝是预期内的业务判定，不是系统故障。"""
+
+
 # ---------------------------------------------------------------------------
 # 问题1：模型输出侧"系统提示词泄露"检测（ragent_backend/workflow.py 用）
 # 命中模板专属分隔符，或者跟模板开头几句话逐字重合，判定为疑似真实泄露——
