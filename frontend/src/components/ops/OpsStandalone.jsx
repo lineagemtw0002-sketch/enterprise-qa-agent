@@ -132,7 +132,11 @@ export default function OpsStandalone() {
             {connectors && (
               <div className={`ops-live-pill ${online > 0 ? 'live' : 'idle'}`}>
                 <span className="ops-live-dot" />
-                {online > 0 ? `实时接入 · ${online} 个连接器在线` : '无连接器在线'}
+                {/* 同 OpsOverview 那条：**没接入过**和**接入了但全掉线**是两回事。
+                    对一家还没开始用的企业说"无连接器在线"，读起来像出了故障。 */}
+                {online > 0
+                  ? `实时接入 · ${online} 个连接器在线`
+                  : (connectors.length ? '无连接器在线' : '尚未接入连接器')}
               </div>
             )}
             <a className="ops-backlink" href="/">← 返回主应用</a>

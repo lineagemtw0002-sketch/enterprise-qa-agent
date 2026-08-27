@@ -29,6 +29,8 @@ from typing import Any, Dict, Optional
 
 import websockets
 
+from services.ops_probe_demo.control_server import FaultState, serve_control
+from services.ops_probe_demo.environments import DEFAULT_ENVIRONMENT, resolve_environment
 from services.ops_probe_demo.fake_ops_data import points_for
 
 HEARTBEAT_INTERVAL_SECONDS = 10.0
@@ -38,7 +40,9 @@ HEARTBEAT_INTERVAL_SECONDS = 10.0
 
 class OpsProbe:
     def __init__(self, platform_ws: str, connection_id: str, register_token: str, *,
-                 healthy: bool = False, exec_fails: bool = False, verbose: bool = True) -> None:
+                 exec_fails: bool = False, verbose: bool = True,
+                 environment: str = DEFAULT_ENVIRONMENT,
+                 state: Optional["FaultState"] = None) -> None:
         # ⚠️ `connection_id` 和 `token` 两个查询参数**都是必需的**（见 app.py
         # 那个端点的签名：`connection_id: str = Query(...)`）。少传一个的表现是
         # 握手直接被拒成 HTTP 403，而**服务端日志里连一条连接记录都不会有**——
@@ -46,7 +50,10 @@ class OpsProbe:
         self._url = (f"{platform_ws.rstrip('/')}/ws/ops/connector/register"
                      f"?connection_id={connection_id}&token={register_token}")
         self.connection_id = connection_id
-        self._healthy = healthy
+        self._environment = environment
+        # 当前注入的故障。**不注入就一切正常**——健康是默认状态，不是特殊分支。
+        # 由控制口在另一个线程里改写，读的时候拿一份快照（见 FaultState）。
+        self._state = state or FaultState()
         # 让执行故意失败，用来验证"执行失败"这条路径在 UI 上长什么样——
         # 一个只会成功的演示件，验不出失败态的展示对不对。
         self._exec_fails = exec_fails
@@ -110,7 +117,7 @@ class OpsProbe:
         points = points_for(
             kind, target=target,
             start_ts=float(p.get("start_ts", 0)), end_ts=float(p.get("end_ts", 0)),
-            healthy=self._healthy,
+            environment=self._environment, faults=self._state.snapshot(),
         )
         limit = int(p.get("limit") or 0)
         truncated = bool(limit and len(points) > limit)
@@ -135,6 +142,12 @@ class OpsProbe:
         target = plan.get("target", "(未指定)")
         action = plan.get("action_type", "unknown")
         await asyncio.sleep(0.4)              # 装作真在做事，让 executing 状态在 UI 上可见
+        # ⚠️ **执行成功要真的把故障恢复掉。** 第一版只回一句"已重启"，故障状态
+        # 原样留着——大屏上动作显示"已完成"、服务却还是红的，看起来像修复无效。
+        # 演示的价值恰恰在"修完之后真的变绿"这一下。
+        if not self._exec_fails and target in self._state.snapshot():
+            self._state.heal(target)
+            self._log(f"故障已恢复：{target}")
         if self._exec_fails:
             await self._send(ws, "exec_result",
                              {"succeeded": False, "detail": f"{target}: 目标进程无响应，操作超时"},
@@ -157,11 +170,21 @@ def main() -> int:
     ap.add_argument("--platform", default="ws://localhost:8010", help="平台 WS 地址，如 ws://localhost:8033")
     ap.add_argument("--connection-id", required=True, help="连接器 id（登记连接器时拿）")
     ap.add_argument("--token", required=True, help="一次性 register_token（管理面「生成握手凭证」拿）")
-    ap.add_argument("--healthy", action="store_true", help="返回「一切正常」的数据，用于验证检测器不会无中生有")
+    ap.add_argument("--environment", default=DEFAULT_ENVIRONMENT,
+                    help="用哪套模拟环境（ecommerce / payments / internal）")
+    ap.add_argument("--control-port", type=int, default=9330,
+                    help="本地故障注入控制口。只监听 127.0.0.1——它能让被监控系统"
+                         "在演示中随时'坏掉'，不该对外可达")
     ap.add_argument("--exec-fails", action="store_true", help="执行一律失败，用于验证失败态的展示")
     args = ap.parse_args()
+    env = resolve_environment(args.environment)
+    state = FaultState()
     probe = OpsProbe(args.platform, args.connection_id, args.token,
-                     healthy=args.healthy, exec_fails=args.exec_fails)
+                     exec_fails=args.exec_fails, environment=env.key, state=state)
+    serve_control(state, env, port=args.control_port)
+    print(f"[probe] 环境={env.label}（{env.key}）　控制口=http://127.0.0.1:{args.control_port}")
+    print(f"[probe] 注入故障：.venv/bin/python -m services.ops_probe_demo.control "
+          f"inject --service <服务名> --kind error_spike --port {args.control_port}")
     try:
         asyncio.run(probe.run())
     except KeyboardInterrupt:

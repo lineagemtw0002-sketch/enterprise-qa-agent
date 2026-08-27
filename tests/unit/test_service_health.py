@@ -50,18 +50,31 @@ class TestClassify:
 
 
 class TestPointsToServices:
-    def test_matches_the_design_mockup_service_by_service(self):
+    def test_all_four_statuses_are_representable_by_the_demo_environment(self):
+        """设计稿那张图上四种状态（异常/观察中/正常/数据中断）都要能被演示环境复现。
+
+        ⚠️ **这条测试的前提在 2026-08-27 变过一次，改动是刻意的**：
+        原来断言的是"探针数据里 order-service 恒为 critical"——因为那时假数据是
+        **静态**的，异常永远在那儿。现在改成了**默认健康、故障要主动注入**，
+        所以"不注入任何故障时 order-service 是 critical"不再成立，也不该成立
+        （一个永远有异常的演示环境，证明不了"没问题时不误报"）。
+
+        断言也相应从"逐个服务的具体状态"退到"四种状态都能被表达"——设计稿上的
+        具体数字（2.4s / 8.1%）本来就是示意，真正要保证的是这四档在界面上都能
+        出现，否则某一档的样式没人验证过。
+        """
         from services.ops_probe_demo.fake_ops_data import points_for
-        got = {s.service: s.status for s in points_to_services(
-            points_for("service_health", target="", start_ts=0, end_ts=0))}
-        assert got == {
-            "order-service": STATUS_CRITICAL,       # 设计稿：异常
-            "payment-gateway": STATUS_WARNING,      # 设计稿：观察中
-            "auth-service": STATUS_OK,              # 设计稿：正常
-            "inventory-api": STATUS_OK,             # 设计稿：正常
-            "notification-worker": STATUS_OK,       # 设计稿：正常（队列延迟 3s）
-            "search-index": STATUS_STALE,           # 设计稿：数据中断
-        }
+
+        got = {s.service: s.status for s in points_to_services(points_for(
+            "service_health", target="", start_ts=0, end_ts=0,
+            faults={"order-service": "latency_spike",      # → 异常
+                    "payment-gateway": "traffic_surge"},   # → 观察中
+        ))}
+        assert got["order-service"] == STATUS_CRITICAL
+        assert got["payment-gateway"] == STATUS_WARNING
+        assert got["auth-service"] == STATUS_OK
+        assert got["search-index"] == STATUS_STALE          # 只被发现、不上报指标
+        assert set(got.values()) == {STATUS_CRITICAL, STATUS_WARNING, STATUS_OK, STATUS_STALE}
 
     def test_discovered_only_service_still_appears(self):
         out = points_to_services([_pt("search-index", "discovered", 1.0)])

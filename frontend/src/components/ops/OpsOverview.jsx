@@ -241,6 +241,14 @@ export default function OpsOverview({ canManage, onModuleDisabled }) {
   const pending = actions.filter((a) => a.status === 'pending_approval')
   const executing = actions.filter((a) => a.status === 'executing')
   const online = connectors.filter((c) => c.connector_status === 'online').length
+  const connectorDelta = !canManage
+    ? { text: '需要管理员权限', tone: 'flat' }
+    : !connectors.length
+      // 还没登记过任何连接器：这是**待办不是故障**，给下一步而不是红色警告。
+      ? { text: '去「连接器管理」登记第一个', tone: 'flat' }
+      : online === connectors.length
+        ? { text: '全部在线', tone: 'good' }
+        : { text: `${connectors.length - online} 个离线`, tone: 'bad' }
 
   if (loading) return <div className="panel-empty"><Spin /></div>
 
@@ -273,11 +281,17 @@ export default function OpsOverview({ canManage, onModuleDisabled }) {
           delta={pending.length ? '需要人工确认' : '暂无待办'}
           deltaTone={pending.length ? 'bad' : 'flat'}
         />
+        {/* ⚠️ **"从没接入过"和"接入了但全掉线"是两回事**，不能混成一个红色告警。
+            前者是待办（这家企业还没开始用），后者是故障（该在线的东西掉了）。
+            早前的判据是 `connectors.length && online === connectors.length ? good : bad`，
+            零连接器时 `length` 为假、落进 else，于是新企业一进来就看到
+            「0/0　有连接器离线」——一个连接器都没有，何来离线。 */}
         <Kpi
           label="连接器在线"
-          value={canManage ? `${online}/${connectors.length}` : '—'}
-          delta={!canManage ? '需要管理员权限' : (connectors.length && online === connectors.length ? '全部在线' : '有连接器离线')}
-          deltaTone={!canManage ? 'flat' : (connectors.length && online === connectors.length ? 'good' : 'bad')}
+          value={!canManage ? '—' : (connectors.length ? `${online}/${connectors.length}` : '未接入')}
+          placeholder={canManage && !connectors.length}
+          delta={connectorDelta.text}
+          deltaTone={connectorDelta.tone}
         />
         <Kpi
           label="进行中事件"
