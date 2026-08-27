@@ -1,0 +1,24 @@
+# pre-commit 配置（2026-08-27 新增，`docs/chitchat_intent_design.md` §5-⑦）。
+#
+# ⚠️ 本仓库此前没有引入过 pre-commit 框架（无此文件、`.venv` 里也没装
+# `pre-commit` 包）——这是本次新增的第一条 hook，只覆盖这一件事：训练集/
+# 评估集去重校验（根因②"测的和训的是同一个分布"这条教训要求有机制兜底，
+# 不能只靠人记得）。
+#
+# 要让它真的在每次 commit 前跑起来，还差最后一步（本次未执行，见交付报告
+# "什么没做"）：
+#   pip install pre-commit
+#   pre-commit install
+# 在此之前，这个文件只是"配置已经写好"，不是"钩子已经在生效"——手动跑
+# `.venv/bin/python scripts/check_router_lora_dedup.py` 仍然是眼下唯一
+# 真正会执行这项检查的方式。
+repos:
+  - repo: local
+    hooks:
+      - id: router-lora-dedup
+        name: 训练集/评估集去重校验（router_lora）
+        entry: .venv/bin/python scripts/check_router_lora_dedup.py
+        language: system
+        # 只在这两类文件变化时跑，避免每次提交都跑一遍无关的检查
+        files: ^(router_lora_data/.*\.jsonl|tests/fixtures/router_eval\.jsonl)$
+        pass_filenames: false
