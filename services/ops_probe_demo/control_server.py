@@ -17,6 +17,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Optional
 
+from services.ops_probe_demo.control_page import render as render_control_page
 from services.ops_probe_demo.environments import FAULT_KINDS, Environment
 
 
@@ -65,7 +66,16 @@ def _make_handler(state: FaultState, env: Environment):
             self.wfile.write(body)
 
         def do_GET(self):                  # noqa: N802
-            if self.path.rstrip("/") != "/state":
+            path = self.path.rstrip("/") or "/"
+            if path == "/":
+                body = render_control_page(env, state.snapshot()).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if path != "/state":
                 self._send(404, {"error": "只有 GET /state"})
                 return
             faults = state.snapshot()
