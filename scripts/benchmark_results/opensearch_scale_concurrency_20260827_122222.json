@@ -1,0 +1,168 @@
+{
+  "generated_at": "2026-08-27T12:22:22.714445",
+  "script": "/private/tmp/wt-opensearch-scale/scripts/verify_opensearch_scale_concurrency.py",
+  "code_state": {
+    "commit": "23269a9",
+    "commit_full": "23269a91d1482f504be540cbbae512cb256b4eb6",
+    "branch": "task/opensearch-scale-verify",
+    "dirty_paths": [
+      "?? scripts/benchmark_results/opensearch_scale_concurrency_20260827_121248.json",
+      "?? scripts/verify_opensearch_scale_concurrency.py"
+    ],
+    "is_clean": false,
+    "warning": "工作区有未提交改动，这批数字对应「含未提交改动的工作区状态」，不能只靠 commit hash 复现"
+  },
+  "args": {
+    "chunks": 20000,
+    "libs": 6,
+    "top_k": 10,
+    "repeat": 3,
+    "seed": 20260827,
+    "thread_counts": "1,2,3,6",
+    "force_reseed": false,
+    "skip_seed": false,
+    "keep": false,
+    "cleanup_only": false,
+    "out": ""
+  },
+  "hot_term": "一一",
+  "corpus_kind": "synthetic",
+  "corpus_caveat": "合成 term_stats + 随机向量，非真实文本/真实语义。只可用于评价并发/延迟/GIL 竞争行为；不可用于评价检索质量、召回率或答案正确性（已在其他脚本用真实黄金测试集验过）。",
+  "seed_report": {
+    "old": {
+      "chunks": 20000,
+      "n_libs": 6,
+      "bm25_build_s": 4.41,
+      "bm25_json_bytes": 102533347,
+      "bm25_sqlite_bytes": 73363456,
+      "chroma_write_s": 96.0
+    },
+    "new": {
+      "chunks": 20000,
+      "n_libs": 6,
+      "write_s": 284.56
+    }
+  },
+  "results": {
+    "old_json": {
+      "label": "旧链路(JSON)",
+      "n_libs": 6,
+      "serial_ms": 6049.38,
+      "parallel_ms": 6920.19,
+      "speedup_x": 0.874,
+      "ideal_speedup_x": 6,
+      "parallel_efficiency": 0.146,
+      "thread_sweep_ms": {
+        "1": 798.25,
+        "2": 2129.85,
+        "3": 3278.97,
+        "6": 6920.19
+      },
+      "hits_per_query": {
+        "1": 10,
+        "2": 10,
+        "3": 10,
+        "6": 10
+      },
+      "wall_ratio_vs_1_thread": 8.67,
+      "serial_ms_all": [
+        6049.38,
+        5740.68,
+        7416.3
+      ]
+    },
+    "old_sqlite": {
+      "label": "旧链路(SQLite)",
+      "n_libs": 6,
+      "serial_ms": 130.84,
+      "parallel_ms": 1336.71,
+      "speedup_x": 0.098,
+      "ideal_speedup_x": 6,
+      "parallel_efficiency": 0.016,
+      "thread_sweep_ms": {
+        "1": 21.71,
+        "2": 78.84,
+        "3": 176.58,
+        "6": 1336.71
+      },
+      "hits_per_query": {
+        "1": 10,
+        "2": 10,
+        "3": 10,
+        "6": 10
+      },
+      "wall_ratio_vs_1_thread": 61.57,
+      "serial_ms_all": [
+        130.67,
+        132.32,
+        130.84
+      ]
+    },
+    "new_opensearch": {
+      "label": "新链路(OpenSearch)",
+      "n_libs": 6,
+      "serial_ms": 1831.99,
+      "parallel_ms": 538.91,
+      "speedup_x": 3.399,
+      "ideal_speedup_x": 6,
+      "parallel_efficiency": 0.567,
+      "thread_sweep_ms": {
+        "1": 35.78,
+        "2": 74.08,
+        "3": 46.7,
+        "6": 538.91
+      },
+      "hits_per_query": {
+        "1": 10,
+        "2": 10,
+        "3": 10,
+        "6": 10
+      },
+      "wall_ratio_vs_1_thread": 15.06,
+      "serial_ms_all": [
+        1409.46,
+        1831.99,
+        2611.53
+      ]
+    }
+  },
+  "verdict": {
+    "old_json": "线性排队（符合预期，不是 convoy）",
+    "old_sqlite": "convoy（超线性恶化）",
+    "new_opensearch": "convoy（超线性恶化）"
+  },
+  "cleanup": {
+    "removed_bm25": [
+      "scaleverify_20000_lib0",
+      "scaleverify_20000_lib1",
+      "scaleverify_20000_lib2",
+      "scaleverify_20000_lib3",
+      "scaleverify_20000_lib4",
+      "scaleverify_20000_lib5"
+    ],
+    "removed_chroma": [
+      "scaleverify_20000_lib0",
+      "scaleverify_20000_lib1",
+      "scaleverify_20000_lib2",
+      "scaleverify_20000_lib3",
+      "scaleverify_20000_lib4",
+      "scaleverify_20000_lib5"
+    ],
+    "removed_opensearch": [
+      "kb_scaleverify_20000_lib0",
+      "kb_scaleverify_20000_lib1",
+      "kb_scaleverify_20000_lib2",
+      "kb_scaleverify_20000_lib3",
+      "kb_scaleverify_20000_lib4",
+      "kb_scaleverify_20000_lib5"
+    ]
+  },
+  "not_covered": [
+    "合成语料，不涉及检索质量/召回率/答案正确性",
+    "不含 cross-encoder 重排阶段（对齐 simulate_search_traffic.py 的既有范围）",
+    "dense 侧用随机向量、跳过真实 Ollama embedding 调用，隔离掉了 Ollama 单线程串行这个已知的独立瓶颈（CLAUDE.md §4 第 3 条），不代表端到端 TTFT 里 embedding 那一段也没有并发问题",
+    "只在本机 Apple Silicon / Docker Desktop 单节点 OpenSearch 上跑过，未覆盖生产硬件、多节点集群、security plugin 开启后的开销",
+    "只测了一个高频查询词（Zipf 秩 1，最坏情况）；未扫描不同命中率的查询分布",
+    "conv_* 对话私有库的并发行为未测（只测了 kb_ 业务库这条路径）"
+  ]
+}
