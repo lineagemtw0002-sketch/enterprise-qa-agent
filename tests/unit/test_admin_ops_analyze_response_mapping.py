@@ -46,7 +46,12 @@ import pytest
 
 from src.ragent_backend.schemas import AnalyzeOpsIncidentResponse
 
-_APP_PY = Path(__file__).resolve().parents[2] / "src" / "ragent_backend" / "app.py"
+# ⚠️ **2026-08-27 端点搬家了**：分层批次 1 把 `admin_analyze_ops_incident` 连同
+# 其余 22 个 `/admin/ops` 端点从 `app.py` 搬进了 `api/ops_router.py`
+# （见 docs/app_layering_design.md）。这个文件靠 AST 锚点定位那段代码，锚点
+# 一失效就整体 `StopIteration` —— 而这**正是当初刻意选的失效方式**：宁可
+# 收集阶段就吵着报错，也不要静默地测了个空气。这次它按预期吵了，改锚点即可。
+_APP_PY = Path(__file__).resolve().parents[2] / "src" / "ragent_backend" / "api" / "ops_router.py"
 
 
 def _extract_mapping_tail() -> List[ast.stmt]:
