@@ -1,25 +1,57 @@
-"""BM25 SQLite 后端（方案 C 阶段 1）的等价性与正确性测试。
+"""BM25 SQLite 后端（方案 C）的等价性与正确性测试。
 
-对应 `docs/bm25_storage_design.md` §7 的 T-1 / T-3 / T-4 / T-5。
+对应 `docs/bm25_storage_design.md` §7 的 T-1 / T-3 / T-4 / T-5，
+以及 `CLAUDE.md` §4 第 2e 条 P0（GIL convoy）的修复验证。
 
-**这组测试的核心是 T-1：两种后端的完整分数映射必须逐 bit 相同。**
-不是"接近"，是 `==`。理由：阶段 1 的 SQLite 是影子副本，切读的唯一依据就是
-"两边算出来一模一样"。一旦允许"差一点点"，就再也说不清某次排序变化到底是
-浮点误差还是后端算错了 —— 而 BM25 是纯确定性逻辑，本来就不该有误差。
+## T-1 判据在 2026-08-27 发生过一次刻意的放宽，原因写在这里
 
-达成逐 bit 相同的前提，每一条都有对应用例钉着：
+`query()` 原来是"Python 侧逐行取数、按 `for term in query_terms` 原序在
+内存里累加"，这个实现能做到与 JSON 侧**完整分数映射逐 bit 相同**（不是
+"接近"，是 `==`）——本文件下方大段的手写累加顺序分析（ord 列、交错
+postings 等）都是那个实现留下的证据。
+
+但那个实现有一个致命问题：热词查询要跨 `sqlite3_step()` 边界（= GIL
+释放/重取一次）与命中 postings 条数同阶，`CLAUDE.md` §4 第 2e 条实测
+6 线程并发下会触发 GIL convoy——比单线程还慢 100 倍量级。修法是把
+`GROUP BY chunk_id ... ORDER BY ... LIMIT top_k` 整段打分逻辑下推进 SQL，
+让跨边界行数从「postings 总数」降到「top_k」。
+
+**下推之后，逐 bit 相同不再成立，且是刻意接受的代价**：单条 posting 的
+打分表达式仍与 JSON 侧逐项对应（因此单个词、单个 chunk 的贡献值本身仍是
+位级相同），但**跨词条/跨 posting 的最终求和顺序改由 SQLite 的查询计划
+决定**，不再是 Python `for term in terms` 的确定原序。浮点加法不满足
+结合律，因此 `SUM()` 的聚合结果与 JSON 侧朴素累加会在最低几位上出现 ULP
+级差异。实测（本文件跑一遍，751 次比对）**最大相对误差 2.02e-16、最大
+绝对误差 8.88e-16**——量级正好卡在 IEEE754 double 的机器精度（约
+2.22e-16）附近，这正是"纯浮点舍入、不是公式算错"的证据：如果哪天这个
+数字涨到远高于 1e-9（比如百分之几），说明是打分逻辑本身出了问题，
+不能靠调大容差糊弄过去。
+
+**因此判据改为**：分数用 `math.isclose(rel_tol=1e-9, abs_tol=1e-12)`
+逐项比较（本文件 `_assert_score_maps_close`），**但候选集合（哪些
+chunk_id 命中）与 top-k 排序不放宽**——容差只用于比较同一个 chunk_id 的
+分数数值，命中集合不同、顺序不同一律判失败。
+
+保留原有关于"公式括号位置""avg_doc_length 存取无损""重复查询词计数"
+三条钉子，因为它们仍然决定单条 posting 的贡献值是否位级正确：
 1. **公式的括号位置**要一致（`idf * (num / den)` ≠ `idf * num / den`）；
 2. **avg_doc_length 存取要无损**（用 `repr` 不用 `str`，否则打分整片偏移）；
-3. **重复查询词**要一样处理（JSON 侧不去重，同词出现两次就算两次分）。
+3. **重复查询词**要一样处理（JSON 侧不去重，同词出现两次就算两次分——
+   下推后改用 `WITH q(term, mult) AS (VALUES ...)` 的乘数语义还原，
+   不是诊断脚本 `_sql_side_query`（`scripts/benchmark_bm25_backends.py`）
+   那种 `WHERE term IN (...)` 的去重语义，两者不等价，这是本次改动要
+   解决的核心问题之一）。
 
-关于累加顺序，这里记一笔实施过程中的弯路，免得有人重走：
+以下是原实现（Python 侧逐行累加）留下的累加顺序分析，**结论在下推之后
+不再是"逐 bit 相同"，但分析本身仍解释了为什么容差可以给得这么紧**：
 浮点加法确实不满足结合律 —— 实测 20 万组真实 BM25 分数，用生产代码那种朴素
-累加（`acc = acc + v`）逐一重排，**62.8% 的组合会差 1 ULP**。所以本实现一度
-给 `chunks` 表加了一个 `ord` 列去复刻 postings 的原始顺序。**那是多余的**：
+累加（`acc = acc + v`）逐一重排，62.8% 的组合会差 1 ULP。所以本实现一度
+给 `chunks` 表加了一个 `ord` 列去复刻 postings 的原始顺序。那是多余的：
 单个 chunk 的分数是「各查询词贡献之和」，累加顺序只由外层
 `for term in query_terms` 决定，词条内 postings 的先后只影响"哪个 chunk 先
-拿到这一项"，不改变任何单个 chunk 自身的累加序列。两种后端外层都按
-`query_terms` 原序走，等价天然成立。`ord` 列已删。
+拿到这一项"，不改变任何单个 chunk 自身的累加序列。`ord` 列已删。
+下推之后这条分析的价值变成了"解释误差为什么恰好卡在机器精度量级"，
+而不是"解释为什么能做到逐 bit 相同"。
 
 〔顺带：验证这件事时若用 `sum()` 会得出"顺序不敏感"的错误结论 ——
 Python 3.12 起 `sum()` 改用 Neumaier 补偿求和，而生产代码是朴素累加。〕
@@ -28,6 +60,7 @@ Python 3.12 起 `sum()` 改用 Neumaier 补偿求和，而生产代码是朴素�
 from __future__ import annotations
 
 import asyncio
+import math
 import random
 from typing import Any, Dict, List
 
@@ -37,6 +70,27 @@ from src.ingestion.storage.bm25_indexer import BM25Indexer
 from src.ingestion.storage.bm25_sqlite_store import BM25SQLiteStore
 
 _HUGE_TOP_K = 10_000  # 取全量分数映射，而不是只比 top-k
+_REL_TOL = 1e-9  # 实测最大相对误差 2.02e-16，留了近 7 个数量级的余量
+_ABS_TOL = 1e-12
+
+
+def _assert_score_maps_close(
+    json_scores: Dict[str, float], sqlite_scores: Dict[str, float], context: str = ""
+) -> None:
+    """比较两种后端的完整分数映射：**候选集合与顺序不放宽，分数值带容差**。
+
+    候选集合不同 = 结果集本身不一样，不是浮点误差能解释的，必须原样报错。
+    """
+    assert json_scores.keys() == sqlite_scores.keys(), f"候选集不同 {context}"
+    diffs = []
+    for cid, jv in json_scores.items():
+        sv = sqlite_scores[cid]
+        if not math.isclose(jv, sv, rel_tol=_REL_TOL, abs_tol=_ABS_TOL):
+            diffs.append((cid, jv, sv, abs(jv - sv)))
+    assert not diffs, (
+        f"{len(diffs)} 个 chunk 的分数超出容差（rel_tol={_REL_TOL}）{context}，"
+        f"首例：{diffs[0]}"
+    )
 
 
 def _stat(chunk_id: str, terms: Dict[str, int]) -> Dict[str, Any]:
@@ -83,12 +137,13 @@ def store(tmp_path) -> BM25SQLiteStore:
 
 
 class TestScoreParity:
-    def test_full_score_map_is_bitwise_identical_on_random_corpora(
+    def test_full_score_map_is_close_on_random_corpora(
         self, indexer, store
     ):
         """随机语料压测 —— 手写的几个例子碰不到累加顺序问题。
 
         固定种子保证可复现；每轮换一批语料和查询，累计比对上千个分数。
+        分数值带容差比较（见模块 docstring），候选集合不放宽。
         """
         rng = random.Random(20260825)
         vocab = [f"w{i}" for i in range(60)]
@@ -110,15 +165,7 @@ class TestScoreParity:
                     for r in store.query(q, top_k=_HUGE_TOP_K)
                 }
 
-                assert json_side.keys() == sqlite_side.keys(), (
-                    f"候选集不同，查询={q}"
-                )
-                for cid, score in json_side.items():
-                    assert score == sqlite_side[cid], (
-                        f"分数不是逐 bit 相同：{cid} 查询={q} "
-                        f"json={score!r} sqlite={sqlite_side[cid]!r} "
-                        f"差={score - sqlite_side[cid]!r}"
-                    )
+                _assert_score_maps_close(json_side, sqlite_side, context=f"查询={q}")
                 compared += len(json_side)
 
         assert compared > 500, f"样本量太小（{compared}），压不出顺序问题"
@@ -134,8 +181,8 @@ class TestScoreParity:
         所以这里刻意造成相反。词表也刻意小（每个 chunk 命中全部查询词），
         让单个 chunk 累加 6 项，把浮点末位差异的机会放到最大。
 
-        实测结论是两边仍然逐 bit 相同（原因见模块 docstring）。这条用例的价值
-        在于**它是这个结论的证据**，而不是在防某个具体实现错误。
+        下推之后不再要求逐 bit 相同（见模块 docstring），这条用例改为验证
+        "即使在这种最容易暴露累加顺序差异的构造下，误差仍在容差内"。
         """
         rng = random.Random(31337)
         # 词表小 => 每个 chunk 命中大部分查询词 => 单个 chunk 累加 4~6 项
@@ -154,12 +201,7 @@ class TestScoreParity:
         j = {r["chunk_id"]: r["score"] for r in indexer.query(q, top_k=_HUGE_TOP_K)}
         s = {r["chunk_id"]: r["score"] for r in store.query(q, top_k=_HUGE_TOP_K)}
 
-        assert j.keys() == s.keys()
-        diffs = [(c, j[c], s[c]) for c in j if j[c] != s[c]]
-        assert not diffs, (
-            f"{len(diffs)}/{len(j)} 个 chunk 的分数不是逐 bit 相同，"
-            f"累加顺序没有被复刻。首例：{diffs[0]}"
-        )
+        _assert_score_maps_close(j, s, context="chunk_id 倒序构造")
 
     def test_multi_term_accumulation_order_matters(self, indexer, store):
         """专门构造"一个 chunk 命中多个查询词"的场景。
@@ -178,13 +220,13 @@ class TestScoreParity:
         for q in (["a", "b", "c", "d"], ["d", "c", "b", "a"], ["c", "a", "d", "b"]):
             j = {r["chunk_id"]: r["score"] for r in indexer.query(q, top_k=_HUGE_TOP_K)}
             s = {r["chunk_id"]: r["score"] for r in store.query(q, top_k=_HUGE_TOP_K)}
-            assert j == s, f"查询词顺序 {q} 下累加结果不一致"
+            _assert_score_maps_close(j, s, context=f"查询词顺序 {q}")
 
     def test_partially_overlapping_postings_lists(self, indexer, store):
         """各词条的 postings 覆盖不同 chunk 子集、且相对顺序不一致的形态。
 
         词条 A 覆盖 [c1, c3]、B 覆盖 [c2, c3]。这类交错曾被怀疑会破坏累加
-        顺序等价（见模块 docstring 里那段弯路），实测不会 —— 保留作为证据。
+        顺序等价（见模块 docstring 里那段弯路），实测在容差内成立。
         """
         term_stats = [
             _stat("c1", {"A": 5}),
@@ -196,12 +238,17 @@ class TestScoreParity:
 
         j = {r["chunk_id"]: r["score"] for r in indexer.query(["A", "B"], top_k=99)}
         s = {r["chunk_id"]: r["score"] for r in store.query(["A", "B"], top_k=99)}
-        assert j == s
+        _assert_score_maps_close(j, s)
 
     def test_duplicate_query_terms_are_counted_twice_on_both_sides(
         self, indexer, store
     ):
-        """JSON 侧 `for term in query_terms` 不去重 —— SQLite 侧不能擅自去重。"""
+        """JSON 侧 `for term in query_terms` 不去重 —— SQLite 侧不能擅自去重。
+
+        这条是"重复计数"语义的判别力核心：诊断脚本 `_sql_side_query`
+        用 `WHERE term IN (...)`，去重语义下 `twice == once`（不会翻倍），
+        如果生产实现退化成那种写法，下面第一条断言会失败。
+        """
         term_stats = [_stat("c_0", {"年假": 4}), _stat("c_1", {"年假": 1, "填充": 20})]
         indexer.build(term_stats, collection="dup")
         _mirror(indexer, store, term_stats)
@@ -212,7 +259,31 @@ class TestScoreParity:
         assert twice[0]["score"] == pytest.approx(once[0]["score"] * 2)
         j = {r["chunk_id"]: r["score"] for r in indexer.query(["年假", "年假"], top_k=9)}
         s = {r["chunk_id"]: r["score"] for r in twice}
-        assert j == s
+        _assert_score_maps_close(j, s)
+
+    def test_duplicate_query_terms_three_times_still_matches_json(
+        self, indexer, store
+    ):
+        """词条重复三次（奇数次，`2*x` 那种"乘法天然精确"的巧合不适用）。
+
+        `x+x` 与 `2*x` 在 IEEE754 下总是位级相同（乘 2 只移指数不进位），
+        但 `x+x+x` 与 `3*x` 不保证相同 —— SQL 侧用的是 `mult * 单行贡献`
+        （乘法），JSON 侧是逐次相加。这条用例专门盯这个奇数次场景，
+        确保就算不是位级相同，也仍在容差内。
+        """
+        term_stats = [_stat("c_0", {"年假": 4}), _stat("c_1", {"年假": 1, "填充": 20})]
+        indexer.build(term_stats, collection="dup3")
+        _mirror(indexer, store, term_stats)
+
+        j = {
+            r["chunk_id"]: r["score"]
+            for r in indexer.query(["年假", "年假", "年假"], top_k=9)
+        }
+        s = {
+            r["chunk_id"]: r["score"]
+            for r in store.query(["年假", "年假", "年假"], top_k=9)
+        }
+        _assert_score_maps_close(j, s)
 
     def test_topk_ordering_is_identical(self, indexer, store):
         """含大量同分候选时，两边的 top-k 必须逐位相同（依赖两侧同样的 tie-break）。"""
@@ -238,6 +309,64 @@ class TestScoreParity:
         empty = BM25SQLiteStore(tmp_path / "never_written.sqlite")
         assert empty.query(["年假"], top_k=5) == []
         empty.close()
+
+    def test_avg_doc_length_zero_falls_back_to_one(self, store):
+        """`avg_doc_length == 0` 时代入 1.0 继续算，不是短路成别的式子。
+
+        真实生产路径里这个分支理论上不可达（`num_docs==0` 时也不会有
+        postings），但 `replace_all` 接受任意 metadata，直接构造这个
+        不常见的库状态来钉住这条边界处理——SQL 侧的
+        `if avg_doc_length == 0: avg_doc_length = 1.0` 必须和 Python 侧的
+        `_calculate_bm25_score` 逐字一致。
+        """
+        index = {
+            "年假": {
+                "idf": 1.2345,
+                "df": 2,
+                "postings": [
+                    {"chunk_id": "c_0", "tf": 3, "doc_length": 5},
+                    {"chunk_id": "c_1", "tf": 1, "doc_length": 9},
+                ],
+            }
+        }
+        metadata = {"num_docs": 2, "avg_doc_length": 0.0, "total_terms": 1,
+                    "collection": "zero_avgdl"}
+        store.replace_all(index=index, metadata=metadata)
+
+        results = store.query(["年假"], top_k=9)
+        by_cid = {r["chunk_id"]: r["score"] for r in results}
+
+        k1, b, avg_doc_length = 1.5, 0.75, 1.0  # 代入的是 1.0，不是 0
+        expected = {}
+        for cid, tf, dl in (("c_0", 3, 5), ("c_1", 1, 9)):
+            numerator = tf * (k1 + 1)
+            denominator = tf + k1 * (1 - b + b * (dl / avg_doc_length))
+            expected[cid] = 1.2345 * (numerator / denominator)
+
+        _assert_score_maps_close(expected, by_cid)
+
+    def test_topk_truncation_boundary_with_many_ties_at_scale(self, indexer, store):
+        """比 `test_topk_ordering_is_identical` 更大规模的截断边界场景。
+
+        200 个候选、"年假"命中全部 200 个且分数完全相同（tf/doc_length
+        一致），"填充"只命中前 100 个把它们的分数拉开，制造一批"刚好卡在
+        top_k 附近"的同分/近分候选，并且候选总数远超一次 SQL 结果窗口，
+        逼 `ORDER BY ... LIMIT` 在真正的候选池里做截断，不是在一个碰巧
+        已经很小的结果集里。
+        """
+        term_stats = []
+        for i in range(200):
+            freqs = {"年假": 2}
+            if i < 100:
+                freqs["填充"] = 3
+            term_stats.append(_stat(f"c_{i:04d}", freqs))
+        indexer.build(term_stats, collection="topk_scale")
+        _mirror(indexer, store, term_stats)
+
+        for k in (1, 5, 37, 100, 150):
+            j = [r["chunk_id"] for r in indexer.query(["年假", "填充"], top_k=k)]
+            s = [r["chunk_id"] for r in store.query(["年假", "填充"], top_k=k)]
+            assert j == s, f"top_k={k} 时结果集/顺序不一致"
 
 
 # ───────────────── T-3：删除真的删得掉（那条 P0 的正解）─────────────────
@@ -571,7 +700,8 @@ class TestReadBackendSwitch:
         assert fresh._index, "小索引应走 JSON，_index 必须被填充"
 
     def test_results_identical_across_backends(self, tmp_path):
-        """同一个库、两种后端，完整分数映射必须逐 bit 相同。"""
+        """同一个库、两种后端，完整分数映射带容差一致（下推后不再逐 bit 相同，
+        见 `tests/unit/test_bm25_sqlite_store.py` 模块 docstring）。"""
         corpus = self._big_corpus()
         ix = BM25Indexer(index_dir=str(tmp_path / "p"))
         ix.build(corpus, collection="par")
@@ -582,8 +712,10 @@ class TestReadBackendSwitch:
         s = BM25Indexer(index_dir=str(tmp_path / "p")); s.read_backend = "sqlite"
         s.load("par")
 
-        assert {r["chunk_id"]: r["score"] for r in j.query(q, top_k=10**6)} == \
-               {r["chunk_id"]: r["score"] for r in s.query(q, top_k=10**6)}
+        _assert_score_maps_close(
+            {r["chunk_id"]: r["score"] for r in j.query(q, top_k=10**6)},
+            {r["chunk_id"]: r["score"] for r in s.query(q, top_k=10**6)},
+        )
 
     def test_stale_sqlite_falls_back_to_json(self, tmp_path, caplog):
         """影子写失败过 => SQLite 比 JSON 旧 => 必须回退，且要留告警。

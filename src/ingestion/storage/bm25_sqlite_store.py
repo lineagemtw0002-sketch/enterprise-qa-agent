@@ -1,5 +1,11 @@
 """BM25 索引的 SQLite 后端 —— `docs/bm25_storage_design.md` 方案 C 的阶段 1。
 
+⚠️ **模块级这句"读仍然全部走 JSON"已过时**（本段以下、写于阶段 1 落地时，
+之后没有回来同步）：阶段 2/3 已把读路径接上（`CLAUDE.md` §4 第 2c 条），
+`BM25Indexer.load()` 在 `auto`/`sqlite` 后端下会真的调 `query()` 走这里。
+以下三段描述的仍是阶段 1 落地时的动机与选型依据，本身没有错，只是"当前
+阶段"这个措辞已经滞后，勿以此判断本模块是否在生产读路径上。
+
 **当前阶段：影子写（双写）。读仍然全部走 JSON。**
 本模块被写入，但还没有任何生产查询路径读它。这是刻意的：阶段 1 的目的是
 让两种后端的数据先并存，好在切读之前逐条比对打分结果（设计文档 §6）。
@@ -241,15 +247,38 @@ class BM25SQLiteStore:
         k1: float = 1.5,
         b: float = 0.75,
     ) -> List[Dict[str, Any]]:
-        """词条级检索。**阶段 1 只有测试和比对脚本会调它，生产读路径仍走 JSON。**
+        """词条级检索，打分**下推进 SQL**（`CLAUDE.md` §4 第 2e 条 P0 的修法）。
 
-        打分公式与 `BM25Indexer._calculate_bm25_score` 必须逐字一致 ——
-        原型验证的判据是「完整分数映射逐 bit 相同」（36 次查询最大绝对差
-        0.000e+00），任何公式上的"等价改写"都可能破坏这个判据。
+        为什么下推：Python 侧逐行取数再累加时，热词查询一次要跨
+        `sqlite3_step()` 边界（= GIL 释放/重取一次）与 postings 条数同阶
+        （50K 档实测约 4 万次）；6 线程并发命中同一批热词时，这个边界交接
+        次数会引发 GIL convoy——6 线程比单线程还慢（`scripts/
+        benchmark_bm25_backends.py` 诊断实测 2633ms vs 25ms）。把 `GROUP BY
+        chunk_id ... ORDER BY ... LIMIT top_k` 整段丢给 SQLite，跨边界的行数
+        从「postings 总数」降到「top_k」，convoy 随之消失。
 
-        tie-break 与 JSON 侧同为 `(-score, chunk_id)`，且**排完整个列表再截断**。
-        没有它，两种后端的 top-k 永远对不齐 —— 同分候选的顺序会退化成各自的
-        物理存储顺序（50K 档截断线上有 14–19 个同分候选）。
+        **与诊断脚本 `_sql_side_query`（scripts/benchmark_bm25_backends.py）
+        的关键差异**：诊断版本用 `WHERE term IN (...)`，这是去重语义 ——
+        同一个查询词出现两次只会贡献一次分数，与
+        `BM25Indexer.query`「`for term in query_terms` 不去重，重复词条要
+        重复累加」的既有语义不等价。这里改用 `WITH q(term, mult) AS
+        (VALUES ...)` 把「每个词条在本次查询里出现几次」当一个乘数交给
+        SQL，`SUM(q.mult * 单词条贡献)` 还原重复累加的效果。
+
+        单行打分表达式与 `BM25Indexer._calculate_bm25_score` 逐项对应
+        （`numerator = tf*(k1+1)`、`denominator = tf + k1*((1-b) + b*(dl/avgdl))`、
+        `idf * (numerator/denominator)`），保证单条 posting 的贡献值本身与
+        JSON 侧位级相同；**但跨词条/跨 posting 的求和顺序由 SQLite 的查询
+        计划决定，不再是 `for term in terms` 的原序**，浮点加法不满足结合律，
+        `SUM()` 的聚合结果因此不再保证与 JSON 侧逐 bit 相同（原「完整分数映射
+        逐 bit 相同」判据已刻意放宽为带容差比较，见
+        `tests/unit/test_bm25_sqlite_store.py` 模块 docstring 里的实测误差
+        数量级说明）。
+
+        tie-break 与 JSON 侧同为 `(-score, chunk_id)`，且**排完整个候选集
+        再截断**（`ORDER BY score DESC, chunk_id ASC LIMIT top_k`，不是先
+        `LIMIT` 再排）。同分候选在大规模语料下并不罕见（50K 档截断线上有
+        14–19 个），少了这条两种后端的 top-k 会退化成各自不可预测的物理顺序。
         """
         if not query_terms:
             return []
@@ -265,45 +294,53 @@ class BM25SQLiteStore:
             return []
         avg_doc_length = float(row[0])
 
-        # 去重只用于取数；累加仍按 `terms` 原序逐个走，**重复词条要重复累加** ——
-        # JSON 侧 `for term in query_terms` 不去重，同一个词出现两次就算两次分。
-        unique_terms = list(dict.fromkeys(terms))
-        placeholders = ",".join("?" * len(unique_terms))
-        cursor = conn.execute(
-            f"SELECT p.term, p.chunk_id, p.tf, p.doc_length, t.idf "
-            f"FROM postings p "
-            f"JOIN terms t ON t.term = p.term "
-            f"WHERE p.term IN ({placeholders})",
-            unique_terms,
-        )
-
-        by_term: Dict[str, List[Tuple[str, int, int, float]]] = {}
-        for term, chunk_id, tf, doc_length, idf in cursor:
-            by_term.setdefault(term, []).append((chunk_id, tf, doc_length, idf))
-
-        # ⚠️ 下面五行是 `BM25Indexer._calculate_bm25_score` 的**逐字复刻**，
-        # 包括 avg_doc_length==0 时代入 1.0 继续算（不是短路成别的式子），
-        # 以及 `idf * (numerator / denominator)` 的括号位置。
-        # 浮点乘除不满足结合律，`idf * num / den` 与 `idf * (num / den)` 会在
-        # 最低位产生差异 —— 而验收判据是「完整分数映射逐 bit 相同」，
-        # 差一个 ULP 就算失败。改这里之前先看 tests/unit/test_bm25_sqlite_store.py。
+        # ⚠️ avg_doc_length==0 时代入 1.0 继续算（不是短路成别的式子）——
+        # 与 `BM25Indexer._calculate_bm25_score` 的边界处理逐字一致。
         if avg_doc_length == 0:
             avg_doc_length = 1.0
 
-        scores: Dict[str, float] = {}
-        for term in terms:  # 原序、不去重 —— 与 JSON 侧的外层循环一一对应
-            for chunk_id, tf, doc_length, idf in by_term.get(term, ()):
-                numerator = tf * (k1 + 1)
-                denominator = tf + k1 * (1 - b + b * (doc_length / avg_doc_length))
-                scores[chunk_id] = (
-                    scores.get(chunk_id, 0.0) + idf * (numerator / denominator)
-                )
+        # 词条重复次数当乘数交给 SQL —— 保留「重复词条重复累加」的语义，
+        # 同时避免对同一个词重复 JOIN/扫描一遍 postings（比诊断脚本的
+        # 去重 IN 语义更完整，比逐次重复扫描更省）。
+        term_counts: Dict[str, int] = {}
+        for t in terms:
+            term_counts[t] = term_counts.get(t, 0) + 1
 
-        results = sorted(
-            ({"chunk_id": cid, "score": s} for cid, s in scores.items()),
-            key=lambda x: (-x["score"], x["chunk_id"]),
-        )
-        return results[:top_k]
+        values_sql = ",".join(["(?,?)"] * len(term_counts))
+        values_params: List[Any] = []
+        for term, count in term_counts.items():
+            values_params.append(term)
+            values_params.append(count)
+
+        # k1+1 与 1-b 各自只是 k1/b 的纯函数，提前算一次和逐行现算数值上
+        # 完全相同（同一个确定性表达式对同一输入永远给同一个浮点结果），
+        # 这样写只是少让 SQLite 对每一行重复算一遍常量。
+        k1_plus_1 = k1 + 1.0
+        one_minus_b = 1.0 - b
+
+        sql = f"""
+            WITH q(term, mult) AS (VALUES {values_sql})
+            SELECT p.chunk_id AS cid,
+                   SUM(
+                       q.mult * (
+                           t.idf * (
+                               (p.tf * ?)
+                               / (p.tf + ? * (? + ? * (p.doc_length / ?)))
+                           )
+                       )
+                   ) AS score
+            FROM postings p
+            JOIN terms t ON t.term = p.term
+            JOIN q ON q.term = p.term
+            GROUP BY p.chunk_id
+            ORDER BY score DESC, cid ASC
+            LIMIT ?
+        """
+        params = values_params + [
+            k1_plus_1, k1, one_minus_b, b, avg_doc_length, top_k
+        ]
+        cursor = conn.execute(sql, params)
+        return [{"chunk_id": cid, "score": score} for cid, score in cursor.fetchall()]
 
     # ────────────────────────────── 自检 ──────────────────────────────
 

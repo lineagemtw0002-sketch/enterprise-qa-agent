@@ -1,0 +1,46 @@
+{
+  "generated_at": "2026-08-27T12:02:21.661864",
+  "script": "/private/tmp/wt-bm25-pushdown/scripts/seed_large_bm25_corpus.py",
+  "code_state": {
+    "commit": "23269a9",
+    "commit_full": "23269a91d1482f504be540cbbae512cb256b4eb6",
+    "branch": "task/bm25-sql-pushdown",
+    "dirty_paths": [
+      "M src/ingestion/storage/bm25_sqlite_store.py",
+      "M tests/unit/test_bm25_sqlite_store.py",
+      "?? scripts/benchmark_results/bm25_backends_20260827_120158.json",
+      "?? scripts/benchmark_results/bm25_seed_20260827_120105.json"
+    ],
+    "is_clean": false,
+    "warning": "工作区有未提交改动，这批数字对应「含未提交改动的工作区状态」，不能只靠 commit hash 复现"
+  },
+  "corpus_params": {
+    "seed": 20260826,
+    "heaps_k": 6388.0,
+    "heaps_alpha": 0.616,
+    "zipf_s": 1.0,
+    "doc_length": 48.0,
+    "unique_ratio": 0.88
+  },
+  "corpus_kind": "synthetic",
+  "corpus_caveat": "合成 term_stats，非真实文本。可用于体积/延迟/内存/一致性测量；不可用于评价检索质量、召回率或答案正确性。",
+  "collections": [
+    {
+      "chunks": 50000,
+      "collection": "synthetic_bm25_50000",
+      "skipped": false,
+      "index_dir": "/private/tmp/wt-bm25-pushdown/data/db/bm25/synthetic_bm25_50000",
+      "json_path": "/private/tmp/wt-bm25-pushdown/data/db/bm25/synthetic_bm25_50000/synthetic_bm25_50000_bm25.json",
+      "sqlite_path": "/private/tmp/wt-bm25-pushdown/data/db/bm25/synthetic_bm25_50000/synthetic_bm25_50000_bm25.sqlite",
+      "json_bytes": 254962268,
+      "sqlite_bytes": 183513088,
+      "vocab_target": 71110,
+      "vocab_realized": 71110,
+      "postings_total": 2113345,
+      "postings_per_chunk": 42.27,
+      "avg_doc_length": 48.034,
+      "generate_s": 1.08,
+      "build_s": 9.89
+    }
+  ]
+}
