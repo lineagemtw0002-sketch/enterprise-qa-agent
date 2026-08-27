@@ -826,7 +826,9 @@ flowchart TB
   其余端点核对后确认干净（批量查询 + 内存 join，或已有意识地避免了 N+1，如
   `_org_response` 的 `seats_used` 注释）
 - `create_app()` 3038 行 / 72 端点，无路由分层、无依赖注入
-- 无 Dockerfile / CI / 依赖锁定
+- ~~无 Dockerfile / CI / 依赖锁定~~ 🟡 **Dockerfile + `requirements.lock` + docker-compose 已有**
+  （`f8fd428`，OpenSearch 迁移阶段 0 前置），但**本文件此前一直没同步更正**——
+  CI（`.github/workflows`）仍然没有，这条只剩 CI 缺失是真的
 
 ---
 
