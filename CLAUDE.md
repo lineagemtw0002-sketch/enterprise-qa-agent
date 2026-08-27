@@ -882,8 +882,9 @@ flowchart TB
 
 ### 🟠 P1
 
-- 🟡 **闲聊路由误判：81% → 0%（可枚举部分）；结构性方案（第五类 `chitchat`）已实施到 Phase 2，
-  Phase 3（重训 1.5b router）数据/评估设施已备好但训练本身未执行** ——
+- 🔴 **闲聊路由误判：81% → 0%（可枚举部分）；结构性方案（第五类 `chitchat`）已实施到 Phase 2，
+  Phase 3（重训 1.5b router）训练已跑通一轮（v1），但产出未通过准入门槛、不能用于生产，
+  今晚计划重训** ——
   2026-08-27 用户明确批准启动 `docs/chitchat_intent_design.md`（覆盖了此前的搁置状态），
   独立 worktree（`task/chitchat-intent-class` 分支）完成 Phase 1a→1b→2：
   - `intent.py`/`schemas.py` 的 `intent_type` 从借用的 `"rag"` 改成真正的第五类 `"chitchat"`；
@@ -898,16 +899,51 @@ flowchart TB
   - **Phase 1/2 效果边界必须说清楚**：这一步**只是把闲聊单独成桶**（此前借用 `rag`，
     每次闲聊都会白跑一次检索、用企业知识库助手 prompt），闲聊本身的**分类准确率没有变化**——
     过渡期仍然只靠 `intent.py` 白名单短路（可枚举部分），1.5b router 没有重训。
-  - **Phase 3 已备料未训练**：`router_lora_data/train_batch1.jsonl`（320 条，五类各 15%~25%，
-    chitchat 内部开放闲聊 53.1%/hard negative 21.9%）+ `tests/fixtures/router_eval.jsonl`
-    （73 条冻结 holdout，覆盖训练集没强调的英文/表情/方言/超长闲聊）+ 去重校验
-    `scripts/check_router_lora_dedup.py`（`.pre-commit-config.yaml` 已接线，但 pre-commit
-    框架本身**未安装**，当前仍需手动跑）。**真实基线已跑出**
-    （`scripts/eval_router_against_holdout.py`，连真实 `qwen2.5-1.5b-router`）：
-    holdout 总体准确率 **53.4%（39/73）**，**chitchat 只有 11.1%（3/27）**，其余四类
-    85.7%~100%——这是"重训前"基准，不是训练结果。**真实 LoRA 训练本次未执行**：
-    本机未装 `mlx-lm`/`peft`/`torch`，原模型是 LoRA+MLX 流程训练的（`docs/optimization_tracking.md`
-    有记录），现装训练环境是独立的工程投入，不能顺带做完，如实标注未完成，没有伪造训练结果。
+  - **Phase 3 训练已跑通、评估结果不达标（2026-08-27）**：`router_lora_data/train_batch1.jsonl`
+    （320 条，五类各 15%~25%，chitchat 内部开放闲聊 53.1%/hard negative 21.9%）+
+    `tests/fixtures/router_eval.jsonl`（73 条冻结 holdout）+ 去重校验
+    `scripts/check_router_lora_dedup.py`。**重训前真实基线**（`scripts/eval_router_against_holdout.py`，
+    连真实 `qwen2.5-1.5b-router`）：holdout 总体准确率 **53.4%（39/73）**，**chitchat 只有
+    11.1%（3/27）**，clarify 100%、rag 20.0%（此前本条目误写成"其余四类 85.7%~100%"，已更正）、
+    tool 85.7%、workflow 100%。
+
+    **训练本身本次真的跑通了**（此前"本机未装 mlx-lm"的判断经核实是错的，环境已确认可用）：
+    `scripts/convert_router_lora_to_mlx_chat.py`（把结构化标签转成 mlx chat 格式，
+    prompt 逐字节复现自 `analyze_and_route` 真实发给 Ollama 的请求体，用
+    `scripts/verify_router_prompt_replication.py` 拦截真实 HTTP 请求实测比对过，不是凭读代码
+    猜的）→ `scripts/train_router_lora.sh`（mlx_lm.lora，batch=1+grad-checkpoint+mask-prompt，
+    816 iters=3 epoch，本机 Metal GPU 在 batch=2 时会 OOM，已实测确认只能 batch=1）→
+    `scripts/fuse_convert_register_router_lora.sh`（`mlx_lm.fuse --dequantize` 融合+反量化 →
+    vendor 的 llama.cpp `convert_hf_to_gguf.py`（`mlx_lm.fuse --export-gguf` 本身**不支持
+    Qwen2**，已实测确认，用的是备用路径）转 Q8_0 GGUF → `ollama create` 注册成**新模型名**
+    `qwen2.5-1.5b-router-chitchat-v1`，**生产的 `qwen2.5-1.5b-router` 全程未被覆盖**，
+    digest 训练前后比对一致）。
+
+    **评估结果：闲聊修好了，但对照组崩了，没通过 R5 硬性准入条件（对照组误判率不得上升），
+    v1 不能用于生产**：
+    | 指标 | 重训前 | v1 |
+    |---|---|---|
+    | holdout 总体 | 53.4%（39/73） | 72.6%（53/73） |
+    | holdout chitchat | 11.1%（3/27） | 70.4%（19/27） |
+    | holdout **tool** | 85.7%（12/14） | 🔴 35.7%（5/14）——14 条里 7 条被误判成 chitchat |
+    | 闲聊误判率（`verify_smalltalk_routing.py`） | 31.4%（22/70） | 2.9%（2/70） |
+    | **对照组误判率** | **0.0%（0/44）** | 🔴 **72.7%（32/44）** |
+
+    对照组里最惨的是纯业务知识库问题（`6_control_kb`，如"报销流程是怎样的"）**100%
+    （18/18）被判成 chitchat**、寒暄+业务混合（`6_control_kb_mixed`）**100%（6/6）**、
+    长得像闲聊的业务问题（`8_control_lookalike`，如"你们公司年会是什么时候"）**75%（6/8）**。
+
+    **初步诊断**（留给今晚重训参考，本次未展开验证）：训练数据 hard negative 只有 10 条，
+    占 chitchat 总数 15.6%（10/64），低于本文档 §2.3-3c④ 自定的 ≥20% 门槛，且这 10 条
+    hard negative 的寒暄开头高度模板化（"你好，X"/"谢谢，X"），而真正被误伤的业务问题
+    很多不含寒暄词、是纯第二人称问句（"你们公司…"/"你知道…吗"/"你能…吗"）——核查训练
+    数据发现"你们公司"这个模式训练集里**零覆盖**、"你能"4 条里 3 条是 chitchat 只 1 条是
+    tool。加上 val loss 收敛到 0.005（3 epoch、272 条数据、prompt 里 ~1400 token 跨样本
+    几乎相同），很可能是模型记住了"第二人称问句→chitchat"这条表层捷径，是典型的小数据
+    过拟合，不是随机噪声。另发现一次异常：同一问题两次请求耗时分别是 2.12s 和 449.59s，
+    指向个别情况下可能有解码退化，只观察到一次，未复现/未定位根因。
+
+    详见 `docs/chitchat_intent_design.md` 顶部状态区。
   - **一处偏离原拍板值**：训练数据落仓路径从 §5-⑦ 拍板的 `data/router_lora/` 改成仓库根目录
     `router_lora_data/`——本机 `.gitignore`（+ `.git/info/exclude` 里 worktree 共享的重复规则）
     把整个 `data/` 忽略，塞进去的文件会被 git 悄悄当不存在，正是要避免的"数据丢失"本身；
@@ -947,7 +983,8 @@ flowchart TB
   但 08-23 基线（7b·两次调用）仍有 **43% 闲聊误判**，只是错法是澄清话术。
   **不是从对变错，是错法变得更有害。**
   **剩余修复顺序**：~~定第五类 `chitchat` 体系~~ ✅ 已完成（见上）→ 按新体系补样本重训 LoRA
-  🟡 **数据已备好、训练本身未执行**（见上方本条目最新记录的 Phase 3 部分）。
+  🔴 **v1 已训练+评估，未通过准入条件、不能用于生产，今晚计划补样本重训 v2**
+  （见上方本条目最新记录的 Phase 3 部分）。
   ~~重训前必须先把训练数据与生成脚本从临时目录落进仓库~~ ✅ **已完成**：
   `router_lora_data/train_batch1.jsonl` + `scripts/gen_router_training_data.py` 均已落仓
   （不在 `data/router_lora/` 是刻意的，见上方"一处偏离原拍板值"说明）。

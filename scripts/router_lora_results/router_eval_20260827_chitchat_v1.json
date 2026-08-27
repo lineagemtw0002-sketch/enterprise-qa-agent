@@ -1,0 +1,593 @@
+{
+  "generated_at": "2026-08-27T15:22:21",
+  "script": "scripts/eval_router_against_holdout.py",
+  "model": "qwen2.5-1.5b-router-chitchat-v1",
+  "eval_path": "tests/fixtures/router_eval.jsonl",
+  "accuracy": 0.726027397260274,
+  "results": [
+    {
+      "query": "那个咋整",
+      "expected": "clarify",
+      "predicted": "clarify",
+      "correct": true,
+      "elapsed_s": 5.22,
+      "error": ""
+    },
+    {
+      "query": "他咋说的",
+      "expected": "clarify",
+      "predicted": "clarify",
+      "correct": true,
+      "elapsed_s": 1.82,
+      "error": ""
+    },
+    {
+      "query": "然后咋办",
+      "expected": "clarify",
+      "predicted": "clarify",
+      "correct": true,
+      "elapsed_s": 1.8,
+      "error": ""
+    },
+    {
+      "query": "这咋弄",
+      "expected": "clarify",
+      "predicted": "clarify",
+      "correct": true,
+      "elapsed_s": 3.35,
+      "error": ""
+    },
+    {
+      "query": "啥意思",
+      "expected": "clarify",
+      "predicted": "clarify",
+      "correct": true,
+      "elapsed_s": 1.76,
+      "error": ""
+    },
+    {
+      "query": "那个到底行不行",
+      "expected": "clarify",
+      "predicted": "clarify",
+      "correct": true,
+      "elapsed_s": 3.46,
+      "error": ""
+    },
+    {
+      "query": "刚说的那事呢",
+      "expected": "clarify",
+      "predicted": "clarify",
+      "correct": true,
+      "elapsed_s": 1.91,
+      "error": ""
+    },
+    {
+      "query": "后来呢",
+      "expected": "clarify",
+      "predicted": "clarify",
+      "correct": true,
+      "elapsed_s": 1.84,
+      "error": ""
+    },
+    {
+      "query": "啥情况这是",
+      "expected": "clarify",
+      "predicted": "rag",
+      "correct": false,
+      "elapsed_s": 3.92,
+      "error": ""
+    },
+    {
+      "query": "那咋办呢",
+      "expected": "clarify",
+      "predicted": "chitchat",
+      "correct": false,
+      "elapsed_s": 5.66,
+      "error": ""
+    },
+    {
+      "query": "这份文件里写的对不对",
+      "expected": "rag",
+      "predicted": "rag",
+      "correct": true,
+      "elapsed_s": 1.94,
+      "error": ""
+    },
+    {
+      "query": "帮我看看刚才那张图",
+      "expected": "rag",
+      "predicted": "rag",
+      "correct": true,
+      "elapsed_s": 3.61,
+      "error": ""
+    },
+    {
+      "query": "这份报告数据准不准",
+      "expected": "rag",
+      "predicted": "rag",
+      "correct": true,
+      "elapsed_s": 1.94,
+      "error": ""
+    },
+    {
+      "query": "这个附件里有没有提到风险",
+      "expected": "rag",
+      "predicted": "rag",
+      "correct": true,
+      "elapsed_s": 1.95,
+      "error": ""
+    },
+    {
+      "query": "帮我把这份文档里的表格提取出来",
+      "expected": "rag",
+      "predicted": "rag",
+      "correct": true,
+      "elapsed_s": 2.03,
+      "error": ""
+    },
+    {
+      "query": "这份合同乙方是谁",
+      "expected": "rag",
+      "predicted": "rag",
+      "correct": true,
+      "elapsed_s": 3.1,
+      "error": ""
+    },
+    {
+      "query": "这份文件签发日期是哪天",
+      "expected": "rag",
+      "predicted": "chitchat",
+      "correct": false,
+      "elapsed_s": 3.85,
+      "error": ""
+    },
+    {
+      "query": "帮我看看这份简历合不合格",
+      "expected": "rag",
+      "predicted": "rag",
+      "correct": true,
+      "elapsed_s": 890.14,
+      "error": ""
+    },
+    {
+      "query": "这份材料里的图表是什么意思",
+      "expected": "rag",
+      "predicted": "rag",
+      "correct": true,
+      "elapsed_s": 3.14,
+      "error": ""
+    },
+    {
+      "query": "这份文档里提到几种方案",
+      "expected": "rag",
+      "predicted": "rag",
+      "correct": true,
+      "elapsed_s": 2.33,
+      "error": ""
+    },
+    {
+      "query": "转正需要考核吗",
+      "expected": "tool",
+      "predicted": "chitchat",
+      "correct": false,
+      "elapsed_s": 9.14,
+      "error": ""
+    },
+    {
+      "query": "加班费怎么发",
+      "expected": "tool",
+      "predicted": "tool",
+      "correct": true,
+      "elapsed_s": 2.78,
+      "error": ""
+    },
+    {
+      "query": "公司几点上班",
+      "expected": "tool",
+      "predicted": "chitchat",
+      "correct": false,
+      "elapsed_s": 8.18,
+      "error": ""
+    },
+    {
+      "query": "年终奖怎么算",
+      "expected": "tool",
+      "predicted": "tool",
+      "correct": true,
+      "elapsed_s": 3.51,
+      "error": ""
+    },
+    {
+      "query": "我这个月请了几次假",
+      "expected": "tool",
+      "predicted": "chitchat",
+      "correct": false,
+      "elapsed_s": 8.56,
+      "error": ""
+    },
+    {
+      "query": "帮我看看我加班了多少小时",
+      "expected": "tool",
+      "predicted": "tool",
+      "correct": true,
+      "elapsed_s": 5.73,
+      "error": ""
+    },
+    {
+      "query": "查一下这周天气",
+      "expected": "tool",
+      "predicted": "chitchat",
+      "correct": false,
+      "elapsed_s": 6.01,
+      "error": ""
+    },
+    {
+      "query": "帮我算下退休还有多少年",
+      "expected": "tool",
+      "predicted": "chitchat",
+      "correct": false,
+      "elapsed_s": 6.32,
+      "error": ""
+    },
+    {
+      "query": "搜一下这个错误代码",
+      "expected": "tool",
+      "predicted": "clarify",
+      "correct": false,
+      "elapsed_s": 2.55,
+      "error": ""
+    },
+    {
+      "query": "查一下附近有没有停车场",
+      "expected": "tool",
+      "predicted": "tool",
+      "correct": true,
+      "elapsed_s": 2.88,
+      "error": ""
+    },
+    {
+      "query": "帮我把请假申请提交了",
+      "expected": "workflow",
+      "predicted": "workflow",
+      "correct": true,
+      "elapsed_s": 0.0,
+      "error": ""
+    },
+    {
+      "query": "我要走个报销流程",
+      "expected": "workflow",
+      "predicted": "workflow",
+      "correct": true,
+      "elapsed_s": 0.0,
+      "error": ""
+    },
+    {
+      "query": "笔记本进水了帮我报修",
+      "expected": "workflow",
+      "predicted": "workflow",
+      "correct": true,
+      "elapsed_s": 0.0,
+      "error": ""
+    },
+    {
+      "query": "我打算下个月出差",
+      "expected": "workflow",
+      "predicted": "workflow",
+      "correct": true,
+      "elapsed_s": 3.5,
+      "error": ""
+    },
+    {
+      "query": "帮我把年假批了",
+      "expected": "workflow",
+      "predicted": "workflow",
+      "correct": true,
+      "elapsed_s": 0.0,
+      "error": ""
+    },
+    {
+      "query": "我想请几天病假",
+      "expected": "workflow",
+      "predicted": "workflow",
+      "correct": true,
+      "elapsed_s": 0.0,
+      "error": ""
+    },
+    {
+      "query": "网线断了帮我报修下",
+      "expected": "workflow",
+      "predicted": "workflow",
+      "correct": true,
+      "elapsed_s": 0.0,
+      "error": ""
+    },
+    {
+      "query": "我要走出差报销流程",
+      "expected": "workflow",
+      "predicted": "workflow",
+      "correct": true,
+      "elapsed_s": 0.0,
+      "error": ""
+    },
+    {
+      "query": "帮我申请一下调休",
+      "expected": "workflow",
+      "predicted": "workflow",
+      "correct": true,
+      "elapsed_s": 0.0,
+      "error": ""
+    },
+    {
+      "query": "我要请假去考试",
+      "expected": "workflow",
+      "predicted": "workflow",
+      "correct": true,
+      "elapsed_s": 0.0,
+      "error": ""
+    },
+    {
+      "query": "how are you",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 5.9,
+      "error": ""
+    },
+    {
+      "query": "good morning",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 2.07,
+      "error": ""
+    },
+    {
+      "query": "what can you do",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 2.84,
+      "error": ""
+    },
+    {
+      "query": "thank you so much",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 8.34,
+      "error": ""
+    },
+    {
+      "query": "see you later",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 2.86,
+      "error": ""
+    },
+    {
+      "query": "good night",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 2.03,
+      "error": ""
+    },
+    {
+      "query": "😊",
+      "expected": "chitchat",
+      "predicted": "clarify",
+      "correct": false,
+      "elapsed_s": 2.17,
+      "error": ""
+    },
+    {
+      "query": "……",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 0.0,
+      "error": ""
+    },
+    {
+      "query": "?",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 3.58,
+      "error": ""
+    },
+    {
+      "query": "!!!",
+      "expected": "chitchat",
+      "predicted": "clarify",
+      "correct": false,
+      "elapsed_s": 2.18,
+      "error": ""
+    },
+    {
+      "query": "🤔",
+      "expected": "chitchat",
+      "predicted": "rag",
+      "correct": false,
+      "elapsed_s": 2.91,
+      "error": ""
+    },
+    {
+      "query": "你干嘛呢",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 3.6,
+      "error": ""
+    },
+    {
+      "query": "在不",
+      "expected": "chitchat",
+      "predicted": "clarify",
+      "correct": false,
+      "elapsed_s": 2.19,
+      "error": ""
+    },
+    {
+      "query": "咋样啊",
+      "expected": "chitchat",
+      "predicted": "clarify",
+      "correct": false,
+      "elapsed_s": 2.64,
+      "error": ""
+    },
+    {
+      "query": "干哈呢",
+      "expected": "chitchat",
+      "predicted": "clarify",
+      "correct": false,
+      "elapsed_s": 6.87,
+      "error": ""
+    },
+    {
+      "query": "你说是不",
+      "expected": "chitchat",
+      "predicted": "rag",
+      "correct": false,
+      "elapsed_s": 10.23,
+      "error": ""
+    },
+    {
+      "query": "整挺好",
+      "expected": "chitchat",
+      "predicted": "clarify",
+      "correct": false,
+      "elapsed_s": 3.29,
+      "error": ""
+    },
+    {
+      "query": "你好呀，最近工作好忙啊，都没时间休息，你说人是不是应该劳逸结合一下比较好呢",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 7.44,
+      "error": ""
+    },
+    {
+      "query": "哎最近天气变化好大，一会儿冷一会儿热的，你说这种天气是不是特别容易感冒呀",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 4.15,
+      "error": ""
+    },
+    {
+      "query": "在么",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 0.0,
+      "error": ""
+    },
+    {
+      "query": "嘿，你在不在",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 2.22,
+      "error": ""
+    },
+    {
+      "query": "你人挺好的",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 2.49,
+      "error": ""
+    },
+    {
+      "query": "跟你聊天挺有意思的",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 3.77,
+      "error": ""
+    },
+    {
+      "query": "你是男的女的",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 2.42,
+      "error": ""
+    },
+    {
+      "query": "你多大了",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 2.85,
+      "error": ""
+    },
+    {
+      "query": "你叫什么",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 0.0,
+      "error": ""
+    },
+    {
+      "query": "你困了吗",
+      "expected": "chitchat",
+      "predicted": "chitchat",
+      "correct": true,
+      "elapsed_s": 3.7,
+      "error": ""
+    },
+    {
+      "query": "嗨，年假还剩几天呀",
+      "expected": "tool",
+      "predicted": "chitchat",
+      "correct": false,
+      "elapsed_s": 2.52,
+      "error": ""
+    },
+    {
+      "query": "你好呀，麻烦帮我查下病假流程",
+      "expected": "tool",
+      "predicted": "workflow",
+      "correct": false,
+      "elapsed_s": 0.0,
+      "error": ""
+    },
+    {
+      "query": "辛苦你了，另外我要出差申请一下",
+      "expected": "workflow",
+      "predicted": "workflow",
+      "correct": true,
+      "elapsed_s": 0.0,
+      "error": ""
+    },
+    {
+      "query": "在的话帮我看看我这月打卡记录",
+      "expected": "tool",
+      "predicted": "tool",
+      "correct": true,
+      "elapsed_s": 7.33,
+      "error": ""
+    },
+    {
+      "query": "谢谢哈，顺便帮我报修下电脑",
+      "expected": "workflow",
+      "predicted": "workflow",
+      "correct": true,
+      "elapsed_s": 0.0,
+      "error": ""
+    },
+    {
+      "query": "你好，加班工资怎么算的呀",
+      "expected": "tool",
+      "predicted": "chitchat",
+      "correct": false,
+      "elapsed_s": 3.75,
+      "error": ""
+    }
+  ]
+}
