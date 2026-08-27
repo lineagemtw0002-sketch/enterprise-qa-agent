@@ -947,7 +947,7 @@ const SECTIONS = [
   { value: 'permissions', label: '授权管理', icon: Users },
 ]
 
-export default function OpsConsole({ canManage = true }) {
+export default function OpsConsole({ canManage = true, onConnectorsChange }) {
   // 白名单/连接器/授权三个分段是 org_admin 专属（后端也只对 org_admin 开放）。
   // 被授予 can_view/can_approve 的普通员工只看总览和审批队列——给他看点进去
   // 必然 403 的分段，跟"导航入口本身要按权限藏起来"是同一个道理。
@@ -958,7 +958,14 @@ export default function OpsConsole({ canManage = true }) {
   const [booting, setBooting] = useState(true)
 
   const onModuleDisabled = useCallback(() => setModuleDisabled(true), [])
-  const onConnectorsLoaded = useCallback((list) => { setConnectors(list); setBooting(false) }, [])
+  const onConnectorsLoaded = useCallback((list) => {
+    setConnectors(list)
+    setBooting(false)
+    // 独立页面的顶栏要显示"N 个连接器在线"。**复用这份已经拉到的列表**，
+    // 不让外壳再发一次相同的请求——同一份数据请求两次，除了多一次往返，
+    // 还会出现顶栏和内容区显示的在线数不一致（两次请求之间状态可能变）。
+    onConnectorsChange?.(list)
+  }, [onConnectorsChange])
 
   // 连接器列表在**控制台这一层**拉，不在「连接器管理」分段里拉——默认落在
   // 「总览」时那个分段根本不会挂载，而「白名单配置」「授权管理」都需要这份列表
@@ -968,7 +975,12 @@ export default function OpsConsole({ canManage = true }) {
     let cancelled = false
     if (!canManage) { setBooting(false); return undefined }
     opsApi.listConnectors()
-      .then((list) => { if (!cancelled) { setConnectors(list); setBooting(false) } })
+      .then((list) => {
+        if (cancelled) return
+        setConnectors(list)
+        setBooting(false)
+        onConnectorsChange?.(list)
+      })
       .catch((error) => {
         if (cancelled) return
         // 这个请求同时充当"模块开没开"的探测：后端未开通时统一 403。
@@ -976,7 +988,7 @@ export default function OpsConsole({ canManage = true }) {
         setBooting(false)
       })
     return () => { cancelled = true }
-  }, [canManage])
+  }, [canManage, onConnectorsChange])
 
   useEffect(() => {
     // 兜底：万一上面的请求既没成功也没失败（网络挂起），别让两个分段永远转圈。

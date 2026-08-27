@@ -16,7 +16,6 @@ import AdminPanel from './components/admin/AdminPanel.jsx'
 import OperationsDashboard from './components/admin/OperationsDashboard.jsx'
 import WorkflowPanel from './components/workflow/WorkflowPanel.jsx'
 import WorkflowStatusPill from './components/workflow/WorkflowStatusPill.jsx'
-import OpsConsole from './components/ops/OpsConsole.jsx'
 import UploadToKbModal from './components/kb/UploadToKbModal.jsx'
 import './App.css'
 
@@ -915,7 +914,10 @@ export default function App() {
         />
       )}
 
-      {view === 'ops' && <OpsConsole canManage={isAdmin} />}
+      {/* 运维塔台已经拆成独立页面（/ops.html，见 vite.config.js 的多页入口）。
+          主应用里**不再内嵌渲染**它——整屏深色的监控大屏嵌在浅色办公界面里，
+          顶栏、弹窗、侧栏全是浅色而中间一块深色，两种视觉语言互相打架。
+          顶部导航的「智能运维」现在是新开标签页，不切 view。 */}
 
       {view === 'chat' && (
       <>

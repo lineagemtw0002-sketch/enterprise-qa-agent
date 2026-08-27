@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <link rel="icon" href="/favicon.ico">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>运维塔台 · RAG Agent</title>
+    <!--
+      ⚠️ 背景色写在 HTML 里，不是等 React 挂载后再上色。
+      运维塔台是深色的，而主应用是浅色的；如果等 JS 跑起来才变深，
+      新标签页会先闪一帧白屏——在一个整屏深色的监控大屏上这一下非常刺眼。
+    -->
+    <style>
+      html, body { margin: 0; padding: 0; background: #0b0c12; }
+    </style>
+  </head>
+  <body>
+    <div id="ops-root"></div>
+    <script type="module" src="/src/opsMain.jsx"></script>
+  </body>
+</html>
