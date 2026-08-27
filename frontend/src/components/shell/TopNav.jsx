@@ -1,7 +1,7 @@
 import { Popover, Tooltip } from 'antd'
 import {
   Sparkles, ChevronDown, MessageSquare, ListChecks, ShieldCheck, Activity,
-  Sparkle, Files as FilesIcon, Building2, LayoutDashboard,
+  Sparkle, Files as FilesIcon, Building2, LayoutDashboard, ExternalLink,
 } from 'lucide-react'
 import NotificationBell from '../workflow/NotificationBell.jsx'
 import './TopNav.css'
@@ -116,7 +116,14 @@ const MODULES = [
   // 的 isAdmin 会把他们全挡在外面，等于后端放宽了、前端的门还锁着。
   // 依据 /auth/me 的 ops_can_view（后端已把 org_admin 通配符和显式授权算成并集，
   // 前端不重复实现权限逻辑——跟 allowed_collections 是同一个思路）。
-  { key: 'ops', label: '智能运维', icon: Activity, hideForPlatform: true, needsAiops: true, needsOpsView: true },
+  // ⚠️ **这一项不切 view，而是新开一个标签页**（externalHref）。
+  // 运维塔台是整屏深色的监控大屏，主应用是浅色的办公界面——塞在同一个壳里，
+  // 浅色顶栏配深色内容区，两种视觉语言互相打架。监控大屏本来就是"独占一屏
+  // 盯着看"的用法，单开一页也更贴合。页面本身是 vite 的第二个入口，不是路由。
+  {
+    key: 'ops', label: '智能运维', icon: Activity, externalHref: '/ops.html',
+    hideForPlatform: true, needsAiops: true, needsOpsView: true,
+  },
 ]
 
 // 顶部导航：登录后所有界面共用的壳——模块切换 + 通知 + 个人信息，替代原来
@@ -221,13 +228,21 @@ export default function TopNav({
             key={m.key}
             className={[
               'nav-item',
-              view === m.key ? 'active' : '',
+              // 外链项永远不高亮：当前页面根本没切过去，高亮它是在说谎。
+              (view === m.key && !m.externalHref) ? 'active' : '',
               m.soon ? 'soon' : '',
             ].filter(Boolean).join(' ')}
-            onClick={() => onNavigate(m.key)}
+            onClick={() => {
+              // 新标签页打开，不 replace 当前页——用户多半是"边用主应用边盯大屏"，
+              // 把他手上的对话顶掉是最不该干的事。
+              if (m.externalHref) window.open(m.externalHref, '_blank', 'noopener')
+              else onNavigate(m.key)
+            }}
+            title={m.externalHref ? '在新标签页打开运维塔台' : undefined}
           >
             <m.icon size={16} />
             {m.label}
+            {m.externalHref && <ExternalLink size={12} className="nav-external-icon" />}
             {m.soon && <span className="nav-soon">即将上线</span>}
           </div>
         ))}
