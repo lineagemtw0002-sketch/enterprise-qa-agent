@@ -48,7 +48,7 @@ from src.ops.analysis import Alert, correlate_alerts, detect_anomalies  # noqa: 
 from src.ops.types import DataPoint  # noqa: E402
 
 TARGET_SERVICE = "order-service"
-CONNECTOR_NAME = "演示探针（模拟客户环境）"
+DEFAULT_CONNECTOR_NAME = "演示探针（模拟客户环境）"
 
 
 def _call(api: str, method: str, path: str, token: str, body: Optional[dict] = None) -> Any:
@@ -128,7 +128,7 @@ def _chat(api: str, token: str, query: str, timeout_s: float = 180.0) -> str:
 
 
 async def run(api: str, ws_url: str, username: str, cleanup: bool, exec_fails: bool,
-              keep_alive: bool) -> int:
+              keep_alive: bool, connector_name: str) -> int:
     from src.ragent_backend import auth
     from src.ragent_backend.org_store import OrgStore
     from src.ragent_backend.user_store import UserStore
@@ -164,13 +164,13 @@ async def run(api: str, ws_url: str, username: str, cleanup: bool, exec_fails: b
     # 而它们跟真探针**同名**，看起来像"我的探针一会儿在线一会儿掉线"，
     # 排查方向会被带到完全错误的地方（我自己就被带偏过一次）。
     for old_conn in await asyncio.to_thread(_call, api, "GET", "/api/v1/admin/ops/connectors", token):
-        if old_conn["name"] == CONNECTOR_NAME:
+        if old_conn["name"] == connector_name:
             await asyncio.to_thread(_call, api, "DELETE",
                                     f"/api/v1/admin/ops/connectors/{old_conn['connection_id']}", token)
             print(f"🧹 清掉上次残留的连接器 {old_conn['connection_id']}")
 
     conn = await asyncio.to_thread(_call, api, "POST", "/api/v1/admin/ops/connectors", token, {
-        "name": CONNECTOR_NAME, "system_type": "prometheus",
+        "name": connector_name, "system_type": "prometheus",
         "approval_timeout_minutes": 30,
     })
     cid = conn["connection_id"]
@@ -271,12 +271,20 @@ def main() -> int:
     ap.add_argument("--user", default="alice_acme", help="用哪个企业管理员账号跑")
     ap.add_argument("--cleanup", action="store_true", help="删掉本企业全部连接器（级联清数据）后退出")
     ap.add_argument("--exec-fails", action="store_true", help="让探针的执行一律失败，验证失败态展示")
+    ap.add_argument("--name", default=DEFAULT_CONNECTOR_NAME,
+                    help="连接器名字。⚠️ **本机同时跑多个后端时必须区分**——脚本每次启动会先"
+                         "按名字清掉同名的旧连接器，而多个后端共用同一个 Postgres，"
+                         "同名就会互相把对方的连接器删掉。"
+                         "另外注意：连接器的「在线」是按库里的心跳时间算的，而能不能真正"
+                         "查询取决于 WebSocket 握在哪个后端进程手里——A 后端上挂的探针，"
+                         "在 B 后端的界面上会显示在线但查不到数据。")
     ap.add_argument("--once", action="store_true",
                     help="灌完数据就退出（探针随之下线，连接器转离线）。默认保持探针常驻，"
                          "因为大屏的实时查询需要一个活着的客户侧进程")
     args = ap.parse_args()
     ws = args.ws or args.api.replace("http://", "ws://").replace("https://", "wss://")
-    return asyncio.run(run(args.api, ws, args.user, args.cleanup, args.exec_fails, not args.once))
+    return asyncio.run(run(args.api, ws, args.user, args.cleanup, args.exec_fails,
+                          not args.once, args.name))
 
 
 if __name__ == "__main__":
