@@ -502,8 +502,9 @@ function ApprovalsSection({ onModuleDisabled }) {
     setActing(actionId)
     try {
       if (kind === 'approve') await opsApi.approveRemediationAction(actionId)
+      else if (kind === 'execute') await opsApi.executeRemediationAction(actionId)
       else await opsApi.rejectRemediationAction(actionId)
-      message.success(kind === 'approve' ? '已批准' : '已拒绝')
+      message.success({ approve: '已批准', execute: '已下发执行', reject: '已拒绝' }[kind])
       load()
     } catch (error) {
       // 409 是并发冲突：别人刚刚已经处理过这条了（后端用条件 UPDATE 保证
@@ -556,6 +557,28 @@ function ApprovalsSection({ onModuleDisabled }) {
     {
       title: '审批',
       render: (_, row) => {
+        // 已批准但还没执行的，这里给出真正的下发入口。
+        // **不做成"批准即执行"**：批准是授权决定，执行是动作本身，把两者合成
+        // 一步会让"我只是想先授权、等窗口期再动手"变得不可能。
+        if (row.status === 'approved') {
+          return (
+            <Space>
+              <Popconfirm
+                title="现在就在客户环境里执行这个动作？"
+                description="这一步会真正下发到探针/连接器并立即执行，不是模拟。执行前会再查一次目标是否仍在允许范围内。"
+                okText="确认执行"
+                okButtonProps={{ danger: true }}
+                cancelText="再想想"
+                onConfirm={() => act(row.action_id, 'execute')}
+              >
+                <Button size="small" danger loading={acting === row.action_id}>执行</Button>
+              </Popconfirm>
+              <Text type="secondary">
+                {displayUser(userNames, row.approver_user_id)} 已批准
+              </Text>
+            </Space>
+          )
+        }
         if (row.status !== 'pending_approval') {
           return row.approver_user_id
             ? <Text type="secondary">{displayUser(userNames, row.approver_user_id)} · {fmtTime(row.approved_at)}</Text>
@@ -565,7 +588,7 @@ function ApprovalsSection({ onModuleDisabled }) {
           <Space>
             <Popconfirm
               title="确认批准这个修复动作？"
-              description="批准 = 授予执行资格，本身不会立刻下发；真正执行由智能运维在对话里另行发起。请先确认上面的动作参数。"
+              description="批准 = 授予执行资格，本身不会立刻下发；批准之后这一列会出现「执行」按钮，由人决定何时下发。请先确认上面的动作参数。"
               okText="确认批准"
               cancelText="再想想"
               onConfirm={() => act(row.action_id, 'approve')}

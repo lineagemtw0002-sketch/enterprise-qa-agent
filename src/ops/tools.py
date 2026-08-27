@@ -303,7 +303,10 @@ class OpsToolset:
         # ③ 白名单复查——**四道里唯一在下游完全没有对应检查的一道**。
         # 提议到批准之间可能隔了 30 分钟（§10.4 默认超时），这期间管理员完全
         # 可能把目标从白名单里摘掉。不在这里复查，就会打在一个已被禁止的目标上。
-        recheck = await self._recheck_scope(action, action_type)
+        # 调用方（LLM）没传类型时从落库的 plan 里推导——原来是直接跳过白名单
+        # 复查，也就是说**模型只要漏传一个参数，最关键的那道检查就没了**。
+        # 推导不出来（历史数据 plan 里没有）才回到"跳过"，那时确实无从检查。
+        recheck = await self._recheck_scope(action, action_type or (action.plan or {}).get("action_type"))
         if recheck is not None:
             return recheck
 

@@ -2139,7 +2139,14 @@ def create_app() -> FastAPI:
 
         action = await ops_store.create_proposed_action(
             org.org_id, connection_id, current_user.user_id, request.intent,
-            request.plan, impact_radius=request.impact_radius, rollback_plan=request.rollback_plan,
+            # ⚠️ **把 `action_type` 盖进 plan 一起落库。**
+            # `remediation_actions` 没有 action_type 列，它只活在请求参数里；
+            # 而执行前的白名单复查（`OpsToolset._recheck_scope`）需要知道类型，
+            # 拿不到就**静默跳过那道检查**——提议到执行之间管理员完全可能把目标
+            # 从白名单里摘掉，跳过复查等于打在一个已被禁止的目标上。
+            # 之前只有"调用方恰好把 action_type 写进了 plan"时才检查得了。
+            {**request.plan, "action_type": request.action_type},
+            impact_radius=request.impact_radius, rollback_plan=request.rollback_plan,
             summary_id=summary_id,
         )
 
@@ -2373,6 +2380,58 @@ def create_app() -> FastAPI:
             current_user.user_id, "approve_remediation_action", "remediation_action", action.action_id, {},
         )
         return _remediation_action_response(action)
+
+    @app.post(
+        "/api/v1/admin/ops/remediation-actions/{action_id}/execute",
+        response_model=RemediationActionResponse,
+    )
+    async def admin_execute_remediation_action(
+        action_id: str,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> RemediationActionResponse:
+        """把一条**已批准**的修复动作真正下发到客户环境。
+
+        ## 为什么需要这个端点
+
+        在它之前，这个模块**唯一的执行通路是 LLM 工具**——审批通过之后，人在
+        运维塔台上没有任何办法让它执行，只能去对话里跟模型说一句，指望模型把
+        `action_id` 传对。实测两次都没传对（一次被意图路由判成了别的类型、
+        一次参数名错），动作永远停在 `approved`。
+        业界的运维审批台都是「批准 → 人点执行」，没有哪个是"批准完去跟聊天
+        机器人说一声"。
+
+        ## 跟 LLM 那条路走的是同一段代码
+
+        直接调 `ops_toolset.execute_approved_remediation`，**不另写一份执行
+        逻辑**——四道检查（跨 org / 状态必须是 approved / 白名单复查 / 下发
+        失败也要落到 failed）两条路径完全一致，不会随时间漂移出差别。
+        一个"给人用的快捷入口"如果比 AI 那条路少一道检查，它就是这个模块最大
+        的漏洞，而不是一个便利功能。
+
+        ## 权限
+
+        跟批准同一档（`can_approve`）。V1 不区分"批准人"和"执行人"——设计文档
+        没有定义过第三档权限，凭空造一档不如留给真实需求出现时再定。
+        """
+        org = await _require_aiops_enabled_org(current_user)
+        action = await _get_owned_action(org.org_id, action_id)
+        await _require_can_approve(current_user.user_id, action.connection_id)
+
+        outcome = await ops_toolset.execute_approved_remediation(
+            org.org_id, action.action_id,
+            # 从落库的 plan 里取，不让调用方传——调用方能传就意味着能传错，
+            # 而传错的后果是白名单复查被跳过（见上面提议处的说明）。
+            action_type=(action.plan or {}).get("action_type"),
+        )
+        await _audit_log(
+            current_user.user_id, "execute_remediation_action", "remediation_action",
+            action.action_id, {"ok": outcome.ok},
+        )
+        if outcome.refused:
+            # 被四道检查挡下 = 业务规则冲突，不是服务器错误，调用方要能区分。
+            raise HTTPException(status_code=409, detail=outcome.message)
+        refreshed = await ops_store.get_action(action.action_id)
+        return _remediation_action_response(refreshed or action)
 
     @app.post(
         "/api/v1/admin/ops/remediation-actions/{action_id}/reject",

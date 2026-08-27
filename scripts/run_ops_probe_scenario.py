@@ -4,12 +4,18 @@
 真跑一遍——查询 → 分析 → 提议 → 审批 → 执行 → 复盘，跑完总览的 KPI、
 告警关联时间线、审批卡片、事后复盘、四个效果指标全部有真实数据。
 
-**为什么必须走对话（而不是脚本直接调工具）**：`analyze_ops_incident` 只注册给了
-LLM，没有 HTTP 触发入口；而且探针的 WebSocket 连接活在**后端进程**里
-（`app.py` 的 `active_ops_connector_ws`），脚本本地构造 `OpsToolset` 根本够不到它。
-所以要产生分析摘要，只有让模型在对话里真的调用那个工具这一条路。
-代价是这一步依赖 7B 模型愿意调工具，不是 100% 稳定——脚本会如实报告它调没调，
+**分析那一步必须走对话**：`analyze_ops_incident` 只注册给了 LLM，没有 HTTP
+触发入口；而且探针的 WebSocket 连接活在**后端进程**里（`app.py` 的
+`active_ops_connector_ws`），脚本本地构造 `OpsToolset` 根本够不到它。
+代价是它依赖 7B 模型愿意调工具，不是 100% 稳定——脚本会如实报告它调没调，
 不会在没调用时假装成功。
+
+**执行那一步不走对话**（2026-08-27 改）：原来也是让模型去调
+`execute_approved_remediation`，实测两次都没成功——一次被意图路由判成了别的
+类型（根本没进工具子图）、一次模型没把 `action_id` 传对。动作永远停在
+`approved`，看起来像"下发失败"，实际是**下发这件事压根没发生**。
+现在走 `POST /remediation-actions/{id}/execute`，也就是运维塔台上「执行」按钮
+调的那个端点；它跟 LLM 那条路是同一段执行代码、同样四道检查。
 
 ⚠️ **默认不清理数据**（CLAUDE.md §7.2 多会话协作纪律）：跑完打印出连接器编号，
 留给另一个会话复核，确认后再用 `--cleanup` 删。
@@ -199,6 +205,7 @@ async def run(api: str, ws_url: str, username: str, cleanup: bool, exec_fails: b
                        f"请调用 analyze_ops_incident 工具，参数 target 设为 {TARGET_SERVICE}，"
                        "分析它最近一小时的运行情况")
         summaries = await asyncio.to_thread(_call, api, "GET", "/api/v1/admin/ops/analysis-summaries", token)
+        summary_id = summaries[0]["summary_id"] if summaries else None
         if summaries:
             print(f"✅ 模型调用了分析工具，产出 {len(summaries)} 条分析摘要")
         else:
@@ -212,17 +219,26 @@ async def run(api: str, ws_url: str, username: str, cleanup: bool, exec_fails: b
             "intent": f"重启 {TARGET_SERVICE} 以缓解错误率突增",
             "plan": {"action_type": "restart_service", "target": TARGET_SERVICE},
             "impact_radius": f"{TARGET_SERVICE} 单实例，下游 payment-gateway 可能短暂受影响",
+            # 链上分析摘要——**MTTR 全靠它**：故障起点取的是该次分析里最早那条
+            # 告警的时间，没有这个链接就只能跳过（不会拿 created_at 凑数）。
+            "summary_id": summary_id,
         })
         print(f"✅ 已生成待审批动作 {action['action_id']}")
 
         await asyncio.to_thread(_call, api, "POST", f"/api/v1/admin/ops/remediation-actions/{action['action_id']}/approve", token)
         print("✅ 已批准（注意：批准不会自动执行，下面这一步才是真正下发）")
 
-        # —— 第一次由真连接器跑通 exec 链路 ——
-        print("⏳ 通过对话触发执行…")
-        await asyncio.to_thread(_chat, api, token,
-              f"请调用 execute_approved_remediation 工具，参数 action_id 设为 {action['action_id']}，"
-              "action_type 设为 restart_service")
+        # —— 真正下发 ——
+        # ⚠️ **不走对话。** 原来这一步是让模型去调 `execute_approved_remediation`，
+        # 实测两次都没成功：一次被意图路由判成了别的类型（根本没进工具子图）、
+        # 一次模型没把 `action_id` 传对被参数校验挡下。动作永远停在 approved，
+        # 看起来像"下发失败"，实际是**下发这件事压根没发生**。
+        # 现在走人点的那个执行端点——它跟 LLM 那条路是同一段执行代码、同样四道
+        # 检查，所以这一步既是造数据，也是对那条链路的真实验证。
+        print("⏳ 下发执行…")
+        await asyncio.to_thread(
+            _call, api, "POST",
+            f"/api/v1/admin/ops/remediation-actions/{action['action_id']}/execute", token)
         final = next((a for a in await asyncio.to_thread(_call, api, "GET", "/api/v1/admin/ops/remediation-actions", token)
                       if a["action_id"] == action["action_id"]), None)
         print(f"   动作最终状态：{final['status'] if final else '?'}"

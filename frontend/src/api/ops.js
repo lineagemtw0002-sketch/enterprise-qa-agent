@@ -204,3 +204,18 @@ export function listPostmortems(limit = 100) {
 export function getLiveOverview() {
   return axios.get(`${BASE}/ops/live-overview`).then((res) => res.data)
 }
+
+// 把一条**已批准**的动作真正下发到客户环境。
+//
+// ⚠️ 在这个接口之前，模块唯一的执行通路是 LLM 工具——审批通过之后人在界面上
+// 没有任何办法让它执行，只能去对话里跟模型说一句、指望它把参数传对（实测两次
+// 都没传对）。后端这个端点走的是**跟 LLM 完全相同的那段执行代码**，四道检查
+// 一模一样，不是一条更宽松的快捷路径。
+//
+// 409 = 被四道检查挡下（状态不对 / 白名单已被移除 / 并发冲突），是业务规则
+// 冲突不是服务器错误，按提示刷新即可。
+export function executeRemediationAction(actionId) {
+  return axios
+    .post(`${BASE}/ops/remediation-actions/${encodeURIComponent(actionId)}/execute`)
+    .then((res) => res.data)
+}
