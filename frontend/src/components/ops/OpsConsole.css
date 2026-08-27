@@ -401,3 +401,83 @@
 }
 .svc-analyze:hover:not(:disabled) { color: var(--ops-accent); border-color: var(--ops-accent); }
 .svc-analyze:disabled { opacity: 0.5; cursor: progress; }
+
+/* ============================================================
+   窄屏卡片列表（≤720px 时代替 antd Table）
+   见 OpsConsole.jsx 的 `useNarrowScreen` / `OpsCards`。
+   ============================================================ */
+
+/* ⚠️ **这一段刻意不写在媒体查询里。** 窄宽两种形态由 JS 的 matchMedia 决定
+   渲染哪一份 DOM，卡片在宽屏上根本不会被渲染出来。写成 `@media (max-width:720px)`
+   反而会踩这个文件里已经踩过的坑：本文件有多个只写上界的断点，同名规则互相
+   覆盖，最后哪条生效取决于书写顺序。 */
+.ops-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ops-cards-loading { display: flex; justify-content: center; padding: 24px 0; }
+.ops-cards-pager { display: flex; justify-content: center; margin-top: 12px; }
+
+.ops-card {
+  background: var(--surface-inset);
+  border: 1px solid var(--ops-border);
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+
+.ops-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+/* 标题（审批的「意图」、连接器的「名称」）是这张卡的身份，允许换行占满——
+   截断成一行省略号等于逼用户点开才知道这是哪条记录。 */
+.ops-card-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.5;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* 状态标签不参与压缩：它比标题短得多，被挤掉一半反而更难认。 */
+.ops-card-extra { flex: none; }
+
+.ops-card-fields {
+  display: grid;
+  /* 标签列固定宽度，让多张卡的值左边缘对齐——竖排字段最容易读的就是这条对齐线。
+     78px 够放最长的标签「事后有效性」（5 个中文字 @11.5px）。 */
+  grid-template-columns: 78px minmax(0, 1fr);
+  gap: 7px 10px;
+  margin: 0;
+}
+.ops-card-field { display: contents; }
+.ops-card-fields dt {
+  font-size: 11.5px;
+  color: var(--ink-muted);
+  line-height: 1.7;
+}
+.ops-card-fields dd {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink);
+  line-height: 1.7;
+  min-width: 0;
+  /* 动作参数里会出现服务名/路径这类不带空格的长串，不给断行点会把整张卡撑宽、
+     让页面横向滚动——那正是这次要消掉的东西。 */
+  overflow-wrap: anywhere;
+}
+
+/* 操作按钮在卡片底部、跟字段区之间隔一条线：它们是有后果的动作
+  （执行 / 删除），不该看起来像又一个字段。 */
+.ops-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 11px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-soft);
+}

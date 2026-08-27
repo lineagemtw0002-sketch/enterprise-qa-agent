@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Alert, Button, Card, Checkbox, ConfigProvider, Empty, Form, Input, InputNumber,
-  Modal, Popconfirm, Segmented, Select, Space, Spin, Table, Tag, Typography, message, theme,
+  Modal, Pagination, Popconfirm, Segmented, Select, Space, Spin, Table, Tag, Typography,
+  message, theme,
 } from 'antd'
 import { Plug, KeyRound, ShieldCheck, ClipboardCheck, RefreshCw, Copy, Users, Trash2, LayoutDashboard, History } from 'lucide-react'
 import OpsOverview from './OpsOverview.jsx'
@@ -90,6 +91,99 @@ function StatusTag({ status }) {
   return <Tag color={meta.color}>{meta.label}</Tag>
 }
 
+// ============================================================ 窄屏卡片
+
+/* 断点跟 OpsConsole.css 里 `.ops-tabnav` 那条改横向滚动的规则对齐（720px）。
+   两处写同一个数字是个隐患，但 CSS 变量不能用在媒体查询条件里，而为这一个
+   数字引一套构建期变量方案不划算——改的时候记得两边一起改。 */
+const NARROW_QUERY = '(max-width: 720px)'
+
+/** 当前视口是不是窄屏。
+ *
+ * 为什么在 JS 里判定，而不是把表格和卡片两份 DOM 都渲染出来、用 CSS 藏掉一份：
+ * 这两个表格里的按钮带 Popconfirm，它挂在 body 的 portal 上、**不受父容器的
+ * `display:none` 约束**。两份 DOM 就是同一个删除动作有两个活着的触发点，
+ * 点开哪一个取决于 DOM 顺序——这类问题在构建和读代码时都看不出来。
+ */
+function useNarrowScreen() {
+  const [narrow, setNarrow] = useState(() => window.matchMedia(NARROW_QUERY).matches)
+
+  useEffect(() => {
+    const mq = window.matchMedia(NARROW_QUERY)
+    const onChange = (e) => setNarrow(e.matches)
+    mq.addEventListener('change', onChange)
+    // 初始值是在渲染时读的，到这里订阅建立之间可能已经变过（挂载后立刻旋转屏幕、
+    // 或者 React 严格模式下的二次挂载）。补读一次，不依赖"这中间不会变"。
+    setNarrow(mq.matches)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+
+  return narrow
+}
+
+/** 窄屏下代替 `Table` 的卡片列表：一条记录一张卡，字段竖排，操作按钮在底部。
+ *
+ * ⚠️ **列定义和卡片字段必须来自同一批 render 函数**，不要在这里重写一遍渲染
+ * 逻辑。运维塔台已经因为"三个视图各写各的"踩过一次坑（总览把 UUID 解析成了
+ * 用户名，审批队列和复盘卡片没跟上，见 CLAUDE.md §5 08-27 那条）——同一个字段
+ * 有两处渲染实现，任何一处漏改都没有测试能发现。
+ *
+ * `card(row)` 返回 `{ title, extra, fields, actions }`，`fields` 里的假值项会被
+ * 丢掉，方便调用方写 `cond && { label, value }`。
+ */
+function OpsCards({ loading, items, rowKey, empty, card, pageSize }) {
+  const [page, setPage] = useState(1)
+
+  // 数据变短（比如筛完/删完）时把页码收回来，否则会停在一个空页上，
+  // 界面显示"什么都没有"而实际有数据。
+  const total = items.length
+  const maxPage = Math.max(1, Math.ceil(total / (pageSize || total || 1)))
+  const current = Math.min(page, maxPage)
+  const shown = pageSize ? items.slice((current - 1) * pageSize, current * pageSize) : items
+
+  if (loading && !total) return <div className="ops-cards-loading"><Spin /></div>
+  if (!total) return <Empty description={empty} />
+
+  return (
+    <>
+      <div className="ops-cards">
+        {shown.map((row) => {
+          const { title, extra, fields, actions } = card(row)
+          return (
+            <div className="ops-card" key={row[rowKey]}>
+              <div className="ops-card-head">
+                <div className="ops-card-title">{title}</div>
+                {extra && <div className="ops-card-extra">{extra}</div>}
+              </div>
+              <dl className="ops-card-fields">
+                {fields.filter(Boolean).map((f) => (
+                  <div className="ops-card-field" key={f.label}>
+                    <dt>{f.label}</dt>
+                    <dd>{f.value}</dd>
+                  </div>
+                ))}
+              </dl>
+              {actions && <div className="ops-card-actions">{actions}</div>}
+            </div>
+          )
+        })}
+      </div>
+      {pageSize && total > pageSize && (
+        <div className="ops-cards-pager">
+          <Pagination
+            simple
+            size="small"
+            current={current}
+            pageSize={pageSize}
+            total={total}
+            onChange={setPage}
+          />
+        </div>
+      )}
+    </>
+  )
+}
+
 /** 整个页面共用的"模块未开通"态。
  *
  * 后端的模块开关是叠加在 ACL 之前的独立一层，未开通时这些端点一律 403。
@@ -119,6 +213,7 @@ function ConnectorsSection({ onModuleDisabled, onConnectorsLoaded }) {
   const [form] = Form.useForm()
   const [tokenInfo, setTokenInfo] = useState(null)
   const [deleting, setDeleting] = useState('')
+  const narrow = useNarrowScreen()
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -179,6 +274,42 @@ function ConnectorsSection({ onModuleDisabled, onConnectorsLoaded }) {
     }
   }
 
+  // 下面三个 render 函数**同时**供宽屏表格列和窄屏卡片使用，不要为某一侧重写。
+  const renderStatusTag = (s) => (
+    <Tag color={s === 'online' ? 'green' : 'default'}>{s === 'online' ? '在线' : '离线'}</Tag>
+  )
+  const renderRowActions = (row) => (
+    <>
+      <Button size="small" icon={<KeyRound size={14} />} onClick={() => handleToken(row)}>
+        生成握手凭证
+      </Button>
+      {/* 删除是硬删除且级联——把"会一起消失什么"逐条列出来再让人点。
+          只写"确定删除吗"的话，管理员不会意识到审批历史也跟着没了。 */}
+      <Popconfirm
+        title="删除这个连接器？"
+        description={
+          <div style={{ maxWidth: 320 }}>
+            会<b>一并永久删除</b>它名下的全部数据：
+            <ul style={{ margin: '6px 0 0 16px', padding: 0 }}>
+              <li>修复范围白名单</li>
+              <li>角色授权（谁能看 / 谁能批）</li>
+              <li><b>全部修复动作记录</b>——谁在什么时候批准了什么，会一起消失</li>
+              <li><b>全部分析摘要与依据引用</b></li>
+              <li>握手/会话令牌</li>
+            </ul>
+            这些属于审计材料，删了无法恢复。
+          </div>
+        }
+        okText="确认删除" cancelText="取消" okButtonProps={{ danger: true }}
+        onConfirm={() => handleDelete(row)}
+      >
+        <Button size="small" danger icon={<Trash2 size={14} />} loading={deleting === row.connection_id}>
+          删除
+        </Button>
+      </Popconfirm>
+    </>
+  )
+
   const columns = [
     { title: '名称', dataIndex: 'name' },
     { title: '系统类型', dataIndex: 'system_type' },
@@ -187,7 +318,7 @@ function ConnectorsSection({ onModuleDisabled, onConnectorsLoaded }) {
       dataIndex: 'connector_status',
       render: (s, row) => (
         <Space size={4}>
-          <Tag color={s === 'online' ? 'green' : 'default'}>{s === 'online' ? '在线' : '离线'}</Tag>
+          {renderStatusTag(s)}
           <Text type="secondary" className="ops-console-hint">
             最近心跳 {fmtTime(row.last_heartbeat_at)}
           </Text>
@@ -196,41 +327,20 @@ function ConnectorsSection({ onModuleDisabled, onConnectorsLoaded }) {
     },
     { title: '审批超时', dataIndex: 'approval_timeout_minutes', render: (m) => `${m} 分钟` },
     { title: '登记时间', dataIndex: 'created_at', render: fmtTime },
-    {
-      title: '操作',
-      render: (_, row) => (
-        <Space>
-          <Button size="small" icon={<KeyRound size={14} />} onClick={() => handleToken(row)}>
-            生成握手凭证
-          </Button>
-          {/* 删除是硬删除且级联——把"会一起消失什么"逐条列出来再让人点。
-              只写"确定删除吗"的话，管理员不会意识到审批历史也跟着没了。 */}
-          <Popconfirm
-            title="删除这个连接器？"
-            description={
-              <div style={{ maxWidth: 320 }}>
-                会<b>一并永久删除</b>它名下的全部数据：
-                <ul style={{ margin: '6px 0 0 16px', padding: 0 }}>
-                  <li>修复范围白名单</li>
-                  <li>角色授权（谁能看 / 谁能批）</li>
-                  <li><b>全部修复动作记录</b>——谁在什么时候批准了什么，会一起消失</li>
-                  <li><b>全部分析摘要与依据引用</b></li>
-                  <li>握手/会话令牌</li>
-                </ul>
-                这些属于审计材料，删了无法恢复。
-              </div>
-            }
-            okText="确认删除" cancelText="取消" okButtonProps={{ danger: true }}
-            onConfirm={() => handleDelete(row)}
-          >
-            <Button size="small" danger icon={<Trash2 size={14} />} loading={deleting === row.connection_id}>
-              删除
-            </Button>
-          </Popconfirm>
-        </Space>
-      ),
-    },
+    { title: '操作', render: (_, row) => <Space>{renderRowActions(row)}</Space> },
   ]
+
+  const asCard = (row) => ({
+    title: row.name,
+    extra: renderStatusTag(row.connector_status),
+    fields: [
+      { label: '系统类型', value: row.system_type },
+      { label: '最近心跳', value: fmtTime(row.last_heartbeat_at) },
+      { label: '审批超时', value: `${row.approval_timeout_minutes} 分钟` },
+      { label: '登记时间', value: fmtTime(row.created_at) },
+    ],
+    actions: renderRowActions(row),
+  })
 
   return (
     <>
@@ -252,20 +362,31 @@ function ConnectorsSection({ onModuleDisabled, onConnectorsLoaded }) {
           你的防火墙也不需要为此开放任何入站端口。
         </Paragraph>
         {err && <Alert type="error" showIcon message={err} className="ops-console-alert" />}
-        {/* ⚠️ `scroll={{ x: 'max-content' }}`：窄屏上让表格按内容宽度横向滚动。
-            不加这条，antd 会把列压进容器宽度，每个单元格的中文被挤成一行两三个字、
-            行高被撑到几百像素——真机 375px 上完全没法看。横向滚动不如卡片式布局
-            优雅，但它至少可读，而且不用为窄屏另写一套表格渲染。 */}
-        <Table
-          rowKey="connection_id"
-          scroll={{ x: 'max-content' }}
-          size="small"
-          loading={loading}
-          columns={columns}
-          dataSource={rows}
-          pagination={false}
-          locale={{ emptyText: <Empty description="还没有登记任何连接器" /> }}
-        />
+        {/* 窄屏走卡片，宽屏保持表格：这是块监控大屏，桌面才是主场景，横向对齐的
+            表格在宽屏上信息密度更高。窄屏原来靠 `scroll={{ x: 'max-content' }}`
+            横拖，六列意味着看完一行要来回拖两三次。
+            ⚠️ 宽屏那条 scroll 保留：721~900px 这一段列仍然放不下，去掉的话
+            antd 会把列压进容器宽度，中文被挤成一行两三个字、行高撑到几百像素。 */}
+        {narrow ? (
+          <OpsCards
+            rowKey="connection_id"
+            loading={loading}
+            items={rows}
+            empty="还没有登记任何连接器"
+            card={asCard}
+          />
+        ) : (
+          <Table
+            rowKey="connection_id"
+            scroll={{ x: 'max-content' }}
+            size="small"
+            loading={loading}
+            columns={columns}
+            dataSource={rows}
+            pagination={false}
+            locale={{ emptyText: <Empty description="还没有登记任何连接器" /> }}
+          />
+        )}
       </Card>
 
       <Modal
@@ -591,6 +712,7 @@ function ApprovalsSection({ onModuleDisabled }) {
   const [acting, setActing] = useState('')
   const [marking, setMarking] = useState('')
   const userNames = useUserNames()
+  const narrow = useNarrowScreen()
   const timer = useRef(null)
 
   const load = useCallback(async (silent = false) => {
@@ -653,113 +775,138 @@ function ApprovalsSection({ onModuleDisabled }) {
     }
   }
 
+  // 下面这批 render 函数**同时**供宽屏表格列和窄屏卡片使用。审批队列有八列，
+  // 任何一处只改一侧都会让两种形态显示不同的东西，而没有测试能发现——这条
+  // 产品线已经因为"同一种数据在三个视图各写各的"踩过一次（见 opsDisplay.jsx）。
+  const renderPlan = (row) => (
+    <div>
+      <Tag>{ACTION_LABEL[row.plan?.action_type] || row.plan?.action_type || '—'}</Tag>
+      {/* 原来这里是 JSON.stringify 直出。改成人话，但**不丢字段**——
+          认不出的键原样列成 key=value（见 formatPlan）：修复动作的参数
+          决定它在生产环境做什么，为了排版好看藏掉一个没预料到的字段，
+          是这类界面最不该犯的错。 */}
+      <div className="ops-console-plan">{formatPlan(row.plan)}</div>
+    </div>
+  )
+
+  // ⚠️ **失败必须说清为什么失败。**
+  // 之前这里只有一个红色的"执行失败"标签，探针回的失败原因
+  //（`result.detail`，比如"目标进程无响应，操作超时"）**在界面上任何地方
+  // 都看不到**——运维人员只知道失败了，得去翻后端日志才知道发生了什么，
+  // 而这正是这个控制台本该替他做的事。成功时的详情同样显示：
+  // "重启了但健康检查没过"和"重启后一切正常"对下一步决策完全不同。
+  const renderResultDetail = (row) => {
+    const detail = (row.result || {}).detail
+    if (!detail) return null
+    return (
+      <Text type={row.status === 'failed' ? 'danger' : 'secondary'} style={{ fontSize: 11 }}>
+        {detail}
+      </Text>
+    )
+  }
+
+  const renderOutcome = (row) => {
+    // 只有跑完了才谈得上"有没有效"——待审批/执行中的动作还没有结果可评。
+    if (!['completed', 'failed'].includes(row.status)) return <Text type="secondary">—</Text>
+    if (row.outcome_effective === true) return <Tag color="green">已标注有效</Tag>
+    if (row.outcome_effective === false) return <Tag color="red">已标注无效</Tag>
+    return (
+      <Space size={4}>
+        <Button size="small" loading={marking === row.action_id}
+                onClick={() => mark(row.action_id, true)}>有效</Button>
+        <Button size="small" danger loading={marking === row.action_id}
+                onClick={() => mark(row.action_id, false)}>无效</Button>
+      </Space>
+    )
+  }
+
+  const renderApproval = (row) => {
+    // 已批准但还没执行的，这里给出真正的下发入口。
+    // **不做成"批准即执行"**：批准是授权决定，执行是动作本身，把两者合成
+    // 一步会让"我只是想先授权、等窗口期再动手"变得不可能。
+    if (row.status === 'approved') {
+      return (
+        <Space wrap>
+          <Popconfirm
+            title="现在就在客户环境里执行这个动作？"
+            description="这一步会真正下发到探针/连接器并立即执行，不是模拟。执行前会再查一次目标是否仍在允许范围内。"
+            okText="确认执行"
+            okButtonProps={{ danger: true }}
+            cancelText="再想想"
+            onConfirm={() => act(row.action_id, 'execute')}
+          >
+            <Button size="small" danger loading={acting === row.action_id}>执行</Button>
+          </Popconfirm>
+          <Text type="secondary">
+            {displayUser(userNames, row.approver_user_id)} 已批准
+          </Text>
+        </Space>
+      )
+    }
+    if (row.status !== 'pending_approval') {
+      return row.approver_user_id
+        ? <Text type="secondary">{displayUser(userNames, row.approver_user_id)} · {fmtTime(row.approved_at)}</Text>
+        : <Text type="secondary">—</Text>
+    }
+    return (
+      <Space wrap>
+        <Popconfirm
+          title="确认批准这个修复动作？"
+          description="批准 = 授予执行资格，本身不会立刻下发；批准之后会出现「执行」按钮，由人决定何时下发。请先确认上面的动作参数。"
+          okText="确认批准"
+          cancelText="再想想"
+          onConfirm={() => act(row.action_id, 'approve')}
+        >
+          <Button size="small" type="primary" loading={acting === row.action_id}>批准</Button>
+        </Popconfirm>
+        <Button size="small" danger onClick={() => act(row.action_id, 'reject')}>拒绝</Button>
+      </Space>
+    )
+  }
+
   const columns = [
     { title: '意图', dataIndex: 'intent', width: 220 },
-    {
-      title: '动作',
-      dataIndex: 'plan',
-      render: (plan, row) => (
-        <div>
-          <Tag>{ACTION_LABEL[row.plan?.action_type] || row.plan?.action_type || '—'}</Tag>
-          {/* 原来这里是 JSON.stringify 直出。改成人话，但**不丢字段**——
-              认不出的键原样列成 key=value（见 formatPlan）：修复动作的参数
-              决定它在生产环境做什么，为了排版好看藏掉一个没预料到的字段，
-              是这类界面最不该犯的错。 */}
-          <div className="ops-console-plan">{formatPlan(plan)}</div>
-        </div>
-      ),
-    },
+    { title: '动作', dataIndex: 'plan', render: (_, row) => renderPlan(row) },
     { title: '影响范围', dataIndex: 'impact_radius', render: (v) => v || '—' },
     { title: '提议人', dataIndex: 'proposed_by', render: (v) => displayUser(userNames, v) },
     {
       title: '状态',
       dataIndex: 'status',
-      render: (s, row) => {
-        // ⚠️ **失败必须说清为什么失败。**
-        // 之前这里只有一个红色的"执行失败"标签，探针回的失败原因
-        //（`result.detail`，比如"目标进程无响应，操作超时"）**在界面上任何地方
-        // 都看不到**——运维人员只知道失败了，得去翻后端日志才知道发生了什么，
-        // 而这正是这个控制台本该替他做的事。成功时的详情同样显示：
-        // "重启了但健康检查没过"和"重启后一切正常"对下一步决策完全不同。
-        const detail = (row.result || {}).detail
-        return (
-          <Space direction="vertical" size={2}>
-            <StatusTag status={s} />
-            {detail && (
-              <Text type={s === 'failed' ? 'danger' : 'secondary'} style={{ fontSize: 11 }}>
-                {detail}
-              </Text>
-            )}
-          </Space>
-        )
-      },
+      render: (s, row) => (
+        <Space direction="vertical" size={2}>
+          <StatusTag status={s} />
+          {renderResultDetail(row)}
+        </Space>
+      ),
     },
     { title: '提议时间', dataIndex: 'created_at', render: fmtTime },
-    {
-      title: '事后有效性',
-      width: 150,
-      render: (_, row) => {
-        // 只有跑完了才谈得上"有没有效"——待审批/执行中的动作还没有结果可评。
-        if (!['completed', 'failed'].includes(row.status)) return <Text type="secondary">—</Text>
-        if (row.outcome_effective === true) return <Tag color="green">已标注有效</Tag>
-        if (row.outcome_effective === false) return <Tag color="red">已标注无效</Tag>
-        return (
-          <Space size={4}>
-            <Button size="small" loading={marking === row.action_id}
-                    onClick={() => mark(row.action_id, true)}>有效</Button>
-            <Button size="small" danger loading={marking === row.action_id}
-                    onClick={() => mark(row.action_id, false)}>无效</Button>
-          </Space>
-        )
-      },
-    },
-    {
-      title: '审批',
-      render: (_, row) => {
-        // 已批准但还没执行的，这里给出真正的下发入口。
-        // **不做成"批准即执行"**：批准是授权决定，执行是动作本身，把两者合成
-        // 一步会让"我只是想先授权、等窗口期再动手"变得不可能。
-        if (row.status === 'approved') {
-          return (
-            <Space>
-              <Popconfirm
-                title="现在就在客户环境里执行这个动作？"
-                description="这一步会真正下发到探针/连接器并立即执行，不是模拟。执行前会再查一次目标是否仍在允许范围内。"
-                okText="确认执行"
-                okButtonProps={{ danger: true }}
-                cancelText="再想想"
-                onConfirm={() => act(row.action_id, 'execute')}
-              >
-                <Button size="small" danger loading={acting === row.action_id}>执行</Button>
-              </Popconfirm>
-              <Text type="secondary">
-                {displayUser(userNames, row.approver_user_id)} 已批准
-              </Text>
-            </Space>
-          )
-        }
-        if (row.status !== 'pending_approval') {
-          return row.approver_user_id
-            ? <Text type="secondary">{displayUser(userNames, row.approver_user_id)} · {fmtTime(row.approved_at)}</Text>
-            : <Text type="secondary">—</Text>
-        }
-        return (
-          <Space>
-            <Popconfirm
-              title="确认批准这个修复动作？"
-              description="批准 = 授予执行资格，本身不会立刻下发；批准之后这一列会出现「执行」按钮，由人决定何时下发。请先确认上面的动作参数。"
-              okText="确认批准"
-              cancelText="再想想"
-              onConfirm={() => act(row.action_id, 'approve')}
-            >
-              <Button size="small" type="primary" loading={acting === row.action_id}>批准</Button>
-            </Popconfirm>
-            <Button size="small" danger onClick={() => act(row.action_id, 'reject')}>拒绝</Button>
-          </Space>
-        )
-      },
-    },
+    { title: '事后有效性', width: 150, render: (_, row) => renderOutcome(row) },
+    { title: '审批', render: (_, row) => renderApproval(row) },
   ]
+
+  // 「审批」这一格在待审批/待执行时是按钮，其余状态下只是一行"谁在什么时候批的"。
+  // 卡片底部那条带分隔线的操作区是留给**有后果的动作**的，把一行元信息放进去会
+  // 让人以为那里有东西可点。所以按这个判据决定它落在字段区还是操作区——
+  // 渲染仍然只有 renderApproval 一份，变的只是位置。
+  const hasApprovalAction = (row) => ['approved', 'pending_approval'].includes(row.status)
+
+  const asCard = (row) => ({
+    // 卡片头部放"意图 + 状态"：这两个决定了要不要继续往下看这张卡。
+    title: row.intent,
+    extra: <StatusTag status={row.status} />,
+    fields: [
+      { label: '动作', value: renderPlan(row) },
+      // 执行结果只在有内容时出现——终态之前后端根本不返回它，
+      // 摆一行恒定的"—"只是占地方。
+      renderResultDetail(row) && { label: '执行结果', value: renderResultDetail(row) },
+      { label: '影响范围', value: row.impact_radius || '—' },
+      { label: '提议人', value: displayUser(userNames, row.proposed_by) },
+      { label: '提议时间', value: fmtTime(row.created_at) },
+      { label: '事后有效性', value: renderOutcome(row) },
+      !hasApprovalAction(row) && { label: '审批', value: renderApproval(row) },
+    ],
+    actions: hasApprovalAction(row) ? renderApproval(row) : null,
+  })
 
   const pending = rows.filter((r) => r.status === 'pending_approval')
 
@@ -779,16 +926,29 @@ function ApprovalsSection({ onModuleDisabled }) {
         message="批准 ≠ 已执行"
         description="批准只是授予执行资格，动作不会因为你点了批准就自动跑起来——真正下发是独立的一步。审批权限按角色授予（见「授权管理」），不是所有管理员默认都能批。"
       />
-      <Table
-        rowKey="action_id"
-        scroll={{ x: 'max-content' }}
-        size="small"
-        loading={loading}
-        columns={columns}
-        dataSource={rows}
-        pagination={{ pageSize: 10, hideOnSinglePage: true }}
-        locale={{ emptyText: <Empty description="还没有任何修复动作" /> }}
-      />
+      {/* 窄屏走卡片，宽屏保持表格。八列在 375px 上横拖三四次才看得完一行，
+          而"批准/拒绝"按钮恰好在最右边——最该点的东西被藏在最远处。 */}
+      {narrow ? (
+        <OpsCards
+          rowKey="action_id"
+          loading={loading}
+          items={rows}
+          empty="还没有任何修复动作"
+          card={asCard}
+          pageSize={10}
+        />
+      ) : (
+        <Table
+          rowKey="action_id"
+          scroll={{ x: 'max-content' }}
+          size="small"
+          loading={loading}
+          columns={columns}
+          dataSource={rows}
+          pagination={{ pageSize: 10, hideOnSinglePage: true }}
+          locale={{ emptyText: <Empty description="还没有任何修复动作" /> }}
+        />
+      )}
     </Card>
   )
 }

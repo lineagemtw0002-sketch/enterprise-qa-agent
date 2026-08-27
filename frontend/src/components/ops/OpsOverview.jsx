@@ -178,6 +178,11 @@ function MetricCell({ label, value, sample, hint }) {
 export default function OpsOverview({ canManage, onModuleDisabled }) {
   const [actions, setActions] = useState([])
   const [metrics, setMetrics] = useState(null)
+  // ⚠️ **不要假设后端一定返回全部字段。** 前端和后端是独立部署的——5190 这个
+  // 前端可以指向任何一个后端，而后端可能还没合并到有这些字段的版本；
+  // 字段缺失时 `xxx.length` 会抛 TypeError，React 把整棵子树卸载 = **整页白屏**，
+  // 而代价本来只是"少显示一块"。实测在控制台见过这个崩溃
+  // （`OpsOverview` 里 `Cannot read properties of undefined (reading 'length')`）。
   const [live, setLive] = useState(null)
   const [analyzing, setAnalyzing] = useState('')
   const [connectors, setConnectors] = useState([])
@@ -201,13 +206,13 @@ export default function OpsOverview({ canManage, onModuleDisabled }) {
       const r = await opsApi.analyzeOpsIncident(target)
       if (!r.ok) { message.warning(r.message || '分析未能完成'); return }
       if (r.has_findings) {
-        message.success(`${target}：发现 ${r.anomaly_targets.length} 处异常、`
+        message.success(`${target}：发现 ${(r.anomaly_targets || []).length} 处异常、`
           + `${r.alert_count} 条告警合并为 ${r.incident_count} 个事件，已记入时间线`)
       } else {
         message.info(`${target}：已分析，未发现异常`)
       }
       if (r.degraded) message.warning('本次分析未经模型推理，结论仅为数据复述')
-      if (r.unavailable.length) {
+      if ((r.unavailable || []).length) {
         message.warning(`部分数据未取到：${r.unavailable.join('、')}，结论并不完整`)
       }
       load(true)
@@ -342,18 +347,18 @@ export default function OpsOverview({ canManage, onModuleDisabled }) {
               <div className="panel-title">
                 服务健康
                 <span className="count">
-                  {live ? `${live.services.length} 个服务（连接器自动发现）` : ''}
+                  {live ? `${(live.services || []).length} 个服务（连接器自动发现）` : ''}
                 </span>
               </div>
             </div>
             <div className="panel-body">
-              {!live || !live.services.length ? (
+              {!live || !(live.services || []).length ? (
                 <div className="panel-empty">
                   还没有连接器上报服务。服务清单由连接器自动发现，不需要在这里手工登记。
                 </div>
               ) : (
                 <div className="svc-grid">
-                  {live.services.map((s) => (
+                  {(live.services || []).map((s) => (
                     <div key={`${s.connection_id}:${s.service}`} className={`svc-card ${s.status}`}>
                       <div className="svc-top">
                         <span className="svc-name">{s.service}</span>
@@ -373,11 +378,11 @@ export default function OpsOverview({ canManage, onModuleDisabled }) {
                   ))}
                 </div>
               )}
-              {live && live.unavailable.length > 0 && (
+              {live && (live.unavailable || []).length > 0 && (
                 // ⚠️ 部分连接器查不到时必须显式说出来——网格上"少了几个服务"
                 // 跟"这些服务都健康"在视觉上毫无区别（§3.5 第 4 条）。
                 <div className="panel-note">
-                  以下连接器的数据本次没有取到，网格并不完整：{live.unavailable.join('、')}
+                  以下连接器的数据本次没有取到，网格并不完整：{(live.unavailable || []).join('、')}
                 </div>
               )}
             </div>
