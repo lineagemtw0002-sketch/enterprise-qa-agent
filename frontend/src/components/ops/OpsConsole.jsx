@@ -252,8 +252,13 @@ function ConnectorsSection({ onModuleDisabled, onConnectorsLoaded }) {
           你的防火墙也不需要为此开放任何入站端口。
         </Paragraph>
         {err && <Alert type="error" showIcon message={err} className="ops-console-alert" />}
+        {/* ⚠️ `scroll={{ x: 'max-content' }}`：窄屏上让表格按内容宽度横向滚动。
+            不加这条，antd 会把列压进容器宽度，每个单元格的中文被挤成一行两三个字、
+            行高被撑到几百像素——真机 375px 上完全没法看。横向滚动不如卡片式布局
+            优雅，但它至少可读，而且不用为窄屏另写一套表格渲染。 */}
         <Table
           rowKey="connection_id"
+          scroll={{ x: 'max-content' }}
           size="small"
           loading={loading}
           columns={columns}
@@ -776,6 +781,7 @@ function ApprovalsSection({ onModuleDisabled }) {
       />
       <Table
         rowKey="action_id"
+        scroll={{ x: 'max-content' }}
         size="small"
         loading={loading}
         columns={columns}

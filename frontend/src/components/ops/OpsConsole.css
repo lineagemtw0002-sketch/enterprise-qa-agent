@@ -243,7 +243,17 @@
 .pm-outcome { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-soft); }
 .pm-ask { font-size: 11.5px; color: var(--ink-muted); margin-right: 4px; }
 
-@media (max-width: 1180px) { .kpi-strip { grid-template-columns: repeat(3, 1fr); } }
+/* ⚠️ **必须是区间，不能只写上界。**
+   下面还有一条 `max-width: 1100px → 单列`，而这条排在它后面；只写上界的话
+   两条在窄屏上同时命中、后者胜出，手机上 KPI 就还是三列——卡片被挤到每个
+   字一行。真机 375px 上看出来的，桌面宽度完全正常。 */
+@media (max-width: 1180px) and (min-width: 1101px) {
+  .kpi-strip { grid-template-columns: repeat(3, 1fr); }
+}
+/* 平板一档：五张挤一行读不了，两行三+二比单列紧凑。 */
+@media (max-width: 1100px) and (min-width: 721px) {
+  .kpi-strip { grid-template-columns: repeat(3, 1fr); }
+}
 
 /* ---------- 服务健康网格 ---------- */
 /* 布局照搬设计稿（docs/design_reference/aiops_console_mockup.html）。 */
@@ -335,6 +345,22 @@
 .ops-empty-hint { text-align: center; color: var(--ink-muted); }
 .ops-empty-hint h1 { color: var(--ink); font-size: 20px; margin: 0 0 8px; }
 .ops-empty-hint a { color: var(--ops-accent); }
+
+/* 分段导航在窄屏上横向滚动。
+   ⚠️ 默认的 flex 会把六个按钮压到放不下、中文标签竖排成一列一个字
+   （真机 375px 上就是这样）。**宁可横向滚动也不要竖排**——竖排既读不了，
+   也把首屏推得很长，用户根本看不到下面的 KPI。 */
+@media (max-width: 720px) {
+  .ops-tabnav {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .ops-tabnav::-webkit-scrollbar { display: none; }
+  .ops-tabbtn { flex: none; white-space: nowrap; }
+  /* KPI 卡片里"数字 + 说明"在窄屏上换行显示，别硬挤在一行里各自竖排。 */
+  .kpi-row { flex-wrap: wrap; row-gap: 2px; }
+}
 
 @media (max-width: 720px) {
   .ops-page { padding: 16px 14px 32px; }
