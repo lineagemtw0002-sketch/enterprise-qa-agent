@@ -201,3 +201,34 @@ class TestRegistration:
         from src.ops.tool_registration import ANALYZE_OPS_INCIDENT_DESCRIPTION as D
         assert "不是结论" in D
         assert "必须原样告诉用户" in D
+
+
+class TestMissingArgumentsAreHandledNotRaised:
+    """必填参数缺失时要回一句人话，不能抛 TypeError。
+
+    **这条来自真机跑对话时的实测**：schema 里 `target` 标了 required，7B 模型
+    照样会不带参数就调 `analyze_ops_incident`；原来的实现直接抛
+    `TypeError: missing a required positional argument: 'target'`，
+    而模型把这句 Python 内部错误**原样转述给了最终用户**
+    （实测回答："工具执行失败，提示缺少必需的位置参数 'target'"）。
+
+    **它在修复前会失败吗**：会——修复前抛 TypeError，`execute()` 把异常包成
+    "工具执行失败: ..." 的错误结果，断言"消息里提到缺了哪个参数"就红。
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_name,args,missing", [
+        (QUERY_OPS_SYSTEM_NAME, {}, "target"),
+        (ANALYZE_OPS_INCIDENT_NAME, {}, "target"),
+        (EXECUTE_REMEDIATION_NAME, {}, "action_id"),
+        (PROPOSE_REMEDIATION_NAME, {"connection_id": "c1"}, "action_type"),
+    ])
+    async def test_missing_required_arg_returns_actionable_message(self, tool_name, args, missing):
+        registry = ToolRegistry()
+        register_ops_tools(registry, _StubToolset())
+        result = await registry.get(tool_name).execute(**args)
+
+        output = result.output or ""
+        assert missing in output, f"没有告诉模型缺的是 {missing}：{output!r}"
+        assert "positional argument" not in output, "Python 内部错误漏给用户了"
+        assert "TypeError" not in output
