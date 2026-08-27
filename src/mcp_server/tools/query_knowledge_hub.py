@@ -1543,6 +1543,18 @@ class QueryKnowledgeHubTool:
                 "status": resp.status_code, "org_id": org_id, "result_count": len(results),
             }, elapsed_ms=elapsed_ms)
 
+            # 提示词注入防护（CLAUDE.md §4 P0 第 6 条，2026-08-27 补齐）：
+            # 本地检索路径在 `_execute_local_single`/`_execute_local_multi`
+            # 里对候选集调用了 `_filter_injected_chunks`（见该方法 docstring
+            # 里"摄入时的检测挡不住上线前的老数据"那段说明），委托模式此前
+            # 完全没有这一步——企业自己的知识库服务返回的内容我们完全不
+            # 掌控它是怎么摄入的，更不能假设对方也做了检测；不过滤就直接
+            # 转发意味着这条链路上从摄入到检索都没有防护，是这条 P0 记的
+            # "委托给企业自建的库一道都没有"里检索侧那一半。复用同一个方法，
+            # 不重新实现一遍检测逻辑。放在 department 归属过滤之前，跟本地
+            # 模式一样——先剔除可疑内容，再决定剩下的内容归属哪个部门可见。
+            results = self._filter_injected_chunks(results, trace)
+
             # 委托模式下每条结果打的 collection 标签——企业自己的知识库服务
             # 按第 4.2 节契约在 metadata.kb_name 里报了"这条结果来自它内部哪个
             # 子库"（人话标签，比如"人力资源"）时，就用 "{tenant_collection}:{kb_name}"

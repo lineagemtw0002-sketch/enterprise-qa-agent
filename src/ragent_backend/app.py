@@ -107,6 +107,7 @@ from src.ragent_backend.auth import (
 )
 from src.ingestion.pipeline import IngestionPipeline
 from src.ingestion.delegated_compute import compute_chunks_for_delegation
+from src.security.prompt_guard import InjectionDetectedError
 from src.core.settings import load_settings, resolve_path
 from src.tool_agent.tool_registry import ToolRegistry
 from src.tool_agent.builtin_tools import register_builtin_tools
@@ -3024,6 +3025,17 @@ def create_app() -> FastAPI:
             # 切块 + embedding 是阻塞/CPU 密集操作，扔进线程池，不卡住事件循环
             # （跟 query_knowledge_hub.py `_ensure_initialized` 的做法一致）。
             computed = await asyncio.to_thread(compute_chunks_for_delegation, load_settings(), str(dest_path))
+        except InjectionDetectedError as e:
+            # 内容被判定为疑似提示词注入而拒绝摄入，是预期内的业务判定，
+            # 不是系统故障——必须在通用的 except Exception 之前单独捕获，
+            # 否则会被兜底成 500"文档解析/编码失败"，把"我们主动拒绝了这份
+            # 文档"误报成"系统出错了"（CLAUDE.md §4 P0 第 6 条）。
+            await _audit_log(
+                current_user.user_id, "upload_tenant_kb_document", "tenant_kb", org.org_id,
+                {"filename": original_name, "org_id": org.org_id, "error": str(e), "reason": "injection_detected"},
+                success=False,
+            )
+            raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             await _audit_log(
                 current_user.user_id, "upload_tenant_kb_document", "tenant_kb", org.org_id,

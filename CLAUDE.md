@@ -25,7 +25,7 @@
    〔建索引二次复杂度与 query 无 tie-break 两条**已于 08-25 修复**，见 §4 第 2b 条；
    文档更新后旧版本片段永久残留（原第 1 条）**已于 08-27 修复并真机验证通过**，见 §5〕
 2. 🟡 模型服务并发形态 → 首次实测：调大 `OLLAMA_NUM_PARALLEL` 本机只换来 1.3–1.5x（很快封顶），不是线性提速，缺口需要真实算力扩展
-3. 🔴 委托模式链路的注入防护零覆盖——`delegated_compute.py` 摄入侧、`query_knowledge_hub.py` 的 `_execute_remote` 检索侧均无检测/过滤
+3. 🔴 知识库文档投毒 → 间接提示注入，可跨话题传染，ACL 拦不住（`docs/security_prompt_injection_test_report.md` 案例2；委托模式那一半已于 08-27 修复，见 §4 第 6 条 / §5，本条针对的是防护规则本身的检出边界，不区分本地/委托）
 
 **四条最容易踩的规则**（完整规则见 [§7](#7-硬性规则)）：
 - 用户说「修改一个BUG」但实为**设计变更**时 → 必须先指出，不要直接开工
@@ -533,10 +533,13 @@ flowchart TB
    这是 `workflow.py:1215-1219` 当初**刻意接受**的取舍，本批没动它。
    正则永远追不上自然语言，**继续放宽必然继续误伤**。
 
-6. **委托模式链路的注入防护零覆盖**（2026-08-25 新发现）——
-   平台本地库有三道防护（摄入拒收 / 检索剔除 / 生成短路），
-   但 `delegated_compute.py` 摄入侧无检测、`query_knowledge_hub.py` 的
-   `_execute_remote` 检索侧无过滤。**委托给企业自建的库一道都没有。**
+6. **委托模式链路的注入防护零覆盖 —— ✅ 已修复（2026-08-27），见 §5**
+   （2026-08-25 新发现）——平台本地库有三道防护（摄入拒收 / 检索剔除 /
+   生成短路），但 `delegated_compute.py` 摄入侧无检测、
+   `query_knowledge_hub.py` 的 `_execute_remote` 检索侧无过滤。
+   ~~委托给企业自建的库一道都没有~~ ✅ 摄入侧、检索侧各补上一道，
+   与本地模式的前两道防护对齐（第三道"生成短路"是模型输出侧的通用防护，
+   不区分本地/委托，两条链路本来就共用，不需要单独补）。
 
 7. **`BM25Indexer.remove_document` 是死代码**（2026-08-25 实测确认）——
    它用 `chunk_id.startswith(doc_id)` 匹配，但实际 chunk_id 形如
@@ -833,6 +836,70 @@ flowchart TB
 ---
 
 ## 5. 已修复（防止重新引入）
+
+- ✅ **2026-08-27　P0 第 6 条：委托模式链路的提示词注入防护零覆盖 —— 摄入侧+检索侧均已补齐**
+
+  背景（2026-08-25 发现，见 §4 第 6 条原文）：平台本地检索模式对提示词
+  注入有三道防护——摄入拒收（`pipeline.py`）、检索剔除
+  （`query_knowledge_hub.py::_filter_injected_chunks`）、生成短路
+  （`workflow.py::_generate_node`）——但委托模式（企业自建知识库微服务，
+  平台只转发）一道都没有：`delegated_compute.py::compute_chunks_for_delegation`
+  加载文档后直接切块编码，从不检测；`_execute_remote` 转发查询、解析企业
+  返回的结果后直接拿去构建响应，中间没有过滤这一步。第三道"生成短路"是
+  模型输出侧的通用防护，跟检索来自本地还是委托无关，两条链路本来就共用，
+  不属于这次要补的范围。
+
+  **改了什么**：
+  1. `src/security/prompt_guard.py` 新增 `InjectionDetectedError(ValueError)`
+     ——继承 `ValueError` 保持对既有 `except ValueError` 兜底路径的向后
+     兼容，但调用方应当优先捕获这个更具体的类型：内容被拒绝是预期内的
+     业务判定，不该被通用异常处理兜底成"系统出错了"。
+  2. `delegated_compute.py::compute_chunks_for_delegation`：`loader.load()`
+     拿到文档后、切块之前，调用既有的 `detect_document_injection` 检测
+     全文，命中就抛 `InjectionDetectedError`（措辞对齐本地模式
+     `pipeline.py` 的既有错误文案）。行为对齐本地模式：**拒绝整份文档**，
+     不是逐块过滤——这一步发生在切块之前，此时还没有"块"的概念。
+  3. `app.py::upload_tenant_kb_document`：原来一个宽泛的
+     `except Exception as e` 会把 `InjectionDetectedError`（连同真正的
+     系统故障）一并转成 `HTTPException(500, "文档解析/编码失败")`，把
+     "我们主动拒绝了这份文档"误报成"系统出错了"。新增专门捕获
+     `InjectionDetectedError` 的分支，排在通用 `except Exception` 之前，
+     返回 400 + 如实的拒绝原因，审计日志里也带上 `reason:
+     "injection_detected"` 以便跟真实系统故障区分。
+  4. `query_knowledge_hub.py::_execute_remote`：`_parse_remote_results`
+     解析出企业知识库服务返回的候选结果后、打 collection 标签和
+     department 归属过滤之前，插入
+     `results = self._filter_injected_chunks(results, trace)`——复用
+     本地模式已有的同一个方法，不重新实现一遍检测逻辑，命中即从候选集
+     里剔除（不影响该方法已有的 trace 记录行为）。
+
+  **怎么验证的**（已验证通过，非"跑通"档位）：
+  `tests/unit/test_delegated_compute_injection_guard.py`（4 条）+
+  `tests/unit/test_query_knowledge_hub_remote_injection_filter.py`（3 条）。
+  判别力已实测确认：临时把 `delegated_compute.py`/`query_knowledge_hub.py`
+  里各自新增的检测/过滤代码去掉、退回到修复前的实现，对应测试从 PASS
+  变 FAILED（`delegated_compute` 侧 2 条失败、`query_knowledge_hub` 侧
+  2 条失败），验证后已恢复代码。全量 `tests/unit` 2378 通过（较修复前
+  2371 多 7 条，即本次新增）、1 skipped、1 xfailed + 1 xpassed（这一组
+  是既有的、文档里记录过的并发竞态 flaky 测试
+  `test_chroma_shared_client_concurrency.py`，跟本次改动无关，多次重跑
+  确认符合已知的 flaky 模式，不是本次引入的回归）。
+
+  **本次未覆盖的范围**：
+  - 没有跑一次真实的端到端场景（真实企业知识库微服务 + 真实上传/查询
+    HTTP 请求）——本仓库委托模式目前只有一份参考实现
+    `services/tenant_kb_demo/`，没有为这次改动单独起一次真机联调，
+    测试全部是鸭子类型假件 + Mock（跟仓库里 `query_knowledge_hub.py`/
+    `delegated_compute.py` 此前完全没有测试覆盖的现状一致，这次是从零
+    开始搭的隔离测试，不是在已有覆盖基础上补充）。
+  - `detect_document_injection`/`_filter_injected_chunks` 本身的检测能力
+    没有变——这次只是把已有的检测/过滤能力接到委托模式这两个原本完全
+    没有防护的位置，规则本身能挡住什么、挡不住什么（见 §4 第 5b 条
+    "规则匹配只挡得住已收录形态，模型转述照样能出去"）跟本地模式是
+    同一套边界，没有一并加固。
+  - 委托模式的"摄入拒收"和本地模式一样是**整份文档拒绝**，如果一份
+    大文档只有一小段可疑内容，目前无法只剔除那一段、保留其余正文——
+    跟本地模式的既有取舍一致，本次没有改变这个粒度。
 
 - ✅ **2026-08-27　P0 第 1 条：文档更新后旧版本片段永久残留 —— 已修复并真机验证通过**
 
