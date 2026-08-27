@@ -61,7 +61,8 @@ class RemediationStore(Protocol):
     async def is_module_enabled(self, org_id: str) -> bool: ...
     async def save_analysis_summary(
         self, org_id: str, connection_id: Optional[str], summary: str,
-        evidence_refs: list,
+        evidence_refs: list, trigger_source: str = "manual",
+        triggered_by: Optional[str] = None,
     ) -> Any: ...
     async def get_analysis_summary(self, summary_id: str) -> Optional[Any]: ...
     async def get_action(self, action_id: str) -> Optional[Any]: ...
@@ -374,6 +375,10 @@ class OpsToolset:
         self, org_id: str, target: str, metric: str = "error_rate",
         window_minutes: int = 60, now_ts: Optional[float] = None,
         connection_ids: Optional[list] = None, persist: bool = True,
+        # ⚠️ 由调用方声明这次分析是谁触发的：告警推送自动触发传 "auto"，
+        # 人在界面上点传 "manual"。时间线要靠它区分"系统主动发现"和
+        # "有人手动查了一下"——复盘时这两件事意义完全不同。
+        trigger_source: str = "manual", triggered_by: Optional[str] = None,
     ) -> ToolOutcome:
         """异常检测 + 告警关联 + 根因分析辅助，一次跑完（设计 §2 的三项 V1 能力）。
 
@@ -465,6 +470,7 @@ class OpsToolset:
                     connection_id=(metric_result.results[0].connection_id if metric_result.results else None),
                     summary=rca.summary,
                     evidence_refs=[*(e.to_dict() for e in rca.evidence), correlation_stats_ref],
+                    trigger_source=trigger_source, triggered_by=triggered_by,
                 )
                 summary_id = getattr(saved, "summary_id", None)
             except Exception as e:  # noqa: BLE001

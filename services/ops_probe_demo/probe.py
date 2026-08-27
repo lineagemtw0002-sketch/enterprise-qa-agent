@@ -31,7 +31,7 @@ import websockets
 
 from services.ops_probe_demo.control_server import FaultState, serve_control
 from services.ops_probe_demo.environments import DEFAULT_ENVIRONMENT, resolve_environment
-from services.ops_probe_demo.fake_ops_data import points_for
+from services.ops_probe_demo.fake_ops_data import alert_points, points_for
 
 HEARTBEAT_INTERVAL_SECONDS = 10.0
 """跟设计文档 §10.1 给的心跳周期一致。平台侧的"多久没心跳算离线"是另一个数，
@@ -51,6 +51,7 @@ class OpsProbe:
                      f"?connection_id={connection_id}&token={register_token}")
         self.connection_id = connection_id
         self._environment = environment
+        self._env = resolve_environment(environment)
         # 当前注入的故障。**不注入就一切正常**——健康是默认状态，不是特殊分支。
         # 由控制口在另一个线程里改写，读的时候拿一份快照（见 FaultState）。
         self._state = state or FaultState()
@@ -76,15 +77,49 @@ class OpsProbe:
             self._log(f"已注册 connection_id={self.connection_id}")
 
             heartbeat = asyncio.create_task(self._heartbeat_loop(ws))
+            pusher = asyncio.create_task(self._alert_push_loop(ws))
             try:
                 await self._receive_loop(ws)
             finally:
                 heartbeat.cancel()
+                pusher.cancel()
 
     async def _heartbeat_loop(self, ws) -> None:
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
             await self._send(ws, "heartbeat", {})
+
+    async def _alert_push_loop(self, ws) -> None:
+        """故障被注入时**主动把告警推给平台**，不等平台来问。
+
+        这一条是"平台怎么知道出事了"那一环的连接器侧实现
+        （见 docs/alert_push_design.md）。真实连接器该在它自己的告警系统
+        触发时推送；演示件退而求其次——轮询本地故障状态，**只在故障刚出现的
+        那一刻推一次**。
+
+        ⚠️ **只推状态转换，不推当前状态。** 这正是业界的做法（Prometheus 在
+        条件变为 firing 时发一次，不是每个采集周期发一次）。故障持续存在时
+        反复推，平台侧靠指纹去重挡住，但那是让平台替连接器擦屁股——
+        连接器规范里写明了"推送前请先按你们自己的告警规则去抖"。
+        """
+        pushed: set = set()
+        while True:
+            await asyncio.sleep(2.0)
+            current = self._state.snapshot()
+            for service, kind in current.items():
+                if service in pushed:
+                    continue
+                pushed.add(service)
+                await self._send(ws, "alert_push", {
+                    "alerts": alert_points(
+                        service=service, fault=kind, env=self._env,
+                        start_ts=time.time() - 240.0, end_ts=time.time(),
+                    ),
+                })
+                self._log(f"已推送告警: {service} ← {kind}")
+            # 故障恢复后把它从"推过"里摘掉，下次再坏还会推——那是一次真实的
+            # 状态转换（也正是 flapping 抑制要处理的场景）。
+            pushed &= set(current)
 
     async def _send(self, ws, frame_type: str, payload: Dict[str, Any],
                     msg_id: Optional[str] = None) -> None:

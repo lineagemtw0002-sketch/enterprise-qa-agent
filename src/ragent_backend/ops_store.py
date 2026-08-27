@@ -650,6 +650,23 @@ class OpsStore:
                 await conn.execute(
                     "DELETE FROM ops_remediation_scopes WHERE connection_id = $1", connection_id,
                 )
+                # ⚠️ **摘要可能被别的连接器的动作引用着。**
+                # `remediation_actions.summary_id` 没有限定同连接器——人工提议时
+                # 完全可以关联一次跨连接器的分析（同一次故障波及多个系统时这很
+                # 正常）。只删本连接器的动作不足以解除引用，所以先把**所有**
+                # 指向这些摘要的动作解绑，再删摘要。
+                # 2026-08-27 真实撞过：删仿真连接器时报
+                # `remediation_actions_summary_id_fkey` 违反。
+                await conn.execute(
+                    "UPDATE remediation_actions SET summary_id = NULL "
+                    "WHERE summary_id IN (SELECT id FROM ops_analysis_summaries "
+                    "                      WHERE connection_id = $1)",
+                    connection_id,
+                )
+                # ops_incidents 也挂在连接器下（2026-08-27 新增）。
+                await conn.execute(
+                    "DELETE FROM ops_incidents WHERE connection_id = $1", connection_id,
+                )
                 await conn.execute(
                     "DELETE FROM ops_analysis_summaries WHERE connection_id = $1", connection_id,
                 )
@@ -1200,6 +1217,7 @@ class OpsStore:
     async def save_analysis_summary(
         self, org_id: str, connection_id: str, summary: str,
         evidence_refs: List[Dict[str, Any]],
+        trigger_source: str = "manual", triggered_by: Optional[str] = None,
     ) -> AnalysisSummary:
         """调用方（AI 分析层）负责保证 `summary`/`evidence_refs` 里不含原始运维
         数据本身（完整日志行、完整指标序列等）——这里不做内容过滤，只管落库。
@@ -1216,10 +1234,11 @@ class OpsStore:
             await conn.execute(
                 """
                 INSERT INTO ops_analysis_summaries
-                    (id, org_id, connection_id, summary, evidence_refs, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                    (id, org_id, connection_id, summary, evidence_refs, created_at, trigger_source, triggered_by)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 """,
                 summary_id, org_id, connection_id, summary, json.dumps(evidence_refs), now,
+                trigger_source, triggered_by,
             )
         return AnalysisSummary(
             summary_id=summary_id, org_id=org_id, connection_id=connection_id,

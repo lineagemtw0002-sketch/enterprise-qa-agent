@@ -214,6 +214,10 @@ async def _trim_checkpoints(checkpointer, thread_id: str, keep_checkpoint_id: Op
 # 全局并发控制：限制同时执行的 ingest 后台任务数量，防止 LLM API 配额和内存被打爆
 INGEST_SEMAPHORE = asyncio.Semaphore(2)
 
+# 一帧推送最多接收多少条告警。一次大面积故障可能瞬间产生几千条——
+# 超出部分丢弃并在 ack 里如实标 truncated，**不能因为告警太多把平台打挂**。
+_ALERT_PUSH_MAX_PER_FRAME = 500
+
 # WebSocket 连接管理：conversation_id -> list[WebSocket]
 active_trace_ws: dict[str, list[WebSocket]] = {}
 
@@ -1701,6 +1705,90 @@ def create_app() -> FastAPI:
 
 
 
+    async def _handle_alert_push(connection_id: str, org_id: str, frame: dict, websocket) -> None:
+        """处理一批推送进来的告警：关联 → 落事件 → 必要时触发分析。
+
+        ⚠️ **分析绝不能在这里 await 完成。** 一次 RCA 实测 7–10 秒，而这个函数
+        跑在 WebSocket 的接收循环里——卡住它，心跳和后续告警全都堵在后面，
+        连接器会因为收不到心跳回执而判定平台失联。所以分析走
+        `asyncio.create_task` 甩出去，这里只负责把事件落库并立刻回 ack。
+
+        ⚠️ **回 ack 是协议要求的**：推送丢了等于故障没被发现，连接器需要靠 ack
+        决定要不要重发。查询丢了顶多是这次没数据，推送丢了是真的漏掉一次故障。
+        """
+        from src.ops.analysis import Alert, correlate_alerts
+        from src.ops.incident_identity import fingerprint_of_incident
+
+        raw = (frame.get("payload") or {}).get("alerts") or []
+        # ⚠️ 上限保护：一次大面积故障可能瞬间产生几千条告警。**不能因为告警太多
+        # 把平台自己打挂**——超出部分丢弃并如实标注，而不是假装全收了。
+        capped = raw[:_ALERT_PUSH_MAX_PER_FRAME]
+        truncated = len(raw) > len(capped)
+
+        alerts = [
+            Alert(alert_id=f"{connection_id}:{i}", ts=float(a.get("ts") or time.time()),
+                  target=(a.get("labels") or {}).get("target", ""),
+                  labels=a.get("labels") or {}, text=a.get("text") or "",
+                  severity=(a.get("labels") or {}).get("severity", "warning"))
+            for i, a in enumerate(capped)
+        ]
+        now = time.time()
+        opened = []
+        if alerts:
+            # 复用既有的关联降噪：推送进来的告警跟查询回来的走**同一套代码**，
+            # 不为推送另写一份分组逻辑。
+            for incident in correlate_alerts(alerts).incidents:
+                try:
+                    applied = await ops_store.apply_alert_batch(
+                        org_id, connection_id,
+                        fingerprint=fingerprint_of_incident(incident),
+                        targets=list(incident.targets), labels=dict(incident.shared_labels),
+                        alert_count=incident.alert_count, now=now,
+                    )
+                except Exception:
+                    logger.exception("failed to apply pushed alert batch",
+                                     extra={"connection_id_len": len(connection_id)})
+                    continue
+                decision = applied["decision"]
+                logger.info("alert push applied", extra={
+                    "action": decision.action, "should_analyze": decision.should_analyze,
+                    "flap_count": decision.flap_count, "alert_count": incident.alert_count,
+                })
+                if decision.should_analyze and incident.targets:
+                    opened.append((applied["incident"], incident, decision))
+
+        for stored, incident, decision in opened:
+            # 甩出去异步跑，不阻塞接收循环。
+            asyncio.create_task(_auto_analyze_incident(org_id, connection_id, stored, incident, decision))
+
+        await websocket.send_json({
+            "type": "ack", "id": frame.get("id"), "connector_id": connection_id,
+            "ts": now,
+            "payload": {"accepted": len(capped), "truncated": truncated,
+                        "analyzing": len(opened)},
+        })
+
+    async def _auto_analyze_incident(org_id: str, connection_id: str, stored: dict,
+                                     incident, decision) -> None:
+        """事件首次打开（或越过 flapping 阈值）时自动分析一次。
+
+        ⚠️ 异常一律吞掉只记日志：**分析失败不能影响告警接收**。告警已经落库了，
+        少一条结论比丢一次故障轻得多；人还可以在界面上手动点分析补上。
+        """
+        target = (incident.targets or [None])[0]
+        if not target:
+            return
+        try:
+            outcome = await ops_toolset.analyze_ops_incident(
+                org_id, target, connection_ids=[connection_id],
+                trigger_source="auto",
+            )
+            summary_id = (outcome.data or {}).get("summary_id")
+            if summary_id:
+                await ops_store.attach_summary_to_incident(stored["id"], summary_id)
+        except Exception:
+            logger.exception("auto analysis failed", extra={"target_len": len(target)})
+
     @app.websocket("/ws/ops/connector/register")
     async def ops_connector_register_ws(
         websocket: WebSocket,
@@ -1772,6 +1860,12 @@ def create_app() -> FastAPI:
                         "type": "heartbeat", "id": frame.get("id"), "connector_id": connection_id,
                         "ts": time.time(), "payload": {},
                     })
+
+                elif frame_type == "alert_push":
+                    # 连接器主动推告警——这是"平台怎么知道出事了"那一环
+                    # （docs/alert_push_design.md）。**它是协议里唯一由连接器
+                    # 发起的业务帧**，其余都是平台问、连接器答。
+                    await _handle_alert_push(connection_id, conn.org_id, frame, websocket)
 
                 elif frame_type == "refresh":
                     provided = (frame.get("payload") or {}).get("refresh_token", "")

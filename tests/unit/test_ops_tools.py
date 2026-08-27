@@ -371,11 +371,14 @@ class _AnalysisStore(FakeStore):
             raise self._enabled_raises
         return self._enabled
 
-    async def save_analysis_summary(self, org_id, connection_id, summary, evidence_refs):
+    async def save_analysis_summary(self, **kw):
+        # ⚠️ 用 **kw 而不是逐个列参数：生产签名加一个参数就让这个假件炸掉，
+        # 而它炸的方式是被 tools.py 里的 try/except 吞掉、表现为"没落库"，
+        # 排查方向会被带到存储逻辑上（这次就是这么发生的）。
+        kw.setdefault("trigger_source", "manual")
         if self._save_raises:
             raise self._save_raises
-        self.saved.append({"org_id": org_id, "connection_id": connection_id,
-                           "summary": summary, "evidence_refs": evidence_refs})
+        self.saved.append(dict(kw))
         return type("S", (), {"summary_id": "opssum_test"})()
 
 
@@ -449,7 +452,14 @@ class TestAnalyzeOpsIncident:
         assert out.data["anomaly_targets"], "带尖峰的指标应该被检出异常"
         assert store.saved, "非降级结果应当落库"
         # ⚠️ 落库的只有摘要 + 依据，没有原始运维数据（§3.1 BYOC）
-        assert set(store.saved[0]) == {"org_id", "connection_id", "summary", "evidence_refs"}
+        # ⚠️ 这条**刻意断言"不多不少"**：多出一个字段说明有人往摘要里塞了新东西，
+        # 而摘要是 §3.1 明令"只存结论和依据引用、不存原始运维数据"的地方——
+        # 塞进去的很可能正是不该落库的东西。所以加字段时必须来这里显式改一次。
+        # 2026-08-27 新增 trigger_source / triggered_by（区分自动触发和人工触发）。
+        assert set(store.saved[0]) == {
+            "org_id", "connection_id", "summary", "evidence_refs",
+            "trigger_source", "triggered_by",
+        }
         # §10.5 验收指标"告警合并率"要求这份统计量真的落库，不能只在这一次
         # ToolOutcome.data 里回给调用方看一眼就丢——判别式：把持久化那行的
         # correlation_stats_ref 删掉，这条会失败。
