@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 import uuid
@@ -36,6 +37,8 @@ from typing import Any, Dict, List, Optional
 import asyncpg
 
 from src.ops import service_health
+
+logger = logging.getLogger(__name__)
 
 from src.ragent_backend.db_pool import get_shared_pool
 from src.ragent_backend.role_store import ROLE_ORG_ADMIN
@@ -367,6 +370,46 @@ class OpsStore:
                 "ALTER TABLE remediation_actions ADD COLUMN IF NOT EXISTS "
                 "summary_id TEXT REFERENCES ops_analysis_summaries(id)"
             )
+
+            # ⚠️ **`role_ops_systems.role_id` 补上外键 + 级联删除。**
+            #
+            # 建表时它是裸 TEXT，而对照组 `role_collections.role_id` 一直有
+            # `REFERENCES roles(id) ON DELETE CASCADE`。后果不是安全漏洞
+            # （role_id 是 UUID4 不会复用，权限查询又是从用户当前持有的角色出发，
+            # 已删角色的行永远匹配不上），而是**授权列表会返回幽灵条目**：
+            # 管理员在「授权管理」里审视"谁能批准这个连接器"时看到一个已经不存在
+            # 的角色，而且撤销不掉——对应的角色已经没了。
+            #
+            # **顺序很要紧**：先清存量孤儿行，再加约束。反过来的话，库里只要有
+            # 一行孤儿，`ADD CONSTRAINT` 就会直接失败、整个 schema 初始化炸掉。
+            #
+            # ⚠️ 整段包在 try 里：`roles` 表由 `role_store` 建，两个 Store 的
+            # schema 初始化没有先后保证。首次启动时 `roles` 可能还不存在，
+            # 那次加不上约束——下次启动会再试一遍（`_ensure_schema` 每次建池都跑），
+            # 所以不需要为此引入初始化顺序依赖。
+            try:
+                await conn.execute(
+                    "DELETE FROM role_ops_systems WHERE role_id NOT IN (SELECT id FROM roles)"
+                )
+                await conn.execute(
+                    """
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_constraint
+                            WHERE conname = 'role_ops_systems_role_id_fkey'
+                        ) THEN
+                            ALTER TABLE role_ops_systems
+                                ADD CONSTRAINT role_ops_systems_role_id_fkey
+                                FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE;
+                        END IF;
+                    END $$;
+                    """
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "role_ops_systems 外键暂未添加（多半是 roles 表还没建），下次启动会重试: %s", e
+                )
 
     async def close(self) -> None:
         # 池现在是跨 Store 共享的（db_pool.py，P1-2），这里只清引用，不触发

@@ -94,6 +94,24 @@ def render(env: Environment, faults: Dict[str, str], *,
   .target b {{ color:#eef0f6; }}
   .target code {{ color:#8b7ffb; font-family:ui-monospace,Menlo,monospace; }}
   a {{ color:#8b7ffb; }}
+
+  /* ⚠️ 窄屏下**不要让表格横向滚动**。这个页面的用途是"演示时随手点一下把某个
+     服务弄坏"，横着拖找按钮完全违背它存在的意义。改成每个服务一块：
+     服务名 + 状态一行，下拉和两个按钮各占一行。
+     用区间写法（这个项目踩过"只写上界的规则被后面的覆盖"）。 */
+  @media (max-width: 620px) {{
+    .wrap {{ padding:16px 12px 32px; }}
+    table, tbody, tr, td {{ display:block; width:100%; }}
+    thead {{ display:none; }}          /* 表头在竖排下没有意义 */
+    tr {{ border-bottom:1px solid #22242f; padding:10px 0; }}
+    tr:last-child {{ border-bottom:none; }}
+    td {{ border-bottom:none; padding:4px 12px; }}
+    .svc {{ font-size:14px; font-weight:600; }}
+    .act {{ flex-direction:column; align-items:stretch; gap:8px; }}
+    .act select, .act button {{ width:100%; padding:9px 12px; font-size:13px; }}
+    /* 手指点得到：44px 是触摸目标的通行下限，桌面上的 6px 内边距太小了。 */
+    .bar button {{ width:100%; min-height:44px; }}
+  }}
 </style></head><body><div class="wrap">
   <div class="banner">⚠️ 这是<b>演示/测试工具</b>，不是产品功能。它能让被监控系统随时"坏掉"，
      只监听 127.0.0.1，不做鉴权，永远不会随产品发布。</div>
@@ -104,8 +122,15 @@ def render(env: Environment, faults: Dict[str, str], *,
     　平台 <code>{platform or "(未知)"}</code>　连接器 <code>{connection_id or "(未知)"}</code>
   </div>
   <table>
-    <tr><th style="width:34%">服务</th><th style="width:22%">当前状态</th><th>操作</th></tr>
+    <!-- ⚠️ 表头必须显式包在 <thead> 里。不写的话浏览器会把这行 <tr> 塞进
+         自动生成的 <tbody>，于是窄屏那条 `thead {{ display:none }}` 一点作用
+         都没有——表头会当成一块内容竖着显示出来。真机渲染才看得出来。 -->
+    <thead>
+      <tr><th style="width:34%">服务</th><th style="width:22%">当前状态</th><th>操作</th></tr>
+    </thead>
+    <tbody>
     {rows}
+    </tbody>
   </table>
   <div class="bar"><button class="heal" onclick="heal(null)">全部恢复</button></div>
   <div class="note">
