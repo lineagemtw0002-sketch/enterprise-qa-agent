@@ -35,6 +35,7 @@ from src.libs.embedding.embedding_factory import EmbeddingFactory
 from src.libs.vector_store.vector_store_factory import VectorStoreFactory
 
 # Ingestion layer imports
+from src.ingestion.document_manager import DocumentManager
 from src.ingestion.chunking.document_chunker import DocumentChunker
 from src.ingestion.transform.chunk_refiner import ChunkRefiner
 from src.ingestion.transform.metadata_enricher import MetadataEnricher
@@ -250,6 +251,7 @@ class IngestionPipeline:
         file_path: str,
         trace: Optional[TraceContext] = None,
         on_progress: Optional[Callable[[str, int, int], None]] = None,
+        version_key: Optional[str] = None,
     ) -> PipelineResult:
         """执行单文件完整摄取流程。
 
@@ -258,12 +260,23 @@ class IngestionPipeline:
         - trace: 可选链路追踪上下文。
         - on_progress: 可选进度回调，签名为
           `(stage_name, current, total)`。
+        - version_key: 用于识别"这次上传是哪份旧文档的新版本"的标识
+          （CLAUDE.md §4 P0 第 1 条：文档更新后旧版本片段永久残留）。
+          默认等于 `file_path`——对 CLI/仪表盘这类"物理路径本身就稳定"
+          的调用方是对的默认值；`/api/v1/collections/{name}/upload` 这类
+          会给每次上传的物理文件加随机前缀的调用方，必须显式传原始文件名，
+          否则每次上传都会被当成全新文档，旧版本永远不会被替换。
+          按文件路径/文件名识别版本是刻意选择的简化方案：不做内容相似度
+          比对，两份内容完全不相关的文档只要 version_key 撞了就会被当成
+          "新旧版本"处理，旧的会被删——这个前提由上传方保证（不复用别人的
+          文件名指代不同文档），不在这一层做防护。
 
         返回：
         - `PipelineResult`，包含成功状态、统计信息与分阶段结果。
         """
         # 统一转 Path，避免后续重复做字符串/路径转换。
         file_path = Path(file_path)
+        version_key = version_key if version_key is not None else str(file_path)
         stages: Dict[str, Any] = {}
         _total_stages = 8
 
@@ -509,7 +522,8 @@ class IngestionPipeline:
                 # 来说没有新增任何东西，不算失败，跟"整份文件之前摄入过"
                 # （文件级去重那条 early return）是同一个语义，直接判定成功收尾。
                 logger.info("  ⏭️  All chunks are duplicates, nothing new to store")
-                self.integrity_checker.mark_success(file_hash, str(file_path), self.collection)
+                self.integrity_checker.mark_success(file_hash, str(file_path), self.collection, version_key)
+                self._replace_old_versions(file_hash, version_key, stages)
                 return PipelineResult(
                     success=True,
                     file_path=str(file_path),
@@ -603,11 +617,23 @@ class IngestionPipeline:
                 stat["chunk_id"] = vid
 
             # 6b: BM25 索引构建
-            logger.info("  6b. BM25 Index...")
+            #
+            # ⚠️ 2026-08-27 修复：`doc_id` 这里必须是 `file_hash`（完整 64 位
+            # 内容哈希），不能是 `document.id`——两者是完全不同的标识：
+            # `document.id = f"doc_{sha256[:16]}"`（`UniversalLoader.load`
+            # 里定义的短前缀形式，只截了 16 位），而 `document_manager.py::
+            # delete_document` 传给 `bm25.remove_document()` 的、以及 Chroma/
+            # 图片索引 `doc_hash` 元数据用的，全部是完整哈希。原来这里传
+            # `document.id`，导致 `chunk_doc_hash` 映射里存的是短前缀值，
+            # 任何按完整哈希发起的删除（管理员删单个文档、下面的版本替换）
+            # 在 BM25 侧永远找不到匹配、`bm25_removed` 恒为 False——
+            # 是本次实现"文档更新后旧版本片段永久残留"修复时，真机验证
+            # 上传同名文件两次才现出原形的一个独立的真实 bug，不是新逻辑
+            # 引入的，仅在这次真正跑通端到端删除路径时才会暴露。
             self.bm25_indexer.add_documents(
                 sparse_stats,
                 collection=self.collection,
-                doc_id=document.id,
+                doc_id=file_hash,
                 trace=trace,
             )
             logger.info(f"      Index built for {len(sparse_stats)} documents")
@@ -740,7 +766,12 @@ class IngestionPipeline:
             # 成功收尾
             # ─────────────────────────────────────────────────────────────
             # 只有当全部阶段完成后才标记成功，避免出现"部分成功但状态已提交"。
-            self.integrity_checker.mark_success(file_hash, str(file_path), self.collection)
+            self.integrity_checker.mark_success(file_hash, str(file_path), self.collection, version_key)
+
+            # 新版本已经落地成功，才轮到清理旧版本——如果反过来先删再摄入，
+            # 新版本这边任何一步失败都会让这份文档在旧版本被删、新版本没写
+            # 成功的空窗期里完全从知识库消失，比"暂时新旧并存"更糟。
+            self._replace_old_versions(file_hash, version_key, stages)
 
             # 去重指纹也在这里才登记，不在阶段 5 筛完就登记——道理跟上面文件级
             # 完整性检查一致：真正写入向量库/BM25 之前，这几个片段还谈不上
@@ -775,8 +806,11 @@ class IngestionPipeline:
 
             # 安全地提取可能已生成的数据用于回滚
             _vector_ids = locals().get("vector_ids")
-            _doc_id = locals().get("document")
-            _doc_id = _doc_id.id if _doc_id else None
+            # 必须用 file_hash（完整哈希），不是 document.id（短前缀）——
+            # 跟上面 add_documents() 那处修复是同一个标识不一致 bug：
+            # BM25 索引里 chunk_doc_hash 存的就是 file_hash，用 document.id
+            # 回滚永远找不到要删的 postings。
+            _doc_id = file_hash if 'file_hash' in locals() else None
             _registered_images = locals().get("registered_image_ids")
             self._rollback_storage(_vector_ids, _doc_id, _registered_images)
 
@@ -796,16 +830,72 @@ class IngestionPipeline:
         file_path: str,
         trace: Optional[TraceContext] = None,
         on_progress: Optional[Callable[[str, int, int], None]] = None,
+        version_key: Optional[str] = None,
     ) -> PipelineResult:
         """异步执行单文件完整摄取流程。
-        
+
         内部通过 asyncio.to_thread 将同步的 run() 放到线程池中执行，
         避免阻塞调用方的事件循环。Transform 阶段各组件内部仍使用
         ThreadPoolExecutor 并发处理 chunks。
         """
         import asyncio
-        return await asyncio.to_thread(self.run, file_path, trace, on_progress)
-    
+        return await asyncio.to_thread(self.run, file_path, trace, on_progress, version_key)
+
+    def _replace_old_versions(
+        self, new_hash: str, version_key: str, stages: Dict[str, Any]
+    ) -> None:
+        """新版本摄入成功后，删除同一 `version_key` 下的旧版本片段。
+
+        对应 CLAUDE.md §4 P0 第 1 条"文档更新后旧版本片段永久残留"——`doc_id`
+        即内容哈希，内容一变就是全新文档，此前全仓没有任何地方知道"这次
+        上传是哪份旧文档的新版本"，旧片段永久留在库里，与新内容一起被检索
+        返回，模型无法判断哪个是当前版本。
+
+        跟摄入失败时的 `_rollback_storage` 是同一个"非致命清理，失败只记日志
+        不影响本次摄入成败判定"的原则——旧版本没清干净不该让这次本来已经
+        成功的新版本摄入被判失败，那样反而两个版本都没有一个是"确定摄入
+        成功"的状态，比"新版本已生效、旧版本清理有残留待人工排查"更糟。
+        """
+        try:
+            old_versions = self.integrity_checker.find_other_versions(
+                version_key, self.collection, exclude_hash=new_hash
+            )
+        except Exception as e:
+            logger.warning(f"  ⚠️  Failed to look up old versions for {version_key!r}: {e}")
+            stages["version_replace"] = {"error": str(e)}
+            return
+
+        if not old_versions:
+            stages["version_replace"] = {"old_versions_removed": 0}
+            return
+
+        manager = DocumentManager(
+            self.vector_upserter.vector_store, self.bm25_indexer,
+            self.image_storage, self.integrity_checker,
+        )
+        removed = 0
+        errors: List[str] = []
+        for old in old_versions:
+            old_hash = old["file_hash"]
+            result = manager.delete_document(
+                old["file_path"], collection=self.collection, source_hash=old_hash
+            )
+            if result.success:
+                removed += 1
+                logger.info(
+                    f"  🔄 Replaced old version {old_hash[:16]}... of {version_key!r} "
+                    f"({result.chunks_deleted} chunks, bm25_removed={result.bm25_removed})"
+                )
+            else:
+                errors.append(f"{old_hash[:16]}...: {'; '.join(result.errors)}")
+                logger.warning(f"  ⚠️  Failed to fully remove old version {old_hash[:16]}...: {result.errors}")
+
+        stages["version_replace"] = {
+            "old_versions_found": len(old_versions),
+            "old_versions_removed": removed,
+            "errors": errors,
+        }
+
     def _rollback_storage(
         self,
         vector_ids: Optional[List[str]] = None,

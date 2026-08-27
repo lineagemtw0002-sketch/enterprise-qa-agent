@@ -666,7 +666,17 @@ def mirror_ingestion_to_opensearch(
                 source_path=chunk.metadata["source_path"],
                 chunk_index=chunk.metadata.get("chunk_index", i),
                 chunk_id=stat["chunk_id"],
-                doc_hash=getattr(document, "id", None),
+                # ⚠️ 2026-08-27 修复：不能用 `document.id`（`UniversalLoader`
+                # 里定义的 `f"doc_{sha256[:16]}"` 短前缀形式）——Chroma/BM25/
+                # 图片索引的 `doc_hash` 全部是完整 64 位内容哈希，`chunk.
+                # metadata["doc_hash"]` 正是这份完整哈希（`_inherit_metadata`
+                # 从 `document.metadata` 整份继承下来的），直接复用它保持
+                # 三个存储后端标识一致，不再引入第二套哈希格式。这是修
+                # BM25 侧同一个 bug（见 `pipeline.py` 6b 阶段注释）时顺带发现
+                # 的：现在没有生产读者读这份镜像数据，暂时零影响，但等
+                # OpenSearch 读路径接上后，按 doc_hash 删除会跟 BM25 当初
+                # 一样恒找不到匹配。
+                doc_hash=chunk.metadata.get("doc_hash"),
                 conversation_id=conversation_id,
                 owner_user_id=owner_user_id,
                 embedding=dense_vectors[i] if dense_vectors else None,

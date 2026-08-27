@@ -77,6 +77,12 @@ def _make_fake_pipeline() -> object:
     fp.dense_encoder.encode.return_value = [[0.1, 0.2]]
     fp.summary_vector_store = MagicMock()
 
+    # 成功收尾：新版本替换旧版本（CLAUDE.md §4 P0 第 1 条），不是本测试
+    # 覆盖的行为，桩掉即可——这是 `IngestionPipeline` 的真实方法，`fp` 是
+    # 鸭子类型的假件而非真实子类，不桩会在 `self._replace_old_versions(...)`
+    # 这一步直接 AttributeError。
+    fp._replace_old_versions = MagicMock()
+
     return fp
 
 

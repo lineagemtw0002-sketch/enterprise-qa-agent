@@ -2838,7 +2838,14 @@ def create_app() -> FastAPI:
         try:
             async with INGEST_SEMAPHORE:
                 pipeline = IngestionPipeline(settings, collection=collection_name)
-                result = await asyncio.to_thread(pipeline.run, file_path=str(dest_path), on_progress=on_progress)
+                # version_key 显式传原始文件名，不能让它默认落回 dest_path——
+                # dest_path 每次上传都带一个随机 UUID 前缀（见上面 upload
+                # 端点的 safe_name），默认值在这条路径上永远不会撞上旧版本，
+                # 等于 P0"旧版本片段永久残留"完全没有被修（CLAUDE.md §4 第 1 条）。
+                result = await asyncio.to_thread(
+                    pipeline.run, file_path=str(dest_path), on_progress=on_progress,
+                    version_key=original_name,
+                )
 
             _upload_progress[upload_id].update(
                 done=True, success=result.success, chunk_count=result.chunk_count,
