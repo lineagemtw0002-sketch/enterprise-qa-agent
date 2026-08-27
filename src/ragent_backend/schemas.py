@@ -316,8 +316,39 @@ class OpsMetricsResponse(BaseModel):
     approval_timeliness_rate: Optional[float] = None
     execution_success_rate: Optional[float] = None
     alert_noise_reduction: Optional[float] = None
+    # MTTR = 最早关联告警时间 → 修复动作执行完成时间（2026-08-27 用户拍板的
+    # 口径）。只统计真正 completed 且链接了分析摘要的动作，没有样本时是 None。
+    mttr_seconds: Optional[float] = None
     outcome_effective_counts: Dict[str, int]
     sample_sizes: Dict[str, int]
+
+
+class ServiceHealthEntry(BaseModel):
+    service: str
+    status: str                       # critical / warning / stale / ok
+    error_rate: Optional[float] = None
+    p95_latency_ms: Optional[float] = None
+    queue_latency_ms: Optional[float] = None
+    connection_id: Optional[str] = None
+    connector_name: Optional[str] = None
+
+
+class OpsLiveOverviewResponse(BaseModel):
+    """总览大屏里**需要现场问连接器**的那部分（服务健康网格 + 今日告警合并）。
+
+    跟 `/admin/ops/metrics`（纯数据库统计）分成两个端点，是因为这个要走
+    联邦查询、耗时取决于客户环境，不该把纯数据库的那几个指标一起拖慢。
+
+    `unavailable` 非空 = 部分连接器没查到（离线/超时/越权），**必须在界面上
+    显示出来**（§3.5 第 4 条）——服务网格少了几个服务和"这些服务都健康"
+    在视觉上没有区别，不标注就是在骗人。
+    """
+
+    services: List[ServiceHealthEntry] = []
+    today_alert_count: int = 0
+    today_incident_count: int = 0
+    today_noise_reduction: Optional[float] = None
+    unavailable: List[str] = []
 
 
 class RemediationActionResponse(BaseModel):

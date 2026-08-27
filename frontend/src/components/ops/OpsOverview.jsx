@@ -28,6 +28,42 @@ const ACTION_TYPE_LABEL = {
 
 const POLL_INTERVAL_MS = 15000
 
+const SERVICE_STATUS_LABEL = {
+  critical: '异常',
+  warning: '观察中',
+  ok: '正常',
+  // ⚠️ 「数据中断」不能写成「正常」或「观察中」：这个服务被发现了，但一个指标
+  // 都没查回来，我们对它的状态一无所知。染成绿色等于替客户断言"我看过了没问题"。
+  stale: '数据中断',
+}
+
+/** 服务卡片上的指标行。**没有的指标显示「—」，不省略也不填 0。**
+ *
+ * 队列延迟和 HTTP P95 是两个不同的指标（阈值也不同，见 `src/ops/service_health.py`），
+ * 显示时也要用各自的名字——都写成"P95 延迟"会让人拿一个异步 worker 的排队时间
+ * 去跟 HTTP 服务比较。
+ */
+function serviceMetricText(s) {
+  const parts = []
+  if (s.p95_latency_ms != null) parts.push(<span key="p95">P95 延迟 <b>{formatMs(s.p95_latency_ms)}</b></span>)
+  if (s.queue_latency_ms != null) parts.push(<span key="q">队列延迟 <b>{formatMs(s.queue_latency_ms)}</b></span>)
+  if (s.error_rate != null) parts.push(<span key="err">错误率 <b>{(s.error_rate * 100).toFixed(2)}%</b></span>)
+  if (!parts.length) {
+    return <><span>P95 延迟 <b>—</b></span><span>连接器 <b>同步中</b></span></>
+  }
+  return parts
+}
+
+function formatMs(ms) {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`
+}
+
+function formatDuration(seconds) {
+  if (seconds < 60) return `${Math.round(seconds)}秒`
+  if (seconds < 3600) return `${(seconds / 60).toFixed(1)}分钟`
+  return `${(seconds / 3600).toFixed(1)}小时`
+}
+
 function fmtClock(ts) {
   if (!ts) return '--:--'
   return new Date(ts * 1000).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' })
@@ -37,12 +73,18 @@ function fmtFull(ts) {
   return ts ? new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false }) : '—'
 }
 
-function Kpi({ label, value, unit, delta, deltaTone = 'flat' }) {
+/** KPI 卡片。
+ *
+ * ⚠️ `placeholder` 不只是"换个字号"：**"暂无数据"不是一个成绩，不该跟真实
+ * 数字一样醒目**。而且它必须 `nowrap`——5 列布局下卡片很窄，26px 的大字号会
+ * 把"暂无数据"折成三行（真机上看出来的，构建和类型都发现不了）。
+ */
+function Kpi({ label, value, unit, delta, deltaTone = 'flat', placeholder = false }) {
   return (
     <div className="kpi-card">
       <div className="kpi-label">{label}</div>
       <div className="kpi-row">
-        <span className="kpi-value">
+        <span className={`kpi-value${placeholder ? ' placeholder' : ''}`}>
           {value}
           {unit && <span className="kpi-unit"> {unit}</span>}
         </span>
@@ -136,6 +178,7 @@ function MetricCell({ label, value, sample, hint }) {
 export default function OpsOverview({ canManage, onModuleDisabled }) {
   const [actions, setActions] = useState([])
   const [metrics, setMetrics] = useState(null)
+  const [live, setLive] = useState(null)
   const [connectors, setConnectors] = useState([])
   const [summaries, setSummaries] = useState([])
   const [loading, setLoading] = useState(true)
@@ -148,7 +191,7 @@ export default function OpsOverview({ canManage, onModuleDisabled }) {
     try {
       // 三个接口并发拉。任意一个 403 都说明模块没开通（后端是统一的门），
       // 交给外层显示"未开通"，不在这里各自处理。
-      const [actionList, summaryList, connectorList, metricsData] = await Promise.all([
+      const [actionList, summaryList, connectorList, metricsData, liveData] = await Promise.all([
         opsApi.listRemediationActions(),
         opsApi.listAnalysisSummaries(),
         // 非管理员没有连接器列表权限（后端 org_admin 专属），拿不到就当空——
@@ -157,11 +200,15 @@ export default function OpsOverview({ canManage, onModuleDisabled }) {
         // 指标算不出来不该让整块大屏挂掉——它是"锦上添花"的那一层，
         // 失败时显示"暂无数据"就够了。
         opsApi.getOpsMetrics().catch(() => null),
+        // 服务健康 + 今日告警要现场问连接器，客户环境慢/离线都可能失败——
+        // 失败时整块大屏照常显示，服务网格自己会说"查不到"。
+        opsApi.getLiveOverview().catch(() => null),
       ])
       setActions(actionList)
       setSummaries(summaryList)
       setConnectors(connectorList)
       setMetrics(metricsData)
+      setLive(liveData)
     } catch (error) {
       if (opsApi.isModuleDisabledError(error)) { onModuleDisabled(); return }
       if (!silent) message.error(opsApi.errorText(error))
@@ -201,6 +248,26 @@ export default function OpsOverview({ canManage, onModuleDisabled }) {
     <>
       <section className="kpi-strip" aria-label="核心指标">
         <Kpi
+          label="今日告警合并"
+          value={live && live.today_alert_count
+            ? `${live.today_alert_count} → ${live.today_incident_count}`
+            : '暂无数据'}
+          delta={live && live.today_alert_count
+            ? `降噪 ${(live.today_noise_reduction * 100).toFixed(1)}%`
+            : '今天还没有收到告警'}
+          deltaTone={live && live.today_alert_count ? 'good' : 'flat'}
+          placeholder={!(live && live.today_alert_count)}
+        />
+        <Kpi
+          label="MTTR（中位数）"
+          value={metrics && metrics.mttr_seconds != null ? formatDuration(metrics.mttr_seconds) : '暂无数据'}
+          delta={metrics && metrics.mttr_seconds != null
+            ? `${metrics.sample_sizes?.mttr ?? 0} 次已完成修复`
+            : '还没有执行完成的修复'}
+          deltaTone="flat"
+          placeholder={!(metrics && metrics.mttr_seconds != null)}
+        />
+        <Kpi
           label="待审批修复"
           value={pending.length}
           delta={pending.length ? '需要人工确认' : '暂无待办'}
@@ -222,6 +289,45 @@ export default function OpsOverview({ canManage, onModuleDisabled }) {
 
       <div className="ops-grid">
         <div className="ops-col">
+          <section className="panel">
+            <div className="panel-head">
+              <div className="panel-title">
+                服务健康
+                <span className="count">
+                  {live ? `${live.services.length} 个服务（连接器自动发现）` : ''}
+                </span>
+              </div>
+            </div>
+            <div className="panel-body">
+              {!live || !live.services.length ? (
+                <div className="panel-empty">
+                  还没有连接器上报服务。服务清单由连接器自动发现，不需要在这里手工登记。
+                </div>
+              ) : (
+                <div className="svc-grid">
+                  {live.services.map((s) => (
+                    <div key={`${s.connection_id}:${s.service}`} className={`svc-card ${s.status}`}>
+                      <div className="svc-top">
+                        <span className="svc-name">{s.service}</span>
+                        <span className={`status-pill ${s.status}`}>
+                          <span className="dot" />{SERVICE_STATUS_LABEL[s.status] || s.status}
+                        </span>
+                      </div>
+                      <div className="svc-metrics">{serviceMetricText(s)}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {live && live.unavailable.length > 0 && (
+                // ⚠️ 部分连接器查不到时必须显式说出来——网格上"少了几个服务"
+                // 跟"这些服务都健康"在视觉上毫无区别（§3.5 第 4 条）。
+                <div className="panel-note">
+                  以下连接器的数据本次没有取到，网格并不完整：{live.unavailable.join('、')}
+                </div>
+              )}
+            </div>
+          </section>
+
           <section className="panel">
             <div className="panel-head">
               <div className="panel-title">

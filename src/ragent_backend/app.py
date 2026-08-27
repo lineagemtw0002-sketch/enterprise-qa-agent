@@ -70,6 +70,7 @@ from src.ragent_backend.schemas import (
     RemediationActionResponse, ProposeRemediationActionRequest,
     RoleOpsPermissionResponse, SetRoleOpsPermissionRequest,
     AnalysisSummaryResponse, SetOutcomeEffectiveRequest, OpsMetricsResponse,
+    OpsLiveOverviewResponse, ServiceHealthEntry,
     PostmortemEntryResponse,
 )
 from src.ragent_backend import account_import as _acct_import
@@ -95,7 +96,9 @@ from src.ragent_backend.ops_store import (
     STATUS_PENDING_APPROVAL, STATUS_REJECTED, STATUS_REJECTED_PRE,
 )
 from src.ragent_backend import aiops_scope
-from src.ops import connector_session
+from src.ops import connector_session, service_health
+from src.ops.analysis import Alert, correlate_alerts
+from src.ops.types import QueryRequest, TimeRange
 from src.ops.connector_transport import WebSocketConnectorTransport, WebSocketRemediationDispatcher
 from src.ops.federation.engine import FederatedQueryEngine
 from src.ops.store_adapters import OpsStoreDirectory
@@ -2137,7 +2140,14 @@ def create_app() -> FastAPI:
 
         action = await ops_store.create_proposed_action(
             org.org_id, connection_id, current_user.user_id, request.intent,
-            request.plan, impact_radius=request.impact_radius, rollback_plan=request.rollback_plan,
+            # ⚠️ **把 `action_type` 盖进 plan 一起落库。**
+            # `remediation_actions` 没有 action_type 列，它只活在请求参数里；
+            # 而执行前的白名单复查（`OpsToolset._recheck_scope`）需要知道类型，
+            # 拿不到就**静默跳过那道检查**——提议到执行之间管理员完全可能把目标
+            # 从白名单里摘掉，跳过复查等于打在一个已被禁止的目标上。
+            # 之前只有"调用方恰好把 action_type 写进了 plan"时才检查得了。
+            {**request.plan, "action_type": request.action_type},
+            impact_radius=request.impact_radius, rollback_plan=request.rollback_plan,
             summary_id=summary_id,
         )
 
@@ -2242,6 +2252,88 @@ def create_app() -> FastAPI:
         metrics = await ops_store.compute_ops_metrics(org.org_id, connection_ids=viewable)
         return OpsMetricsResponse(**metrics)
 
+    @app.get("/api/v1/admin/ops/live-overview", response_model=OpsLiveOverviewResponse)
+    async def admin_ops_live_overview(
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> OpsLiveOverviewResponse:
+        """总览大屏里需要**现场问连接器**的两块：服务健康网格 + 今日告警合并。
+
+        ## 服务清单为什么不存库
+
+        服务清单由连接器自动发现（`kind="service_health"`），平台侧一条都不存
+        ——跟 §3.1「不落库原始运维数据」是同一条原则。清单是运维现状的投影，
+        存下来立刻开始跟现实脱节：服务下线了平台还画着它，新服务上线了没人
+        去补。业界（Datadog Service Catalog / Grafana 的 label 发现）也是
+        发现优先、配置只补 owner 这类人类才知道的元数据。
+
+        ## 今日告警合并为什么现场算
+
+        向连接器要当天全部告警，**当场跑一次 `correlate_alerts`**。
+        另一种做法是只统计"人工触发过分析"的那部分告警，但那个口径答不了
+        "今天"这个问题——没人去触发分析的时段就当作没有告警发生过。
+
+        ## 部分失败必须显式暴露
+
+        `unavailable` 带着"哪些连接器没查到"回给前端。服务网格少了几个服务，
+        跟"这些服务都健康"在视觉上没有任何区别——不标注就是在骗人（§3.5 第 4 条）。
+        """
+        org = await _require_aiops_enabled_org(current_user)
+        viewable = await ops_store.viewable_connection_ids_for_user(current_user.user_id, org.org_id)
+        if viewable is not None and not viewable:
+            return OpsLiveOverviewResponse()
+
+        now = time.time()
+        day_start = now - 86400.0
+        health_req = QueryRequest(kind="service_health", target="",
+                                  time_range=TimeRange(start_ts=now - 300.0, end_ts=now))
+        alert_req = QueryRequest(kind="alert", target="",
+                                 time_range=TimeRange(start_ts=day_start, end_ts=now))
+        health_res, alert_res = await asyncio.gather(
+            _ops_engine.query(org.org_id, health_req, connection_ids=viewable),
+            _ops_engine.query(org.org_id, alert_req, connection_ids=viewable),
+        )
+
+        names = {c.connection_id: c.name for c in await ops_store.list_connectors_for_org(org.org_id)}
+        services: List[ServiceHealthEntry] = []
+        for result in health_res.results:
+            services.extend(
+                ServiceHealthEntry(**s.to_dict())
+                for s in service_health.points_to_services(
+                    # `points` 恒为 `DataPoint`（`QueryResult.points` 的类型），
+                    # 这里不做"也许是 dict"的兼容——那种防御只会让真正的类型
+                    # 错误变成静默的空结果。
+                    [{"ts": p.ts, "value": p.value, "text": p.text, "labels": p.labels}
+                     for p in result.points],
+                    connection_id=result.connection_id,
+                    connector_name=names.get(result.connection_id),
+                )
+            )
+
+        alerts = [
+            Alert(alert_id=f"{result.connection_id}:{i}", ts=p.ts,
+                  target=(p.labels or {}).get("target", ""), labels=p.labels or {},
+                  text=p.text or "", severity=(p.labels or {}).get("severity", "warning"))
+            for result in alert_res.results
+            for i, p in enumerate(result.points)
+        ]
+        correlated = correlate_alerts(alerts) if alerts else None
+
+        # 带上连接器 id 的尾巴——**同名连接器是现实**（同一个企业接两套
+        # Prometheus 很常见，客户也未必会起不同的名字），只显示名字的话
+        # "哪一个不可用"根本分不出来。
+        unavailable = sorted({
+            f"{names[e.connection_id]}（{e.connection_id[-6:]}）" if e.connection_id in names
+            else e.connection_id
+            for e in list(health_res.errors) + list(alert_res.errors)
+        })
+        return OpsLiveOverviewResponse(
+            services=services,
+            today_alert_count=correlated.original_count if correlated else 0,
+            today_incident_count=len(correlated.incidents) if correlated else 0,
+            today_noise_reduction=correlated.noise_reduction if correlated else None,
+            unavailable=unavailable,
+        )
+
     @app.get("/api/v1/admin/ops/postmortems", response_model=List[PostmortemEntryResponse])
     async def admin_list_postmortems(
         limit: int = 100,
@@ -2289,6 +2381,58 @@ def create_app() -> FastAPI:
             current_user.user_id, "approve_remediation_action", "remediation_action", action.action_id, {},
         )
         return _remediation_action_response(action)
+
+    @app.post(
+        "/api/v1/admin/ops/remediation-actions/{action_id}/execute",
+        response_model=RemediationActionResponse,
+    )
+    async def admin_execute_remediation_action(
+        action_id: str,
+        current_user: AuthenticatedUser = Depends(get_current_user),
+    ) -> RemediationActionResponse:
+        """把一条**已批准**的修复动作真正下发到客户环境。
+
+        ## 为什么需要这个端点
+
+        在它之前，这个模块**唯一的执行通路是 LLM 工具**——审批通过之后，人在
+        运维塔台上没有任何办法让它执行，只能去对话里跟模型说一句，指望模型把
+        `action_id` 传对。实测两次都没传对（一次被意图路由判成了别的类型、
+        一次参数名错），动作永远停在 `approved`。
+        业界的运维审批台都是「批准 → 人点执行」，没有哪个是"批准完去跟聊天
+        机器人说一声"。
+
+        ## 跟 LLM 那条路走的是同一段代码
+
+        直接调 `ops_toolset.execute_approved_remediation`，**不另写一份执行
+        逻辑**——四道检查（跨 org / 状态必须是 approved / 白名单复查 / 下发
+        失败也要落到 failed）两条路径完全一致，不会随时间漂移出差别。
+        一个"给人用的快捷入口"如果比 AI 那条路少一道检查，它就是这个模块最大
+        的漏洞，而不是一个便利功能。
+
+        ## 权限
+
+        跟批准同一档（`can_approve`）。V1 不区分"批准人"和"执行人"——设计文档
+        没有定义过第三档权限，凭空造一档不如留给真实需求出现时再定。
+        """
+        org = await _require_aiops_enabled_org(current_user)
+        action = await _get_owned_action(org.org_id, action_id)
+        await _require_can_approve(current_user.user_id, action.connection_id)
+
+        outcome = await ops_toolset.execute_approved_remediation(
+            org.org_id, action.action_id,
+            # 从落库的 plan 里取，不让调用方传——调用方能传就意味着能传错，
+            # 而传错的后果是白名单复查被跳过（见上面提议处的说明）。
+            action_type=(action.plan or {}).get("action_type"),
+        )
+        await _audit_log(
+            current_user.user_id, "execute_remediation_action", "remediation_action",
+            action.action_id, {"ok": outcome.ok},
+        )
+        if outcome.refused:
+            # 被四道检查挡下 = 业务规则冲突，不是服务器错误，调用方要能区分。
+            raise HTTPException(status_code=409, detail=outcome.message)
+        refreshed = await ops_store.get_action(action.action_id)
+        return _remediation_action_response(refreshed or action)
 
     @app.post(
         "/api/v1/admin/ops/remediation-actions/{action_id}/reject",

@@ -149,23 +149,45 @@ def register_ops_tools(
     def _format(outcome: "ToolOutcome") -> str:
         return outcome.message
 
+    def _missing(**required: Any) -> Optional["ToolOutcome"]:
+        """必填参数缺失时回一句**模型能照着改**的话，而不是让它炸成 TypeError。
+
+        ⚠️ 真机跑对话时发现的：schema 里 `target` 标了 required，7B 模型照样会
+        不带参数就调 `analyze_ops_incident`。原来这些参数写成 Python 位置参数，
+        于是直接抛 `TypeError: missing a required positional argument: 'target'`
+        ——**这句内部错误会被原样转述给最终用户**（实测模型回了"工具执行失败，
+        提示缺少必需的位置参数 'target'"）。用户看到的是实现细节，模型也拿不到
+        "该补什么"的可执行提示。显式检查 + 人话回复之后两边都解决了。
+        """
+        blank = [name for name, value in required.items()
+                 if value is None or (isinstance(value, str) and not value.strip())]
+        if not blank:
+            return None
+        return ToolOutcome(ok=False, message=f"调用缺少必需参数：{'、'.join(blank)}。请补上后重试。")
+
     async def _resolve_org_id(user_id: Optional[str]) -> Optional[str]:
         if not user_id or org_store is None:
             return None
         org = await org_store.get_org_for_user(user_id)
         return org.org_id if org is not None else None
 
-    async def _query(target: str, metric: str = "error_rate", window_minutes: int = 60,
+    async def _query(target: str = None, metric: str = "error_rate", window_minutes: int = 60,
                      user_id: str = None, **_: Any) -> Any:
+        bad = _missing(target=target)
+        if bad:
+            return bad
         org_id = await _resolve_org_id(user_id)
         if not org_id:
             return ToolOutcome(ok=False, message="缺少调用方身份，无法查询运维系统。")
         return await toolset.query_ops_system(
             org_id=org_id, target=target, metric=metric, window_minutes=window_minutes)
 
-    async def _propose(connection_id: str, action_type: str, intent: str, plan: dict,
-                       impact_radius: str = None, summary_id: str = None, user_id: str = None,
-                       **_: Any) -> Any:
+    async def _propose(connection_id: str = None, action_type: str = None, intent: str = None,
+                       plan: dict = None, impact_radius: str = None, summary_id: str = None,
+                       user_id: str = None, **_: Any) -> Any:
+        bad = _missing(connection_id=connection_id, action_type=action_type, intent=intent, plan=plan)
+        if bad:
+            return bad
         org_id = await _resolve_org_id(user_id)
         if not org_id or not user_id:
             return ToolOutcome(ok=False, message="缺少调用方身份，无法提交修复建议。")
@@ -174,15 +196,21 @@ def register_ops_tools(
             action_type=action_type, intent=intent, plan=plan, impact_radius=impact_radius,
             summary_id=summary_id)
 
-    async def _analyze(target: str, metric: str = "error_rate", window_minutes: int = 60,
+    async def _analyze(target: str = None, metric: str = "error_rate", window_minutes: int = 60,
                        user_id: str = None, **_: Any) -> Any:
+        bad = _missing(target=target)
+        if bad:
+            return bad
         org_id = await _resolve_org_id(user_id)
         if not org_id:
             return ToolOutcome(ok=False, message="缺少调用方身份，无法执行运维分析。")
         return await toolset.analyze_ops_incident(
             org_id=org_id, target=target, metric=metric, window_minutes=window_minutes)
 
-    async def _execute(action_id: str, action_type: str = None, user_id: str = None, **_: Any) -> Any:
+    async def _execute(action_id: str = None, action_type: str = None, user_id: str = None, **_: Any) -> Any:
+        bad = _missing(action_id=action_id)
+        if bad:
+            return bad
         org_id = await _resolve_org_id(user_id)
         if not org_id:
             return ToolOutcome(ok=False, message="缺少调用方身份，无法执行修复动作。")
