@@ -594,8 +594,13 @@ class RollbackRequest(BaseModel):
 
 
 class IntentResult(BaseModel):
-    """意图识别结果 — 四分支：clarify / rag / tool / workflow"""
-    intent_type: Literal["clarify", "rag", "tool", "workflow"] = "rag"
+    """意图识别结果 — 五分支：clarify / rag / tool / workflow / chitchat。
+
+    `chitchat`（2026-08-27 新增，Phase 1a，`docs/chitchat_intent_design.md`）：
+    闲聊/寒暄/问助手自身身份能力，不查企业知识库、不查本次对话附件。
+    在此之前闲聊借用的是 `rag` 这个桶（历史理由见该设计文档 §1.2），
+    `rag` 的语义现在收回到"只回答本次对话上传附件本身的内容"。"""
+    intent_type: Literal["clarify", "rag", "tool", "workflow", "chitchat"] = "rag"
     confidence: float
     rewritten_query: str
     target_tool: Optional[str] = None      # tool 意图时指定目标工具

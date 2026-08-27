@@ -46,10 +46,14 @@ class QueryAnalysisResult(BaseModel):
 
 
 class IntentDetectionResult(BaseModel):
-    """LLM 结构化输出：意图四分类"""
-    intent_type: Literal["clarify", "rag", "tool", "workflow"] = Field(
+    """LLM 结构化输出：意图五分类（2026-08-27 Phase 1b 加入 chitchat，
+    `docs/chitchat_intent_design.md`）。过渡期内 chitchat 主要靠
+    `_match_chitchat_intent` 白名单在 LLM 之前短路，模型自己判出这个标签的
+    准确率如何有待 Phase 3 重训后验证——见该设计文档 §2.3-3a。"""
+    intent_type: Literal["clarify", "rag", "tool", "workflow", "chitchat"] = Field(
         description="意图类型: clarify=需要澄清, rag=知识库检索, tool=需要调用外部工具, "
-                    "workflow=发起一个业务流程（报修/请假/出差等）"
+                    "workflow=发起一个业务流程（报修/请假/出差等）, "
+                    "chitchat=闲聊/寒暄/问助手自身身份能力，不需要查资料"
     )
     confidence: float = Field(
         ge=0.0, le=1.0,
@@ -82,18 +86,20 @@ class IntentDetectionResult(BaseModel):
 
 class QueryAnalysisAndIntentResult(BaseModel):
     """LLM 结构化输出：合并版，一次调用同时完成"查询重写+子查询拆分"
-    （QueryAnalysisResult 的字段）和"意图四分类"（IntentDetectionResult 的字段）。
-    字段定义跟那两个模型逐一对应，方便 `_reconcile_intent_result` 用同一套
-    后处理逻辑同时兼容这三个模型（duck typing，不要求共同基类）。"""
+    （QueryAnalysisResult 的字段）和"意图五分类"（IntentDetectionResult 的字段，
+    2026-08-27 Phase 1b 加入 chitchat）。字段定义跟那两个模型逐一对应，方便
+    `_reconcile_intent_result` 用同一套后处理逻辑同时兼容这三个模型
+    （duck typing，不要求共同基类）。"""
     rewritten_query: str = Field(
         description="消除所有代词和指代后的完整、独立查询"
     )
     sub_queries: List[str] = Field(
         description="如果查询包含多个并列主题，拆分为可独立执行的子查询列表；否则只放一个元素"
     )
-    intent_type: Literal["clarify", "rag", "tool", "workflow"] = Field(
+    intent_type: Literal["clarify", "rag", "tool", "workflow", "chitchat"] = Field(
         description="意图类型: clarify=需要澄清, rag=知识库检索, tool=需要调用外部工具, "
-                    "workflow=发起一个业务流程（报修/请假/出差等）"
+                    "workflow=发起一个业务流程（报修/请假/出差等）, "
+                    "chitchat=闲聊/寒暄/问助手自身身份能力，不需要查资料"
     )
     confidence: float = Field(
         ge=0.0, le=1.0,
@@ -492,13 +498,19 @@ def _has_vague_pronoun(text: str) -> bool:
 # 之前用高精度白名单把闲聊摘出来，长度阈值**原样不动**——"他呢""多少"这类
 # 真正模糊的短查询仍然被拦成 clarify，那个能力一点没丢。
 #
-# 为什么终判是 "rag" 而不是新增一类 "chitchat"：四分类里确实没有"直接对话
-# 回答"这一桶（根因三），补第五类要同时改 `IntentDetectionResult` 的 Literal、
-# `workflow.py` 的 `_route_after_intent` 并新增一个生成节点，属于结构性改动、
-# 本次不做。"rag" 是现有四个桶里唯一能走到"正常调 LLM 生成回答"的：
-# `_route_after_intent` 把 rag 送进 `_retrieve_node`（只搜本次对话上传的附件，
-# 闲聊时零命中），再进 `_generate_node` 正常生成——**不会**碰到只认
-# `target_tool == "query_knowledge_hub"` 的知识库空命中闸门。
+# 2026-08-27 更新（Phase 1a，`docs/chitchat_intent_design.md`）：终判改成了
+# 真正的第五类 "chitchat"，不再借用 "rag"。历史背景（为什么曾经借用 "rag"）：
+# 旧版四分类里没有"直接对话回答"这一桶（根因三），补第五类要同时改
+# `IntentDetectionResult` 的 Literal、`workflow.py` 的 `_route_after_intent`，
+# 当时判定属于结构性改动、搁置不做，"rag" 是那时四个桶里唯一能走到"正常调
+# LLM 生成回答"的临时借位。搁置的理由与代价见该设计文档 §1.2；本次已按
+# 用户批准的方案 B+ 正式启动，"rag" 的语义收回到"只回答本次对话上传附件
+# 本身的内容"。`_route_after_intent`（workflow.py）在 Phase 1a 阶段还没有
+# `chitchat` 对应的路由分支，会落到默认分支 `return "retrieve"`——这与旧版
+# "rag" 的走法逐字相同，Phase 1a 上线不改变任何用户可见行为
+# （`docs/chitchat_intent_design.md` §2.5"关键设计"）。Phase 2 会给
+# `chitchat` 接上真正的路由（直连 generate + 模板/受约束 prompt 两条 lane，
+# 见 `src/ragent_backend/chitchat.py`）。
 
 # 归一化后**整句精确相等**才命中（不是子串匹配）——子串匹配会把
 # "报销流程你好像提过" 这类正常业务问句也吞掉。
@@ -584,8 +596,7 @@ def _is_chitchat_segment(segment: str) -> bool:
 
 def _match_chitchat_intent(query: str) -> Optional[IntentResult]:
     """闲聊白名单短路：整句（按标点切成的**每一个**片段）都是寒暄/致谢/告别/
-    问助手自身身份能力时，直接判成 rag —— 不调 LLM、不进知识库检索工具，
-    让主图走 `_retrieve_node` -> `_generate_node` 正常生成一句对话回答。
+    问助手自身身份能力时，直接判成 chitchat —— 不调 LLM、不进知识库检索工具。
 
     与 `_needs_clarify_rule` 的分工（这是本函数存在的关键）：本函数只认**白名单
     里那些确定无疑的寒暄**，`_needs_clarify_rule` 继续负责拦真正模糊的短查询。
@@ -612,7 +623,7 @@ def _match_chitchat_intent(query: str) -> Optional[IntentResult]:
         return None
 
     return IntentResult(
-        intent_type="rag",
+        intent_type="chitchat",
         rewritten_query=cleaned,
         confidence=0.9,
         need_clarify=False,
@@ -661,12 +672,14 @@ async def detect_intent(
     available_workflows: Optional[List[Dict[str, Any]]] = None,
 ) -> IntentResult:
     """
-    意图四分类：clarify / rag / tool / workflow。
+    意图五分类：clarify / rag / tool / workflow / chitchat
+    （chitchat 为 2026-08-27 Phase 1b 新增，`docs/chitchat_intent_design.md`）。
 
     策略：
+    0. 闲聊白名单短路（保留现有规则，排在澄清检查之前，见 _match_chitchat_intent）
     1. 先检查是否需要澄清（保留现有规则）
     1.5. 明确的"我想/我要 + 流程关键词"动作型表达，规则直接短路成 workflow
-    2. 如果有 LLM，用结构化调用做四分类（推荐）
+    2. 如果有 LLM，用结构化调用做五分类（推荐）
     3. 无 LLM 时，回退到规则-based 分类
 
     Args:
@@ -755,7 +768,11 @@ _INTENT_CLASSIFY_RULES = """分类规则：
   说明（用 query_knowledge_hub 工具，不要跟上面的 "rag" 搞混——员工手册、报销制度、
   入职指南这类"公司内部资料"问题都归这一类，不是 "rag"）、搜网页、查天气、算数、
   查考勤等
-- "workflow": 用户想发起一个业务流程/申请（如报修、请假、出差、报销），不是在问知识、不是在查资料"""
+- "workflow": 用户想发起一个业务流程/申请（如报修、请假、出差、报销），不是在问知识、不是在查资料
+- "chitchat": 闲聊/寒暄/问候/致谢/告别，或者问助手自身的身份、能力、工作方式（比如"你好"
+  "谢谢""再见""你是谁""你能做什么""你用的是什么模型"），不需要查任何资料、不需要调用
+  任何工具就能回答；如果闲聊里夹带了具体的业务问题（比如"你好，年假多少天"），按业务
+  问题本身的性质选 "tool" 或 "workflow"，不要选这个"""
 
 
 def _reconcile_intent_result(
@@ -866,7 +883,7 @@ async def _detect_intent_with_llm(
     available_tools: List[Dict[str, Any]],
     available_workflows: List[Dict[str, Any]],
 ) -> IntentResult:
-    """使用 LLM 做结构化意图四分类（独立一次调用；合并版见 analyze_and_route）。"""
+    """使用 LLM 做结构化意图五分类（独立一次调用；合并版见 analyze_and_route）。"""
     prompt = f"""你是意图分类专家。请根据用户查询、可用工具列表和可用流程模板列表，判断用户的真实意图。
 
 {_INTENT_CLASSIFY_RULES}
@@ -918,7 +935,7 @@ async def analyze_and_route(
     available_workflows: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[str, List[str], IntentResult]:
     """合并版入口：一次结构化 LLM 调用同时完成"指代消解+子查询拆分"
-    （原 analyze_query）和"四分类"（原 detect_intent），取代原来两次串行往返
+    （原 analyze_query）和"五分类"（原 detect_intent），取代原来两次串行往返
     ——本地小模型每次推理都是几秒级的，省一次往返是当前这条链路里最直接的
     延迟优化（`_intent_node` 实测能省小几秒，具体见 workflow.py 调用点的说明）。
 

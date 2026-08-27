@@ -790,7 +790,38 @@ flowchart TB
 
 ### 🟠 P1
 
-- 🟡 **闲聊路由误判：81% → 0%（但只覆盖"可枚举的寒暄"，不是结构性解决）** ⏸ **结构性方案已设计但搁置**，见 `docs/chitchat_intent_design.md`，需用户明确启动，不要主动开工
+- 🟡 **闲聊路由误判：81% → 0%（可枚举部分）；结构性方案（第五类 `chitchat`）已实施到 Phase 2，
+  Phase 3（重训 1.5b router）数据/评估设施已备好但训练本身未执行** ——
+  2026-08-27 用户明确批准启动 `docs/chitchat_intent_design.md`（覆盖了此前的搁置状态），
+  独立 worktree（`task/chitchat-intent-class` 分支）完成 Phase 1a→1b→2：
+  - `intent.py`/`schemas.py` 的 `intent_type` 从借用的 `"rag"` 改成真正的第五类 `"chitchat"`；
+  - 新模块 `src/ragent_backend/chitchat.py`：`match_chitchat_reply()`（身份/能力/元问题固定文案，
+    问候/致谢/告别 2~3 条随机文案零 LLM 调用）+ `build_chitchat_prompt()`（开放闲聊受约束
+    prompt，能力白名单 + D4/D5 同构约束，`CHITCHAT_MAX_TOKENS=200` 更紧的生成上限）；
+  - `workflow.py::_route_after_intent` 加 `chitchat → generate` 直连路由（不新增节点），
+    `_generate_node` 内新增模板短路——**排在**越权话术/ACL 拒绝/知识库空命中三道既有短路
+    **之后**（防止模板 lane 绕过安全检查）；
+  - **真机验证**（连本机真实 `qwen2.5:7b`，非 mock）：模板命中零 LLM 调用直接返回；开放闲聊
+    走 LLM 但受约束 prompt 管着，未出现编造实时信息/夸大能力。
+  - **Phase 1/2 效果边界必须说清楚**：这一步**只是把闲聊单独成桶**（此前借用 `rag`，
+    每次闲聊都会白跑一次检索、用企业知识库助手 prompt），闲聊本身的**分类准确率没有变化**——
+    过渡期仍然只靠 `intent.py` 白名单短路（可枚举部分），1.5b router 没有重训。
+  - **Phase 3 已备料未训练**：`router_lora_data/train_batch1.jsonl`（320 条，五类各 15%~25%，
+    chitchat 内部开放闲聊 53.1%/hard negative 21.9%）+ `tests/fixtures/router_eval.jsonl`
+    （73 条冻结 holdout，覆盖训练集没强调的英文/表情/方言/超长闲聊）+ 去重校验
+    `scripts/check_router_lora_dedup.py`（`.pre-commit-config.yaml` 已接线，但 pre-commit
+    框架本身**未安装**，当前仍需手动跑）。**真实基线已跑出**
+    （`scripts/eval_router_against_holdout.py`，连真实 `qwen2.5-1.5b-router`）：
+    holdout 总体准确率 **53.4%（39/73）**，**chitchat 只有 11.1%（3/27）**，其余四类
+    85.7%~100%——这是"重训前"基准，不是训练结果。**真实 LoRA 训练本次未执行**：
+    本机未装 `mlx-lm`/`peft`/`torch`，原模型是 LoRA+MLX 流程训练的（`docs/optimization_tracking.md`
+    有记录），现装训练环境是独立的工程投入，不能顺带做完，如实标注未完成，没有伪造训练结果。
+  - **一处偏离原拍板值**：训练数据落仓路径从 §5-⑦ 拍板的 `data/router_lora/` 改成仓库根目录
+    `router_lora_data/`——本机 `.gitignore`（+ `.git/info/exclude` 里 worktree 共享的重复规则）
+    把整个 `data/` 忽略，塞进去的文件会被 git 悄悄当不存在，正是要避免的"数据丢失"本身；
+    改用的路径名与本条目前一版记录的历史路径一致。
+  - 详见 `docs/chitchat_intent_design.md` 顶部状态区（已更新到 Phase 3 现状）。
+  ⏸ 以下为 2026-08-25 首次修复留下的原始记录，保留供对照：
   （2026-08-25 修复，`intent.py` 的 `_match_chitchat_intent`；
   复现/度量脚本 `scripts/verify_smalltalk_routing.py`，
   回归测试 `tests/unit/test_intent_chitchat_routing.py`；
@@ -815,18 +846,19 @@ flowchart TB
      学到的先验就是"拿不准就判 tool"。白名单只是挡在它前面，**没治它**：
      白名单外的开放闲聊（"今天天气不错""你几岁了""周末有什么安排"）实测
      **仍然撞知识库拒绝话术**。
-  3. 🔴 **`_INTENT_CLASSIFY_RULES` 四个桶里没有"闲聊/直接回答"这一类**（未修）——
-     补第五类 `chitchat` 要同时改 `IntentDetectionResult` 的 `Literal`、
-     `workflow.py` 的 `_route_after_intent` 并新增生成节点，是结构性改动，
-     本次刻意没做（当时 `workflow.py` 有其他会话在改）。
-     现在用 `rag` 顶替"直接对话回答"，语义上是**借位**不是正解。
+  3. ✅ **`_INTENT_CLASSIFY_RULES` 补了第五类 `chitchat`**——2026-08-27 已修，
+     见上方本条目最新记录。`IntentDetectionResult` 的 `Literal`、
+     `workflow.py` 的 `_route_after_intent` 与新的路由分支均已落地，
+     不再用 `rag` 借位。
   **是不是换 1.5b 引入的**：症状是新的，病根不是。
   "告诉用户知识库里没有你是谁"确实是 1.5b 带来的（7b 两条链路下均为 0%），
   但 08-23 基线（7b·两次调用）仍有 **43% 闲聊误判**，只是错法是澄清话术。
   **不是从对变错，是错法变得更有害。**
-  **剩余修复顺序**：定第五类 `chitchat` 体系 → 按新体系补样本重训 LoRA。
-  **重训前必须先把训练数据与生成脚本从临时目录落进仓库**
-  （目前只在 scratchpad，本项目已因 `latency_probe.py` 丢失吃过一次亏）。
+  **剩余修复顺序**：~~定第五类 `chitchat` 体系~~ ✅ 已完成（见上）→ 按新体系补样本重训 LoRA
+  🟡 **数据已备好、训练本身未执行**（见上方本条目最新记录的 Phase 3 部分）。
+  ~~重训前必须先把训练数据与生成脚本从临时目录落进仓库~~ ✅ **已完成**：
+  `router_lora_data/train_batch1.jsonl` + `scripts/gen_router_training_data.py` 均已落仓
+  （不在 `data/router_lora/` 是刻意的，见上方"一处偏离原拍板值"说明）。
   ⚠️ **不要用"拆掉空命中短路"来修剩下的** —— 那道短路是刻意的安全设计
   （防 LLM 零依据编造公司制度），拆掉等于拿"业务问答可能幻觉编制度"换"闲聊能寒暄"。
 - 🟢 **TTFT 卡在提示词泄露检测窗口上 —— 已解决（长回答收益极大，短回答无感）**
@@ -2472,6 +2504,7 @@ flowchart TB
 | `docs/scale_slo_and_priorities.md` | 容量测算 · 最小 SLO · 27+3 条发现重新分级（12 条 P0） | 活文档 |
 | `docs/orchestration_design.md` | 编排层设计：并行防护 + 记忆异步化 | **部分实施**：A 部分 D4/D5（08-25 第二批）、**D1/D2（08-25 第三批，见 §4.5）** 已落地；D3/D6 未实施；**B 部分整体未实施**（阻塞项 B-R1 已实测查清） |
 | `docs/aiops_module_design.md` | **新功能设计**：智能运维模块（企业接入自己的运维系统，AI 做分析+审批后执行修复，BYOC + 联邦查询架构，自动修复限四类动作） | **V1 范围已收尾（2026-08-27）**：2026-08-26 用户明确要求插队开工（覆盖了文档自己"排期维持在 12 条 P0 之后"的原始决定）。阶段一～四全部落地并合并：数据模型/越界判定/审批状态机/管理面端点/审批工作流端点/BYOC 连接器协议（`ConnectorTransport` 实现）+ 联邦查询层/工具注册，粗粒度门禁已升级为 `role_ops_systems` 细粒度审批权限（§10.6，org_admin 通配符 + super_admin 零权限 + can_approve 隐含 can_view）；6 处越界判定漏洞 + 审批状态机 TOCTOU 竞态 + 运维工具 `org_id` 从未被注入过的阻塞 bug 均已修复，见 §5。**LangGraph 接入已确认不需要新增 `intent_type`/`ops_subgraph`**（§10.2 已更正）——既有 `tool_subgraph` 的 `general_agent` 路由天然覆盖。审批超时扫描任务已接线；前端"运维塔台"UI 已完成并真机联调验收（刘德华开发）；`ops_analysis_summaries` CRUD 已实现。**AI 分析层（异常检测/告警关联降噪/RCA 辅助，§2 三项 V1 已确认能力）已实现**（刘德华开发）：异常检测用中位数+MAD 稳健统计（不用均值+标准差，抗遮蔽效应）、告警关联走时间窗+标签规则，两者都不用 LLM；RCA 复用既有生成用 7b LLM，依据引用只从输入推导、不采信模型输出，降级结果不落库；整合点是 `tool_registration.py` 新增的 `analyze_ops_incident` 工具，走既有 `intent_type="tool"` 路由。`role_ops_systems`、`ops_analysis_summaries`、AI 分析层、前端、工具列表按调用者动态过滤（2026-08-27）、§9.2 事后复盘聚合视图最小可行版、§10.5 验收指标公式、三视图展示逻辑统一（UUID→用户名 + `plan` 可读化）均已实现；真实 BYOC 连接器进程（客户环境那一端）未实施。**有意不做**：P1-4 零测试覆盖（阻塞在"无 DB fixture 隔离方案"这个设计问题，非体力活）、§10.3 `scale_instances` baseline 自指（需要 scope schema 设计变更，`xfail(strict=True)` 留作提醒） |
+| `docs/chitchat_intent_design.md` | 意图分类第五类 `chitchat` 设计方案（路由方案 B+、能力白名单、重训配比） | **Phase 1a/1b/2 已实施并验证（2026-08-27）**：`intent_type` 新增 `chitchat`，`chitchat.py` 模板+受约束 prompt，`workflow.py` 接线（真机验证）。**Phase 3 数据/评估设施已备好，训练本身未执行**（无 `mlx-lm`/`peft`/`torch`）：`router_lora_data/train_batch1.jsonl`（320 条）+ `tests/fixtures/router_eval.jsonl`（73 条 holdout）+ 真实基线（总体 53.4%，chitchat 11.1%）。死期 2026-10-31（仅约束剩余的训练执行部分） |
 | `docs/collaboration_retrospective.md` | 协作复盘与开发流程指南（**每周自查只需读 §1**） | 活文档 |
 | `docs/review_2026-08-24/review_codebase_findings.md` | 代码审计，带行号证据 | 时点快照 |
 | `docs/review_2026-08-24/review_process_retro.md` | 过程复盘量化分析 | 时点快照 |

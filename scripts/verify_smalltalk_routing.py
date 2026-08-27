@@ -176,6 +176,39 @@ CASES: List[Case] = [
     Case("6_control_workflow", "我想请假", "workflow"),
     Case("6_control_workflow", "我要报销", "workflow"),
     Case("6_control_workflow", "帮我报修电脑", "workflow"),
+    # 7. 开放闲聊——白名单覆盖不到的部分（`docs/chitchat_intent_design.md` §1.3）。
+    #    这一类是 Phase 3（重训 1.5b router）的验收基准，**Phase 1/2 上线后
+    #    这一类应当仍然大概率不通过**——第五类 chitchat 只是给分类体系定了
+    #    个名字，不会让模型突然认出这些句子（设计文档 §0 最重要的一条）。
+    #    这里补齐的正是该文档 §1.3 提到过、但当时"没有实跑，靠外推"的三句，
+    #    现在跑出诚实基线，不再是外推（该文档 §2.5 第 4 点、§6.2 第 2 条）。
+    Case("7_open_chitchat", "今天天气不错", "chat"),
+    Case("7_open_chitchat", "你几岁了", "chat"),
+    Case("7_open_chitchat", "周末有什么安排", "chat"),
+    Case("7_open_chitchat", "讲个笑话", "chat"),
+    Case("7_open_chitchat", "最近好吗", "chat"),
+    Case("7_open_chitchat", "今天几号", "chat"),
+    Case("7_open_chitchat", "你喜欢吃什么", "chat"),
+    Case("7_open_chitchat", "你有感情吗", "chat"),
+    # 8. hard negative 对照组：长得像闲聊、实为业务，守"第五类不许吃掉业务问答"
+    Case("8_control_lookalike", "你们公司年会是什么时候", "kb"),
+    Case("8_control_lookalike", "你能帮我看看我的考勤吗", "tool"),
+    Case("8_control_lookalike", "你知道报销上限吗", "kb"),
+    Case("8_control_lookalike", "你好，我想请个假", "workflow"),
+    # 9. 英文/多语种闲聊（报告 §6 记的零覆盖之一，此前只有 "hello" 一条）
+    Case("9_multilingual", "how are you", "chat"),
+    Case("9_multilingual", "good morning", "chat"),
+    Case("9_multilingual", "what can you do", "chat"),
+    # 10. 纯表情/纯标点（零覆盖之一）——这类文本经 `_normalize_chitchat_token`
+    #     处理后大概率变成空串，预期结果是"至少不误发起流程/不误查知识库"，
+    #     不强求判成 chat（纯表情本身语义空洞，判 clarify 也可以接受）；
+    #     这里仍标 expect="chat"，如果实测经常落到 clarify，属于诚实暴露的
+    #     新缺口，不代表脚本判据错了。
+    Case("10_punct_only", "😊", "chat"),
+    Case("10_punct_only", "……", "chat"),
+    # 11. 超长闲聊（零覆盖之一）——刻意超过 `_match_chitchat_intent` 的 30 字
+    #     长度上限，验证"太长的寒暄交给 LLM 更稳妥"这条设计判断是否成立。
+    Case("11_long_chitchat", "你好呀，最近工作好忙啊，都没时间休息，你说人是不是应该劳逸结合一下比较好呢", "chat"),
 ]
 
 

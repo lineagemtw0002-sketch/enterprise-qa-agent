@@ -1,4 +1,4 @@
-"""闲聊路由回归测试（2026-08-25）。
+"""闲聊路由回归测试（2026-08-25 首版；2026-08-27 Phase 1a 更新标签）。
 
 对应问题
 --------
@@ -8,14 +8,19 @@
 知识库空命中短路（用户看到"您的知识库里没有『你是谁』"）。
 
 修法：在 LLM 调用**之前**加一层高精度闲聊白名单短路
-（`intent._match_chitchat_intent`），命中就判 `rag`（现有四分类里唯一能走到
-"正常调 LLM 生成一句对话回答"的桶），**长度阈值原样不动**。
+（`intent._match_chitchat_intent`），命中就判 `chitchat`，**长度阈值原样不动**。
+
+2026-08-27 更新（`docs/chitchat_intent_design.md` Phase 1a）：终判标签从
+借用的 `rag` 改成真正的第五类 `chitchat`。按该文档 §2.4 的盘点，这次改动
+**只动 3 行断言 + 1 处测试改名**——回归保护的主体
+（`TestVagueShortQueryStillClarifies` / `TestBusinessQueriesUnaffected`）
+守的是"哪些句子算闲聊、哪些不算"，跟标签叫什么无关，一行未动。
 
 每个测试"在修复前会不会失败"（本项目硬性规则，逐条说明）
 ------------------------------------------------------
 - `TestChitchatWhitelist` / `TestChitchatShortCircuitsBeforeLLM`：**会失败**。
   修复前 `_match_chitchat_intent` 根本不存在（ImportError），且这些用例实测
-  终态是 clarify / kb_refusal，不是 rag。
+  终态是 clarify / kb_refusal，不是 chitchat。
 - `TestVagueShortQueryStillClarifies`：修复前**也通过**——这是**刻意的防回归
   测试**，它守的不是"新功能"，而是"修的时候没把旧能力弄丢"。做过 A/B 对照
   实验：把长度阈值从 `<4` 放宽到关掉，闲聊总误判率 81.0%→66.7% 看着变好，
@@ -25,6 +30,9 @@
   **不会失败**（那时没有白名单，业务问题当然不会被白名单吞掉），但它守的是
   白名单类修法最危险的失败模式——**误伤业务问答**。没有这组测试，白名单一
   扩大就可能悄悄吃掉带寒暄前缀的正经业务问题。
+- `test_chitchat_label_is_chitchat` / `test_chitchat_no_longer_borrows_rag_label`：
+  **会失败**（旧值是 `"rag"`）——钉死 Phase 1a 这次改动本身
+  （`docs/chitchat_intent_design.md` §2.4 ③"在旧实现下它会失败"那条要求）。
 """
 
 import pytest
@@ -115,19 +123,40 @@ KB_TOOL_SCHEMA = [{"type": "function", "function": {"name": "query_knowledge_hub
 
 
 class TestChitchatWhitelist:
-    """纯函数层：白名单该命中的命中、不该命中的一条不碰。"""
+    """纯函数层：白名单该命中的命中、不该命中的一条不碰。
+
+    2026-08-27 Phase 1a 重构（`docs/chitchat_intent_design.md` §2.4 ①）：
+    把"命中判定"和"标签值"拆成两组独立断言——35 条参数化的那组只断言
+    **行为契约**（用户不会看到固定拒绝话术/固定澄清话术这件事本身），
+    不再断言 `== "rag"`；标签值单独用一条具名用例钉死，以后标签再改名
+    也只影响这一条。
+    """
 
     @pytest.mark.parametrize("query", ALL_CHITCHAT)
-    def test_chitchat_is_matched_and_routed_to_rag(self, query):
+    def test_chitchat_is_matched(self, query):
+        """行为契约（T3）：闲聊必须被白名单识别、不进澄清话术、不进知识库
+        检索工具——这三条才是"用户不会看到固定话术"的真正契约，比标签值
+        更接近意图，以后改标签不用再动这 35 条。"""
         result = _match_chitchat_intent(query)
         assert result is not None, f"闲聊未被白名单识别: {query!r}"
-        # rag 是现有四分类里唯一能走到 generate 正常调 LLM 的桶：
-        # tool + query_knowledge_hub 会撞 workflow.py 的知识库空命中短路，
-        # need_clarify=True 会被 clarify 节点用固定话术短路。
-        assert result.intent_type == "rag"
+        # target_tool != "query_knowledge_hub"：不会撞 workflow.py 的知识库
+        # 空命中短路；need_clarify is False：不会被 clarify 节点用固定话术
+        # 短路。
         assert result.need_clarify is False
-        assert result.target_tool is None
+        assert result.target_tool != "query_knowledge_hub"
         assert result.workflow_type is None
+
+    def test_chitchat_label_is_chitchat(self):
+        """T1：标签值本身。旧实现下这里会失败（旧值是 "rag"）。"""
+        result = _match_chitchat_intent("你好")
+        assert result is not None
+        assert result.intent_type == "chitchat"
+
+    def test_chitchat_no_longer_borrows_rag_label(self):
+        """T2：钉死"闲聊不再借用 rag 这个桶"这个决定本身。"""
+        result = _match_chitchat_intent("你好")
+        assert result is not None
+        assert result.intent_type != "rag"
 
     @pytest.mark.parametrize(
         "query", BUSINESS_KB + BUSINESS_KB_MIXED + BUSINESS_TOOL + BUSINESS_WORKFLOW + VAGUE_SHORT
@@ -200,19 +229,19 @@ class TestChitchatShortCircuitsBeforeLLM:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("query", ["你好", "你是谁", "谢谢", "你用的是什么模型"])
-    async def test_detect_intent_returns_rag_without_llm_call(self, query):
+    async def test_detect_intent_returns_chitchat_without_llm_call(self, query):
         llm = _FakeLLM(_fake_kb_payload(query))
         intent = await detect_intent(
             query, llm=llm, available_tools=KB_TOOL_SCHEMA, available_workflows=[],
         )
-        assert intent.intent_type == "rag"
+        assert intent.intent_type == "chitchat"
         assert intent.need_clarify is False
         assert intent.target_tool is None
         assert llm.call_count == 0, "闲聊不该触发 LLM 分类调用"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("query", ALL_CHITCHAT)
-    async def test_analyze_and_route_returns_rag_without_llm_call(self, query):
+    async def test_analyze_and_route_returns_chitchat_without_llm_call(self, query):
         """合并链路（线上走的这条）：即使 LLM 被固定成"判去查知识库"，
         闲聊也不会走到它，因此不会撞上知识库空命中短路。"""
         llm = _FakeLLM(_fake_kb_payload(query))
@@ -220,7 +249,7 @@ class TestChitchatShortCircuitsBeforeLLM:
             query=query, messages=[], llm=llm,
             available_tools=KB_TOOL_SCHEMA, available_workflows=[],
         )
-        assert intent.intent_type == "rag"
+        assert intent.intent_type == "chitchat"
         assert intent.need_clarify is False
         assert intent.target_tool != "query_knowledge_hub"
         assert sub_queries == [rewritten]
