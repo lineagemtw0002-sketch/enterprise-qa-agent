@@ -32,6 +32,8 @@
   --ink-muted: #8d90a3;
   --ink-faint: #5c5f70;
   --ops-accent: #8b7ffb;
+  --accent-dim: #4a4270;
+  --accent-glow: rgba(139, 127, 251, 0.18);
   --good: #34d399;
   --good-dim: #163a2d;
   --warning: #fbbf24;
@@ -46,6 +48,12 @@
   background: var(--ground);
   color: var(--ink);
   font-family: var(--font-display);
+}
+
+/* 盒子样式只属于**嵌在主应用里**的那个版本。
+   之前这几条写在共享块里，独立页面于是也拿到了 `border-radius: 12px`
+   ——一个铺满视口的页面带着圆角，边缘会露出下面的 body。 */
+.ops-console {
   min-height: 100%;
   padding: 16px;
   border-radius: 12px;
@@ -280,8 +288,6 @@
   /* 深色**只存在于这一页**。主应用一点没变——这正是把塔台拆成独立页面的原因：
      整屏深色的监控大屏和浅色的办公界面塞在一个壳里，两种视觉语言互相打架。 */
   min-height: 100vh;
-  background: var(--ground);
-  color: var(--ink, #e7e9f0);
   max-width: 1440px;
   margin: 0 auto;
   padding: 20px 28px 40px;
@@ -306,7 +312,7 @@
 .ops-brand-text h1 { font-size: 17px; font-weight: 700; margin: 0; letter-spacing: 0.01em; }
 .ops-brand-text .sub {
   font-size: 11.5px; color: var(--ink-muted); letter-spacing: 0.02em;
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
 }
 
 .ops-topbar-right { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
@@ -323,7 +329,7 @@
 .ops-backlink:hover { color: var(--ink); border-color: var(--ops-accent); }
 .ops-clock {
   font-size: 12.5px; color: var(--ink-muted); font-variant-numeric: tabular-nums;
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
 }
 
 .ops-empty-hint { text-align: center; color: var(--ink-muted); }
@@ -340,7 +346,7 @@
   font-size: 11.5px; color: var(--ink-muted);
   padding: 6px 11px; background: var(--surface);
   border: 1px solid var(--ops-border); border-radius: 20px;
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
 }
 .ops-live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ink-faint); }
 /* 呼吸动画只在**真的有连接器在线**时出现——一个一直在跳的指示灯，
